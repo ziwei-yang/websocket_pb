@@ -123,21 +123,12 @@ using MacOSDefault = WebSocketClient<
 // Use when memory is constrained but still need good performance
 
 #ifdef __linux__
-#ifdef ENABLE_IO_URING
 using LowMemory = WebSocketClient<
-    WolfSSLPolicy,
-    EpollPolicy,
+    DefaultSSLPolicy,
+    DefaultEventPolicy,
     RingBuffer<4 * 1024 * 1024>,  // 4MB RX buffer
     RingBuffer<4 * 1024 * 1024>   // 4MB TX buffer
 >;
-#else
-using LowMemory = WebSocketClient<
-    OpenSSLPolicy,
-    EpollPolicy,
-    RingBuffer<4 * 1024 * 1024>,  // 4MB RX buffer
-    RingBuffer<4 * 1024 * 1024>   // 4MB TX buffer
->;
-#endif
 #endif
 
 // ============================================================================
@@ -146,21 +137,12 @@ using LowMemory = WebSocketClient<
 // For extremely high message rates or large messages
 
 #ifdef __linux__
-#ifdef ENABLE_IO_URING
 using HighThroughput = WebSocketClient<
-    WolfSSLPolicy,
-    EpollPolicy,
+    DefaultSSLPolicy,
+    DefaultEventPolicy,
     RingBuffer<16 * 1024 * 1024>,  // 16MB RX buffer
     RingBuffer<16 * 1024 * 1024>   // 16MB TX buffer
 >;
-#else
-using HighThroughput = WebSocketClient<
-    OpenSSLPolicy,
-    EpollPolicy,
-    RingBuffer<16 * 1024 * 1024>,  // 16MB RX buffer
-    RingBuffer<16 * 1024 * 1024>   // 16MB TX buffer
->;
-#endif
 #endif
 
 // ============================================================================
@@ -169,21 +151,12 @@ using HighThroughput = WebSocketClient<
 // Common pattern: receive lots of market data, send few commands
 
 #ifdef __linux__
-#ifdef ENABLE_IO_URING
 using AsymmetricBuffers = WebSocketClient<
-    WolfSSLPolicy,
-    EpollPolicy,
+    DefaultSSLPolicy,
+    DefaultEventPolicy,
     RingBuffer<16 * 1024 * 1024>,  // 16MB RX buffer (market data)
     RingBuffer<1 * 1024 * 1024>    // 1MB TX buffer (commands)
 >;
-#else
-using AsymmetricBuffers = WebSocketClient<
-    OpenSSLPolicy,
-    EpollPolicy,
-    RingBuffer<16 * 1024 * 1024>,  // 16MB RX buffer (market data)
-    RingBuffer<1 * 1024 * 1024>    // 1MB TX buffer (commands)
->;
-#endif
 #endif
 
 // ============================================================================

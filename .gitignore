@@ -1,0 +1,132 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Compiled binaries
+ws_example
+io_echo_server
+test_ringbuffer
+test_event
+test_bug_fixes
+test_new_bug_fixes
+test_binance_integration
+example
+benchmark_binance
+check_hw_timestamp
+test_nic_timestamp
+test_timestamp_simple
+
+# Benchmark results
+benchmark_results/
+*.log
+*.txt
+*.csv
+
+# Core dumps
+core
+core.*
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.project
+.cproject
+.settings/
+*.code-workspace
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.user
+*.cmake
+
+# Valgrind output
+vgcore.*
+*.valgrind
+
+# GDB history
+.gdb_history
+
+# Profiling data
+*.prof
+*.gcda
+*.gcno
+*.gcov
+gmon.out
+perf.data
+perf.data.old
+
+# Coverage reports
+coverage/
+*.coverage
+htmlcov/
+
+# Documentation backups
+*.backup
+*.bak
+doc/*.backup
+
+# Mac OS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.directory
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Backup files
+*.orig
+
+# Dependencies
+.deps/
+.libs/
+
+# Package manager
+node_modules/
+vendor/
+
+# Test outputs
+test_output/
+*.test
+
+# Logs
+*.log
+logs/
+
+# Performance data
+*.perf
+
+# Shared memory files
+/dev/shm/*
+
+# Nohup output
+nohup.out
+
+# Scripts output
+scripts/*.log
+scripts/output/
+
+# Temporary run files
+/tmp/run_*.sh

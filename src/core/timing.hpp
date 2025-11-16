@@ -9,6 +9,7 @@
 #include <ctime>
 #include <cstring>
 #include <cerrno>
+#include <cstdlib>
 
 #ifdef __linux__
 #include <sys/socket.h>
@@ -143,16 +144,24 @@ static inline bool enable_hw_timestamping(int sockfd) {
     hwconfig.tx_type = HWTSTAMP_TX_OFF;  // We only care about RX
     hwconfig.rx_filter = HWTSTAMP_FILTER_ALL;  // Timestamp all incoming packets
 
+    // Make NIC interface configurable via environment variable
+    const char* nic_interface = getenv("WS_NIC_INTERFACE");
+    if (!nic_interface) {
+        nic_interface = "enp108s0";  // Default fallback
+    }
+
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "enp108s0");  // Your NIC interface
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", nic_interface);
     ifr.ifr_data = (char*)&hwconfig;
 
     if (ioctl(sockfd, SIOCSHWTSTAMP, &ifr) < 0) {
-        printf("[TIMESTAMP] Warning: Failed to configure NIC hardware timestamping: %s\n", strerror(errno));
+        printf("[TIMESTAMP] Warning: Failed to configure NIC hardware timestamping on %s: %s\n",
+               nic_interface, strerror(errno));
         printf("[TIMESTAMP] Continuing anyway - timestamps may not be available\n");
+        printf("[TIMESTAMP] Tip: Set WS_NIC_INTERFACE env var to your network interface name\n");
     } else {
-        printf("[TIMESTAMP] Configured NIC enp108s0 for hardware RX timestamping\n");
+        printf("[TIMESTAMP] Configured NIC %s for hardware RX timestamping\n", nic_interface);
     }
 
     // Step 2: Request hardware timestamping on socket

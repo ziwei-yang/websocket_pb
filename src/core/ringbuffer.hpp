@@ -456,8 +456,8 @@ private:
         void* addr2 = mmap(static_cast<uint8_t*>(addr) + Capacity, Capacity,
                            PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, fd, 0);
         if (addr2 == MAP_FAILED || addr2 != static_cast<uint8_t*>(addr) + Capacity) {
-            munmap(addr1, Capacity);
-            munmap(static_cast<uint8_t*>(addr) + Capacity, Capacity);
+            // Unmap the full original reservation (both halves)
+            munmap(addr, 2 * Capacity);
             close(fd);
             return -1;
         }

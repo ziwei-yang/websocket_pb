@@ -48,6 +48,7 @@ public:
         rx_buffer_.init();  // Buffer initializes with its template parameter size
         tx_buffer_.init();
         event_loop_.init();
+        event_loop_.set_wait_timeout(1000);  // Set default 1 second timeout
         ssl_.init();
 
         // Initialize timing record
@@ -68,7 +69,10 @@ public:
 
         // Enable TCP_NODELAY for low-latency (disable Nagle's algorithm)
         int flag = 1;
-        ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        if (::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
+            printf("[WARN] Failed to set TCP_NODELAY: %s\n", strerror(errno));
+            // Continue anyway - not critical
+        }
 
         // Enable RX timestamping (must be done before data arrives)
         enable_hw_timestamping(fd_);
@@ -85,15 +89,75 @@ public:
             throw std::runtime_error(std::string("getaddrinfo() failed: ") + gai_strerror(ret));
         }
 
+        // Validate getaddrinfo result
+        if (!result || !result->ai_addr) {
+            if (result) freeaddrinfo(result);
+            ::close(fd_);
+            throw std::runtime_error("getaddrinfo() returned invalid result");
+        }
+
         auto* addr = (struct sockaddr_in*)result->ai_addr;
         addr->sin_port = htons(port);
 
+        // Set socket to non-blocking mode before connect (for timeout support)
+        int flags = fcntl(fd_, F_GETFL, 0);
+        if (flags < 0 || fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+            freeaddrinfo(result);
+            ::close(fd_);
+            throw std::runtime_error("Failed to set non-blocking mode");
+        }
+
+        // Attempt non-blocking connect
         ret = ::connect(fd_, (struct sockaddr*)addr, sizeof(*addr));
         freeaddrinfo(result);
 
-        if (ret < 0) {
+        // Handle non-blocking connect
+        if (ret < 0 && errno != EINPROGRESS) {
             ::close(fd_);
-            throw std::runtime_error("connect() failed");
+            throw std::runtime_error(std::string("connect() failed: ") + strerror(errno));
+        }
+
+        // Wait for connection with 5-second timeout
+        if (ret < 0) {  // EINPROGRESS - connection in progress
+            fd_set write_fds, error_fds;
+            FD_ZERO(&write_fds);
+            FD_ZERO(&error_fds);
+            FD_SET(fd_, &write_fds);
+            FD_SET(fd_, &error_fds);
+
+            struct timeval tv;
+            tv.tv_sec = 5;   // 5 second timeout
+            tv.tv_usec = 0;
+
+            ret = select(fd_ + 1, nullptr, &write_fds, &error_fds, &tv);
+
+            if (ret <= 0) {
+                ::close(fd_);
+                if (ret == 0) {
+                    throw std::runtime_error("connect() timeout after 5 seconds");
+                } else {
+                    throw std::runtime_error(std::string("select() failed: ") + strerror(errno));
+                }
+            }
+
+            // Check if connection succeeded or failed
+            int sock_error = 0;
+            socklen_t len = sizeof(sock_error);
+            if (getsockopt(fd_, SOL_SOCKET, SO_ERROR, &sock_error, &len) < 0) {
+                ::close(fd_);
+                throw std::runtime_error("getsockopt() failed");
+            }
+
+            if (sock_error != 0) {
+                ::close(fd_);
+                throw std::runtime_error(std::string("connect() failed: ") + strerror(sock_error));
+            }
+        }
+
+        // Restore blocking mode for SSL handshake
+        if (fcntl(fd_, F_SETFL, flags) < 0) {
+            ::close(fd_);
+            throw std::runtime_error("Failed to restore blocking mode");
         }
 
         // 3. SSL/TLS handshake
@@ -129,8 +193,8 @@ public:
         on_message_ = on_message;
 
         while (connected_) {
-            // Wait for events (1 second timeout)
-            int ready = event_loop_.wait(1000);
+            // Wait for events (uses pre-configured timeout)
+            int ready = event_loop_.wait_with_timeout();
             if (ready <= 0) continue;
 
             int ready_fd = event_loop_.get_ready_fd();
@@ -236,6 +300,14 @@ private:
             bool masked = (byte1 & 0x80) != 0;
             uint64_t payload_len = byte1 & 0x7F;
 
+            // Reject fragmented messages (not supported)
+            if (!fin) {
+                printf("[ERROR] Fragmented WebSocket messages not supported (FIN=0)\n");
+                printf("[ERROR] This library is designed for single-frame messages only\n");
+                connected_ = false;
+                break;
+            }
+
             size_t header_len = 2;
 
             // Extended payload length
@@ -255,6 +327,18 @@ private:
             // Masking key (if present)
             if (masked) {
                 header_len += 4;
+                // Check bounds after adding masking key length
+                if (available_len < header_len) {
+                    break;  // Need more data for masking key
+                }
+            }
+
+            // Check for integer overflow before calculating frame_len
+            if (payload_len > SIZE_MAX - header_len) {
+                printf("[ERROR] Frame too large: payload_len=%lu exceeds SIZE_MAX\n",
+                       (unsigned long)payload_len);
+                connected_ = false;
+                break;
             }
 
             // Check if full frame is available
@@ -336,15 +420,15 @@ private:
 
     // Receive HTTP 101 Switching Protocols response
     void recv_http_response() {
-        uint8_t buf[4096];
-        ssize_t n = ssl_.read(buf, sizeof(buf));
+        uint8_t buf[4097];  // +1 for null terminator
+        ssize_t n = ssl_.read(buf, sizeof(buf) - 1);  // Reserve space for '\0'
 
         if (n <= 0) {
             throw std::runtime_error("Failed to receive HTTP response");
         }
 
         // Simple validation: check for "101 Switching Protocols"
-        buf[n] = '\0';
+        buf[n] = '\0';  // Safe: n <= 4096
         if (strstr((char*)buf, "101") == nullptr) {
             throw std::runtime_error("HTTP upgrade failed");
         }
@@ -352,15 +436,22 @@ private:
 
     // Send PONG frame in response to PING
     void send_pong(const uint8_t* payload, size_t len) {
+        // Validate payload length (RFC 6455: control frames <= 125 bytes)
+        if (len > 125) {
+            printf("[WARN] PING payload too large (%zu bytes), truncating to 125\n", len);
+            len = 125;
+        }
+
         uint8_t pong[256];
 
         // PONG frame: FIN + opcode 0x0A
         pong[0] = 0x8A;
 
-        // Payload length (assuming < 126 for simplicity)
+        // Payload length (now guaranteed < 126)
         pong[1] = 0x80 | (uint8_t)len;  // Masked
 
         // Masking key (client must mask)
+        // Note: Static key is intentional for performance (single-threaded HFT env)
         uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78};
         memcpy(pong + 2, mask, 4);
 
@@ -369,7 +460,11 @@ private:
             pong[6 + i] = payload[i] ^ mask[i % 4];
         }
 
-        ssl_.write(pong, 6 + len);
+        // Check write return value
+        ssize_t ret = ssl_.write(pong, 6 + len);
+        if (ret <= 0) {
+            printf("[WARN] Failed to send PONG response\n");
+        }
     }
 
 private:

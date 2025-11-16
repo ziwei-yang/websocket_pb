@@ -213,30 +213,6 @@ struct EpollPolicy {
     }
 
     /**
-     * Wait for events with dynamic timeout (backward compatibility)
-     *
-     * Less efficient than wait_with_timeout() because it converts timeout each call.
-     * For best performance, use set_wait_timeout() once, then call wait_with_timeout().
-     *
-     * @param timeout_ms Timeout in milliseconds (-1 = infinite, 0 = poll)
-     * @return Number of ready file descriptors (0 = timeout, -1 = error)
-     */
-    int wait(int timeout_ms) {
-        struct epoll_event events[MAX_EVENTS];
-        int n = epoll_wait(epfd_, events, MAX_EVENTS, timeout_ms);
-
-        if (n > 0) {
-            ready_fd_ = events[0].data.fd;
-            ready_events_ = events[0].events;
-            return n;
-        } else if (n == 0) {
-            return 0;
-        } else {
-            return -1;
-        }
-    }
-
-    /**
      * Set timeout value for wait_with_timeout()
      *
      * Pre-converts timeout to avoid conversion overhead on every wait call.
@@ -525,36 +501,6 @@ struct KqueuePolicy {
             return n;
         } else {
             // Error (timeout cannot occur with nullptr)
-            return -1;
-        }
-    }
-
-    /**
-     * Wait for events with dynamic timeout (backward compatibility)
-     *
-     * @param timeout_ms Timeout in milliseconds (-1 = infinite, 0 = poll)
-     * @return Number of ready file descriptors (0 = timeout, -1 = error)
-     */
-    int wait(int timeout_ms) {
-        struct kevent events[MAX_EVENTS];
-        struct timespec ts = {};
-        struct timespec* timeout_ptr = nullptr;
-
-        if (timeout_ms >= 0) {
-            ts.tv_sec = timeout_ms / 1000;
-            ts.tv_nsec = (timeout_ms % 1000) * 1000000L;
-            timeout_ptr = &ts;
-        }
-
-        int n = kevent(kq_, nullptr, 0, events, MAX_EVENTS, timeout_ptr);
-
-        if (n > 0) {
-            ready_fd_ = static_cast<int>(events[0].ident);
-            ready_filter_ = events[0].filter;
-            return n;
-        } else if (n == 0) {
-            return 0;
-        } else {
             return -1;
         }
     }
@@ -887,44 +833,6 @@ struct SelectPolicy {
     }
 
     /**
-     * Wait for events with dynamic timeout (backward compatibility)
-     *
-     * @param timeout_ms Timeout in milliseconds (-1 = infinite, 0 = poll)
-     * @return Number of ready file descriptors (0 = timeout, -1 = error)
-     */
-    int wait(int timeout_ms) {
-        fd_set tmp_read = read_fds_;
-        fd_set tmp_write = write_fds_;
-
-        struct timeval tv;
-        struct timeval* tv_ptr = nullptr;
-
-        if (timeout_ms >= 0) {
-            tv.tv_sec = timeout_ms / 1000;
-            tv.tv_usec = (timeout_ms % 1000) * 1000;
-            tv_ptr = &tv;
-        }
-
-        int n = ::select(max_fd_ + 1, &tmp_read, &tmp_write, nullptr, tv_ptr);
-
-        if (n > 0) {
-            for (int fd = 0; fd <= max_fd_; ++fd) {
-                uint32_t events = 0;
-                if (FD_ISSET(fd, &tmp_read)) events |= 0x01;
-                if (FD_ISSET(fd, &tmp_write)) events |= 0x04;
-
-                if (events) {
-                    ready_fd_ = fd;
-                    ready_events_ = events;
-                    return n;
-                }
-            }
-        }
-
-        return n;
-    }
-
-    /**
      * Set timeout value for wait_with_timeout()
      *
      * @param timeout_ms Timeout in milliseconds (-1 = infinite, 0 = poll)
@@ -1053,20 +961,23 @@ using SelectPolicy = websocket::event_policies::SelectPolicy;
 // ============================================================================
 // Default Event Policy Selection
 // ============================================================================
+// NOTE: Policy selection is now handled in ws_configs.hpp via compile-time flags
+// (USE_SELECT, ENABLE_IO_URING, etc.). These old defaults are commented out to
+// avoid conflicts with the new flexible policy system.
 
-#if defined(EVENT_POLICY_LINUX)
-    // Linux with epoll (default)
-    using DefaultEventPolicy = websocket::event_policies::EpollPolicy;
-    using EventPolicy = websocket::event_policies::EpollPolicy;
-#elif defined(EVENT_POLICY_BSD)
-    // macOS/BSD with kqueue
-    using DefaultEventPolicy = websocket::event_policies::KqueuePolicy;
-    using EventPolicy = websocket::event_policies::KqueuePolicy;
-#else
-    // Fallback to select
-    using DefaultEventPolicy = websocket::event_policies::SelectPolicy;
-    using EventPolicy = websocket::event_policies::SelectPolicy;
-#endif
+// #if defined(EVENT_POLICY_LINUX)
+//     // Linux with epoll (default)
+//     using DefaultEventPolicy = websocket::event_policies::EpollPolicy;
+//     using EventPolicy = websocket::event_policies::EpollPolicy;
+// #elif defined(EVENT_POLICY_BSD)
+//     // macOS/BSD with kqueue
+//     using DefaultEventPolicy = websocket::event_policies::KqueuePolicy;
+//     using EventPolicy = websocket::event_policies::KqueuePolicy;
+// #else
+//     // Fallback to select
+//     using DefaultEventPolicy = websocket::event_policies::SelectPolicy;
+//     using EventPolicy = websocket::event_policies::SelectPolicy;
+// #endif
 
 // ============================================================================
 // Event Policy Concepts (C++20)
@@ -1101,8 +1012,9 @@ concept EventPolicyConcept = requires(T event, int fd, uint32_t events, int time
 };
 
 // Verify our policies conform to the concept
-static_assert(EventPolicyConcept<EventPolicy>);
-static_assert(EventPolicyConcept<DefaultEventPolicy>);
+// NOTE: These are now verified in ws_configs.hpp after policy selection
+// static_assert(EventPolicyConcept<EventPolicy>);
+// static_assert(EventPolicyConcept<DefaultEventPolicy>);
 
 #ifdef EVENT_POLICY_LINUX
 static_assert(EventPolicyConcept<EpollPolicy>);

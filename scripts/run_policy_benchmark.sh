@@ -115,7 +115,7 @@ CONFIGS=(
     "WolfSSL|epoll|USE_WOLFSSL=1 USE_IOURING=0"
     "WolfSSL|io_uring|USE_WOLFSSL=1 USE_IOURING=1"
 
-    # LibreSSL combinations (will be skipped if not available)
+    # LibreSSL combinations
     "LibreSSL|select|USE_LIBRESSL=1 USE_IOURING=0 USE_SELECT=1"
     "LibreSSL|epoll|USE_LIBRESSL=1 USE_IOURING=0"
     "LibreSSL|io_uring|USE_LIBRESSL=1 USE_IOURING=1"

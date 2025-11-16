@@ -108,9 +108,14 @@ IO_ECHO_SRC := examples/io_echo_server.cpp
 # Test source files
 TEST_RINGBUFFER_SRC := $(TEST_DIR)/test_ringbuffer.cpp
 TEST_EVENT_SRC := $(TEST_DIR)/test_event.cpp
+TEST_BUG_FIXES_SRC := $(TEST_DIR)/test_bug_fixes.cpp
+TEST_NEW_BUG_FIXES_SRC := $(TEST_DIR)/test_new_bug_fixes.cpp
 
 # Integration test source files
 TEST_BINANCE_SRC := $(INTEGRATION_DIR)/binance.cpp
+
+# Minimal example source file
+EXAMPLE_MINIMAL_SRC := test/example.cpp
 
 # Benchmark source files
 BENCHMARK_DIR := ./test/benchmark
@@ -126,13 +131,16 @@ EXAMPLE_BIN := $(BUILD_DIR)/ws_example
 IO_ECHO_BIN := $(BUILD_DIR)/io_echo_server
 TEST_RINGBUFFER_BIN := $(BUILD_DIR)/test_ringbuffer
 TEST_EVENT_BIN := $(BUILD_DIR)/test_event
+TEST_BUG_FIXES_BIN := $(BUILD_DIR)/test_bug_fixes
+TEST_NEW_BUG_FIXES_BIN := $(BUILD_DIR)/test_new_bug_fixes
 TEST_BINANCE_BIN := $(BUILD_DIR)/test_binance_integration
+EXAMPLE_MINIMAL_BIN := $(BUILD_DIR)/example
 BENCHMARK_BINANCE_BIN := $(BUILD_DIR)/benchmark_binance
 CHECK_HW_TIMESTAMP_BIN := $(BUILD_DIR)/check_hw_timestamp
 TEST_NIC_TIMESTAMP_BIN := $(BUILD_DIR)/test_nic_timestamp
 TEST_NIC_TIMESTAMP_SIMPLE_BIN := $(BUILD_DIR)/test_timestamp_simple
 
-.PHONY: all clean run run-echo help test test-ringbuffer test-event test-integration test-binance benchmark-binance check-hw-timestamp test-nic-timestamp test-timestamp-simple
+.PHONY: all clean run run-echo help test test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-integration test-binance example run-example benchmark-binance check-hw-timestamp test-nic-timestamp test-timestamp-simple
 
 all: $(EXAMPLE_BIN) $(IO_ECHO_BIN)
 
@@ -185,6 +193,28 @@ test-event: $(TEST_EVENT_BIN)
 	@echo "🧪 Running event policy unit tests..."
 	./$(TEST_EVENT_BIN)
 
+# Build bug fixes verification tests
+$(TEST_BUG_FIXES_BIN): $(TEST_BUG_FIXES_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling bug fixes unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $^
+	@echo "✅ Test build complete: $@"
+
+# Run bug fixes verification tests
+test-bug-fixes: $(TEST_BUG_FIXES_BIN)
+	@echo "🧪 Running bug fixes verification tests..."
+	./$(TEST_BUG_FIXES_BIN)
+
+# Build new bug fixes verification tests
+$(TEST_NEW_BUG_FIXES_BIN): $(TEST_NEW_BUG_FIXES_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling new bug fixes unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $^
+	@echo "✅ Test build complete: $@"
+
+# Run new bug fixes verification tests
+test-new-bug-fixes: $(TEST_NEW_BUG_FIXES_BIN)
+	@echo "🧪 Running new bug fixes verification tests..."
+	./$(TEST_NEW_BUG_FIXES_BIN)
+
 # Build Binance integration test
 $(TEST_BINANCE_BIN): $(TEST_BINANCE_SRC) | $(BUILD_DIR)
 	@echo "🔨 Compiling Binance integration test..."
@@ -196,6 +226,21 @@ test-binance: $(TEST_BINANCE_BIN)
 	@echo "🧪 Running Binance WebSocket integration test..."
 	@echo "📡 Connecting to wss://stream.binance.com:443..."
 	./$(TEST_BINANCE_BIN)
+
+# Build minimal example
+$(EXAMPLE_MINIMAL_BIN): $(EXAMPLE_MINIMAL_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling minimal example..."
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "✅ Example build complete: $@"
+
+# Build and run minimal example
+example: $(EXAMPLE_MINIMAL_BIN)
+	@echo "Building minimal example..."
+
+run-example: $(EXAMPLE_MINIMAL_BIN)
+	@echo "🚀 Running minimal WebSocket example..."
+	@echo "📡 Connecting to wss://stream.binance.com:443..."
+	./$(EXAMPLE_MINIMAL_BIN)
 
 # Build Binance benchmark
 $(BENCHMARK_BINANCE_BIN): $(BENCHMARK_BINANCE_SRC) | $(BUILD_DIR)
@@ -258,7 +303,7 @@ test-integration: test-binance
 	@echo "✅ All integration tests completed"
 
 # Run all tests (unit + integration)
-test: test-ringbuffer test-event
+test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes
 	@echo "✅ All unit tests completed"
 
 # Clean build artifacts

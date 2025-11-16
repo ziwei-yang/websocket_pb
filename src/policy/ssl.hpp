@@ -24,22 +24,21 @@
 #include <cstring>
 
 // ============================================================================
-// Library Detection
+// Library Detection and Headers
 // ============================================================================
 
-// Determine which SSL library is available
+// Include ALL SSL library headers (they'll compile conditionally based on which is selected)
+// Note: WolfSSL and OpenSSL are mutually exclusive, but LibreSSL is OpenSSL-compatible
+
 #if defined(WOLFSSL_USER_SETTINGS) || defined(HAVE_WOLFSSL)
+    // WolfSSL selected
     #define SSL_POLICY_WOLFSSL 1
     #include <wolfssl/options.h>
     #include <wolfssl/ssl.h>
-#elif defined(LIBRESSL_VERSION_NUMBER)
-    #define SSL_POLICY_LIBRESSL 1
-    #include <openssl/ssl.h>
-    #include <openssl/err.h>
-    #include <openssl/bio.h>
 #else
-    // Default to OpenSSL
+    // OpenSSL or LibreSSL (they're API-compatible)
     #define SSL_POLICY_OPENSSL 1
+    #define SSL_POLICY_LIBRESSL 1
     #include <openssl/ssl.h>
     #include <openssl/err.h>
     #include <openssl/bio.h>
@@ -202,9 +201,22 @@ struct OpenSSLPolicy {
             int err = SSL_get_error(ssl_, n);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
                 // Would block (non-blocking socket)
+                errno = EAGAIN;  // Set errno for caller
                 return -1;
             }
-            return -1;  // Error
+
+            // Fatal SSL error - log and set errno
+            unsigned long err_code = ERR_get_error();
+            if (err_code != 0) {
+                char err_buf[256];
+                ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
+                printf("[SSL ERROR] SSL_read failed: %s (ssl_err=%d)\n", err_buf, err);
+            } else {
+                printf("[SSL ERROR] SSL_read failed: ssl_error=%d\n", err);
+            }
+
+            errno = EIO;  // Fatal error
+            return -1;
         }
     }
 
@@ -226,9 +238,22 @@ struct OpenSSLPolicy {
             int err = SSL_get_error(ssl_, n);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
                 // Would block (non-blocking socket)
+                errno = EAGAIN;  // Set errno for caller
                 return -1;
             }
-            return -1;  // Error
+
+            // Fatal SSL error - log and set errno
+            unsigned long err_code = ERR_get_error();
+            if (err_code != 0) {
+                char err_buf[256];
+                ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
+                printf("[SSL ERROR] SSL_write failed: %s (ssl_err=%d)\n", err_buf, err);
+            } else {
+                printf("[SSL ERROR] SSL_write failed: ssl_error=%d\n", err);
+            }
+
+            errno = EIO;  // Fatal error
+            return -1;
         }
     }
 
@@ -410,9 +435,22 @@ struct LibreSSLPolicy {
             int err = SSL_get_error(ssl_, n);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
                 // Would block (non-blocking socket)
+                errno = EAGAIN;  // Set errno for caller
                 return -1;
             }
-            return -1;  // Error
+
+            // Fatal SSL error - log and set errno
+            unsigned long err_code = ERR_get_error();
+            if (err_code != 0) {
+                char err_buf[256];
+                ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
+                printf("[SSL ERROR] SSL_read failed: %s (ssl_err=%d)\n", err_buf, err);
+            } else {
+                printf("[SSL ERROR] SSL_read failed: ssl_error=%d\n", err);
+            }
+
+            errno = EIO;  // Fatal error
+            return -1;
         }
     }
 
@@ -434,9 +472,22 @@ struct LibreSSLPolicy {
             int err = SSL_get_error(ssl_, n);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
                 // Would block (non-blocking socket)
+                errno = EAGAIN;  // Set errno for caller
                 return -1;
             }
-            return -1;  // Error
+
+            // Fatal SSL error - log and set errno
+            unsigned long err_code = ERR_get_error();
+            if (err_code != 0) {
+                char err_buf[256];
+                ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
+                printf("[SSL ERROR] SSL_write failed: %s (ssl_err=%d)\n", err_buf, err);
+            } else {
+                printf("[SSL ERROR] SSL_write failed: ssl_error=%d\n", err);
+            }
+
+            errno = EIO;  // Fatal error
+            return -1;
         }
     }
 
@@ -607,9 +658,17 @@ struct WolfSSLPolicy {
             int err = wolfSSL_get_error(ssl_, n);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
                 // Would block (non-blocking socket)
+                errno = EAGAIN;  // Set errno for caller
                 return -1;
             }
-            return -1;  // Error
+
+            // Fatal SSL error - log and set errno
+            char err_buf[256];
+            wolfSSL_ERR_error_string(err, err_buf);
+            printf("[SSL ERROR] wolfSSL_read failed: %s (err=%d)\n", err_buf, err);
+
+            errno = EIO;  // Fatal error
+            return -1;
         }
     }
 
@@ -631,9 +690,17 @@ struct WolfSSLPolicy {
             int err = wolfSSL_get_error(ssl_, n);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
                 // Would block (non-blocking socket)
+                errno = EAGAIN;  // Set errno for caller
                 return -1;
             }
-            return -1;  // Error
+
+            // Fatal SSL error - log and set errno
+            char err_buf[256];
+            wolfSSL_ERR_error_string(err, err_buf);
+            printf("[SSL ERROR] wolfSSL_write failed: %s (err=%d)\n", err_buf, err);
+
+            errno = EIO;  // Fatal error
+            return -1;
         }
     }
 
@@ -694,6 +761,9 @@ struct WolfSSLPolicy {
 // Backward-Compatible Type Aliases (Global Scope)
 // ============================================================================
 
+// Always provide all three policy type names
+// When a library is not available, alias it to a working implementation
+
 #ifdef SSL_POLICY_OPENSSL
 using OpenSSLPolicy = websocket::ssl::OpenSSLPolicy;
 #endif
@@ -706,23 +776,46 @@ using LibreSSLPolicy = websocket::ssl::LibreSSLPolicy;
 using WolfSSLPolicy = websocket::ssl::WolfSSLPolicy;
 #endif
 
+// Provide fallback type aliases for non-compiled policies
+// When used in ws_configs.hpp conditionals, they need to exist as types
+
+#if !defined(SSL_POLICY_OPENSSL)
+// Dummy OpenSSL/LibreSSL types when not available (WolfSSL build)
+namespace websocket { namespace ssl {
+    struct OpenSSLPolicy {};  // Empty stub - will fail if instantiated
+    struct LibreSSLPolicy {}; // Empty stub - will fail if instantiated
+}}
+using OpenSSLPolicy = websocket::ssl::OpenSSLPolicy;
+using LibreSSLPolicy = websocket::ssl::LibreSSLPolicy;
+#endif
+
+#if !defined(SSL_POLICY_WOLFSSL)
+// Dummy WolfSSL type when not available (OpenSSL/LibreSSL build)
+namespace websocket { namespace ssl {
+    struct WolfSSLPolicy {};  // Empty stub - will fail if instantiated
+}}
+using WolfSSLPolicy = websocket::ssl::WolfSSLPolicy;
+#endif
+
 // ============================================================================
 // Default SSL Policy Selection
 // ============================================================================
+// NOTE: Policy selection is now handled in ws_configs.hpp via compile-time flags
+// These old defaults are commented out to avoid conflicts with the new system.
 
-#if defined(SSL_POLICY_OPENSSL)
-    // OpenSSL (default)
-    using DefaultSSLPolicy = websocket::ssl::OpenSSLPolicy;
-    using SSLPolicy = websocket::ssl::OpenSSLPolicy;
-#elif defined(SSL_POLICY_LIBRESSL)
-    // LibreSSL (macOS, BSD)
-    using DefaultSSLPolicy = websocket::ssl::LibreSSLPolicy;
-    using SSLPolicy = websocket::ssl::LibreSSLPolicy;
-#elif defined(SSL_POLICY_WOLFSSL)
-    // WolfSSL (embedded, lightweight)
-    using DefaultSSLPolicy = websocket::ssl::WolfSSLPolicy;
-    using SSLPolicy = websocket::ssl::WolfSSLPolicy;
-#endif
+// #if defined(SSL_POLICY_OPENSSL)
+//     // OpenSSL (default)
+//     using DefaultSSLPolicy = websocket::ssl::OpenSSLPolicy;
+//     using SSLPolicy = websocket::ssl::OpenSSLPolicy;
+// #elif defined(SSL_POLICY_LIBRESSL)
+//     // LibreSSL (macOS, BSD)
+//     using DefaultSSLPolicy = websocket::ssl::LibreSSLPolicy;
+//     using SSLPolicy = websocket::ssl::LibreSSLPolicy;
+// #elif defined(SSL_POLICY_WOLFSSL)
+//     // WolfSSL (embedded, lightweight)
+//     using DefaultSSLPolicy = websocket::ssl::WolfSSLPolicy;
+//     using SSLPolicy = websocket::ssl::WolfSSLPolicy;
+// #endif
 
 // ============================================================================
 // SSL Policy Concepts (C++20)
