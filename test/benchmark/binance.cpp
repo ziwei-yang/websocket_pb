@@ -145,13 +145,20 @@ void on_message(const uint8_t* data, size_t len, const timing_record_t& timing) 
     LatencyData latency;
 
     // Stage 1 → Stage 2: NIC RX to event loop start
-    if (timing.hw_timestamp_ns > 0 && timing.event_cycle > 0) {
+    // Use latest timestamp (most recent packet arrival) for latency measurement
+    if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0 && timing.event_cycle > 0) {
         // Calculate Stage 2 time in CLOCK_MONOTONIC domain:
         // stage2_time = stage6_time - (stage6_cycle - stage2_cycle) / cpu_freq
         uint64_t stage2_to_stage6_ns = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz);
         uint64_t stage2_monotonic_ns = stage6_monotonic_ns - stage2_to_stage6_ns;
-        int64_t delta_ns = stage2_monotonic_ns - timing.hw_timestamp_ns;
+        int64_t delta_ns = stage2_monotonic_ns - timing.hw_timestamp_latest_ns;
         latency.stage1_to_stage2_us = delta_ns / 1000.0;
+
+        // Warn if timestamp queue buildup detected
+        if (timing.hw_timestamp_count > 1) {
+            printf("[WARN] Timestamp queue buildup: %u packets (may affect latency accuracy)\n",
+                   timing.hw_timestamp_count);
+        }
     } else {
         latency.stage1_to_stage2_us = 0;  // Hardware timestamps not available
     }
@@ -197,9 +204,10 @@ void on_message(const uint8_t* data, size_t len, const timing_record_t& timing) 
     }
 
     // End-to-end (Stage 1 → Stage 6)
-    if (timing.hw_timestamp_ns > 0) {
+    // Use latest timestamp (most recent packet) for end-to-end measurement
+    if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0) {
         // Hardware timestamps available: use CLOCK_MONOTONIC delta
-        int64_t delta_ns = stage6_monotonic_ns - timing.hw_timestamp_ns;
+        int64_t delta_ns = stage6_monotonic_ns - timing.hw_timestamp_latest_ns;
         latency.end_to_end_us = delta_ns / 1000.0;
     } else {
         // Hardware timestamps not available: use TSC-only (Stage 2→6)

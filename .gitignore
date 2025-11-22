@@ -79,7 +79,7 @@ htmlcov/
 # Documentation backups
 *.backup
 *.bak
-doc/*.backup
+doc/
 
 # Mac OS
 .DS_Store

@@ -6,6 +6,8 @@
 #include "core/timing.hpp"
 #include <functional>
 #include <string>
+#include <vector>
+#include <random>
 #include <cstring>
 #include <cstdio>
 #include <stdexcept>
@@ -37,6 +39,9 @@ public:
     using RxBufferPolicy = RxBufferPolicy_;
     using TxBufferPolicy = TxBufferPolicy_;
 
+    // HTTP header customization support
+    using HeaderMap = std::vector<std::pair<std::string, std::string>>;
+
     // Message callback now includes timing information
     using MessageCallback = std::function<void(const uint8_t*, size_t, const timing_record_t&)>;
 
@@ -59,8 +64,9 @@ public:
         disconnect();
     }
 
-    // Connect to WebSocket server
-    void connect(const char* host, uint16_t port, const char* path) {
+    // Connect to WebSocket server with optional custom HTTP headers
+    void connect(const char* host, uint16_t port, const char* path,
+                 const HeaderMap& custom_headers = {}) {
         // 1. Create socket
         fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd_ < 0) {
@@ -171,11 +177,11 @@ public:
         }
 
         // 5. HTTP upgrade to WebSocket
-        send_http_upgrade(host, path);
+        send_http_upgrade(host, path, custom_headers);
         recv_http_response();
 
         // 6. Set non-blocking mode
-        int flags = fcntl(fd_, F_GETFL, 0);
+        flags = fcntl(fd_, F_GETFL, 0);  // Reuse existing flags variable
         if (flags < 0 || fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
             ::close(fd_);
             throw std::runtime_error("Failed to set non-blocking mode");
@@ -200,9 +206,9 @@ public:
             int ready_fd = event_loop_.get_ready_fd();
             if (ready_fd != fd_) continue;
 
-            // Stage 1: Extract hardware RX timestamp from NIC
-            // Returns 0 if hardware timestamps not supported (e.g., consumed by SSL layer)
-            timing_.hw_timestamp_ns = extract_hw_timestamp(fd_);
+            // Stage 1: Drain hardware RX timestamps from NIC/kernel queue
+            // Populates oldest, latest, and count to detect timestamp queue buildup
+            drain_hw_timestamps(fd_, &timing_);
 
             // Stage 2: Record CPU cycle when event loop processing starts
             timing_.event_cycle = rdtsc();
@@ -354,12 +360,7 @@ private:
 
             // Handle different frame types
             if (opcode == 0x09) {  // PING frame
-                static int ping_count = 0;
-                ping_count++;
-                if (ping_count <= 3) {  // Only log first 3 pings
-                    printf("[WS] Received PING #%d, sending PONG (%zu bytes payload)\n",
-                           ping_count, (size_t)payload_len);
-                }
+                // Silently respond with PONG (no logging for production HFT performance)
                 send_pong(read_ptr + header_len, payload_len);
                 rx_buffer_.commit_read(frame_len);
             }
@@ -399,20 +400,97 @@ private:
         }
     }
 
-    // Send HTTP upgrade request
-    void send_http_upgrade(const char* host, const char* path) {
-        char request[2048];
-        int len = snprintf(request, sizeof(request),
-            "GET %s HTTP/1.1\r\n"
-            "Host: %s\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-            "Sec-WebSocket-Version: 13\r\n"
-            "\r\n",
-            path, host);
+    // Validate HTTP header to prevent CRLF injection
+    static bool is_valid_header(const std::string& key, const std::string& value) {
+        // Check for CRLF sequences that could allow header injection
+        if (key.find("\r\n") != std::string::npos || key.find('\n') != std::string::npos) {
+            return false;
+        }
+        if (value.find("\r\n") != std::string::npos || value.find('\n') != std::string::npos) {
+            return false;
+        }
+        // Check for empty key
+        if (key.empty()) {
+            return false;
+        }
+        return true;
+    }
 
-        ssize_t n = ssl_.write(request, len);
+    // Generate random WebSocket key (RFC 6455 compliance)
+    static std::string generate_websocket_key() {
+        // Generate 16 random bytes
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, 255);
+
+        uint8_t nonce[16];
+        for (int i = 0; i < 16; ++i) {
+            nonce[i] = static_cast<uint8_t>(dis(gen));
+        }
+
+        // Base64 encode (simplified - produces 24 character output)
+        static const char base64_chars[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+        std::string encoded;
+        encoded.reserve(24);
+
+        for (int i = 0; i < 16; i += 3) {
+            uint32_t val = (nonce[i] << 16);
+            if (i + 1 < 16) val |= (nonce[i + 1] << 8);
+            if (i + 2 < 16) val |= nonce[i + 2];
+
+            encoded.push_back(base64_chars[(val >> 18) & 0x3F]);
+            encoded.push_back(base64_chars[(val >> 12) & 0x3F]);
+            encoded.push_back((i + 1 < 16) ? base64_chars[(val >> 6) & 0x3F] : '=');
+            encoded.push_back((i + 2 < 16) ? base64_chars[val & 0x3F] : '=');
+        }
+
+        return encoded;
+    }
+
+    // Send HTTP upgrade request with custom headers
+    void send_http_upgrade(const char* host, const char* path,
+                          const HeaderMap& custom_headers) {
+        // Build HTTP request dynamically with std::string for flexibility
+        std::string request;
+        request.reserve(2048);
+
+        // Generate random WebSocket key
+        std::string ws_key = generate_websocket_key();
+
+        // Request line and required headers
+        request += "GET ";
+        request += path;
+        request += " HTTP/1.1\r\n";
+        request += "Host: ";
+        request += host;
+        request += "\r\n";
+        request += "Upgrade: websocket\r\n";
+        request += "Connection: Upgrade\r\n";
+        request += "Sec-WebSocket-Key: ";
+        request += ws_key;
+        request += "\r\n";
+        request += "Sec-WebSocket-Version: 13\r\n";
+
+        // Add custom headers with validation
+        for (const auto& [key, value] : custom_headers) {
+            if (!is_valid_header(key, value)) {
+                printf("[WARN] Skipping invalid header: %s (contains CRLF or invalid)\n",
+                       key.c_str());
+                continue;
+            }
+
+            request += key;
+            request += ": ";
+            request += value;
+            request += "\r\n";
+        }
+
+        // End of headers
+        request += "\r\n";
+
+        ssize_t n = ssl_.write(request.data(), request.size());
         if (n <= 0) {
             throw std::runtime_error("Failed to send HTTP upgrade");
         }

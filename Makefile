@@ -30,28 +30,14 @@ ifeq ($(UNAME_S),Linux)
         CXXFLAGS += -DHAVE_WOLFSSL
         LDFLAGS += -lwolfssl
         SSL_INFO := WolfSSL
-    else ifdef USE_LIBRESSL
-        CXXFLAGS += -DUSE_LIBRESSL
-        LDFLAGS += -lssl -lcrypto
-        SSL_INFO := LibreSSL
     else ifdef USE_OPENSSL
         LDFLAGS += -lssl -lcrypto
         SSL_INFO := OpenSSL
     else
-        # Default: Try io_uring + WolfSSL, fall back to OpenSSL
-        ifneq ($(USE_IOURING),0)
-            ifeq ($(HAS_WOLFSSL),1)
-                CXXFLAGS += -DHAVE_WOLFSSL
-                LDFLAGS += -lwolfssl
-                SSL_INFO := WolfSSL
-            else
-                LDFLAGS += -lssl -lcrypto
-                SSL_INFO := OpenSSL
-            endif
-        else
-            LDFLAGS += -lssl -lcrypto
-            SSL_INFO := OpenSSL
-        endif
+        # Default: LibreSSL
+        CXXFLAGS += -DUSE_LIBRESSL
+        LDFLAGS += -lssl -lcrypto
+        SSL_INFO := LibreSSL
     endif
 
     # IO Backend Selection
@@ -315,9 +301,9 @@ clean:
 # Variant builds
 # ============================================================================
 
-# Build with epoll + OpenSSL (Linux only, io_uring is default)
+# Build with epoll + LibreSSL (Linux only, io_uring is default)
 epoll:
-	@echo "🔧 Building epoll + OpenSSL variant..."
+	@echo "🔧 Building epoll + LibreSSL variant..."
 	$(MAKE) all USE_IOURING=0
 
 # Build optimized for production
@@ -370,8 +356,8 @@ help:
 	@echo "  make help         - Show this help message"
 	@echo ""
 	@echo "Platform-specific default configurations:"
-	@echo "  Linux   : io_uring + WolfSSL (use USE_IOURING=0 for epoll + OpenSSL)"
-	@echo "  macOS   : kqueue + LibreSSL (falls back to OpenSSL if LibreSSL not found)"
+	@echo "  Linux   : io_uring + LibreSSL (use USE_IOURING=0 for epoll)"
+	@echo "  macOS   : kqueue + LibreSSL"
 	@echo ""
 	@echo "Output directory:"
 	@echo "  ./build/          - All binaries and test executables"
@@ -381,7 +367,9 @@ help:
 	@echo "  ./build/io_echo_server   - Async I/O echo server"
 	@echo ""
 	@echo "Environment variables:"
-	@echo "  USE_IOURING=0     - Disable io_uring, use epoll + OpenSSL (Linux only)"
+	@echo "  USE_IOURING=0     - Disable io_uring, use epoll (Linux only)"
+	@echo "  USE_OPENSSL=1     - Use OpenSSL instead of LibreSSL"
+	@echo "  USE_WOLFSSL=1     - Use WolfSSL instead of LibreSSL"
 	@echo "  CXX=clang++       - Use Clang compiler"
 	@echo ""
 	@echo "Quick start:"

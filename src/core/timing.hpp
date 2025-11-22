@@ -23,14 +23,21 @@
 // Timestamp recording structure
 // Captures timing at 6 stages from network to application
 typedef struct {
-    uint64_t hw_timestamp_ns;       // Stage 1: NIC RX timestamp (CLOCK_MONOTONIC ns, 0 if unsupported)
-    uint64_t event_cycle;           // Stage 2: Event loop start (TSC cycles)
-    uint64_t recv_start_cycle;      // Stage 3: Before SSL_read/recv call (TSC cycles)
-    uint64_t recv_end_cycle;        // Stage 4: When SSL_read/recv completed (TSC cycles)
-    uint64_t frame_parsed_cycle;    // Stage 5: When frame parsing completed (TSC cycles)
+    // Stage 1: NIC RX timestamps (CLOCK_MONOTONIC ns, 0 if unsupported)
+    // Multiple packets may arrive between event loop iterations, so we track:
+    uint64_t hw_timestamp_oldest_ns;  // Oldest packet timestamp in queue (first arrival)
+    uint64_t hw_timestamp_latest_ns;  // Latest packet timestamp in queue (most recent arrival)
+    uint32_t hw_timestamp_count;      // Number of packets with timestamps found in queue
+                                      // If count > 1, indicates timestamp queue buildup (potential staleness)
+
+    uint64_t event_cycle;             // Stage 2: Event loop start (TSC cycles)
+    uint64_t recv_start_cycle;        // Stage 3: Before SSL_read/recv call (TSC cycles)
+    uint64_t recv_end_cycle;          // Stage 4: When SSL_read/recv completed (TSC cycles)
+    uint64_t frame_parsed_cycle;      // Stage 5: When frame parsing completed (TSC cycles)
     // Stage 6: Implemented in user callback - records both CPU cycle and CLOCK_MONOTONIC
     size_t payload_len;
-    uint8_t opcode;
+    uint8_t opcode;                   // WebSocket frame opcode (0x01=text, 0x02=binary, 0x08=close, 0x09=ping, 0x0A=pong)
+                                      // Use this to distinguish between text and binary messages in callbacks
 } timing_record_t;
 
 // Read CPU Time Stamp Counter (TSC) - x86/x64 only
@@ -186,98 +193,130 @@ static inline bool enable_hw_timestamping(int sockfd) {
 #endif
 }
 
-// Extract RX hardware/software timestamp from socket and convert to CLOCK_MONOTONIC
-// Attempts to retrieve timestamp from when packet arrived at NIC/kernel
-// Returns timestamp in CLOCK_MONOTONIC nanoseconds, or 0 if not available
-static inline uint64_t extract_hw_timestamp(int sockfd) {
+// Drain all RX hardware/software timestamps from socket and collect metrics
+// Drains the entire MSG_ERRQUEUE to prevent stale timestamp accumulation
+// Populates timing_record_t with oldest, latest, and count of timestamps found
+static inline void drain_hw_timestamps(int sockfd, timing_record_t* timing) {
 #ifdef __linux__
-    char control[512];
-    char data[2048];  // Buffer for peeking at socket data
-    struct msghdr msg;
-    struct iovec iov;
-
-    memset(&msg, 0, sizeof(msg));
-    memset(control, 0, sizeof(control));
-
-    iov.iov_base = data;
-    iov.iov_len = sizeof(data);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control;
-    msg.msg_controllen = sizeof(control);
+    uint64_t oldest_ts_ns = 0;
+    uint64_t latest_ts_ns = 0;
+    uint32_t count = 0;
 
     // Capture current time for REALTIME to MONOTONIC conversion
     struct timespec now_real, now_mono;
     clock_gettime(CLOCK_REALTIME, &now_real);
     clock_gettime(CLOCK_MONOTONIC, &now_mono);
 
-    // Approach 1: Try MSG_ERRQUEUE (for TX timestamps, but worth checking)
-    ssize_t ret = recvmsg(sockfd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
-    if (ret >= 0) {
+    int64_t real_now_ns = (int64_t)now_real.tv_sec * 1000000000LL + now_real.tv_nsec;
+    int64_t mono_now_ns = (int64_t)now_mono.tv_sec * 1000000000LL + now_mono.tv_nsec;
+
+    // Approach 1: Drain entire MSG_ERRQUEUE to prevent timestamp accumulation
+    // This queue can build up multiple packets' timestamps over time
+    while (true) {
+        char control[512];
+        char data[2048];
+        struct msghdr msg;
+        struct iovec iov;
+
+        memset(&msg, 0, sizeof(msg));
+        memset(control, 0, sizeof(control));
+        iov.iov_base = data;
+        iov.iov_len = sizeof(data);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+
+        ssize_t ret = recvmsg(sockfd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+        if (ret < 0) break;  // Queue drained or error
+
         // Parse control messages to find timestamp
         for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
             if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
                 struct timespec* ts = (struct timespec*)CMSG_DATA(cmsg);
 
-                // SO_TIMESTAMPING returns 3 timestamps: software, deprecated, hardware
-                // Since we're using HARDWARE-ONLY mode, only check index 2
-                struct timespec rx_ts = ts[2];  // Hardware timestamp (index 2)
-
-                if (rx_ts.tv_sec > 0 || rx_ts.tv_nsec > 0) {
-                    // Convert CLOCK_REALTIME to CLOCK_MONOTONIC
-                    // Formula: monotonic = (realtime_rx - realtime_now) + monotonic_now
-                    int64_t real_rx_ns = (int64_t)rx_ts.tv_sec * 1000000000LL + rx_ts.tv_nsec;
-                    int64_t real_now_ns = (int64_t)now_real.tv_sec * 1000000000LL + now_real.tv_nsec;
-                    int64_t mono_now_ns = (int64_t)now_mono.tv_sec * 1000000000LL + now_mono.tv_nsec;
-
-                    int64_t mono_rx_ns = mono_now_ns + (real_rx_ns - real_now_ns);
-
-                    return (mono_rx_ns > 0) ? (uint64_t)mono_rx_ns : 0;
-                }
-            }
-        }
-    }
-
-    // Approach 2: Try normal recvmsg with MSG_PEEK to get ancillary data without consuming
-    // This might work for RX timestamps before SSL_read() processes the data
-    memset(&msg, 0, sizeof(msg));
-    memset(control, 0, sizeof(control));
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control;
-    msg.msg_controllen = sizeof(control);
-
-    ret = recvmsg(sockfd, &msg, MSG_PEEK | MSG_DONTWAIT);
-    if (ret >= 0) {
-        // Parse control messages for RX timestamp
-        for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
-                struct timespec* ts = (struct timespec*)CMSG_DATA(cmsg);
-
-                // With SOFTWARE + RX_HARDWARE + RAW_HARDWARE:
-                //   ts[0]: Hardware timestamp transformed to CLOCK_REALTIME
+                // SO_TIMESTAMPING returns 3 timestamps:
+                //   ts[0]: Hardware timestamp transformed to CLOCK_REALTIME (or software fallback)
+                //   ts[1]: Deprecated
                 //   ts[2]: Raw hardware timestamp in PTP clock domain
                 // We use ts[0] as it's already in system clock domain
                 struct timespec rx_ts = ts[0];
 
                 if (rx_ts.tv_sec > 0 || rx_ts.tv_nsec > 0) {
                     // Convert CLOCK_REALTIME to CLOCK_MONOTONIC
+                    // Formula: monotonic = (realtime_rx - realtime_now) + monotonic_now
                     int64_t real_rx_ns = (int64_t)rx_ts.tv_sec * 1000000000LL + rx_ts.tv_nsec;
-                    int64_t real_now_ns = (int64_t)now_real.tv_sec * 1000000000LL + now_real.tv_nsec;
-                    int64_t mono_now_ns = (int64_t)now_mono.tv_sec * 1000000000LL + now_mono.tv_nsec;
-
                     int64_t mono_rx_ns = mono_now_ns + (real_rx_ns - real_now_ns);
 
-                    return (mono_rx_ns > 0) ? (uint64_t)mono_rx_ns : 0;
+                    if (mono_rx_ns > 0) {
+                        uint64_t ts_ns = (uint64_t)mono_rx_ns;
+
+                        if (count == 0) {
+                            // First timestamp found
+                            oldest_ts_ns = ts_ns;
+                            latest_ts_ns = ts_ns;
+                        } else {
+                            // Track oldest and latest
+                            if (ts_ns < oldest_ts_ns) oldest_ts_ns = ts_ns;
+                            if (ts_ns > latest_ts_ns) latest_ts_ns = ts_ns;
+                        }
+                        count++;
+                    }
                 }
             }
         }
     }
 
-    return 0;  // Timestamp not available
+    // Approach 2: If no timestamps in errqueue, try MSG_PEEK for immediate RX timestamp
+    // This gets timestamp for the next packet to be read without consuming it
+    if (count == 0) {
+        char control[512];
+        char data[2048];
+        struct msghdr msg;
+        struct iovec iov;
+
+        memset(&msg, 0, sizeof(msg));
+        memset(control, 0, sizeof(control));
+        iov.iov_base = data;
+        iov.iov_len = sizeof(data);
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+
+        ssize_t ret = recvmsg(sockfd, &msg, MSG_PEEK | MSG_DONTWAIT);
+        if (ret >= 0) {
+            // Parse control messages for RX timestamp
+            for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+                if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
+                    struct timespec* ts = (struct timespec*)CMSG_DATA(cmsg);
+                    struct timespec rx_ts = ts[0];
+
+                    if (rx_ts.tv_sec > 0 || rx_ts.tv_nsec > 0) {
+                        int64_t real_rx_ns = (int64_t)rx_ts.tv_sec * 1000000000LL + rx_ts.tv_nsec;
+                        int64_t mono_rx_ns = mono_now_ns + (real_rx_ns - real_now_ns);
+
+                        if (mono_rx_ns > 0) {
+                            oldest_ts_ns = latest_ts_ns = (uint64_t)mono_rx_ns;
+                            count = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Populate timing record
+    timing->hw_timestamp_oldest_ns = oldest_ts_ns;
+    timing->hw_timestamp_latest_ns = latest_ts_ns;
+    timing->hw_timestamp_count = count;
+
 #else
     (void)sockfd;
-    return 0;  // Not supported on non-Linux platforms
+    // Not supported on non-Linux platforms
+    timing->hw_timestamp_oldest_ns = 0;
+    timing->hw_timestamp_latest_ns = 0;
+    timing->hw_timestamp_count = 0;
 #endif
 }
 
@@ -286,42 +325,36 @@ static inline void print_timing_record(const timing_record_t& tr, uint64_t tsc_f
     printf("Timing Record:\n");
     printf("  Payload length: %zu bytes, Opcode: 0x%02x\n", tr.payload_len, tr.opcode);
 
-    if (tr.hw_timestamp_ns > 0) {
-        // Convert CLOCK_MONOTONIC (boot time) to wall clock time
-        struct timespec mono_ts;
-        mono_ts.tv_sec = tr.hw_timestamp_ns / 1000000000ULL;
-        mono_ts.tv_nsec = tr.hw_timestamp_ns % 1000000000ULL;
+    if (tr.hw_timestamp_count > 0) {
+        printf("  [Stage 1] NIC/Kernel RX Timestamps:\n");
+        printf("            Packets timestamped: %u\n", tr.hw_timestamp_count);
 
-        // Get current monotonic and realtime to calculate offset
-        struct timespec now_mono, now_real;
-        clock_gettime(CLOCK_MONOTONIC, &now_mono);
-        clock_gettime(CLOCK_REALTIME, &now_real);
-
-        // Calculate wall clock time for this timestamp
-        int64_t mono_diff_ns = ((int64_t)now_mono.tv_sec - mono_ts.tv_sec) * 1000000000LL +
-                               ((int64_t)now_mono.tv_nsec - mono_ts.tv_nsec);
-        int64_t wall_sec = now_real.tv_sec - (mono_diff_ns / 1000000000LL);
-        int64_t wall_nsec = now_real.tv_nsec - (mono_diff_ns % 1000000000LL);
-
-        if (wall_nsec < 0) {
-            wall_sec--;
-            wall_nsec += 1000000000LL;
+        if (tr.hw_timestamp_count > 1) {
+            printf("            ⚠️  WARNING: %u packets queued (potential timestamp staleness)\n",
+                   tr.hw_timestamp_count);
         }
 
-        // Format wall clock time
-        time_t t = wall_sec;
-        struct tm* tm_info = localtime(&t);
-        char time_str[64];
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+        // Print oldest timestamp
+        if (tr.hw_timestamp_oldest_ns > 0) {
+            printf("            Oldest packet:  %.6f s since boot\n",
+                   tr.hw_timestamp_oldest_ns / 1e9);
+        }
 
-        // Note: This could be either hardware NIC timestamp or software timestamp
-        // depending on what was successfully retrieved
-        printf("  [Stage 1] RX timestamp: %s.%09lu\n",
-               time_str, (unsigned long)wall_nsec);
-        printf("            Monotonic time: %.6f s since boot\n",
-               tr.hw_timestamp_ns / 1e9);
+        // Print latest timestamp
+        if (tr.hw_timestamp_latest_ns > 0) {
+            printf("            Latest packet:  %.6f s since boot\n",
+                   tr.hw_timestamp_latest_ns / 1e9);
+        }
+
+        // Show queue delay if multiple packets
+        if (tr.hw_timestamp_count > 1 && tr.hw_timestamp_latest_ns > tr.hw_timestamp_oldest_ns) {
+            uint64_t queue_delay_ns = tr.hw_timestamp_latest_ns - tr.hw_timestamp_oldest_ns;
+            printf("            Queue span:     %.3f μs (oldest→latest)\n",
+                   queue_delay_ns / 1000.0);
+        }
     } else {
-        printf("  [Stage 1] RX timestamp: Not recorded\n");
+        printf("  [Stage 1] NIC/Kernel RX timestamp: Not available\n");
+        printf("            (Hardware timestamping may not be supported or enabled)\n");
     }
 
     printf("\n  [Stage 2] Event loop:   %lu cycles", tr.event_cycle);

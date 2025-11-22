@@ -12,21 +12,31 @@
 #include "policy/ssl.hpp"
 
 // ============================================================================
-// Configuration 1: Linux Default
+// Configuration 1: Linux Default (Optimized for HFT)
 // ============================================================================
-// Best for: Linux production HFT systems
+// Best for: Linux production high-frequency trading (HFT) systems
 //
 // Policy composition (io_uring mode - default):
 //   - SSLPolicy: WolfSSLPolicy (optimized for io_uring)
 //   - EventPolicy: EpollPolicy (edge-triggered, low latency)
-//   - RxBufferPolicy: RingBuffer<8MB> (receive buffer)
-//   - TxBufferPolicy: RingBuffer<8MB> (transmit buffer)
+//   - RxBufferPolicy: RingBuffer<32MB> (large receive buffer for market data bursts)
+//   - TxBufferPolicy: RingBuffer<2MB> (small transmit buffer for order commands)
 //
 // Policy composition (epoll mode - USE_IOURING=0):
 //   - SSLPolicy: OpenSSLPolicy (with automatic kTLS support)
 //   - EventPolicy: EpollPolicy (edge-triggered, low latency)
-//   - RxBufferPolicy: RingBuffer<8MB>
-//   - TxBufferPolicy: RingBuffer<8MB>
+//   - RxBufferPolicy: RingBuffer<32MB>
+//   - TxBufferPolicy: RingBuffer<2MB>
+//
+// HFT-optimized buffer sizing rationale:
+//   - RX: 32MB handles high-volume market data bursts without drops
+//     * Typical HFT scenario: streaming orderbook updates, trades, quotes
+//     * Prevents message loss during microsecond-scale processing delays
+//     * Accommodates exchange reconnection/recovery message backlogs
+//   - TX: 2MB sufficient for order commands and status updates
+//     * HFT sends orders infrequently compared to receiving market data
+//     * Typical order messages: 100-500 bytes each
+//     * 2MB = ~4,000-20,000 pending orders (excessive headroom)
 //
 // Performance characteristics:
 //   - io_uring for true async I/O (when ENABLE_IO_URING is defined)
@@ -34,6 +44,7 @@
 //   - Sub-microsecond latency for message processing
 //   - Zero memory allocations in hot path
 //   - Zero-copy ring buffer operations
+//   - Asymmetric buffer design minimizes cache pollution
 
 #ifdef __linux__
 
@@ -59,8 +70,8 @@
 using LinuxOptimized = WebSocketClient<
     DefaultSSLPolicy,
     DefaultEventPolicy,
-    RingBuffer<8192 * 1024>,     // 8MB RX buffer
-    RingBuffer<8192 * 1024>      // 8MB TX buffer
+    RingBuffer<32 * 1024 * 1024>,  // 32MB RX buffer (HFT: high-volume market data ingestion)
+    RingBuffer<2 * 1024 * 1024>    // 2MB TX buffer (HFT: low-volume order commands)
 >;
 
 #endif
@@ -83,36 +94,41 @@ using LinuxOptimized = WebSocketClient<
 // #endif
 
 // ============================================================================
-// Configuration 3: macOS/BSD Default (LibreSSL + kqueue)
+// Configuration 3: macOS/BSD Default (LibreSSL + kqueue, HFT-optimized)
 // ============================================================================
-// Best for: macOS/BSD development and trading systems
+// Best for: macOS/BSD development and high-frequency trading systems
 //
 // Policy composition:
 //   - SSLPolicy: LibreSSLPolicy (preferred on macOS/BSD)
 //   - EventPolicy: KqueuePolicy (edge-cleared, similar to epoll)
-//   - RxBufferPolicy: RingBuffer<8MB>
-//   - TxBufferPolicy: RingBuffer<8MB>
+//   - RxBufferPolicy: RingBuffer<32MB> (HFT: high-volume market data)
+//   - TxBufferPolicy: RingBuffer<2MB> (HFT: low-volume order commands)
+//
+// HFT-optimized buffer sizing (same as Linux):
+//   - RX: 32MB handles market data bursts without message loss
+//   - TX: 2MB sufficient for order flow (asymmetric usage pattern)
 //
 // Performance characteristics:
 //   - kqueue for efficient event notification
 //   - Standard user-space TLS (kTLS is Linux-only)
 //   - Zero-copy ring buffer operations
+//   - Asymmetric buffers reduce memory footprint
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
 #ifdef USE_LIBRESSL
 using MacOSDefault = WebSocketClient<
     LibreSSLPolicy,
     KqueuePolicy,
-    RingBuffer<8192 * 1024>,
-    RingBuffer<8192 * 1024>
+    RingBuffer<32 * 1024 * 1024>,  // 32MB RX buffer (HFT: market data ingestion)
+    RingBuffer<2 * 1024 * 1024>    // 2MB TX buffer (HFT: order commands)
 >;
 #else
 // Fallback to OpenSSL if LibreSSL not available
 using MacOSDefault = WebSocketClient<
     OpenSSLPolicy,
     KqueuePolicy,
-    RingBuffer<8192 * 1024>,
-    RingBuffer<8192 * 1024>
+    RingBuffer<32 * 1024 * 1024>,  // 32MB RX buffer (HFT: market data ingestion)
+    RingBuffer<2 * 1024 * 1024>    // 2MB TX buffer (HFT: order commands)
 >;
 #endif
 #endif

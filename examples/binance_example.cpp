@@ -58,6 +58,15 @@ int main() {
 
         // Connect to Binance WebSocket
         printf("🔌 Connecting to Binance WebSocket...\n");
+
+        // Optional: Add custom HTTP headers (e.g., for authentication, user agent)
+        // DefaultWebSocket::HeaderMap custom_headers = {
+        //     {"User-Agent", "MyTradingBot/1.0"},
+        //     {"X-API-Key", "your-api-key-here"}
+        // };
+        // client.connect("stream.binance.com", 443, "/stream?streams=btcusdt@trade", custom_headers);
+
+        // Connect without custom headers (default behavior)
         client.connect(
             "stream.binance.com",
             443,
@@ -74,9 +83,18 @@ int main() {
         // Run event loop with message callback
         client.run([&](const uint8_t* data, size_t len, const timing_record_t& timing) {
             // Zero-copy access to message data
-            // timing parameter contains latency information (ignored in this example)
-            (void)timing;  // Suppress unused parameter warning
+            // timing.opcode contains frame type: 0x01=text, 0x02=binary
+            // Binance sends text (JSON), but you can check timing.opcode to distinguish
             msg_count++;
+
+            // Optional: Handle different message types
+            // if (timing.opcode == 0x01) {
+            //     // Text message (JSON)
+            //     std::string_view text(reinterpret_cast<const char*>(data), len);
+            // } else if (timing.opcode == 0x02) {
+            //     // Binary message (protobuf, msgpack, etc.)
+            //     std::span<const uint8_t> binary(data, len);
+            // }
 
             // Extract price from JSON (simple parsing)
             double price = extract_price(data, len);

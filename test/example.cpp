@@ -46,12 +46,24 @@ void on_message(const uint8_t* data, size_t len, const timing_record_t& timing) 
     printf("Latency breakdown:\n");
 
     // Stage 1→2: NIC to Event Loop (if hardware timestamp available)
-    if (timing.hw_timestamp_ns > 0 && timing.event_cycle > 0 && g_tsc_freq_hz > 0) {
+    if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0 && timing.event_cycle > 0 && g_tsc_freq_hz > 0) {
         // Convert stage 2 cycle to CLOCK_MONOTONIC
         uint64_t stage2_to_stage6_ns = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz);
         uint64_t stage2_monotonic_ns = stage6_monotonic_ns - stage2_to_stage6_ns;
-        int64_t stage1_to_2_ns = stage2_monotonic_ns - timing.hw_timestamp_ns;
-        printf("  [1→2] NIC→Event:       %7.3f μs\n", stage1_to_2_ns / 1000.0);
+
+        // Display detailed hardware timestamp metrics
+        printf("  [HW Timestamps] Packets: %u", timing.hw_timestamp_count);
+
+        // Show queue span if multiple packets
+        if (timing.hw_timestamp_count > 1 && timing.hw_timestamp_oldest_ns > 0 && timing.hw_timestamp_latest_ns > timing.hw_timestamp_oldest_ns) {
+            uint64_t queue_span_ns = timing.hw_timestamp_latest_ns - timing.hw_timestamp_oldest_ns;
+            printf(", Queue span (oldest→latest): %.3f μs ⚠️", queue_span_ns / 1000.0);
+        }
+        printf("\n");
+
+        // Show NIC→Event latency using latest timestamp
+        int64_t nic_to_event_ns = stage2_monotonic_ns - timing.hw_timestamp_latest_ns;
+        printf("  [1→2] NIC→Event (latest→event): %7.3f μs\n", nic_to_event_ns / 1000.0);
     }
 
     // Stage 2→3: Event Loop to SSL_read start

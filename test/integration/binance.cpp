@@ -58,14 +58,17 @@ void on_message(const uint8_t* data, size_t len, const timing_record_t& timing) 
     }
 
     // Calculate Stage 1→2 if hardware timestamps available
-    if (timing.hw_timestamp_ns > 0 && timing.event_cycle > 0) {
+    if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0 && timing.event_cycle > 0) {
         // Calculate Stage 2 time in CLOCK_MONOTONIC domain:
         // stage2_time = stage6_time - (stage6_cycle - stage2_cycle) / cpu_freq
         uint64_t stage2_to_stage6_ns = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz);
         uint64_t stage2_monotonic_ns = stage6_monotonic_ns - stage2_to_stage6_ns;
-        int64_t stage1_to_stage2_ns = stage2_monotonic_ns - timing.hw_timestamp_ns;
-        printf("\n  [Stage 1→2] NIC→Event:  %.3f μs (hardware timestamp available)\n",
-               stage1_to_stage2_ns / 1000.0);
+        int64_t stage1_to_stage2_ns = stage2_monotonic_ns - timing.hw_timestamp_latest_ns;
+        printf("\n  [Stage 1→2] NIC→Event:  %.3f μs (%u packet%s timestamped%s)\n",
+               stage1_to_stage2_ns / 1000.0,
+               timing.hw_timestamp_count,
+               timing.hw_timestamp_count > 1 ? "s" : "",
+               timing.hw_timestamp_count > 1 ? " - QUEUE BUILDUP!" : "");
     } else {
         printf("\n  [Stage 1→2] NIC→Event:  N/A (hardware timestamps not available)\n");
     }
