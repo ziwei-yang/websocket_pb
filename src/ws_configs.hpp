@@ -192,6 +192,54 @@ using AsymmetricBuffers = WebSocketClient<
 using PortableWebSocket = DefaultWebSocket;
 
 // ============================================================================
+// Configuration 7: DPDK WebSocket (Ultra-Low Latency)
+// ============================================================================
+// Best for: Ultra-low latency HFT with dedicated NICs and CPU cores
+//
+// Policy composition:
+//   - TransportPolicy: DPDKTransport (userspace TCP stack)
+//   - SSLPolicy: DPDKSSLPolicy (OpenSSL with custom BIO)
+//   - EventPolicy: DPDKEventPolicy (polling-based, no syscalls)
+//   - RxBufferPolicy: RingBuffer<32MB> (HFT market data)
+//   - TxBufferPolicy: RingBuffer<2MB> (HFT orders)
+//
+// Requirements:
+//   - DPDK installed (dpdk, dpdk-dev packages)
+//   - NIC bound to DPDK (dpdk-devbind.py)
+//   - Huge pages configured (2MB pages)
+//   - Dedicated CPU core for polling
+//
+// Performance characteristics:
+//   - Sub-50 μs latency (NIC→callback)
+//   - Zero syscalls (pure userspace)
+//   - 100% CPU on polling core
+//   - Hardware timestamping support
+//   - No kernel bypass overhead
+//
+// Build:
+//   USE_DPDK=1 make clean all
+//
+// NOTE: This is an advanced configuration requiring DPDK setup.
+//       See doc/DPDK_SETUP.md for installation instructions.
+
+#ifdef USE_DPDK
+#include "dpdk/ssl/dpdk_ssl_policy.hpp"
+#include "dpdk/dpdk_event.hpp"
+
+// Note: DPDK WebSocket integration is work-in-progress
+// Full integration requires Phase 4 (HTTP/WebSocket framing) completion
+// For now, this serves as a template for future DPDK configs
+//
+// using DPDKWebSocket = WebSocketClient<
+//     websocket::dpdk::ssl::DPDKSSLPolicy,
+//     DPDKEventPolicy,
+//     RingBuffer<32 * 1024 * 1024>,  // 32MB RX (market data)
+//     RingBuffer<2 * 1024 * 1024>    // 2MB TX (orders)
+// >;
+
+#endif // USE_DPDK
+
+// ============================================================================
 // Custom Configuration Example
 // ============================================================================
 // You can create your own custom configuration:

@@ -57,7 +57,52 @@ ifeq ($(UNAME_S),Linux)
         IO_INFO := epoll
     endif
 
-    $(info Building with $(SSL_INFO) + $(IO_INFO))
+    # Transport Layer Selection
+    # Note: These are mutually exclusive - only one can be active at a time
+
+    # DPDK Support (Linux only)
+    ifdef USE_DPDK
+        ifdef USE_XDP
+            $(error Cannot use both USE_DPDK=1 and USE_XDP=1 simultaneously)
+        endif
+        ifdef USE_SOCKET
+            $(error Cannot use both USE_DPDK=1 and USE_SOCKET=1 simultaneously)
+        endif
+        # Check if DPDK is installed (pkg-config method)
+        HAS_DPDK := $(shell pkg-config --exists libdpdk && echo 1 || echo 0)
+        ifeq ($(HAS_DPDK),1)
+            CXXFLAGS += -DUSE_DPDK $(shell pkg-config --cflags libdpdk)
+            LDFLAGS += $(shell pkg-config --libs libdpdk)
+            TRANSPORT_INFO := DPDK
+            $(info Building with DPDK support enabled)
+        else
+            $(error DPDK requested but not found. Install DPDK and ensure pkg-config can find libdpdk)
+        endif
+    # XDP Support (Linux only)
+    else ifdef USE_XDP
+        ifdef USE_SOCKET
+            $(error Cannot use both USE_XDP=1 and USE_SOCKET=1 simultaneously)
+        endif
+        # Check if libbpf and libxdp are installed
+        HAS_LIBBPF := $(shell pkg-config --exists libbpf && echo 1 || echo 0)
+        HAS_LIBXDP := $(shell pkg-config --exists libxdp && echo 1 || echo 0)
+        ifeq ($(HAS_LIBBPF)$(HAS_LIBXDP),11)
+            CXXFLAGS += -DUSE_XDP $(shell pkg-config --cflags libbpf libxdp)
+            LDFLAGS += $(shell pkg-config --libs libbpf libxdp) -lbpf -lxdp
+            TRANSPORT_INFO := XDP (AF_XDP)
+            $(info Building with XDP support enabled)
+        else
+            $(error XDP requested but dependencies not found. Install libbpf-dev and libxdp-dev)
+        endif
+    # BSD Sockets (default or explicit)
+    else
+        TRANSPORT_INFO := BSD sockets
+        ifdef USE_SOCKET
+            $(info Building with BSD sockets (explicit USE_SOCKET=1))
+        endif
+    endif
+
+    $(info Building with $(SSL_INFO) + $(IO_INFO) + $(TRANSPORT_INFO))
 
 else ifeq ($(UNAME_S),Darwin)
     # macOS configuration
@@ -97,8 +142,24 @@ TEST_EVENT_SRC := $(TEST_DIR)/test_event.cpp
 TEST_BUG_FIXES_SRC := $(TEST_DIR)/test_bug_fixes.cpp
 TEST_NEW_BUG_FIXES_SRC := $(TEST_DIR)/test_new_bug_fixes.cpp
 
+# DPDK test source files
+TEST_DPDK_TCP_CONNECTION_SRC := $(TEST_DIR)/test_dpdk_tcp_connection.cpp
+TEST_DPDK_TCP_PACKET_SRC := $(TEST_DIR)/test_dpdk_tcp_packet.cpp
+TEST_DPDK_PACKET_PARSER_SRC := $(TEST_DIR)/test_dpdk_packet_parser.cpp
+TEST_DPDK_INIT_SRC := $(TEST_DIR)/test_dpdk_init.cpp
+TEST_DPDK_MEMPOOL_SRC := $(TEST_DIR)/test_dpdk_mempool.cpp
+TEST_DPDK_PORT_SRC := $(TEST_DIR)/test_dpdk_port.cpp
+
+# XDP test source files
+TEST_XDP_TRANSPORT_SRC := $(TEST_DIR)/test_xdp_transport.cpp
+TEST_XDP_FRAME_SRC := $(TEST_DIR)/test_xdp_frame.cpp
+
 # Integration test source files
 TEST_BINANCE_SRC := $(INTEGRATION_DIR)/binance.cpp
+TEST_DPDK_BINANCE_SRC := $(INTEGRATION_DIR)/dpdk_binance.cpp
+TEST_XDP_BINANCE_SRC := $(INTEGRATION_DIR)/xdp_binance.cpp
+TEST_XDP_FRAME_ZEROCOPY_SRC := $(INTEGRATION_DIR)/xdp_frame_zerocopy.cpp
+TEST_XDP_USERSPACE_WEBSOCKET_SRC := $(INTEGRATION_DIR)/test_xdp_userspace_websocket.cpp
 
 # Minimal example source file
 EXAMPLE_MINIMAL_SRC := test/example.cpp
@@ -126,7 +187,23 @@ CHECK_HW_TIMESTAMP_BIN := $(BUILD_DIR)/check_hw_timestamp
 TEST_NIC_TIMESTAMP_BIN := $(BUILD_DIR)/test_nic_timestamp
 TEST_NIC_TIMESTAMP_SIMPLE_BIN := $(BUILD_DIR)/test_timestamp_simple
 
-.PHONY: all clean run run-echo help test test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-integration test-binance example run-example benchmark-binance check-hw-timestamp test-nic-timestamp test-timestamp-simple
+# DPDK test binaries
+TEST_DPDK_TCP_CONNECTION_BIN := $(BUILD_DIR)/test_dpdk_tcp_connection
+TEST_DPDK_TCP_PACKET_BIN := $(BUILD_DIR)/test_dpdk_tcp_packet
+TEST_DPDK_PACKET_PARSER_BIN := $(BUILD_DIR)/test_dpdk_packet_parser
+TEST_DPDK_INIT_BIN := $(BUILD_DIR)/test_dpdk_init
+TEST_DPDK_MEMPOOL_BIN := $(BUILD_DIR)/test_dpdk_mempool
+TEST_DPDK_PORT_BIN := $(BUILD_DIR)/test_dpdk_port
+TEST_DPDK_BINANCE_BIN := $(BUILD_DIR)/test_dpdk_binance_integration
+
+# XDP test binaries
+TEST_XDP_TRANSPORT_BIN := $(BUILD_DIR)/test_xdp_transport
+TEST_XDP_FRAME_BIN := $(BUILD_DIR)/test_xdp_frame
+TEST_XDP_BINANCE_BIN := $(BUILD_DIR)/test_xdp_binance_integration
+TEST_XDP_FRAME_ZEROCOPY_BIN := $(BUILD_DIR)/test_xdp_frame_zerocopy
+TEST_XDP_USERSPACE_WEBSOCKET_BIN := $(BUILD_DIR)/test_xdp_userspace_websocket
+
+.PHONY: all clean clean-bpf run run-echo help test test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-integration test-binance example run-example benchmark-binance check-hw-timestamp test-nic-timestamp test-timestamp-simple test-dpdk test-dpdk-tcp-connection test-dpdk-tcp-packet test-dpdk-packet-parser test-dpdk-init test-dpdk-mempool test-dpdk-port test-dpdk-binance test-xdp test-xdp-transport test-xdp-frame test-xdp-binance test-xdp-userspace-websocket bpf
 
 all: $(EXAMPLE_BIN) $(IO_ECHO_BIN)
 
@@ -284,16 +361,212 @@ test-timestamp-simple: $(TEST_NIC_TIMESTAMP_SIMPLE_BIN)
 	@echo "     Terminal 1: ./$(TEST_NIC_TIMESTAMP_SIMPLE_BIN) 8888"
 	@echo "     Terminal 2: echo 'test' | nc -u localhost 8888"
 
+# ============================================================================
+# DPDK Unit Tests
+# ============================================================================
+
+# Build DPDK TCP connection tests
+$(TEST_DPDK_TCP_CONNECTION_BIN): $(TEST_DPDK_TCP_CONNECTION_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling DPDK TCP connection unit tests..."
+	$(CXX) $(CXXFLAGS) -I./test/unittest -o $@ $^
+	@echo "✅ Test build complete: $@"
+
+# Run DPDK TCP connection tests
+test-dpdk-tcp-connection: $(TEST_DPDK_TCP_CONNECTION_BIN)
+	@echo "🧪 Running DPDK TCP connection unit tests..."
+	./$(TEST_DPDK_TCP_CONNECTION_BIN)
+
+# Build DPDK TCP packet tests
+$(TEST_DPDK_TCP_PACKET_BIN): $(TEST_DPDK_TCP_PACKET_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling DPDK TCP packet unit tests..."
+	$(CXX) -std=c++17 -O0 -I./src -I./test/unittest -o $@ $^
+	@echo "✅ Test build complete: $@"
+
+# Run DPDK TCP packet tests
+test-dpdk-tcp-packet: $(TEST_DPDK_TCP_PACKET_BIN)
+	@echo "🧪 Running DPDK TCP packet unit tests..."
+	./$(TEST_DPDK_TCP_PACKET_BIN)
+
+# Build DPDK packet parser tests
+$(TEST_DPDK_PACKET_PARSER_BIN): $(TEST_DPDK_PACKET_PARSER_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling DPDK packet parser unit tests..."
+	$(CXX) $(CXXFLAGS) -I./test/unittest -o $@ $^
+	@echo "✅ Test build complete: $@"
+
+# Run DPDK packet parser tests
+test-dpdk-packet-parser: $(TEST_DPDK_PACKET_PARSER_BIN)
+	@echo "🧪 Running DPDK packet parser unit tests..."
+	./$(TEST_DPDK_PACKET_PARSER_BIN)
+
+# Build DPDK Binance integration test
+$(TEST_DPDK_BINANCE_BIN): $(TEST_DPDK_BINANCE_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling DPDK Binance integration test..."
+ifdef USE_DPDK
+	$(CXX) $(CXXFLAGS) $(DPDK_CFLAGS) -o $@ $< $(DPDK_LIBS)
+	@echo "✅ Test build complete: $@"
+else
+	@echo "❌ Error: DPDK not enabled. Build with USE_DPDK=1"
+	@exit 1
+endif
+
+# Run DPDK Binance integration test
+test-dpdk-binance: $(TEST_DPDK_BINANCE_BIN)
+	@echo "🧪 Running DPDK Binance integration test..."
+	@echo "⚠️  NOTE: This test requires:"
+	@echo "    - DPDK installed and configured"
+	@echo "    - NIC bound to DPDK driver"
+	@echo "    - Huge pages configured"
+	@echo "    - Run as root or with CAP_SYS_ADMIN"
+	@echo ""
+	sudo ./$(TEST_DPDK_BINANCE_BIN)
+
+# Build DPDK initialization tests
+$(TEST_DPDK_INIT_BIN): $(TEST_DPDK_INIT_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling DPDK initialization unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run DPDK initialization tests
+test-dpdk-init: $(TEST_DPDK_INIT_BIN)
+	@echo "🧪 Running DPDK initialization unit tests..."
+	./$(TEST_DPDK_INIT_BIN)
+
+# Build DPDK mempool tests
+$(TEST_DPDK_MEMPOOL_BIN): $(TEST_DPDK_MEMPOOL_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling DPDK mempool unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run DPDK mempool tests
+test-dpdk-mempool: $(TEST_DPDK_MEMPOOL_BIN)
+	@echo "🧪 Running DPDK mempool unit tests..."
+	./$(TEST_DPDK_MEMPOOL_BIN)
+
+# Build DPDK port tests
+$(TEST_DPDK_PORT_BIN): $(TEST_DPDK_PORT_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling DPDK port unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run DPDK port tests
+test-dpdk-port: $(TEST_DPDK_PORT_BIN)
+	@echo "🧪 Running DPDK port unit tests..."
+	./$(TEST_DPDK_PORT_BIN)
+
+# Run all DPDK tests
+test-dpdk: test-dpdk-tcp-connection test-dpdk-tcp-packet test-dpdk-packet-parser test-dpdk-init test-dpdk-mempool test-dpdk-port
+	@echo "✅ All DPDK unit tests completed"
+
+# ============================================================================
+# XDP Integration Tests
+# ============================================================================
+
+# Build XDP Binance integration test
+$(TEST_XDP_BINANCE_BIN): $(TEST_XDP_BINANCE_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling XDP Binance integration test..."
+ifdef USE_XDP
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Test build complete: $@"
+else
+	@echo "❌ Error: XDP not enabled. Build with USE_XDP=1"
+	@exit 1
+endif
+
+# Run XDP Binance integration test
+test-xdp-binance: $(TEST_XDP_BINANCE_BIN)
+	@echo "🧪 Running XDP Binance integration test..."
+	@echo "⚠️  NOTE: This test requires:"
+	@echo "    - libbpf-dev and libxdp-dev installed"
+	@echo "    - Huge pages configured (sudo sh -c 'echo 256 > /proc/sys/vm/nr_hugepages')"
+	@echo "    - Run as root or with CAP_NET_RAW + CAP_BPF"
+	@echo "    - Network interface that supports XDP"
+	@echo ""
+	sudo ./$(TEST_XDP_BINANCE_BIN)
+
+# Build XDP transport tests
+$(TEST_XDP_TRANSPORT_BIN): $(TEST_XDP_TRANSPORT_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling XDP transport unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run XDP transport tests
+test-xdp-transport: $(TEST_XDP_TRANSPORT_BIN)
+	@echo "🧪 Running XDP transport unit tests..."
+	./$(TEST_XDP_TRANSPORT_BIN)
+
+# Build XDP frame tests
+$(TEST_XDP_FRAME_BIN): $(TEST_XDP_FRAME_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling XDP frame unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run XDP frame tests
+test-xdp-frame: $(TEST_XDP_FRAME_BIN)
+	@echo "🧪 Running XDP frame unit tests..."
+	./$(TEST_XDP_FRAME_BIN)
+
+# Run all XDP tests
+test-xdp: test-xdp-transport test-xdp-frame
+
+# Build XDP + Userspace Stack integration test
+$(TEST_XDP_USERSPACE_WEBSOCKET_BIN): $(TEST_XDP_USERSPACE_WEBSOCKET_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling XDP + Userspace TCP/IP Stack integration test..."
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "✅ Integration test build complete: $@"
+
+# ============================================================================
+# BPF (eBPF) Program Compilation
+# ============================================================================
+
+BPF_SRC := src/xdp/bpf/exchange_filter.bpf.c
+BPF_OBJ := src/xdp/bpf/exchange_filter.bpf.o
+CLANG := clang
+BPFTOOL := bpftool
+
+# Compile BPF program to object file
+$(BPF_OBJ): $(BPF_SRC)
+	@echo "🔨 Compiling eBPF program..."
+	@$(CLANG) -O2 -g -target bpf \
+		-D__TARGET_ARCH_x86_64 \
+		-I/usr/include/bpf \
+		-I/usr/include/$(shell uname -m)-linux-gnu \
+		-c $< -o $@
+	@echo "✅ BPF object created: $@"
+
+# Target to build BPF program (can be called explicitly)
+bpf: $(BPF_OBJ)
+
+# Clean BPF objects
+clean-bpf:
+	rm -f $(BPF_OBJ)
+
+# Run XDP + Userspace Stack integration test
+test-xdp-userspace-websocket: $(TEST_XDP_USERSPACE_WEBSOCKET_BIN) $(BPF_OBJ)
+	@echo "🧪 Running XDP + Userspace TCP/IP Stack integration test..."
+	@echo "📋 Prerequisites:"
+	@echo "   1. Root privileges: sudo"
+	@echo "   2. BPF program will be loaded automatically (packet filtering)"
+	@echo "   3. Network interface must be up"
+	@echo ""
+	@echo "🚀 Recommended: Use the test runner script instead:"
+	@echo "   sudo ./scripts/test_xdp_complete_stack.sh --setup-flow --cleanup"
+	@echo ""
+	@echo "✅ All XDP unit tests completed"
+
+# ============================================================================
+# Integration Tests
+# ============================================================================
+
 # Run all integration tests
 test-integration: test-binance
 	@echo "✅ All integration tests completed"
 
 # Run all tests (unit + integration)
-test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes
+test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-dpdk test-xdp
 	@echo "✅ All unit tests completed"
 
 # Clean build artifacts
-clean:
+clean: clean-bpf
 	rm -rf $(BUILD_DIR)
 	@echo "🧹 Cleaned build artifacts"
 
@@ -342,9 +615,13 @@ help:
 	@echo "  make              - Build all examples"
 	@echo "  make run          - Build and run WebSocket example"
 	@echo "  make run-echo     - Build and run I/O echo server (port 8080)"
-	@echo "  make test         - Build and run all unit tests"
+	@echo "  make test         - Build and run all unit tests (including DPDK)"
 	@echo "  make test-ringbuffer - Build and run ringbuffer unit tests"
 	@echo "  make test-event   - Build and run event policy unit tests"
+	@echo "  make test-dpdk    - Build and run DPDK unit tests"
+	@echo "  make test-dpdk-tcp-connection - Build and run DPDK TCP connection tests"
+	@echo "  make test-dpdk-tcp-packet - Build and run DPDK TCP packet tests"
+	@echo "  make test-dpdk-packet-parser - Build and run DPDK packet parser tests"
 	@echo "  make test-binance - Build and run Binance integration test (first 20 msgs)"
 	@echo "  make test-integration - Build and run all integration tests"
 	@echo "  make check-hw-timestamp - Check hardware timestamping capabilities"
@@ -370,6 +647,7 @@ help:
 	@echo "  USE_IOURING=0     - Disable io_uring, use epoll (Linux only)"
 	@echo "  USE_OPENSSL=1     - Use OpenSSL instead of LibreSSL"
 	@echo "  USE_WOLFSSL=1     - Use WolfSSL instead of LibreSSL"
+	@echo "  USE_DPDK=1        - Enable DPDK support (Linux only, requires libdpdk)"
 	@echo "  CXX=clang++       - Use Clang compiler"
 	@echo ""
 	@echo "Quick start:"

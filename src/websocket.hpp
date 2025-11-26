@@ -4,6 +4,7 @@
 
 #include "ws_policies.hpp"
 #include "core/timing.hpp"
+#include "core/http.hpp"
 #include <functional>
 #include <string>
 #include <vector>
@@ -291,101 +292,71 @@ private:
 
     // Process WebSocket frames from ring buffer
     void process_frames() {
+        using namespace websocket::http;
+
         while (rx_buffer_.readable() >= 2) {  // Minimum frame header size
             size_t available_len = 0;
             const uint8_t* read_ptr = rx_buffer_.next_read_region(&available_len);
 
             if (available_len < 2) break;
 
-            // Parse WebSocket frame header
-            uint8_t byte0 = read_ptr[0];
-            uint8_t byte1 = read_ptr[1];
-
-            bool fin = (byte0 & 0x80) != 0;
-            uint8_t opcode = byte0 & 0x0F;
-            bool masked = (byte1 & 0x80) != 0;
-            uint64_t payload_len = byte1 & 0x7F;
+            // Parse WebSocket frame using core utilities
+            WebSocketFrame frame;
+            if (!parse_websocket_frame(read_ptr, available_len, frame)) {
+                break;  // Need more data or invalid frame
+            }
 
             // Reject fragmented messages (not supported)
-            if (!fin) {
+            if (!frame.fin) {
                 printf("[ERROR] Fragmented WebSocket messages not supported (FIN=0)\n");
                 printf("[ERROR] This library is designed for single-frame messages only\n");
                 connected_ = false;
                 break;
             }
 
-            size_t header_len = 2;
-
-            // Extended payload length
-            if (payload_len == 126) {
-                if (available_len < 4) break;  // Need more data
-                payload_len = (read_ptr[2] << 8) | read_ptr[3];
-                header_len = 4;
-            } else if (payload_len == 127) {
-                if (available_len < 10) break;  // Need more data
-                payload_len = 0;
-                for (int i = 0; i < 8; i++) {
-                    payload_len = (payload_len << 8) | read_ptr[2 + i];
-                }
-                header_len = 10;
-            }
-
-            // Masking key (if present)
-            if (masked) {
-                header_len += 4;
-                // Check bounds after adding masking key length
-                if (available_len < header_len) {
-                    break;  // Need more data for masking key
-                }
-            }
-
             // Check for integer overflow before calculating frame_len
-            if (payload_len > SIZE_MAX - header_len) {
+            if (frame.payload_len > SIZE_MAX - frame.header_len) {
                 printf("[ERROR] Frame too large: payload_len=%lu exceeds SIZE_MAX\n",
-                       (unsigned long)payload_len);
+                       (unsigned long)frame.payload_len);
                 connected_ = false;
                 break;
             }
 
-            // Check if full frame is available
-            size_t frame_len = header_len + payload_len;
-            if (available_len < frame_len) {
-                break;  // Need more data
-            }
+            size_t frame_len = frame.header_len + frame.payload_len;
 
             // Stage 5: Frame parsing completed
             timing_.frame_parsed_cycle = rdtscp();
-            timing_.payload_len = payload_len;
-            timing_.opcode = opcode;
+            timing_.payload_len = frame.payload_len;
+            timing_.opcode = frame.opcode;
 
             // Handle different frame types
-            if (opcode == 0x09) {  // PING frame
+            if (frame.opcode == 0x09) {  // PING frame
                 // Silently respond with PONG (no logging for production HFT performance)
-                send_pong(read_ptr + header_len, payload_len);
+                send_pong(frame.payload, frame.payload_len);
                 rx_buffer_.commit_read(frame_len);
             }
-            else if (opcode == 0x01 || opcode == 0x02) {  // Text or Binary frame
+            else if (frame.opcode == 0x01 || frame.opcode == 0x02) {  // Text or Binary frame
                 // Invoke user callback with zero-copy pointer and timing data
                 // Stage 6 is implemented inside the callback by user code
                 if (on_message_) {
-                    on_message_(read_ptr + header_len, payload_len, timing_);
+                    on_message_(frame.payload, frame.payload_len, timing_);
                 }
                 msg_count_++;
                 rx_buffer_.commit_read(frame_len);
             }
-            else if (opcode == 0x0A) {  // PONG frame (response to our ping)
+            else if (frame.opcode == 0x0A) {  // PONG frame (response to our ping)
                 // Server sent a pong, just ignore it
                 rx_buffer_.commit_read(frame_len);
             }
-            else if (opcode == 0x08) {  // Close frame
+            else if (frame.opcode == 0x08) {  // Close frame
                 printf("[WS] Received close frame from server\n");
-                if (payload_len > 0 && payload_len < 126) {
+                if (frame.payload_len > 0 && frame.payload_len < 126) {
                     // Close frame can have status code and reason
-                    uint16_t status_code = (read_ptr[header_len] << 8) | read_ptr[header_len + 1];
+                    uint16_t status_code = (frame.payload[0] << 8) | frame.payload[1];
                     printf("[WS] Close status code: %u\n", status_code);
-                    if (payload_len > 2) {
-                        printf("[WS] Close reason: %.*s\n", (int)(payload_len - 2),
-                               read_ptr + header_len + 2);
+                    if (frame.payload_len > 2) {
+                        printf("[WS] Close reason: %.*s\n", (int)(frame.payload_len - 2),
+                               frame.payload + 2);
                     }
                 }
                 connected_ = false;
@@ -394,103 +365,24 @@ private:
             }
             else {
                 // Unknown opcode, skip frame
-                printf("[WARN] Unknown opcode: 0x%02X, payload_len: %zu\n", opcode, (size_t)payload_len);
+                printf("[WARN] Unknown opcode: 0x%02X, payload_len: %zu\n",
+                       frame.opcode, (size_t)frame.payload_len);
                 rx_buffer_.commit_read(frame_len);
             }
         }
     }
 
-    // Validate HTTP header to prevent CRLF injection
-    static bool is_valid_header(const std::string& key, const std::string& value) {
-        // Check for CRLF sequences that could allow header injection
-        if (key.find("\r\n") != std::string::npos || key.find('\n') != std::string::npos) {
-            return false;
-        }
-        if (value.find("\r\n") != std::string::npos || value.find('\n') != std::string::npos) {
-            return false;
-        }
-        // Check for empty key
-        if (key.empty()) {
-            return false;
-        }
-        return true;
-    }
-
-    // Generate random WebSocket key (RFC 6455 compliance)
-    static std::string generate_websocket_key() {
-        // Generate 16 random bytes
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_int_distribution<> dis(0, 255);
-
-        uint8_t nonce[16];
-        for (int i = 0; i < 16; ++i) {
-            nonce[i] = static_cast<uint8_t>(dis(gen));
-        }
-
-        // Base64 encode (simplified - produces 24 character output)
-        static const char base64_chars[] =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-        std::string encoded;
-        encoded.reserve(24);
-
-        for (int i = 0; i < 16; i += 3) {
-            uint32_t val = (nonce[i] << 16);
-            if (i + 1 < 16) val |= (nonce[i + 1] << 8);
-            if (i + 2 < 16) val |= nonce[i + 2];
-
-            encoded.push_back(base64_chars[(val >> 18) & 0x3F]);
-            encoded.push_back(base64_chars[(val >> 12) & 0x3F]);
-            encoded.push_back((i + 1 < 16) ? base64_chars[(val >> 6) & 0x3F] : '=');
-            encoded.push_back((i + 2 < 16) ? base64_chars[val & 0x3F] : '=');
-        }
-
-        return encoded;
-    }
 
     // Send HTTP upgrade request with custom headers
     void send_http_upgrade(const char* host, const char* path,
                           const HeaderMap& custom_headers) {
-        // Build HTTP request dynamically with std::string for flexibility
-        std::string request;
-        request.reserve(2048);
+        using namespace websocket::http;
 
-        // Generate random WebSocket key
-        std::string ws_key = generate_websocket_key();
+        char request[4096];
+        size_t len = build_websocket_upgrade_request(host, path, custom_headers,
+                                                       request, sizeof(request));
 
-        // Request line and required headers
-        request += "GET ";
-        request += path;
-        request += " HTTP/1.1\r\n";
-        request += "Host: ";
-        request += host;
-        request += "\r\n";
-        request += "Upgrade: websocket\r\n";
-        request += "Connection: Upgrade\r\n";
-        request += "Sec-WebSocket-Key: ";
-        request += ws_key;
-        request += "\r\n";
-        request += "Sec-WebSocket-Version: 13\r\n";
-
-        // Add custom headers with validation
-        for (const auto& [key, value] : custom_headers) {
-            if (!is_valid_header(key, value)) {
-                printf("[WARN] Skipping invalid header: %s (contains CRLF or invalid)\n",
-                       key.c_str());
-                continue;
-            }
-
-            request += key;
-            request += ": ";
-            request += value;
-            request += "\r\n";
-        }
-
-        // End of headers
-        request += "\r\n";
-
-        ssize_t n = ssl_.write(request.data(), request.size());
+        ssize_t n = ssl_.write(request, len);
         if (n <= 0) {
             throw std::runtime_error("Failed to send HTTP upgrade");
         }
@@ -514,32 +406,18 @@ private:
 
     // Send PONG frame in response to PING
     void send_pong(const uint8_t* payload, size_t len) {
-        // Validate payload length (RFC 6455: control frames <= 125 bytes)
-        if (len > 125) {
-            printf("[WARN] PING payload too large (%zu bytes), truncating to 125\n", len);
-            len = 125;
-        }
+        using namespace websocket::http;
 
         uint8_t pong[256];
 
-        // PONG frame: FIN + opcode 0x0A
-        pong[0] = 0x8A;
-
-        // Payload length (now guaranteed < 126)
-        pong[1] = 0x80 | (uint8_t)len;  // Masked
-
-        // Masking key (client must mask)
-        // Note: Static key is intentional for performance (single-threaded HFT env)
+        // Static masking key for performance (single-threaded HFT env)
         uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78};
-        memcpy(pong + 2, mask, 4);
 
-        // Masked payload
-        for (size_t i = 0; i < len; i++) {
-            pong[6 + i] = payload[i] ^ mask[i % 4];
-        }
+        // Build PONG frame using core utilities
+        size_t frame_len = build_pong_frame(payload, len, pong, mask);
 
         // Check write return value
-        ssize_t ret = ssl_.write(pong, 6 + len);
+        ssize_t ret = ssl_.write(pong, frame_len);
         if (ret <= 0) {
             printf("[WARN] Failed to send PONG response\n");
         }
