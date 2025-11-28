@@ -69,9 +69,8 @@ struct {
 #define STAT_IPV4_PACKETS       5
 #define STAT_TCP_PACKETS        6
 #define STAT_NON_TCP_PACKETS    7
-#define STAT_INCOMING_CHECK     8  // Phase 1 debug: checked incoming path
-#define STAT_IP_MATCH           9  // Phase 1 debug: destination IP matched
-#define STAT_PORT_MATCH        10  // Phase 1 debug: destination port matched
+#define STAT_INCOMING_CHECK     8  // Incoming packets (dst_ip = local_ip)
+#define STAT_IP_MATCH           9  // Exchange IP+port matched
 
 // Helper to increment statistics
 static __always_inline void inc_stat(__u32 index) {
@@ -163,11 +162,15 @@ static __always_inline int parse_tcp(struct parse_ctx *pctx) {
 }
 
 // Check if packet is exchange traffic (INCOMING ONLY)
-// PHASE 1: Destination-based filtering to handle load-balanced backends
 // NOTE: We ONLY redirect incoming responses, NOT outgoing requests.
 //       Outgoing packets go through kernel normally (for routing, NAT, etc.)
+//
+// Matching criteria:
+//   - Destination IP = our local IP (incoming packet)
+//   - Source IP is in exchange_ips map (e.g., Binance server)
+//   - Source port is in exchange_ports map (e.g., 443)
 static __always_inline int is_exchange_packet(struct parse_ctx *pctx) {
-    // ONLY Check INCOMING packets: destination IP = our local IP
+    // ONLY check INCOMING packets: destination IP = our local IP
     __u32 key = 0;
     __u32 *our_ip = bpf_map_lookup_elem(&local_ip, &key);
 
@@ -177,31 +180,17 @@ static __always_inline int is_exchange_packet(struct parse_ctx *pctx) {
     }
 
     inc_stat(STAT_INCOMING_CHECK);  // Debug: Checked incoming path
-    inc_stat(STAT_IP_MATCH);  // Debug: Destination IP matched
 
-    // Log incoming packet details
-    bpf_printk("INCOMING: src=%pI4:%d dst=%pI4:%d", &pctx->ip_src, pctx->tcp_sport, &pctx->ip_dst, pctx->tcp_dport);
-
-    // Check if destination port is in ephemeral range
-    // Ephemeral ports: 60000-65535 (used by client connections)
-    if (pctx->tcp_dport >= 60000) {
-        inc_stat(STAT_PORT_MATCH);  // Debug: Port matched too!
-        bpf_printk("MATCH: ephemeral port %d -> REDIRECT", pctx->tcp_dport);
-        // Incoming to our IP on ephemeral port - exchange response
-        return 1;
-    }
-
-    // Also check if source is from exchange (for established connections)
+    // Check if source is from exchange (IP + port must both match)
     __u8 *src_ip_val = bpf_map_lookup_elem(&exchange_ips, &pctx->ip_src);
     __u8 *src_port_val = bpf_map_lookup_elem(&exchange_ports, &pctx->tcp_sport);
 
     if (src_ip_val && *src_ip_val != 0 && src_port_val && *src_port_val != 0) {
-        // Incoming from exchange: src_ip=exchange AND src_port=exchange_port
-        bpf_printk("MATCH: exchange IP+port -> REDIRECT");
+        inc_stat(STAT_IP_MATCH);  // Debug: Exchange IP+port matched
+        bpf_printk("MATCH: src=%pI4:%d -> REDIRECT", &pctx->ip_src, pctx->tcp_sport);
         return 1;
     }
 
-    bpf_printk("NO MATCH: port %d not ephemeral, exchange lookup failed", pctx->tcp_dport);
     return 0;  // Not exchange traffic
 }
 

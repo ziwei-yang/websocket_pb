@@ -35,6 +35,11 @@
 #include <unistd.h>
 #include <errno.h>
 
+// io_uring header must be included outside namespace to avoid polluting it
+#ifdef ENABLE_IO_URING
+#include <liburing.h>
+#endif
+
 // Platform-specific socket flags
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0  // macOS doesn't have MSG_NOSIGNAL
@@ -763,7 +768,6 @@ private:
 // ============================================================================
 
 #ifdef ENABLE_IO_URING
-#include <liburing.h>
 
 /**
  * IoUringBackend - Linux io_uring-based asynchronous I/O

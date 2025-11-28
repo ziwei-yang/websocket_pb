@@ -2,17 +2,19 @@
 // Event policy for XDP transport (polling-based)
 //
 // Unlike Epoll/IOUring which wait on file descriptors, XDP requires explicit
-// polling via UserspaceStack::poll(). This event policy provides that interface.
+// polling. This event policy provides a polling-based event loop that calls
+// a user-provided poll callback.
+//
+// Note: The UserspaceStack is now pure packet operations only.
+// The transport policy (XDPUserspaceTransport) owns the poll loop.
+// This event policy is for integration with generic event loop code.
 
 #pragma once
 
 #include <cstdint>
 #include <unistd.h>
 #include <time.h>
-
-#ifdef USE_XDP
-#include "../stack/userspace_stack.hpp"
-#endif
+#include <functional>
 
 namespace websocket {
 
@@ -20,7 +22,7 @@ namespace websocket {
  * XDP Event Policy
  *
  * Polling-based event loop for XDP transport. Unlike epoll/io_uring which wait
- * for kernel notifications, this policy actively polls the UserspaceStack to
+ * for kernel notifications, this policy actively calls a poll callback to
  * process incoming packets.
  *
  * Performance Characteristics:
@@ -31,7 +33,7 @@ namespace websocket {
  * Usage:
  *   XDPEventPolicy event_loop;
  *   event_loop.init();
- *   event_loop.set_stack(&userspace_stack);
+ *   event_loop.set_poll_callback([&transport]() { transport.poll(); });
  *   event_loop.set_wait_timeout(100);  // 100μs polling interval
  *
  *   while (running) {
@@ -42,19 +44,16 @@ namespace websocket {
  *   }
  */
 struct XDPEventPolicy {
-#ifdef USE_XDP
-    userspace_stack::UserspaceStack* stack_;
-#endif
+    using PollCallback = std::function<void()>;
+
+    PollCallback poll_callback_;
     int timeout_us_;        // Polling interval in microseconds
     bool busy_poll_;        // If true, busy poll (no sleep)
     uint64_t poll_count_;   // Statistics
+
     XDPEventPolicy()
-#ifdef USE_XDP
-        : stack_(nullptr)
+        : poll_callback_()
         , timeout_us_(100)   // Default: 100μs polling interval
-#else
-        : timeout_us_(100)
-#endif
         , busy_poll_(false)  // Default: sleep-based polling
         , poll_count_(0)
     {}
@@ -69,15 +68,14 @@ struct XDPEventPolicy {
         poll_count_ = 0;
     }
 
-#ifdef USE_XDP
     /**
-     * Set the UserspaceStack to poll
-     * Must be called before wait_with_timeout()
+     * Set the poll callback
+     * This callback is invoked on each wait_with_timeout() call.
+     * Typically set to transport.poll() to process RX and retransmits.
      */
-    void set_stack(userspace_stack::UserspaceStack* stack) {
-        stack_ = stack;
+    void set_poll_callback(PollCallback cb) {
+        poll_callback_ = std::move(cb);
     }
-#endif
 
     /**
      * Set polling interval
@@ -114,19 +112,17 @@ struct XDPEventPolicy {
      * Wait for events with timeout
      * @return 1 if ready (always), 0 on timeout, -1 on error
      *
-     * For XDP, this polls the UserspaceStack and optionally sleeps.
+     * Calls the poll callback and optionally sleeps.
      * Always returns 1 (ready) to signal that polling occurred.
      *
      * Note: Unlike epoll which blocks until events, this always returns
      *       after one poll cycle (with optional sleep).
      */
     int wait_with_timeout() {
-#ifdef USE_XDP
-        if (stack_) {
-            // Poll the userspace stack to process packets
-            stack_->poll();
+        // Call user-provided poll callback (e.g., transport.poll())
+        if (poll_callback_) {
+            poll_callback_();
         }
-#endif
 
         poll_count_++;
 

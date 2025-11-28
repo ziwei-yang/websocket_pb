@@ -60,26 +60,8 @@ ifeq ($(UNAME_S),Linux)
     # Transport Layer Selection
     # Note: These are mutually exclusive - only one can be active at a time
 
-    # DPDK Support (Linux only)
-    ifdef USE_DPDK
-        ifdef USE_XDP
-            $(error Cannot use both USE_DPDK=1 and USE_XDP=1 simultaneously)
-        endif
-        ifdef USE_SOCKET
-            $(error Cannot use both USE_DPDK=1 and USE_SOCKET=1 simultaneously)
-        endif
-        # Check if DPDK is installed (pkg-config method)
-        HAS_DPDK := $(shell pkg-config --exists libdpdk && echo 1 || echo 0)
-        ifeq ($(HAS_DPDK),1)
-            CXXFLAGS += -DUSE_DPDK $(shell pkg-config --cflags libdpdk)
-            LDFLAGS += $(shell pkg-config --libs libdpdk)
-            TRANSPORT_INFO := DPDK
-            $(info Building with DPDK support enabled)
-        else
-            $(error DPDK requested but not found. Install DPDK and ensure pkg-config can find libdpdk)
-        endif
     # XDP Support (Linux only)
-    else ifdef USE_XDP
+    ifdef USE_XDP
         ifdef USE_SOCKET
             $(error Cannot use both USE_XDP=1 and USE_SOCKET=1 simultaneously)
         endif
@@ -134,7 +116,6 @@ endif
 
 # Source files
 EXAMPLE_SRC := examples/binance_example.cpp
-IO_ECHO_SRC := examples/io_echo_server.cpp
 
 # Test source files
 TEST_RINGBUFFER_SRC := $(TEST_DIR)/test_ringbuffer.cpp
@@ -142,21 +123,12 @@ TEST_EVENT_SRC := $(TEST_DIR)/test_event.cpp
 TEST_BUG_FIXES_SRC := $(TEST_DIR)/test_bug_fixes.cpp
 TEST_NEW_BUG_FIXES_SRC := $(TEST_DIR)/test_new_bug_fixes.cpp
 
-# DPDK test source files
-TEST_DPDK_TCP_CONNECTION_SRC := $(TEST_DIR)/test_dpdk_tcp_connection.cpp
-TEST_DPDK_TCP_PACKET_SRC := $(TEST_DIR)/test_dpdk_tcp_packet.cpp
-TEST_DPDK_PACKET_PARSER_SRC := $(TEST_DIR)/test_dpdk_packet_parser.cpp
-TEST_DPDK_INIT_SRC := $(TEST_DIR)/test_dpdk_init.cpp
-TEST_DPDK_MEMPOOL_SRC := $(TEST_DIR)/test_dpdk_mempool.cpp
-TEST_DPDK_PORT_SRC := $(TEST_DIR)/test_dpdk_port.cpp
-
 # XDP test source files
 TEST_XDP_TRANSPORT_SRC := $(TEST_DIR)/test_xdp_transport.cpp
 TEST_XDP_FRAME_SRC := $(TEST_DIR)/test_xdp_frame.cpp
 
 # Integration test source files
 TEST_BINANCE_SRC := $(INTEGRATION_DIR)/binance.cpp
-TEST_DPDK_BINANCE_SRC := $(INTEGRATION_DIR)/dpdk_binance.cpp
 TEST_XDP_BINANCE_SRC := $(INTEGRATION_DIR)/xdp_binance.cpp
 TEST_XDP_FRAME_ZEROCOPY_SRC := $(INTEGRATION_DIR)/xdp_frame_zerocopy.cpp
 TEST_XDP_USERSPACE_WEBSOCKET_SRC := $(INTEGRATION_DIR)/test_xdp_userspace_websocket.cpp
@@ -175,7 +147,6 @@ TEST_NIC_TIMESTAMP_SIMPLE_SRC := test/test_nic_timestamp_simple.cpp
 
 # Binary output
 EXAMPLE_BIN := $(BUILD_DIR)/ws_example
-IO_ECHO_BIN := $(BUILD_DIR)/io_echo_server
 TEST_RINGBUFFER_BIN := $(BUILD_DIR)/test_ringbuffer
 TEST_EVENT_BIN := $(BUILD_DIR)/test_event
 TEST_BUG_FIXES_BIN := $(BUILD_DIR)/test_bug_fixes
@@ -187,15 +158,6 @@ CHECK_HW_TIMESTAMP_BIN := $(BUILD_DIR)/check_hw_timestamp
 TEST_NIC_TIMESTAMP_BIN := $(BUILD_DIR)/test_nic_timestamp
 TEST_NIC_TIMESTAMP_SIMPLE_BIN := $(BUILD_DIR)/test_timestamp_simple
 
-# DPDK test binaries
-TEST_DPDK_TCP_CONNECTION_BIN := $(BUILD_DIR)/test_dpdk_tcp_connection
-TEST_DPDK_TCP_PACKET_BIN := $(BUILD_DIR)/test_dpdk_tcp_packet
-TEST_DPDK_PACKET_PARSER_BIN := $(BUILD_DIR)/test_dpdk_packet_parser
-TEST_DPDK_INIT_BIN := $(BUILD_DIR)/test_dpdk_init
-TEST_DPDK_MEMPOOL_BIN := $(BUILD_DIR)/test_dpdk_mempool
-TEST_DPDK_PORT_BIN := $(BUILD_DIR)/test_dpdk_port
-TEST_DPDK_BINANCE_BIN := $(BUILD_DIR)/test_dpdk_binance_integration
-
 # XDP test binaries
 TEST_XDP_TRANSPORT_BIN := $(BUILD_DIR)/test_xdp_transport
 TEST_XDP_FRAME_BIN := $(BUILD_DIR)/test_xdp_frame
@@ -203,9 +165,9 @@ TEST_XDP_BINANCE_BIN := $(BUILD_DIR)/test_xdp_binance_integration
 TEST_XDP_FRAME_ZEROCOPY_BIN := $(BUILD_DIR)/test_xdp_frame_zerocopy
 TEST_XDP_USERSPACE_WEBSOCKET_BIN := $(BUILD_DIR)/test_xdp_userspace_websocket
 
-.PHONY: all clean clean-bpf run run-echo help test test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-integration test-binance example run-example benchmark-binance check-hw-timestamp test-nic-timestamp test-timestamp-simple test-dpdk test-dpdk-tcp-connection test-dpdk-tcp-packet test-dpdk-packet-parser test-dpdk-init test-dpdk-mempool test-dpdk-port test-dpdk-binance test-xdp test-xdp-transport test-xdp-frame test-xdp-binance test-xdp-userspace-websocket bpf
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-integration test-binance example run-example benchmark-binance check-hw-timestamp test-nic-timestamp test-timestamp-simple test-xdp test-xdp-transport test-xdp-frame test-xdp-binance test-xdp-userspace-websocket bpf
 
-all: $(EXAMPLE_BIN) $(IO_ECHO_BIN)
+all: $(EXAMPLE_BIN)
 
 # Create build directory
 $(BUILD_DIR):
@@ -215,12 +177,6 @@ $(BUILD_DIR):
 $(EXAMPLE_BIN): $(EXAMPLE_SRC) | $(BUILD_DIR)
 	@echo "🔨 Compiling example..."
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-	@echo "✅ Build complete: $@"
-
-# Build I/O echo server example
-$(IO_ECHO_BIN): $(IO_ECHO_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling I/O echo server..."
-	$(CXX) $(CXXFLAGS) -o $@ $^
 	@echo "✅ Build complete: $@"
 
 # Build ringbuffer tests
@@ -239,12 +195,6 @@ $(TEST_EVENT_BIN): $(TEST_EVENT_SRC) | $(BUILD_DIR)
 run: $(EXAMPLE_BIN)
 	@echo "🚀 Running WebSocket example..."
 	./$(EXAMPLE_BIN)
-
-# Run I/O echo server
-run-echo: $(IO_ECHO_BIN)
-	@echo "🚀 Running I/O echo server on port 8080..."
-	@echo "Test with: nc localhost 8080"
-	./$(IO_ECHO_BIN)
 
 # Run ringbuffer tests
 test-ringbuffer: $(TEST_RINGBUFFER_BIN)
@@ -362,102 +312,6 @@ test-timestamp-simple: $(TEST_NIC_TIMESTAMP_SIMPLE_BIN)
 	@echo "     Terminal 2: echo 'test' | nc -u localhost 8888"
 
 # ============================================================================
-# DPDK Unit Tests
-# ============================================================================
-
-# Build DPDK TCP connection tests
-$(TEST_DPDK_TCP_CONNECTION_BIN): $(TEST_DPDK_TCP_CONNECTION_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling DPDK TCP connection unit tests..."
-	$(CXX) $(CXXFLAGS) -I./test/unittest -o $@ $^
-	@echo "✅ Test build complete: $@"
-
-# Run DPDK TCP connection tests
-test-dpdk-tcp-connection: $(TEST_DPDK_TCP_CONNECTION_BIN)
-	@echo "🧪 Running DPDK TCP connection unit tests..."
-	./$(TEST_DPDK_TCP_CONNECTION_BIN)
-
-# Build DPDK TCP packet tests
-$(TEST_DPDK_TCP_PACKET_BIN): $(TEST_DPDK_TCP_PACKET_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling DPDK TCP packet unit tests..."
-	$(CXX) -std=c++17 -O0 -I./src -I./test/unittest -o $@ $^
-	@echo "✅ Test build complete: $@"
-
-# Run DPDK TCP packet tests
-test-dpdk-tcp-packet: $(TEST_DPDK_TCP_PACKET_BIN)
-	@echo "🧪 Running DPDK TCP packet unit tests..."
-	./$(TEST_DPDK_TCP_PACKET_BIN)
-
-# Build DPDK packet parser tests
-$(TEST_DPDK_PACKET_PARSER_BIN): $(TEST_DPDK_PACKET_PARSER_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling DPDK packet parser unit tests..."
-	$(CXX) $(CXXFLAGS) -I./test/unittest -o $@ $^
-	@echo "✅ Test build complete: $@"
-
-# Run DPDK packet parser tests
-test-dpdk-packet-parser: $(TEST_DPDK_PACKET_PARSER_BIN)
-	@echo "🧪 Running DPDK packet parser unit tests..."
-	./$(TEST_DPDK_PACKET_PARSER_BIN)
-
-# Build DPDK Binance integration test
-$(TEST_DPDK_BINANCE_BIN): $(TEST_DPDK_BINANCE_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling DPDK Binance integration test..."
-ifdef USE_DPDK
-	$(CXX) $(CXXFLAGS) $(DPDK_CFLAGS) -o $@ $< $(DPDK_LIBS)
-	@echo "✅ Test build complete: $@"
-else
-	@echo "❌ Error: DPDK not enabled. Build with USE_DPDK=1"
-	@exit 1
-endif
-
-# Run DPDK Binance integration test
-test-dpdk-binance: $(TEST_DPDK_BINANCE_BIN)
-	@echo "🧪 Running DPDK Binance integration test..."
-	@echo "⚠️  NOTE: This test requires:"
-	@echo "    - DPDK installed and configured"
-	@echo "    - NIC bound to DPDK driver"
-	@echo "    - Huge pages configured"
-	@echo "    - Run as root or with CAP_SYS_ADMIN"
-	@echo ""
-	sudo ./$(TEST_DPDK_BINANCE_BIN)
-
-# Build DPDK initialization tests
-$(TEST_DPDK_INIT_BIN): $(TEST_DPDK_INIT_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling DPDK initialization unit tests..."
-	$(CXX) $(CXXFLAGS) -o $@ $<
-	@echo "✅ Test build complete: $@"
-
-# Run DPDK initialization tests
-test-dpdk-init: $(TEST_DPDK_INIT_BIN)
-	@echo "🧪 Running DPDK initialization unit tests..."
-	./$(TEST_DPDK_INIT_BIN)
-
-# Build DPDK mempool tests
-$(TEST_DPDK_MEMPOOL_BIN): $(TEST_DPDK_MEMPOOL_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling DPDK mempool unit tests..."
-	$(CXX) $(CXXFLAGS) -o $@ $<
-	@echo "✅ Test build complete: $@"
-
-# Run DPDK mempool tests
-test-dpdk-mempool: $(TEST_DPDK_MEMPOOL_BIN)
-	@echo "🧪 Running DPDK mempool unit tests..."
-	./$(TEST_DPDK_MEMPOOL_BIN)
-
-# Build DPDK port tests
-$(TEST_DPDK_PORT_BIN): $(TEST_DPDK_PORT_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling DPDK port unit tests..."
-	$(CXX) $(CXXFLAGS) -o $@ $<
-	@echo "✅ Test build complete: $@"
-
-# Run DPDK port tests
-test-dpdk-port: $(TEST_DPDK_PORT_BIN)
-	@echo "🧪 Running DPDK port unit tests..."
-	./$(TEST_DPDK_PORT_BIN)
-
-# Run all DPDK tests
-test-dpdk: test-dpdk-tcp-connection test-dpdk-tcp-packet test-dpdk-packet-parser test-dpdk-init test-dpdk-mempool test-dpdk-port
-	@echo "✅ All DPDK unit tests completed"
-
-# ============================================================================
 # XDP Integration Tests
 # ============================================================================
 
@@ -562,7 +416,7 @@ test-integration: test-binance
 	@echo "✅ All integration tests completed"
 
 # Run all tests (unit + integration)
-test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-dpdk test-xdp
+test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-xdp
 	@echo "✅ All unit tests completed"
 
 # Clean build artifacts
@@ -614,14 +468,12 @@ help:
 	@echo "Targets:"
 	@echo "  make              - Build all examples"
 	@echo "  make run          - Build and run WebSocket example"
-	@echo "  make run-echo     - Build and run I/O echo server (port 8080)"
-	@echo "  make test         - Build and run all unit tests (including DPDK)"
+	@echo "  make run-example  - Build and run WebSocket example"
+	@echo "  make test         - Build and run all unit tests"
 	@echo "  make test-ringbuffer - Build and run ringbuffer unit tests"
 	@echo "  make test-event   - Build and run event policy unit tests"
-	@echo "  make test-dpdk    - Build and run DPDK unit tests"
-	@echo "  make test-dpdk-tcp-connection - Build and run DPDK TCP connection tests"
-	@echo "  make test-dpdk-tcp-packet - Build and run DPDK TCP packet tests"
-	@echo "  make test-dpdk-packet-parser - Build and run DPDK packet parser tests"
+	@echo "  make test-xdp     - Build and run XDP unit tests"
+	@echo "  make test-xdp-binance - Build and run XDP Binance integration test"
 	@echo "  make test-binance - Build and run Binance integration test (first 20 msgs)"
 	@echo "  make test-integration - Build and run all integration tests"
 	@echo "  make check-hw-timestamp - Check hardware timestamping capabilities"
@@ -641,17 +493,16 @@ help:
 	@echo ""
 	@echo "Examples:"
 	@echo "  ./build/ws_example       - WebSocket client example"
-	@echo "  ./build/io_echo_server   - Async I/O echo server"
 	@echo ""
 	@echo "Environment variables:"
 	@echo "  USE_IOURING=0     - Disable io_uring, use epoll (Linux only)"
 	@echo "  USE_OPENSSL=1     - Use OpenSSL instead of LibreSSL"
 	@echo "  USE_WOLFSSL=1     - Use WolfSSL instead of LibreSSL"
-	@echo "  USE_DPDK=1        - Enable DPDK support (Linux only, requires libdpdk)"
+	@echo "  USE_XDP=1         - Enable XDP support (Linux only, requires libbpf/libxdp)"
 	@echo "  CXX=clang++       - Use Clang compiler"
 	@echo ""
 	@echo "Quick start:"
-	@echo "  make run-echo                # Start echo server"
+	@echo "  make run                     # Run WebSocket example"
 	@echo "  make test                    # Run all tests"
 	@echo "  CXX=clang++ make             # Build with Clang"
-	@echo "  USE_IOURING=0 make           # Use epoll instead of io_uring (Linux)"
+	@echo "  USE_XDP=1 make test-xdp-binance  # Run XDP Binance test"

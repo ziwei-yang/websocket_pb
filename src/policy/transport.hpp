@@ -1,18 +1,31 @@
 // policy/transport.hpp
-// Transport layer policy interface
+// Transport Layer Policy - Network Transport Abstraction
 //
-// Abstracts the underlying network transport mechanism:
+// This header provides transport implementations for different network stacks:
 //   - BSDSocketTransport: Traditional BSD sockets (kernel TCP/IP stack)
-//   - DPDKTransport: DPDK userspace networking (bypass kernel)
+//   - XDPUserspaceTransport: XDP + Userspace TCP/IP stack (complete kernel bypass)
+//
+// Architecture (XDPUserspaceTransport):
+//   Transport Policy (this file)
+//       │
+//       ├── Owns: TCP state, timers, retransmit queue, receive buffer
+//       ├── Owns: All control flow (connect loop, send/recv, close)
+//       ├── Owns: XDP I/O operations (xdp_transport.hpp)
+//       │
+//       └── Uses: UserspaceStack (pure packet operations)
+//                 ├── build_syn(), build_ack(), build_data(), build_fin()
+//                 ├── parse_tcp() - parse raw frames
+//                 └── process_tcp() - pure state machine
 //
 // TransportPolicy concept:
 //   - void init()
 //   - void connect(const char* host, uint16_t port)
 //   - ssize_t send(const void* buf, size_t len)
 //   - ssize_t recv(void* buf, size_t len)
-//   - int get_fd() const  // For BSD sockets, -1 for DPDK
+//   - int get_fd() const  // For BSD sockets, -1 for XDP
 //   - void set_nonblocking()
 //   - void close()
+//   - void poll()         // For XDP: process RX and retransmits
 //   - bool is_connected() const
 
 #pragma once
@@ -29,6 +42,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <cstdio>
+#include <chrono>
+#include <thread>
 
 namespace websocket {
 namespace transport {
@@ -71,38 +86,25 @@ public:
         return *this;
     }
 
-    /**
-     * Initialize transport (no-op for BSD sockets)
-     */
     void init() {
         // No initialization needed for BSD sockets
     }
 
-    /**
-     * Connect to remote host via TCP
-     *
-     * @param host Hostname or IP address
-     * @param port Port number
-     * @throws std::runtime_error on connection failure
-     */
     void connect(const char* host, uint16_t port) {
         if (connected_) {
             throw std::runtime_error("Already connected");
         }
 
-        // Create socket
         fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (fd_ < 0) {
             throw std::runtime_error("Failed to create socket");
         }
 
-        // Enable TCP_NODELAY for low-latency (disable Nagle's algorithm)
         int flag = 1;
         if (::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
             printf("[WARN] Failed to set TCP_NODELAY: %s\n", strerror(errno));
         }
 
-        // Resolve hostname
         struct addrinfo hints = {};
         struct addrinfo* result = nullptr;
         hints.ai_family = AF_INET;
@@ -122,11 +124,9 @@ public:
             throw std::runtime_error("getaddrinfo() returned no addresses");
         }
 
-        // Set port
         auto* addr = reinterpret_cast<struct sockaddr_in*>(result->ai_addr);
         addr->sin_port = htons(port);
 
-        // Connect with timeout
         set_nonblocking();
 
         ret = ::connect(fd_, result->ai_addr, result->ai_addrlen);
@@ -138,7 +138,6 @@ public:
             throw std::runtime_error(std::string("connect() failed: ") + strerror(errno));
         }
 
-        // Wait for connection with 5-second timeout
         fd_set write_fds;
         FD_ZERO(&write_fds);
         FD_SET(fd_, &write_fds);
@@ -154,7 +153,6 @@ public:
             throw std::runtime_error("Connection timeout");
         }
 
-        // Check for socket errors
         int so_error = 0;
         socklen_t len = sizeof(so_error);
         if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0 || so_error != 0) {
@@ -167,13 +165,6 @@ public:
         printf("[BSD] Connected to %s:%u (fd=%d)\n", host, port, fd_);
     }
 
-    /**
-     * Send data via socket
-     *
-     * @param buf Data buffer
-     * @param len Data length
-     * @return Number of bytes sent, or -1 on error (check errno)
-     */
     ssize_t send(const void* buf, size_t len) {
         if (!connected_ || fd_ < 0) {
             errno = ENOTCONN;
@@ -182,13 +173,6 @@ public:
         return ::send(fd_, buf, len, 0);
     }
 
-    /**
-     * Receive data from socket
-     *
-     * @param buf Buffer to store received data
-     * @param len Buffer size
-     * @return Number of bytes received, 0 on EOF, -1 on error (check errno)
-     */
     ssize_t recv(void* buf, size_t len) {
         if (!connected_ || fd_ < 0) {
             errno = ENOTCONN;
@@ -197,34 +181,19 @@ public:
         return ::recv(fd_, buf, len, 0);
     }
 
-    /**
-     * Get socket file descriptor
-     *
-     * @return File descriptor, or -1 if not connected
-     */
-    int get_fd() const {
-        return fd_;
-    }
+    int get_fd() const { return fd_; }
 
-    /**
-     * Set socket to non-blocking mode
-     */
     void set_nonblocking() {
         if (fd_ < 0) return;
-
         int flags = fcntl(fd_, F_GETFL, 0);
         if (flags < 0) {
             throw std::runtime_error("fcntl(F_GETFL) failed");
         }
-
         if (fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
             throw std::runtime_error("fcntl(F_SETFL) failed");
         }
     }
 
-    /**
-     * Close socket connection
-     */
     void close() {
         if (fd_ >= 0) {
             ::close(fd_);
@@ -233,12 +202,7 @@ public:
         }
     }
 
-    /**
-     * Check if transport is connected
-     */
-    bool is_connected() const {
-        return connected_;
-    }
+    bool is_connected() const { return connected_; }
 
 private:
     int fd_;
@@ -251,6 +215,7 @@ private:
 // Include XDP headers outside namespace to avoid conflicts
 #ifdef USE_XDP
 #include "../xdp/xdp_transport.hpp"
+#include "../xdp/xdp_frame.hpp"
 #include "../stack/userspace_stack.hpp"
 #include <net/if.h>
 #include <sys/ioctl.h>
@@ -264,21 +229,23 @@ namespace transport {
  * XDP Userspace Transport Policy
  *
  * Uses XDP driver mode with userspace TCP/IP stack (complete kernel bypass).
- * Suitable for: Ultra-low latency HFT, sub-microsecond packet processing
  *
  * Architecture:
- *   Application → XDPUserspaceTransport → Userspace TCP/IP → XDP (AF_XDP) → NIC
+ *   - Stack: Pure packet building/parsing (no I/O, no control flow)
+ *   - Transport: Owns all I/O and control flow (connect loops, retransmits, timers)
  *
- * Performance:
- *   - RX latency: ~1-2μs (NIC to app)
- *   - TX latency: ~1μs (app to wire)
- *   - 5-25x faster than kernel stack
+ * This class owns:
+ *   - TCP state machine (state_, tcp_params_)
+ *   - Retransmit queue and timers
+ *   - Receive buffer
+ *   - XDP I/O operations
  */
 class XDPUserspaceTransport {
 public:
     XDPUserspaceTransport()
         : xdp_()
         , stack_()
+        , state_(userspace_stack::TCPState::CLOSED)
         , connected_(false)
     {}
 
@@ -292,25 +259,19 @@ public:
 
     /**
      * Initialize XDP transport with userspace stack
-     *
-     * @param interface Network interface (e.g., "enp108s0")
-     * @param enable_bpf Enable eBPF packet filtering (default: true)
-     * @param bpf_path Path to BPF object file
      */
     void init(const char* interface = "eth0",
-              bool enable_bpf = true,
               const char* bpf_path = "src/xdp/bpf/exchange_filter.bpf.o") {
         // Configure XDP
         websocket::xdp::XDPConfig config;
         config.interface = interface;
         config.queue_id = 0;
-        config.frame_size = 4096;  // Increased from 2048 to handle MTU-sized packets
+        config.frame_size = 4096;
         config.num_frames = 4096;
-        config.zero_copy = true;  // Enable zero-copy for HFT performance
+        config.zero_copy = true;
         config.batch_size = 64;
 
-        // Initialize XDP transport with BPF filtering
-        xdp_.init(config, enable_bpf, bpf_path);
+        xdp_.init(config, bpf_path);
 
         // Get local interface configuration
         uint8_t local_mac[6];
@@ -320,15 +281,18 @@ public:
             throw std::runtime_error("Failed to get interface configuration");
         }
 
-        // Initialize userspace TCP/IP stack
+        // Initialize stack (pure packet ops only)
         char local_ip_str[16], gateway_ip_str[16], netmask_str[16];
         ip_to_string(local_ip, local_ip_str);
         ip_to_string(gateway_ip, gateway_ip_str);
         ip_to_string(netmask, netmask_str);
 
-        stack_.init(&xdp_, local_ip_str, gateway_ip_str, netmask_str, local_mac);
+        stack_.init(local_ip_str, gateway_ip_str, netmask_str, local_mac);
 
-        // Phase 1: Set local IP in BPF filter for destination-based filtering
+        // Initialize TCP params
+        tcp_params_.local_ip = local_ip;
+
+        // Set local IP in BPF filter
         if (xdp_.is_bpf_enabled()) {
             xdp_.set_local_ip(local_ip_str);
         }
@@ -342,18 +306,16 @@ public:
     }
 
     /**
-     * Connect to remote host via userspace TCP
+     * Connect to remote host via userspace TCP (3-way handshake)
      *
-     * @param host Hostname or IP address
-     * @param port Port number
-     * @throws std::runtime_error on connection failure
+     * ALL control flow is here in transport, not in stack.
      */
     void connect(const char* host, uint16_t port) {
         if (connected_) {
             throw std::runtime_error("Already connected");
         }
 
-        // Resolve hostname to IP
+        // Resolve hostname
         struct addrinfo hints = {};
         struct addrinfo* result = nullptr;
         hints.ai_family = AF_INET;
@@ -371,8 +333,52 @@ public:
 
         printf("[XDP-Userspace] Connecting to %s:%u via userspace TCP...\n", host, port);
 
-        // Connect via userspace TCP stack (3-way handshake)
-        stack_.connect(remote_ip, port, 5000);
+        // Setup TCP parameters
+        tcp_params_.remote_ip = remote_ip;
+        tcp_params_.remote_port = port;
+        tcp_params_.local_port = userspace_stack::UserspaceStack::generate_port();
+        tcp_params_.snd_una = tcp_params_.snd_nxt = userspace_stack::UserspaceStack::generate_isn();
+        tcp_params_.rcv_nxt = 0;
+        tcp_params_.snd_wnd = userspace_stack::TCP_MAX_WINDOW;
+        tcp_params_.rcv_wnd = userspace_stack::TCP_MAX_WINDOW;
+
+        // Send SYN
+        printf("[TCP] Sending SYN to %s:%u (local port %u, seq=%u)\n",
+               userspace_stack::UserspaceStack::ip_to_string(remote_ip).c_str(),
+               port, tcp_params_.local_port, tcp_params_.snd_nxt);
+
+        send_syn();
+        state_ = userspace_stack::TCPState::SYN_SENT;
+
+        // Add SYN to retransmit queue
+        retransmit_queue_.add_segment(tcp_params_.snd_nxt, userspace_stack::TCP_FLAG_SYN, nullptr, 0);
+        tcp_params_.snd_nxt++;  // SYN consumes one sequence number
+
+        // Wait for SYN-ACK with timeout
+        auto start = std::chrono::steady_clock::now();
+        constexpr uint32_t timeout_ms = 5000;
+
+        while (state_ == userspace_stack::TCPState::SYN_SENT) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+
+            if (elapsed_ms >= timeout_ms) {
+                state_ = userspace_stack::TCPState::CLOSED;
+                throw std::runtime_error("Connection timeout");
+            }
+
+            // Poll XDP for RX frames and process
+            poll_rx_and_process();
+
+            // Check retransmissions
+            check_retransmit();
+
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+
+        if (state_ != userspace_stack::TCPState::ESTABLISHED) {
+            throw std::runtime_error("Failed to establish connection");
+        }
 
         connected_ = true;
         printf("[XDP-Userspace] Connected to %s:%u\n", host, port);
@@ -380,34 +386,48 @@ public:
 
     /**
      * Send data via userspace TCP
-     *
-     * @param buf Data buffer
-     * @param len Data length
-     * @return Number of bytes sent, or -1 on error (check errno)
      */
     ssize_t send(const void* buf, size_t len) {
-        if (!connected_) {
+        if (!connected_ || state_ != userspace_stack::TCPState::ESTABLISHED) {
             errno = ENOTCONN;
             return -1;
         }
 
-        // Poll stack before sending
-        stack_.poll();
+        if (!buf || len == 0) {
+            return 0;
+        }
 
-        ssize_t result = stack_.send(buf, len);
+        const uint8_t* data = static_cast<const uint8_t*>(buf);
+        size_t sent = 0;
 
-        // Poll after sending to process ACKs
-        stack_.poll();
+        while (sent < len) {
+            // Poll for incoming packets (ACKs)
+            poll_rx_and_process();
 
-        return result;
+            // Calculate chunk size (MSS limit)
+            size_t remaining = len - sent;
+            size_t chunk_size = std::min(remaining, static_cast<size_t>(tcp_params_.snd_mss));
+
+            // Build and send data packet
+            send_data(data + sent, chunk_size);
+
+            // Add to retransmit queue
+            retransmit_queue_.add_segment(tcp_params_.snd_nxt,
+                                          userspace_stack::TCP_FLAG_ACK | userspace_stack::TCP_FLAG_PSH,
+                                          data + sent, static_cast<uint16_t>(chunk_size));
+
+            tcp_params_.snd_nxt += chunk_size;
+            sent += chunk_size;
+        }
+
+        // Poll after sending
+        poll_rx_and_process();
+
+        return static_cast<ssize_t>(sent);
     }
 
     /**
      * Receive data from userspace TCP
-     *
-     * @param buf Buffer to store received data
-     * @param len Buffer size
-     * @return Number of bytes received, 0 on EOF, -1 on error (check errno)
      */
     ssize_t recv(void* buf, size_t len) {
         if (!connected_) {
@@ -415,112 +435,257 @@ public:
             return -1;
         }
 
-        // Poll stack to process incoming packets
-        stack_.poll();
+        if (!buf || len == 0) {
+            return 0;
+        }
 
-        return stack_.recv(buf, len);
+        // Poll for incoming packets
+        poll_rx_and_process();
+
+        // Read from receive buffer
+        return recv_buffer_.read(static_cast<uint8_t*>(buf), len);
     }
 
-    /**
-     * Get file descriptor (not available for userspace stack)
-     *
-     * @return -1 (no kernel FD for userspace TCP)
-     */
-    int get_fd() const {
-        return -1;  // Userspace stack doesn't have kernel FD
-    }
-
-    /**
-     * Set non-blocking mode (userspace stack is always non-blocking)
-     */
-    void set_nonblocking() {
-        // Userspace stack is inherently non-blocking
-    }
+    int get_fd() const { return -1; }
+    void set_nonblocking() { /* Always non-blocking */ }
 
     /**
      * Close TCP connection
      */
     void close() {
-        if (connected_) {
-            stack_.close();
+        if (state_ == userspace_stack::TCPState::CLOSED) {
+            return;
+        }
+
+        if (state_ == userspace_stack::TCPState::ESTABLISHED) {
+            // Send FIN
+            send_fin();
+            retransmit_queue_.add_segment(tcp_params_.snd_nxt,
+                                          userspace_stack::TCP_FLAG_FIN | userspace_stack::TCP_FLAG_ACK,
+                                          nullptr, 0);
+            tcp_params_.snd_nxt++;
+            state_ = userspace_stack::TCPState::FIN_WAIT_1;
+
+            // Wait briefly for FIN-ACK
+            auto start = std::chrono::steady_clock::now();
+            while (state_ != userspace_stack::TCPState::CLOSED &&
+                   state_ != userspace_stack::TCPState::TIME_WAIT) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+                if (elapsed_ms >= 2000) break;
+
+                poll_rx_and_process();
+                check_retransmit();
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+        }
+
+        state_ = userspace_stack::TCPState::CLOSED;
+        connected_ = false;
+        retransmit_queue_.clear();
+        recv_buffer_.clear();
+    }
+
+    bool is_connected() const {
+        return connected_ && state_ == userspace_stack::TCPState::ESTABLISHED;
+    }
+
+    /**
+     * Poll for RX and handle retransmits (call periodically)
+     */
+    void poll() {
+        poll_rx_and_process();
+        check_retransmit();
+    }
+
+    // XDP/BPF configuration
+    void add_exchange_ip(const char* ip) { xdp_.add_exchange_ip(ip); }
+    void add_exchange_port(uint16_t port) { xdp_.add_exchange_port(port); }
+    websocket::xdp::XDPTransport* get_xdp_transport() { return &xdp_; }
+    const char* get_xdp_mode() const { return xdp_.get_xdp_mode(); }
+    const char* get_interface() const { return xdp_.get_interface(); }
+    uint32_t get_queue_id() const { return xdp_.get_queue_id(); }
+    bool is_bpf_enabled() const { return xdp_.is_bpf_enabled(); }
+    void print_bpf_stats() const { xdp_.print_bpf_stats(); }
+
+private:
+    // =========================================================================
+    // PACKET SENDING (uses stack's pure packet building)
+    // =========================================================================
+
+    void send_syn() {
+        auto [buffer, capacity] = alloc_tx_buffer();
+        if (!buffer) {
+            throw std::runtime_error("Failed to allocate TX buffer for SYN");
+        }
+
+        size_t len = stack_.build_syn(buffer, capacity, tcp_params_);
+        if (len == 0) {
+            throw std::runtime_error("Failed to build SYN packet");
+        }
+
+        send_tx_buffer(len);
+    }
+
+    void send_ack() {
+        auto [buffer, capacity] = alloc_tx_buffer();
+        if (!buffer) return;
+
+        size_t len = stack_.build_ack(buffer, capacity, tcp_params_);
+        if (len > 0) {
+            send_tx_buffer(len);
+        }
+    }
+
+    void send_data(const uint8_t* data, size_t data_len) {
+        auto [buffer, capacity] = alloc_tx_buffer();
+        if (!buffer) {
+            throw std::runtime_error("Failed to allocate TX buffer for data");
+        }
+
+        size_t len = stack_.build_data(buffer, capacity, tcp_params_, data, data_len);
+        if (len == 0) {
+            throw std::runtime_error("Failed to build data packet");
+        }
+
+        send_tx_buffer(len);
+    }
+
+    void send_fin() {
+        auto [buffer, capacity] = alloc_tx_buffer();
+        if (!buffer) return;
+
+        size_t len = stack_.build_fin(buffer, capacity, tcp_params_);
+        if (len > 0) {
+            send_tx_buffer(len);
+        }
+    }
+
+    // =========================================================================
+    // RX PROCESSING
+    // =========================================================================
+
+    void poll_rx_and_process() {
+        websocket::xdp::XDPFrame* frame = xdp_.peek_rx_frame();
+        if (!frame) return;
+
+        // Parse the TCP packet using stack's pure parsing
+        auto parsed = stack_.parse_tcp(frame->data, frame->len,
+                                       tcp_params_.local_port,
+                                       tcp_params_.remote_ip,
+                                       tcp_params_.remote_port);
+
+        if (parsed.valid) {
+            // Process through state machine (pure function)
+            auto result = stack_.process_tcp(state_, tcp_params_, parsed);
+
+            // Handle state transition
+            if (result.state_changed) {
+                state_ = result.new_state;
+            }
+
+            // Handle action
+            switch (result.action) {
+            case userspace_stack::TCPAction::SEND_ACK:
+                // Update rcv_nxt before sending ACK
+                if (parsed.flags & userspace_stack::TCP_FLAG_SYN) {
+                    tcp_params_.rcv_nxt = parsed.seq + 1;
+                } else if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
+                    tcp_params_.rcv_nxt++;
+                }
+                send_ack();
+                break;
+
+            case userspace_stack::TCPAction::DATA_RECEIVED:
+                // Append data to receive buffer
+                if (result.data && result.data_len > 0) {
+                    recv_buffer_.append(result.data, result.data_len);
+                    tcp_params_.rcv_nxt += result.data_len;
+                    send_ack();
+                }
+                break;
+
+            case userspace_stack::TCPAction::CONNECTED:
+                printf("[TCP] Connection ESTABLISHED!\n");
+                break;
+
+            case userspace_stack::TCPAction::CLOSED:
+                printf("[TCP] Connection closed\n");
+                connected_ = false;
+                break;
+
+            default:
+                break;
+            }
+
+            // Process ACKs (update snd_una, remove from retransmit queue)
+            if (parsed.flags & userspace_stack::TCP_FLAG_ACK) {
+                if (userspace_stack::seq_gt(parsed.ack, tcp_params_.snd_una)) {
+                    retransmit_queue_.remove_acked(parsed.ack);
+                    tcp_params_.snd_una = parsed.ack;
+                }
+            }
+
+            // Update window
+            tcp_params_.snd_wnd = parsed.window;
+        }
+
+        xdp_.release_rx_frame(frame);
+    }
+
+    // =========================================================================
+    // RETRANSMIT HANDLING
+    // =========================================================================
+
+    void check_retransmit() {
+        auto segments = retransmit_queue_.get_retransmit_segments(timers_.rto);
+
+        for (auto* seg : segments) {
+            // Retransmit the segment
+            auto [buffer, capacity] = alloc_tx_buffer();
+            if (!buffer) continue;
+
+            // Build packet with original seq number
+            userspace_stack::TCPParams retx_params = tcp_params_;
+            retx_params.snd_nxt = seg->seq;
+
+            size_t len = stack_.build_tcp(buffer, capacity, retx_params, seg->flags,
+                                          seg->data, seg->len);
+            if (len > 0) {
+                send_tx_buffer(len);
+                retransmit_queue_.mark_retransmitted(seg->seq);
+            }
+        }
+
+        // Check for failed segments
+        if (retransmit_queue_.has_failed_segment()) {
+            state_ = userspace_stack::TCPState::CLOSED;
             connected_ = false;
         }
     }
 
-    /**
-     * Check if transport is connected
-     */
-    bool is_connected() const {
-        return connected_ && stack_.is_connected();
+    // =========================================================================
+    // XDP I/O HELPERS
+    // =========================================================================
+
+    std::pair<uint8_t*, size_t> alloc_tx_buffer() {
+        current_tx_frame_ = xdp_.get_tx_frame();
+        if (!current_tx_frame_) {
+            return {nullptr, 0};
+        }
+        return {current_tx_frame_->data, current_tx_frame_->capacity};
     }
 
-    /**
-     * Get XDP transport for SSL handshake
-     */
-    websocket::xdp::XDPTransport* get_xdp_transport() {
-        return &xdp_;
+    void send_tx_buffer(size_t len) {
+        if (!current_tx_frame_) return;
+        xdp_.send_frame(current_tx_frame_, len);
+        current_tx_frame_ = nullptr;
     }
 
-    /**
-     * Add exchange IP to BPF filter
-     */
-    void add_exchange_ip(const char* ip) {
-        xdp_.add_exchange_ip(ip);
-    }
+    // =========================================================================
+    // UTILITY
+    // =========================================================================
 
-    /**
-     * Add exchange port to BPF filter
-     */
-    void add_exchange_port(uint16_t port) {
-        xdp_.add_exchange_port(port);
-    }
-
-    /**
-     * Poll userspace stack (must be called periodically)
-     */
-    void poll() {
-        stack_.poll();
-    }
-
-    /**
-     * Get XDP mode (for verification)
-     */
-    const char* get_xdp_mode() const {
-        return xdp_.get_xdp_mode();
-    }
-
-    /**
-     * Get interface name
-     */
-    const char* get_interface() const {
-        return xdp_.get_interface();
-    }
-
-    /**
-     * Get queue ID
-     */
-    uint32_t get_queue_id() const {
-        return xdp_.get_queue_id();
-    }
-
-    /**
-     * Check if BPF filtering is enabled
-     */
-    bool is_bpf_enabled() const {
-        return xdp_.is_bpf_enabled();
-    }
-
-    /**
-     * Print BPF statistics
-     */
-    void print_bpf_stats() const {
-        xdp_.print_bpf_stats();
-    }
-
-private:
-    /**
-     * Get interface configuration (IP, MAC, gateway, netmask)
-     */
     bool get_interface_config(const char* interface,
                              uint8_t* local_mac,
                              uint32_t* local_ip,
@@ -529,7 +694,6 @@ private:
         int fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd < 0) return false;
 
-        // Get local IP
         struct ifreq ifr = {};
         strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
 
@@ -539,14 +703,12 @@ private:
         }
         *local_ip = ntohl(((struct sockaddr_in*)&ifr.ifr_addr)->sin_addr.s_addr);
 
-        // Get MAC address
         if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
             ::close(fd);
             return false;
         }
         memcpy(local_mac, ifr.ifr_hwaddr.sa_data, 6);
 
-        // Get netmask
         if (ioctl(fd, SIOCGIFNETMASK, &ifr) < 0) {
             ::close(fd);
             return false;
@@ -554,16 +716,11 @@ private:
         *netmask = ntohl(((struct sockaddr_in*)&ifr.ifr_netmask)->sin_addr.s_addr);
 
         ::close(fd);
-
-        // Calculate gateway (assume .1 in subnet)
         *gateway_ip = (*local_ip & *netmask) | 1;
 
         return true;
     }
 
-    /**
-     * Convert IP (host byte order) to string
-     */
     void ip_to_string(uint32_t ip, char* buf) {
         snprintf(buf, 16, "%u.%u.%u.%u",
                 (ip >> 24) & 0xFF,
@@ -572,9 +729,22 @@ private:
                 ip & 0xFF);
     }
 
+    // XDP and Stack (pure packet ops)
     websocket::xdp::XDPTransport xdp_;
     userspace_stack::UserspaceStack stack_;
+
+    // TCP state (owned by transport, not stack)
+    userspace_stack::TCPState state_;
+    userspace_stack::TCPParams tcp_params_;
+    userspace_stack::TCPTimers timers_;
+    userspace_stack::RetransmitQueue retransmit_queue_;
+    userspace_stack::ReceiveBuffer recv_buffer_;
+
+    // Connection state
     bool connected_;
+
+    // Current TX frame
+    websocket::xdp::XDPFrame* current_tx_frame_ = nullptr;
 };
 #endif  // USE_XDP
 

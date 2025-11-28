@@ -1,6 +1,15 @@
 // src/stack/tcp/tcp_state.hpp
-// TCP State Machine Definitions
-// Minimal implementation for WebSocket HFT (client only)
+// TCP Types, Constants, and Helpers (Internal)
+//
+// INTERNAL: Use UserspaceStack (userspace_stack.hpp) as the entry point.
+//
+// Provides:
+//   - TCPState enum (CLOSED, SYN_SENT, ESTABLISHED, etc.)
+//   - TCPParams struct (sequence numbers, ports, IPs)
+//   - TCPTimers struct (RTO, timeouts)
+//   - TCPHeader struct (20-byte TCP header)
+//   - TCP flag constants (TCP_FLAG_SYN, TCP_FLAG_ACK, etc.)
+//   - Sequence number helpers (seq_lt, seq_gt, seq_le, seq_ge)
 
 #pragma once
 

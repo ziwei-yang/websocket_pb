@@ -1,6 +1,15 @@
 // src/stack/ip/ip_layer.hpp
-// Minimal IPv4 Layer for WebSocket HFT
-// No fragmentation, no options, direct routing
+// IPv4 Packet Building and Parsing (Internal)
+//
+// INTERNAL: Use UserspaceStack (userspace_stack.hpp) as the entry point.
+//
+// Provides:
+//   - IPv4Header struct (20-byte IP header)
+//   - IPLayer::build_packet() - Build IP packet into buffer
+//   - IPLayer::parse_packet() - Parse IP packet from Ethernet frame
+//   - IP protocol constants (IP_PROTO_TCP, IP_PROTO_UDP, etc.)
+//
+// Note: No IP options support (HFT optimization)
 
 #pragma once
 
@@ -47,7 +56,7 @@ private:
     uint16_t ip_id_ = 0;        // IP identification counter
 
     // Current RX packet being processed
-    uint8_t* current_rx_payload_ = nullptr;
+    const uint8_t* current_rx_payload_ = nullptr;
     size_t current_rx_len_ = 0;
     bool has_current_rx_ = false;
 
@@ -81,123 +90,119 @@ public:
         return gateway_ip_;
     }
 
-    // Send IP packet
+    // Get gateway MAC (for TX path)
+    const uint8_t* get_gateway_mac() const {
+        return mac_ ? mac_->get_gateway_mac() : nullptr;
+    }
+
+    // Get next IP ID (for zero-copy TX path)
+    uint16_t get_next_id() {
+        return ip_id_++;
+    }
+
+    // --- TX Path: Build IP packet into buffer ---
+
+    // Build IP packet into provided buffer
     // dst_ip: Destination IP in host byte order
     // protocol: IP_PROTO_TCP (6), IP_PROTO_UDP (17), etc.
-    // payload: Packet payload (TCP/UDP/ICMP)
+    // payload: Packet payload (TCP/UDP)
     // len: Payload length
-    void send_packet(uint32_t dst_ip, uint8_t protocol,
-                    const uint8_t* payload, size_t len) {
-        if (!mac_ || !arp_) {
-            throw std::runtime_error("IPLayer: Not initialized");
-        }
+    // out_buffer: Output buffer (must have room for IP_HEADER_LEN + len)
+    // Returns: Total packet length, or 0 on error
+    size_t build_packet(uint32_t dst_ip, uint8_t protocol,
+                        const uint8_t* payload, size_t len,
+                        uint8_t* out_buffer, size_t buffer_capacity) {
         if (!payload || len == 0 || len > 1480) {
-            throw std::runtime_error("IPLayer: Invalid payload");
+            return 0;
         }
-
-        // Ensure gateway is resolved
-        if (!arp_->is_resolved()) {
-            throw std::runtime_error("IPLayer: Gateway MAC not resolved");
+        if (buffer_capacity < IP_HEADER_LEN + len) {
+            return 0;
         }
 
         // Build IP header
-        IPv4Header hdr = {};
-        hdr.version_ihl = 0x45;           // Version 4, IHL 5 (20 bytes)
-        hdr.tos = 0;                      // No special service
-        hdr.tot_len = htons(static_cast<uint16_t>(IP_HEADER_LEN + len));
-        hdr.id = htons(ip_id_++);
-        hdr.frag_off = htons(0x4000);     // Don't fragment flag set
-        hdr.ttl = IP_DEFAULT_TTL;
-        hdr.protocol = protocol;
-        hdr.check = 0;                    // Calculate later
-        hdr.saddr = htonl(local_ip_);
-        hdr.daddr = htonl(dst_ip);
+        IPv4Header* hdr = reinterpret_cast<IPv4Header*>(out_buffer);
+        hdr->version_ihl = 0x45;           // Version 4, IHL 5 (20 bytes)
+        hdr->tos = 0;                      // No special service
+        hdr->tot_len = htons(static_cast<uint16_t>(IP_HEADER_LEN + len));
+        hdr->id = htons(ip_id_++);
+        hdr->frag_off = htons(0x4000);     // Don't fragment flag set
+        hdr->ttl = IP_DEFAULT_TTL;
+        hdr->protocol = protocol;
+        hdr->check = 0;                    // Calculate later
+        hdr->saddr = htonl(local_ip_);
+        hdr->daddr = htonl(dst_ip);
 
         // Calculate IP header checksum
-        hdr.check = htons(ip_checksum(&hdr));
+        hdr->check = htons(ip_checksum(hdr));
 
-        // Construct complete IP packet
-        uint8_t packet[1500];
-        std::memcpy(packet, &hdr, IP_HEADER_LEN);
-        std::memcpy(packet + IP_HEADER_LEN, payload, len);
+        // Copy payload after IP header
+        std::memcpy(out_buffer + IP_HEADER_LEN, payload, len);
 
-        // Determine next hop MAC address
-        // For simplicity, always send to gateway (no local network routing)
-        const uint8_t* next_hop_mac = arp_->get_gateway_mac();
-
-        // Send via MAC layer
-        mac_->send_frame(next_hop_mac, ETH_TYPE_IP, packet, IP_HEADER_LEN + len);
+        return IP_HEADER_LEN + len;
     }
 
-    // Receive IP packet
-    // Returns true if packet received
+    // --- RX Path: Parse IP packet from buffer ---
+
+    // Parse IP packet from MAC layer's current RX frame
+    // Returns true if valid IP packet for us
     // protocol: Output protocol (IP_PROTO_TCP, etc.)
-    // payload: Output pointer to payload (points into frame data)
+    // payload: Output pointer to payload
     // len: Output payload length
     // src_ip: Output source IP address (host byte order)
-    bool recv_packet(uint8_t* protocol, uint8_t** payload, size_t* len,
-                    uint32_t* src_ip = nullptr) {
+    bool parse_packet(uint8_t* protocol, const uint8_t** payload, size_t* len,
+                      uint32_t* src_ip = nullptr) {
         if (!mac_) {
-            throw std::runtime_error("IPLayer: Not initialized");
+            return false;
         }
 
-        // Release previous packet if any
-        release_rx_packet();
-
+        // Parse Ethernet frame first
         uint16_t ethertype;
-        uint8_t* frame_payload;
-        size_t frame_len;
+        const uint8_t* eth_payload;
+        size_t eth_len;
 
-        if (!mac_->recv_frame(&ethertype, &frame_payload, &frame_len)) {
-            return false;  // No frame
+        if (!mac_->parse_frame(&ethertype, &eth_payload, &eth_len)) {
+            return false;  // No valid frame
         }
 
         // Check if IPv4 packet
         if (ethertype != ETH_TYPE_IP) {
-            mac_->release_rx_frame();
             return false;
         }
 
         // Validate packet size
-        if (frame_len < IP_HEADER_LEN) {
-            mac_->release_rx_frame();
+        if (eth_len < IP_HEADER_LEN) {
             return false;
         }
 
         // Parse IP header
-        const IPv4Header* hdr = reinterpret_cast<const IPv4Header*>(frame_payload);
+        const IPv4Header* hdr = reinterpret_cast<const IPv4Header*>(eth_payload);
 
         // Validate IP version and header length (reject options for HFT)
         if ((hdr->version_ihl >> 4) != IP_VERSION ||
             (hdr->version_ihl & 0x0F) != 5) {  // Require exactly IHL=5 (no options)
-            mac_->release_rx_frame();
             return false;
         }
 
         // Verify checksum
         if (verify_ip_checksum(hdr) != 0) {
-            mac_->release_rx_frame();
             return false;
         }
 
         // Drop fragmented packets (HFT optimization: no reassembly)
         uint16_t frag_off = ntohs(hdr->frag_off);
         if ((frag_off & 0x3FFF) != 0) {  // Check MF flag or fragment offset
-            mac_->release_rx_frame();
             return false;
         }
 
         // Check if packet is for us
         uint32_t dst = ntohl(hdr->daddr);
         if (dst != local_ip_ && dst != 0xFFFFFFFF) {  // Not for us and not broadcast
-            mac_->release_rx_frame();
             return false;
         }
 
         // Extract payload (use constant since we reject options)
         uint16_t total_len = ntohs(hdr->tot_len);
-        if (total_len < IP_HEADER_LEN || total_len > frame_len) {
-            mac_->release_rx_frame();
+        if (total_len < IP_HEADER_LEN || total_len > eth_len) {
             return false;
         }
 
@@ -205,7 +210,7 @@ public:
 
         // Return packet info
         *protocol = hdr->protocol;
-        *payload = frame_payload + IP_HEADER_LEN;
+        *payload = eth_payload + IP_HEADER_LEN;
         *len = payload_len;
 
         if (src_ip) {
@@ -220,14 +225,11 @@ public:
         return true;
     }
 
-    // Release current RX packet (must be called after processing)
-    void release_rx_packet() {
-        if (has_current_rx_) {
-            mac_->release_rx_frame();
-            current_rx_payload_ = nullptr;
-            current_rx_len_ = 0;
-            has_current_rx_ = false;
-        }
+    // Clear current RX state
+    void clear_rx_packet() {
+        current_rx_payload_ = nullptr;
+        current_rx_len_ = 0;
+        has_current_rx_ = false;
     }
 
     // Helper: Check if IP is in local subnet

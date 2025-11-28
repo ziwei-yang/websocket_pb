@@ -1,6 +1,14 @@
 // src/stack/tcp/tcp_retransmit.hpp
-// TCP Retransmission Queue Management
-// Simplified for WebSocket HFT (low packet loss expected)
+// TCP Retransmit Queue and Receive Buffer (Internal)
+//
+// INTERNAL: These classes are used by transport policy, not by stack.
+// Transport policy owns TCP state, including retransmit queue and receive buffer.
+//
+// Provides:
+//   - RetransmitQueue: Tracks unacknowledged segments for retransmission
+//   - ReceiveBuffer: Simple buffer for in-order TCP data reception
+//
+// Note: Simplified for HFT (low packet loss, in-order delivery expected)
 
 #pragma once
 

@@ -73,31 +73,37 @@ if ! ip link show "$IFACE" &>/dev/null; then
     exit 1
 fi
 
-# Check if test binary exists
-if [[ ! -x "$PROJECT_DIR/build/test_xdp_binance_integration" ]]; then
-    print_error "Test binary not found. Build with: USE_XDP=1 USE_OPENSSL=1 make"
-    exit 1
-fi
-
 cd "$PROJECT_DIR"
 
 print_banner
 
+# Step 0: Build
+print_step "0/5" "Building XDP Binance Integration Test"
+echo "Cleaning and rebuilding..."
+USE_XDP=1 USE_OPENSSL=1 make clean >/dev/null 2>&1
+USE_XDP=1 USE_OPENSSL=1 make src/xdp/bpf/exchange_filter.bpf.o build/test_xdp_binance_integration 2>&1 | tail -5
+
+if [[ ! -x "$PROJECT_DIR/build/test_xdp_binance_integration" ]]; then
+    print_error "Build failed. Check compiler output above."
+    exit 1
+fi
+echo -e "${GREEN}[OK]${NC} Build complete"
+
 # Step 1: Prepare
-print_step "1/4" "Preparing NIC for XDP"
+print_step "1/5" "Preparing NIC for XDP"
 "$SCRIPT_DIR/xdp_prepare.sh" "$IFACE"
 
 # Step 2: Filter
-print_step "2/4" "Setting up DNS and route bypass"
+print_step "2/5" "Setting up DNS and route bypass"
 "$SCRIPT_DIR/xdp_filter.sh" "$IFACE" "$DOMAIN"
 
 # Step 3: Run test
-print_step "3/4" "Running XDP Binance Integration Test"
+print_step "3/5" "Running XDP Binance Integration Test"
 timeout 45 "$PROJECT_DIR/build/test_xdp_binance_integration" "$IFACE"
 TEST_RESULT=$?
 
 # Step 4: Reset (handled by trap, but show status)
-print_step "4/4" "Cleanup"
+print_step "4/5" "Cleanup"
 
 if [[ $TEST_RESULT -eq 0 ]]; then
     echo ""

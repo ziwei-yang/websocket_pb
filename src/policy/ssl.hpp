@@ -8,8 +8,9 @@
 //
 // All policies conform to the SSLPolicyConcept interface:
 //   - void init()
-//   - void handshake(int fd)
-//   - void handshake_dpdk_transport(DPDKTransport*) // DPDK mode only
+//   - void handshake(int fd)                              // BSD socket mode
+//   - void handshake_xdp_transport(XDPTransport*)         // XDP zero-copy mode
+//   - void handshake_userspace_transport(TransportPolicy*) // Userspace TCP mode
 //   - ssize_t read(void* buf, size_t len)
 //   - ssize_t write(const void* buf, size_t len)
 //   - bool ktls_enabled() const
@@ -47,10 +48,6 @@
 #endif
 
 // Forward declarations for transport layers (only when enabled)
-#ifdef USE_DPDK
-namespace websocket { namespace dpdk { class DPDKTransport; } }
-#endif
-
 #ifdef USE_XDP
 namespace websocket { namespace xdp { class XDPTransport; } }
 #include "../xdp/xdp_bio.hpp"
@@ -61,123 +58,6 @@ namespace websocket { namespace xdp { class XDPTransport; } }
 
 namespace websocket {
 namespace ssl {
-
-// ============================================================================
-// DPDK BIO Handlers (OpenSSL only, conditionally compiled)
-// ============================================================================
-
-#if defined(USE_DPDK) && defined(SSL_POLICY_OPENSSL)
-
-/**
- * DPDK BIO - Custom BIO for bridging OpenSSL with DPDK transport
- *
- * This BIO replaces the standard socket BIO and redirects all SSL I/O
- * operations to the DPDK transport layer (userspace, kernel bypass).
- */
-class DPDK_BIO {
-public:
-    static BIO_METHOD* create_bio_method() {
-        BIO_METHOD* bio_method = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "dpdk_bio");
-        if (!bio_method) return nullptr;
-
-        BIO_meth_set_write(bio_method, bio_write);
-        BIO_meth_set_read(bio_method, bio_read);
-        BIO_meth_set_puts(bio_method, bio_puts);
-        BIO_meth_set_gets(bio_method, nullptr);
-        BIO_meth_set_ctrl(bio_method, bio_ctrl);
-        BIO_meth_set_create(bio_method, bio_create);
-        BIO_meth_set_destroy(bio_method, bio_destroy);
-
-        return bio_method;
-    }
-
-    static BIO* create_bio(BIO_METHOD* method, websocket::dpdk::DPDKTransport* transport) {
-        BIO* bio = BIO_new(method);
-        if (!bio) return nullptr;
-
-        BIO_set_data(bio, transport);
-        BIO_set_init(bio, 1);
-        return bio;
-    }
-
-private:
-    static int bio_write(BIO* bio, const char* buf, int len) {
-        if (!bio || !buf || len <= 0) return -1;
-
-        auto* transport = static_cast<websocket::dpdk::DPDKTransport*>(BIO_get_data(bio));
-        if (!transport) return -1;
-
-        ssize_t result = transport->send(buf, len);
-        if (result < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                BIO_set_retry_write(bio);
-            }
-            return -1;
-        }
-
-        BIO_clear_retry_flags(bio);
-        return static_cast<int>(result);
-    }
-
-    static int bio_read(BIO* bio, char* buf, int len) {
-        if (!bio || !buf || len <= 0) return -1;
-
-        auto* transport = static_cast<websocket::dpdk::DPDKTransport*>(BIO_get_data(bio));
-        if (!transport) return -1;
-
-        ssize_t result = transport->recv(buf, len);
-        if (result < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                BIO_set_retry_read(bio);
-            }
-            return -1;
-        }
-
-        if (result == 0) return 0;  // Connection closed
-
-        BIO_clear_retry_flags(bio);
-        return static_cast<int>(result);
-    }
-
-    static int bio_puts(BIO* bio, const char* str) {
-        if (!bio || !str) return -1;
-        return bio_write(bio, str, strlen(str));
-    }
-
-    static long bio_ctrl(BIO* bio, int cmd, long num, void* ptr) {
-        (void)num; (void)ptr;
-        if (!bio) return 0;
-
-        switch (cmd) {
-            case BIO_CTRL_FLUSH:
-                return 1;
-            case BIO_CTRL_GET_CLOSE:
-                return BIO_get_shutdown(bio);
-            case BIO_CTRL_SET_CLOSE:
-                BIO_set_shutdown(bio, static_cast<int>(num));
-                return 1;
-            default:
-                return 0;
-        }
-    }
-
-    static int bio_create(BIO* bio) {
-        if (!bio) return 0;
-        BIO_set_init(bio, 0);
-        BIO_set_data(bio, nullptr);
-        BIO_clear_flags(bio, ~0);
-        return 1;
-    }
-
-    static int bio_destroy(BIO* bio) {
-        if (!bio) return 0;
-        BIO_set_init(bio, 0);
-        BIO_set_data(bio, nullptr);
-        return 1;
-    }
-};
-
-#endif  // USE_DPDK && SSL_POLICY_OPENSSL
 
 // ============================================================================
 // OpenSSL Policy (with optional kTLS support)
@@ -312,75 +192,6 @@ struct OpenSSLPolicy {
         }
         #endif
     }
-
-#ifdef USE_DPDK
-    /**
-     * Perform TLS handshake over DPDK transport (kernel bypass)
-     *
-     * Uses custom BIO handlers to bridge OpenSSL with DPDK mbufs.
-     * No kTLS support (DPDK bypasses kernel).
-     *
-     * @param transport DPDK transport instance
-     * @throws std::runtime_error if handshake fails
-     */
-    void handshake_dpdk_transport(websocket::dpdk::DPDKTransport* transport) {
-        if (!transport) {
-            throw std::runtime_error("DPDK transport is null");
-        }
-
-        ssl_ = SSL_new(ctx_);
-        if (!ssl_) {
-            throw std::runtime_error("SSL_new() failed");
-        }
-
-        // Create custom BIO for DPDK transport
-        BIO_METHOD* bio_method = DPDK_BIO::create_bio_method();
-        if (!bio_method) {
-            throw std::runtime_error("Failed to create DPDK BIO method");
-        }
-
-        BIO* bio = DPDK_BIO::create_bio(bio_method, transport);
-        if (!bio) {
-            BIO_meth_free(bio_method);
-            throw std::runtime_error("Failed to create DPDK BIO");
-        }
-
-        // Associate DPDK BIO with SSL object (replaces SSL_set_fd)
-        SSL_set_bio(ssl_, bio, bio);
-
-        // Perform TLS handshake (non-blocking, polling-based)
-        int max_retries = 100;
-        int retries = 0;
-
-        while (retries < max_retries) {
-            int ret = SSL_do_handshake(ssl_);
-
-            if (ret == 1) {
-                // Handshake successful
-                ktls_enabled_ = false;  // kTLS not supported with DPDK
-                BIO_meth_free(bio_method);
-                return;
-            }
-
-            int err = SSL_get_error(ssl_, ret);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                // Would block, retry after brief sleep
-                usleep(1000);  // 1ms
-                retries++;
-                continue;
-            }
-
-            // Fatal error
-            char err_buf[256];
-            ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
-            BIO_meth_free(bio_method);
-            throw std::runtime_error(std::string("DPDK SSL handshake failed: ") + err_buf);
-        }
-
-        BIO_meth_free(bio_method);
-        throw std::runtime_error("DPDK SSL handshake timeout");
-    }
-#endif  // USE_DPDK
 
     /**
      * Perform TLS handshake over XDP transport with zero-copy BIO
@@ -794,64 +605,6 @@ struct LibreSSLPolicy {
         }
     }
 
-#ifdef USE_DPDK
-    /**
-     * Perform TLS handshake over DPDK transport (kernel bypass)
-     * LibreSSL version - same as OpenSSL (API compatible)
-     */
-    void handshake_dpdk_transport(websocket::dpdk::DPDKTransport* transport) {
-        if (!transport) {
-            throw std::runtime_error("DPDK transport is null");
-        }
-
-        ssl_ = SSL_new(ctx_);
-        if (!ssl_) {
-            throw std::runtime_error("SSL_new() failed");
-        }
-
-        // Create custom BIO for DPDK transport
-        BIO_METHOD* bio_method = DPDK_BIO::create_bio_method();
-        if (!bio_method) {
-            throw std::runtime_error("Failed to create DPDK BIO method");
-        }
-
-        BIO* bio = DPDK_BIO::create_bio(bio_method, transport);
-        if (!bio) {
-            BIO_meth_free(bio_method);
-            throw std::runtime_error("Failed to create DPDK BIO");
-        }
-
-        SSL_set_bio(ssl_, bio, bio);
-
-        // Non-blocking handshake
-        int max_retries = 100;
-        int retries = 0;
-
-        while (retries < max_retries) {
-            int ret = SSL_do_handshake(ssl_);
-            if (ret == 1) {
-                BIO_meth_free(bio_method);
-                return;
-            }
-
-            int err = SSL_get_error(ssl_, ret);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                usleep(1000);
-                retries++;
-                continue;
-            }
-
-            char err_buf[256];
-            ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
-            BIO_meth_free(bio_method);
-            throw std::runtime_error(std::string("DPDK SSL handshake failed: ") + err_buf);
-        }
-
-        BIO_meth_free(bio_method);
-        throw std::runtime_error("DPDK SSL handshake timeout");
-    }
-#endif  // USE_DPDK
-
     /**
      * Perform TLS handshake over XDP transport with zero-copy BIO
      *
@@ -1143,18 +896,6 @@ struct WolfSSLPolicy {
             throw std::runtime_error(std::string("wolfSSL_connect() failed: ") + err_buf);
         }
     }
-
-#ifdef USE_DPDK
-    /**
-     * DPDK transport handshake - NOT SUPPORTED with WolfSSL
-     *
-     * WolfSSL uses a different I/O callback system than OpenSSL's BIO.
-     * To add DPDK support for WolfSSL, implement wolfSSL_SetIORecv/Send callbacks.
-     */
-    void handshake_dpdk_transport(websocket::dpdk::DPDKTransport* /*transport*/) {
-        throw std::runtime_error("DPDK transport not supported with WolfSSL. Use OpenSSL or LibreSSL for DPDK mode.");
-    }
-#endif  // USE_DPDK
 
     /**
      * Perform TLS handshake over XDP transport

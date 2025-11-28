@@ -1,6 +1,15 @@
 // src/stack/ip/checksum.hpp
-// IP and TCP checksum calculation
-// RFC 1071 - Computing the Internet Checksum
+// IP and TCP Checksum Calculation (Internal)
+//
+// INTERNAL: Used by tcp_packet.hpp and ip_layer.hpp.
+//
+// Implements RFC 1071 - Computing the Internet Checksum
+//
+// Provides:
+//   - ip_checksum()        - Calculate IP header checksum
+//   - verify_ip_checksum() - Verify IP header checksum
+//   - tcp_checksum()       - Calculate TCP checksum (with pseudo-header)
+//   - verify_tcp_checksum() - Verify TCP checksum
 
 #pragma once
 

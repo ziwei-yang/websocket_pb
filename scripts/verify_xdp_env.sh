@@ -1,0 +1,1 @@
+../../websocket_dpdk_zwy/scripts/verify_xdp_env.sh

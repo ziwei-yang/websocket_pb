@@ -1,23 +1,23 @@
 // xdp/xdp_transport.hpp
 // AF_XDP (eXpress Data Path) Transport Layer
 //
-// This provides a fast-path network I/O using AF_XDP sockets, which offer:
+// This provides zero-copy packet I/O using AF_XDP sockets for HFT use cases:
 //   - Zero-copy packet I/O via UMEM (User Memory)
-//   - Kernel bypass for packet processing
-//   - Uses kernel TCP/IP stack (simpler than DPDK)
-//   - Lower latency than BSD sockets (~10-30 μs vs ~50-150 μs)
+//   - Complete kernel bypass with userspace TCP/IP stack
+//   - Sub-microsecond latency (~1-2 μs NIC to app)
 //
 // Architecture:
-//   Application → XDP Transport → AF_XDP Socket → Kernel TCP/IP → NIC
+//   Application → Userspace TCP/IP Stack → XDP Transport → AF_XDP Socket → NIC
 //
-// Key Difference from DPDK:
-//   - XDP: Uses kernel TCP stack, fast-path packet I/O
-//   - DPDK: Implements full TCP stack in userspace, complete bypass
+// Primary API (Zero-Copy):
+//   - peek_rx_frame() / release_rx_frame() - Zero-copy RX
+//   - get_tx_frame() / send_frame() - Zero-copy TX
 //
 // Requirements:
-//   - Linux kernel 4.18+ (AF_XDP support)
+//   - Linux kernel 5.4+ (AF_XDP zero-copy support)
 //   - libbpf, libxdp
-//   - CAP_NET_RAW or root privileges
+//   - XDP-capable NIC (e.g., Intel igc/i40e/ixgbe)
+//   - CAP_NET_RAW + CAP_BPF or root privileges
 
 #pragma once
 
@@ -73,18 +73,25 @@ struct XDPConfig {
 };
 
 /**
- * XDP Transport - AF_XDP socket-based transport
+ * XDP Transport - AF_XDP socket-based transport for zero-copy packet I/O
  *
- * Provides fast-path network I/O using AF_XDP sockets with zero-copy
- * ring buffers. Uses kernel TCP/IP stack for protocol handling.
+ * Provides zero-copy frame access for HFT applications using userspace
+ * TCP/IP stack. All packet processing bypasses the kernel completely.
  *
- * Usage:
- *   XDPTransport transport;
- *   transport.init(config);
- *   transport.connect("example.com", 443);
- *   transport.send(data, len);
- *   transport.recv(buf, len);
- *   transport.close();
+ * Usage with userspace stack:
+ *   XDPTransport xdp;
+ *   xdp.init(config, "path/to/bpf.o");  // With BPF filtering
+ *   xdp.init(config);                    // Without BPF filtering
+ *
+ *   // TX (zero-copy):
+ *   XDPFrame* tx = xdp.get_tx_frame();
+ *   memcpy(tx->data, packet, len);
+ *   xdp.send_frame(tx, len);
+ *
+ *   // RX (zero-copy):
+ *   XDPFrame* rx = xdp.peek_rx_frame();
+ *   process(rx->data, rx->len);
+ *   xdp.release_rx_frame(rx);
  */
 class XDPTransport {
 public:
@@ -121,18 +128,17 @@ public:
      * Initialize XDP transport
      *
      * @param config XDP configuration
-     * @param enable_bpf Enable eBPF packet filtering (load BPF before socket creation)
-     * @param bpf_obj_path Path to BPF object file (if enable_bpf is true)
+     * @param bpf_obj_path Path to BPF object file, or nullptr to disable BPF filtering
      * @throws std::runtime_error on failure
      */
-    void init(const XDPConfig& config, bool enable_bpf = false,
-              const char* bpf_obj_path = "src/xdp/bpf/exchange_filter.bpf.o") {
+    void init(const XDPConfig& config,
+              const char* bpf_obj_path = nullptr) {
         config_ = config;
 
-        // If BPF filtering requested, load AND ATTACH BPF program FIRST (before creating socket)
+        // If BPF path provided, load AND ATTACH BPF program FIRST (before creating socket)
         // This is critical: the XDP program must be attached BEFORE creating the XSK socket
         // so the socket properly binds to receive redirects
-        if (enable_bpf) {
+        if (bpf_obj_path != nullptr) {
             printf("[XDP] Loading and attaching BPF program before socket creation...\n");
             bpf_loader_ = new BPFLoader();
             bpf_loader_->load(config_.interface, bpf_obj_path);
@@ -271,9 +277,11 @@ public:
         printf("[XDP] Reserved first %u frames for RX fill ring (TX starts at frame %u)\n",
                frames_to_populate, next_free_frame_);
 
-        // Initialize frame pool for zero-copy operations
-        // Use same headroom value as UMEM configuration
-        frame_pool_.init(umem_area_, config_.frame_size, config_.num_frames, XDP_HEADROOM);
+        // Initialize reusable frame structs (no FramePool needed)
+        rx_frame_.clear();
+        rx_frame_.capacity = config_.frame_size - XDP_HEADROOM;
+        tx_frame_.clear();
+        tx_frame_.capacity = config_.frame_size - XDP_HEADROOM;
 
         // Mark as "connected" for userspace stack usage (no TCP socket needed)
         connected_ = true;
@@ -283,183 +291,8 @@ public:
                config_.interface, config_.queue_id, config_.num_frames);
     }
 
-    /**
-     * Connect to remote host via TCP
-     *
-     * NOTE: AF_XDP is for packet I/O optimization. We still use a regular
-     * TCP socket for connection establishment (kernel handles TCP handshake).
-     *
-     * @param host Hostname or IP
-     * @param port Port number
-     * @throws std::runtime_error on failure
-     */
-    void connect(const char* host, uint16_t port) {
-        // Resolve hostname
-        struct addrinfo hints, *result;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        int ret = getaddrinfo(host, nullptr, &hints, &result);
-        if (ret != 0) {
-            throw std::runtime_error(std::string("Failed to resolve host: ") + gai_strerror(ret));
-        }
-
-        // Create TCP socket
-        socket_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-        if (socket_fd_ < 0) {
-            freeaddrinfo(result);
-            throw std::runtime_error("Failed to create TCP socket");
-        }
-
-        // Connect
-        struct sockaddr_in* addr = (struct sockaddr_in*)result->ai_addr;
-        addr->sin_port = htons(port);
-
-        ret = ::connect(socket_fd_, (struct sockaddr*)addr, sizeof(*addr));
-        if (ret < 0 && errno != EINPROGRESS) {
-            freeaddrinfo(result);
-            ::close(socket_fd_);
-            throw std::runtime_error("Failed to connect");
-        }
-
-        // Wait for connection (poll with timeout)
-        struct pollfd pfd;
-        pfd.fd = socket_fd_;
-        pfd.events = POLLOUT;
-
-        ret = poll(&pfd, 1, 5000);  // 5s timeout
-        if (ret <= 0) {
-            freeaddrinfo(result);
-            ::close(socket_fd_);
-            throw std::runtime_error("Connection timeout");
-        }
-
-        // Check connection status
-        int error = 0;
-        socklen_t len = sizeof(error);
-        getsockopt(socket_fd_, SOL_SOCKET, SO_ERROR, &error, &len);
-        if (error != 0) {
-            freeaddrinfo(result);
-            ::close(socket_fd_);
-            throw std::runtime_error("Connection failed");
-        }
-
-        freeaddrinfo(result);
-        connected_ = true;
-
-        printf("[XDP] Connected to %s:%u via TCP socket (fd=%d)\n", host, port, socket_fd_);
-    }
-
-    /**
-     * Send data over XDP socket
-     *
-     * Uses AF_XDP TX ring for zero-copy transmission.
-     *
-     * @param buf Data to send
-     * @param len Data length
-     * @return Bytes sent, or -1 on error
-     */
-    ssize_t send(const void* buf, size_t len) {
-        if (!connected_ || socket_fd_ < 0) {
-            errno = ENOTCONN;
-            return -1;
-        }
-
-        // Check if data fits in a single frame
-        if (len > config_.frame_size - XSK_UMEM__DEFAULT_FRAME_HEADROOM) {
-            errno = EMSGSIZE;
-            return -1;
-        }
-
-        // First, reclaim completed TX frames from completion ring
-        reclaim_completed_frames();
-
-        // Try to reserve a TX descriptor
-        uint32_t idx;
-        if (xsk_ring_prod__reserve(&tx_ring_, 1, &idx) != 1) {
-            // TX ring is full
-            errno = EAGAIN;
-            return -1;
-        }
-
-        // Get a free UMEM frame
-        uint64_t frame_addr = get_free_frame();
-        if (frame_addr == UINT64_MAX) {
-            // No free frames available - the reservation will just not be used
-            errno = ENOBUFS;
-            return -1;
-        }
-
-        // Copy data to UMEM frame at frame_addr + headroom
-        uint8_t* frame = (uint8_t*)umem_area_ + frame_addr + XDP_HEADROOM;
-        memcpy(frame, buf, len);
-
-        // Set TX descriptor - point to actual data location (frame_addr + headroom)
-        struct xdp_desc* tx_desc = xsk_ring_prod__tx_desc(&tx_ring_, idx);
-        tx_desc->addr = frame_addr + XDP_HEADROOM;
-        tx_desc->len = len;
-        tx_desc->options = 0;
-
-        // Submit the TX descriptor
-        xsk_ring_prod__submit(&tx_ring_, 1);
-
-        // Kick the kernel to process TX ring (sendto triggers transmission)
-        kick_tx();
-
-        return len;
-    }
-
-    /**
-     * Receive data from XDP socket
-     *
-     * Uses AF_XDP RX ring for zero-copy reception.
-     *
-     * @param buf Buffer to store data
-     * @param len Buffer size
-     * @return Bytes received, 0 on no data available, -1 on error
-     */
-    ssize_t recv(void* buf, size_t len) {
-        if (!connected_ || socket_fd_ < 0) {
-            errno = ENOTCONN;
-            return -1;
-        }
-
-        // Check RX ring for received packets
-        uint32_t idx_rx;
-        uint32_t nb_pkts = xsk_ring_cons__peek(&rx_ring_, config_.batch_size, &idx_rx);
-
-        if (nb_pkts == 0) {
-            // No packets available
-            errno = EAGAIN;
-            return 0;
-        }
-
-        // Process first packet (for streaming protocols like TCP, multiple packets
-        // might need to be reassembled, but we'll return first packet's data)
-        const struct xdp_desc* rx_desc = xsk_ring_cons__rx_desc(&rx_ring_, idx_rx);
-
-        uint64_t addr = rx_desc->addr;
-        uint32_t pkt_len = rx_desc->len;
-
-        // Get packet data from UMEM
-        const uint8_t* pkt_data = (const uint8_t*)umem_area_ + addr;
-
-        // Copy to user buffer (limit to buffer size)
-        size_t copy_len = (pkt_len < len) ? pkt_len : len;
-        memcpy(buf, pkt_data, copy_len);
-
-        // Release consumed RX descriptors
-        xsk_ring_cons__release(&rx_ring_, nb_pkts);
-
-        // Refill the fill ring with freed frames
-        refill_fill_ring(nb_pkts, idx_rx);
-
-        return copy_len;
-    }
-
     // ========================================================================
-    // Zero-Copy API
+    // Zero-Copy API (Primary interface for HFT use case)
     // ========================================================================
 
     /**
@@ -497,8 +330,10 @@ public:
             fflush(stdout);
         }
 
-        // Wake up kernel to process RX packets
-        kick_rx();
+        // NOTE: No kick_rx() here - kernel is kicked only when:
+        //   1. After init (FILL ring initially populated)
+        //   2. After release_rx_frame() (FILL ring refilled)
+        // This avoids unnecessary syscalls on every peek attempt.
 
         // Check RX ring for received packets
         uint32_t idx_rx;
@@ -520,27 +355,19 @@ public:
         // Store RX descriptor address (includes headroom) for refill
         current_rx_addr_ = rx_desc->addr;
 
-        // Get frame reference from pool using base address
+        // Setup rx_frame_ directly from descriptor (no FramePool lookup needed)
         uint64_t base_addr = rx_desc->addr & ~(config_.frame_size - 1);
-        XDPFrame* frame = frame_pool_.get_frame(base_addr);
-        if (frame == nullptr) {
-            printf("[RX-ERROR] Failed to get frame for addr=0x%lx (base=0x%lx, not in pool?)\n",
-                   rx_desc->addr, base_addr);
-            errno = EINVAL;
-            return nullptr;
-        }
-
-        // Override frame->data to point to actual packet location (RX descriptor address)
-        frame->data = (uint8_t*)umem_area_ + rx_desc->addr;
-        frame->addr = base_addr;
-
-        // Update frame with packet info
-        frame_pool_.set_rx_length(frame, rx_desc->len);
+        rx_frame_.addr = base_addr;
+        rx_frame_.data = (uint8_t*)umem_area_ + rx_desc->addr;
+        rx_frame_.len = rx_desc->len;
+        rx_frame_.capacity = config_.frame_size - XDP_HEADROOM;
+        rx_frame_.offset = 0;
+        rx_frame_.owned = true;
 
         // Hold this frame until release_rx_frame() is called
-        current_rx_frame_ = frame;
+        current_rx_frame_ = &rx_frame_;
 
-        return frame;
+        return &rx_frame_;
     }
 
     /**
@@ -587,8 +414,8 @@ public:
                    refill_count, current_rx_addr_);
         }
 
-        // Clear frame state
-        frame_pool_.release(frame);
+        // Clear frame state (no FramePool to release, just clear pointer)
+        rx_frame_.clear();
         current_rx_frame_ = nullptr;
         current_rx_addr_ = 0;
     }
@@ -618,20 +445,15 @@ public:
             return nullptr;
         }
 
-        // Get frame reference
-        XDPFrame* frame = frame_pool_.get_frame(frame_addr);
-        if (frame == nullptr) {
-            // Return frame to free pool
-            free_frames_.push_back(frame_addr);
-            errno = EINVAL;
-            return nullptr;
-        }
+        // Setup tx_frame_ directly (no FramePool lookup needed)
+        tx_frame_.addr = frame_addr;
+        tx_frame_.data = (uint8_t*)umem_area_ + frame_addr + XDP_HEADROOM;
+        tx_frame_.len = 0;
+        tx_frame_.capacity = config_.frame_size - XDP_HEADROOM;
+        tx_frame_.offset = 0;
+        tx_frame_.owned = true;
 
-        // Clear frame for writing
-        frame->clear();
-        frame->owned = true;
-
-        return frame;
+        return &tx_frame_;
     }
 
     /**
@@ -678,7 +500,7 @@ public:
         if (xsk_ring_prod__reserve(&tx_ring_, 1, &idx) != 1) {
             // TX ring is full - return frame to free pool
             free_frames_.push_back(frame->addr);
-            frame_pool_.release(frame);
+            frame->clear();  // No FramePool, just clear the frame
             errno = EAGAIN;
             return -1;
         }
@@ -1015,34 +837,6 @@ private:
         }
     }
 
-    /**
-     * Refill fill ring with freed RX frames
-     *
-     * @param count Number of frames to refill
-     * @param start_idx Starting index in RX ring
-     */
-    void refill_fill_ring(uint32_t count, uint32_t start_idx) {
-        uint32_t idx_fq;
-        uint32_t nb_reserved = xsk_ring_prod__reserve(&fill_ring_, count, &idx_fq);
-
-        if (nb_reserved == 0) {
-            return;  // Fill ring is full
-        }
-
-        // Add the freed RX frame addresses back to fill ring
-        for (uint32_t i = 0; i < nb_reserved; i++) {
-            // Reuse the frame addresses from the RX descriptors we just consumed
-            const struct xdp_desc* rx_desc = xsk_ring_cons__rx_desc(&rx_ring_, start_idx + i);
-            *xsk_ring_prod__fill_addr(&fill_ring_, idx_fq++) = rx_desc->addr;
-        }
-
-        xsk_ring_prod__submit(&fill_ring_, nb_reserved);
-
-        // CRITICAL FIX: Wake up kernel after refilling FILL ring!
-        // Without this, kernel doesn't know new frames are available -> ENOSPC errors
-        kick_rx();
-    }
-
     // Configuration
     XDPConfig config_;                      // XDP configuration (interface, queue, frame size, etc.)
 
@@ -1069,9 +863,10 @@ private:
     std::vector<uint64_t> free_frames_;     // Pool of free UMEM frame addresses
     uint32_t next_free_frame_;              // Next unused frame index for initial allocation
 
-    // Zero-copy frame management
-    FramePool frame_pool_;                  // Frame pool for zero-copy operations
-    XDPFrame* current_rx_frame_;            // Currently held RX frame (for zero-copy recv)
+    // Zero-copy frame management (no FramePool - just reusable frame structs)
+    XDPFrame rx_frame_;                     // Reusable RX frame (only one held at a time)
+    XDPFrame tx_frame_;                     // Reusable TX frame (only one built at a time)
+    XDPFrame* current_rx_frame_;            // Points to rx_frame_ when holding, nullptr otherwise
     uint64_t current_rx_addr_;              // RX descriptor address (with headroom)
 
     // BPF packet filtering (optional)
@@ -1087,10 +882,6 @@ public:
     void init(const void*) {
         throw std::runtime_error("XDP support not compiled. Build with USE_XDP=1");
     }
-    void connect(const char*, uint16_t) {}
-    ssize_t send(const void*, size_t) { return -1; }
-    ssize_t recv(void*, size_t) { return -1; }
-    int get_fd() const { return -1; }
     bool is_connected() const { return false; }
     void close() {}
     static const char* name() { return "XDP (disabled)"; }
