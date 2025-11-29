@@ -1,5 +1,12 @@
 // ws_configs.hpp
-// Pre-configured WebSocket client instantiations using 4-policy design
+// Pre-configured WebSocket client instantiations using policy-based design
+//
+// Template parameters:
+//   - SSLPolicy: OpenSSLPolicy, LibreSSLPolicy, WolfSSLPolicy, NoSSLPolicy
+//   - TransportPolicy: BSDSocketTransport<EventPolicy> or XDPUserspaceTransport
+//   - RxBufferPolicy: RingBuffer<size>
+//   - TxBufferPolicy: RingBuffer<size>
+//
 #pragma once
 
 #include "websocket.hpp"
@@ -10,6 +17,9 @@
 
 // Unified SSL policy (OpenSSL, LibreSSL, WolfSSL)
 #include "policy/ssl.hpp"
+
+// Transport policy (BSD sockets + event, XDP)
+#include "policy/transport.hpp"
 
 // ============================================================================
 // Configuration 1: Linux Default (Optimized for HFT)
@@ -67,9 +77,12 @@
     using DefaultEventPolicy = EpollPolicy;
 #endif
 
+// Default Transport Policy: BSD socket + event loop (kernel TCP/IP stack)
+using DefaultTransportPolicy = websocket::transport::BSDSocketTransport<DefaultEventPolicy>;
+
 using LinuxOptimized = WebSocketClient<
     DefaultSSLPolicy,
-    DefaultEventPolicy,
+    DefaultTransportPolicy,        // Transport now wraps event policy
     RingBuffer<32 * 1024 * 1024>,  // 32MB RX buffer (HFT: high-volume market data ingestion)
     RingBuffer<2 * 1024 * 1024>    // 2MB TX buffer (HFT: low-volume order commands)
 >;
@@ -115,10 +128,13 @@ using LinuxOptimized = WebSocketClient<
 //   - Asymmetric buffers reduce memory footprint
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+// macOS/BSD Transport Policy: BSD socket + kqueue
+using MacOSTransportPolicy = websocket::transport::BSDSocketTransport<KqueuePolicy>;
+
 #ifdef USE_LIBRESSL
 using MacOSDefault = WebSocketClient<
     LibreSSLPolicy,
-    KqueuePolicy,
+    MacOSTransportPolicy,
     RingBuffer<32 * 1024 * 1024>,  // 32MB RX buffer (HFT: market data ingestion)
     RingBuffer<2 * 1024 * 1024>    // 2MB TX buffer (HFT: order commands)
 >;
@@ -126,7 +142,7 @@ using MacOSDefault = WebSocketClient<
 // Fallback to OpenSSL if LibreSSL not available
 using MacOSDefault = WebSocketClient<
     OpenSSLPolicy,
-    KqueuePolicy,
+    MacOSTransportPolicy,
     RingBuffer<32 * 1024 * 1024>,  // 32MB RX buffer (HFT: market data ingestion)
     RingBuffer<2 * 1024 * 1024>    // 2MB TX buffer (HFT: order commands)
 >;
@@ -141,7 +157,7 @@ using MacOSDefault = WebSocketClient<
 #ifdef __linux__
 using LowMemory = WebSocketClient<
     DefaultSSLPolicy,
-    DefaultEventPolicy,
+    DefaultTransportPolicy,
     RingBuffer<4 * 1024 * 1024>,  // 4MB RX buffer
     RingBuffer<4 * 1024 * 1024>   // 4MB TX buffer
 >;
@@ -155,7 +171,7 @@ using LowMemory = WebSocketClient<
 #ifdef __linux__
 using HighThroughput = WebSocketClient<
     DefaultSSLPolicy,
-    DefaultEventPolicy,
+    DefaultTransportPolicy,
     RingBuffer<16 * 1024 * 1024>,  // 16MB RX buffer
     RingBuffer<16 * 1024 * 1024>   // 16MB TX buffer
 >;
@@ -169,7 +185,7 @@ using HighThroughput = WebSocketClient<
 #ifdef __linux__
 using AsymmetricBuffers = WebSocketClient<
     DefaultSSLPolicy,
-    DefaultEventPolicy,
+    DefaultTransportPolicy,
     RingBuffer<16 * 1024 * 1024>,  // 16MB RX buffer (market data)
     RingBuffer<1 * 1024 * 1024>    // 1MB TX buffer (commands)
 >;
@@ -240,13 +256,90 @@ using PortableWebSocket = DefaultWebSocket;
 #endif // USE_DPDK
 
 // ============================================================================
+// XDP Zero-Copy Configuration (AF_XDP + Userspace TCP)
+// ============================================================================
+// Best for: Ultra-low latency HFT with kernel bypass
+//
+// Policy composition:
+//   - TransportPolicy: XDPUserspaceTransport (AF_XDP + userspace TCP/IP)
+//   - SSLPolicy: OpenSSLPolicy (via UserspaceTransportBIO)
+//   - RxBufferPolicy: RingBuffer<32MB>
+//   - TxBufferPolicy: RingBuffer<2MB>
+//
+// Performance characteristics:
+//   - ~1-5us latency (vs ~10-50us for BSD sockets)
+//   - Zero-copy from NIC to userspace via UMEM
+//   - Busy-polling (100% CPU, lowest latency)
+//
+// Requirements:
+//   - NIC with XDP driver support
+//   - CAP_NET_ADMIN capability (sudo)
+//   - NIC queue set to 1 (scripts/nic_queue_num_switch.sh)
+//
+// Build:
+//   USE_XDP=1 USE_OPENSSL=1 make
+
+#ifdef USE_XDP
+using XDPTransportPolicy = websocket::transport::XDPUserspaceTransport;
+
+using XDPWebSocket = WebSocketClient<
+    DefaultSSLPolicy,
+    XDPTransportPolicy,
+    RingBuffer<32 * 1024 * 1024>,  // 32MB RX buffer (HFT: market data)
+    RingBuffer<2 * 1024 * 1024>    // 2MB TX buffer (HFT: orders)
+>;
+#endif
+
+// ============================================================================
+// Transport Type Traits (Re-exported for convenience)
+// ============================================================================
+// Use these traits to check transport type at compile-time:
+//
+//   if constexpr (is_fd_based_transport_v<MyTransport>) {
+//       // BSD socket specific code
+//   } else {
+//       // Userspace transport specific code
+//   }
+
+using websocket::traits::is_fd_based_transport;
+using websocket::traits::is_fd_based_transport_v;
+
+// ============================================================================
+// C++20 Concepts (Re-exported for convenience)
+// ============================================================================
+#if __cplusplus >= 202002L
+using websocket::transport::TransportPolicyConcept;
+using websocket::transport::FdBasedTransportConcept;
+using websocket::transport::UserspaceTransportConcept;
+
+// Compile-time validation of default transport
+static_assert(FdBasedTransportConcept<DefaultTransportPolicy>,
+              "DefaultTransportPolicy must conform to FdBasedTransportConcept");
+
+#ifdef USE_XDP
+static_assert(UserspaceTransportConcept<XDPTransportPolicy>,
+              "XDPTransportPolicy must conform to UserspaceTransportConcept");
+#endif
+
+#endif // C++20
+
+// ============================================================================
 // Custom Configuration Example
 // ============================================================================
 // You can create your own custom configuration:
 //
 // using MyCustomClient = WebSocketClient<
 //     OpenSSLPolicy,
-//     EpollPolicy,
+//     websocket::transport::BSDSocketTransport<EpollPolicy>,
 //     RingBuffer<2 * 1024 * 1024>,  // 2MB RX
-//     RingBuffer<512 * 1024>         // 512KB TX
+//     RingBuffer<512 * 1024>        // 512KB TX
+// >;
+//
+// For XDP zero-copy:
+//
+// using MyXDPClient = WebSocketClient<
+//     OpenSSLPolicy,
+//     websocket::transport::XDPUserspaceTransport,
+//     RingBuffer<32 * 1024 * 1024>,
+//     RingBuffer<2 * 1024 * 1024>
 // >;

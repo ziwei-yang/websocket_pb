@@ -2,7 +2,7 @@
 // Transport Layer Policy - Network Transport Abstraction
 //
 // This header provides transport implementations for different network stacks:
-//   - BSDSocketTransport: Traditional BSD sockets (kernel TCP/IP stack)
+//   - BSDSocketTransport<EventPolicy>: BSD sockets + event loop (kernel TCP/IP stack)
 //   - XDPUserspaceTransport: XDP + Userspace TCP/IP stack (complete kernel bypass)
 //
 // Architecture (XDPUserspaceTransport):
@@ -17,16 +17,18 @@
 //                 ├── parse_tcp() - parse raw frames
 //                 └── process_tcp() - pure state machine
 //
-// TransportPolicy concept:
+// TransportPolicy concept (unified interface):
 //   - void init()
 //   - void connect(const char* host, uint16_t port)
 //   - ssize_t send(const void* buf, size_t len)
 //   - ssize_t recv(void* buf, size_t len)
-//   - int get_fd() const  // For BSD sockets, -1 for XDP
-//   - void set_nonblocking()
 //   - void close()
-//   - void poll()         // For XDP: process RX and retransmits
 //   - bool is_connected() const
+//   - void set_wait_timeout(int timeout_ms)  // Event waiting config
+//   - int wait()                              // Wait for data (epoll/select or busy-poll)
+//   - int get_fd() const                      // For BSD sockets, -1 for XDP
+//   - void* get_transport_ptr()               // For userspace transport BIO
+//   - bool supports_ktls() const              // kTLS availability
 
 #pragma once
 
@@ -49,11 +51,17 @@ namespace websocket {
 namespace transport {
 
 /**
- * BSD Socket Transport Policy
+ * BSD Socket Transport Policy (Templated on EventPolicy)
  *
  * Uses traditional BSD sockets with kernel TCP/IP stack.
+ * Integrates event loop (epoll/select/io_uring/kqueue) for wait operations.
+ *
  * Suitable for: Standard deployments, kTLS support, multi-platform
+ *
+ * Template parameter:
+ *   EventPolicy - EpollPolicy, SelectPolicy, IoUringPolicy, or KqueuePolicy
  */
+template<typename EventPolicy>
 class BSDSocketTransport {
 public:
     BSDSocketTransport() : fd_(-1), connected_(false) {}
@@ -70,6 +78,7 @@ public:
     BSDSocketTransport(BSDSocketTransport&& other) noexcept
         : fd_(other.fd_)
         , connected_(other.connected_)
+        , event_(std::move(other.event_))
     {
         other.fd_ = -1;
         other.connected_ = false;
@@ -80,16 +89,23 @@ public:
             close();
             fd_ = other.fd_;
             connected_ = other.connected_;
+            event_ = std::move(other.event_);
             other.fd_ = -1;
             other.connected_ = false;
         }
         return *this;
     }
 
+    /**
+     * Initialize transport (event loop)
+     */
     void init() {
-        // No initialization needed for BSD sockets
+        event_.init();
     }
 
+    /**
+     * Connect to remote host
+     */
     void connect(const char* host, uint16_t port) {
         if (connected_) {
             throw std::runtime_error("Already connected");
@@ -100,11 +116,13 @@ public:
             throw std::runtime_error("Failed to create socket");
         }
 
+        // Enable TCP_NODELAY for low latency
         int flag = 1;
         if (::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
             printf("[WARN] Failed to set TCP_NODELAY: %s\n", strerror(errno));
         }
 
+        // Resolve hostname
         struct addrinfo hints = {};
         struct addrinfo* result = nullptr;
         hints.ai_family = AF_INET;
@@ -127,6 +145,7 @@ public:
         auto* addr = reinterpret_cast<struct sockaddr_in*>(result->ai_addr);
         addr->sin_port = htons(port);
 
+        // Set non-blocking for async connect
         set_nonblocking();
 
         ret = ::connect(fd_, result->ai_addr, result->ai_addrlen);
@@ -138,6 +157,7 @@ public:
             throw std::runtime_error(std::string("connect() failed: ") + strerror(errno));
         }
 
+        // Wait for connection with timeout
         fd_set write_fds;
         FD_ZERO(&write_fds);
         FD_SET(fd_, &write_fds);
@@ -161,18 +181,30 @@ public:
             throw std::runtime_error(std::string("Connection failed: ") + strerror(so_error));
         }
 
+        // Restore blocking mode for SSL handshake
+        int flags = fcntl(fd_, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(fd_, F_SETFL, flags & ~O_NONBLOCK);
+        }
+
         connected_ = true;
         printf("[BSD] Connected to %s:%u (fd=%d)\n", host, port, fd_);
     }
 
+    /**
+     * Send data
+     */
     ssize_t send(const void* buf, size_t len) {
         if (!connected_ || fd_ < 0) {
             errno = ENOTCONN;
             return -1;
         }
-        return ::send(fd_, buf, len, 0);
+        return ::send(fd_, buf, len, MSG_NOSIGNAL);
     }
 
+    /**
+     * Receive data
+     */
     ssize_t recv(void* buf, size_t len) {
         if (!connected_ || fd_ < 0) {
             errno = ENOTCONN;
@@ -181,8 +213,82 @@ public:
         return ::recv(fd_, buf, len, 0);
     }
 
+    /**
+     * Close connection
+     */
+    void close() {
+        if (fd_ >= 0) {
+            event_.remove(fd_);
+            ::close(fd_);
+            fd_ = -1;
+            connected_ = false;
+        }
+    }
+
+    /**
+     * Check if connected
+     */
+    bool is_connected() const { return connected_; }
+
+    // =========================================================================
+    // Event waiting (TransportPolicy interface)
+    // =========================================================================
+
+    /**
+     * Set timeout for wait operations
+     * @param timeout_ms Timeout in milliseconds (-1 = infinite)
+     */
+    void set_wait_timeout(int timeout_ms) {
+        event_.set_wait_timeout(timeout_ms);
+    }
+
+    /**
+     * Wait for data to be available
+     * @return >0 if data ready, 0 on timeout, -1 on error
+     */
+    int wait() {
+        return event_.wait_with_timeout();
+    }
+
+    /**
+     * Get ready file descriptor after wait()
+     */
+    int get_ready_fd() const {
+        return event_.get_ready_fd();
+    }
+
+    // =========================================================================
+    // SSL integration (TransportPolicy interface)
+    // =========================================================================
+
+    /**
+     * Get file descriptor for SSL handshake
+     */
     int get_fd() const { return fd_; }
 
+    /**
+     * Get transport pointer for userspace BIO (not used for BSD sockets)
+     */
+    void* get_transport_ptr() { return nullptr; }
+
+    /**
+     * Check if kTLS is supported (yes for BSD sockets on Linux)
+     */
+    bool supports_ktls() const {
+#ifdef __linux__
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    // =========================================================================
+    // Utility
+    // =========================================================================
+
+    /**
+     * Set socket to non-blocking mode
+     */
     void set_nonblocking() {
         if (fd_ < 0) return;
         int flags = fcntl(fd_, F_GETFL, 0);
@@ -194,19 +300,38 @@ public:
         }
     }
 
-    void close() {
-        if (fd_ >= 0) {
-            ::close(fd_);
-            fd_ = -1;
-            connected_ = false;
-        }
+    /**
+     * Start event loop monitoring. Call AFTER SSL handshake is complete.
+     * Sets non-blocking mode and registers with event loop.
+     */
+    void start_event_loop() {
+        if (fd_ < 0) return;
+
+        // Set non-blocking mode
+        set_nonblocking();
+
+        // Register with event loop for read events
+        event_.add_read(fd_);
     }
 
-    bool is_connected() const { return connected_; }
+    /**
+     * Poll (no-op for BSD sockets - event loop handles this)
+     */
+    void poll() {
+        // BSD sockets don't need explicit polling
+    }
+
+    /**
+     * Get event policy name
+     */
+    static constexpr const char* event_policy_name() {
+        return EventPolicy::name();
+    }
 
 private:
     int fd_;
     bool connected_;
+    EventPolicy event_;
 };
 
 } // namespace transport
@@ -501,6 +626,67 @@ public:
         check_retransmit();
     }
 
+    // =========================================================================
+    // Event waiting (TransportPolicy interface)
+    // =========================================================================
+
+    /**
+     * Set timeout for wait operations
+     * @param timeout_us Timeout in microseconds (0 = busy poll)
+     *
+     * For XDP, this controls the sleep between poll iterations.
+     * 0 = pure busy-poll (lowest latency, highest CPU)
+     */
+    void set_wait_timeout(int timeout_us) {
+        poll_interval_us_ = timeout_us;
+    }
+
+    /**
+     * Wait for data to be available
+     * @return 1 if data available in recv buffer, 0 otherwise
+     *
+     * Polls XDP for incoming packets and processes them.
+     * For HFT, use set_wait_timeout(0) for pure busy-polling.
+     */
+    int wait() {
+        poll_rx_and_process();
+        check_retransmit();
+
+        // Sleep if configured (reduces CPU at cost of latency)
+        if (poll_interval_us_ > 0) {
+            struct timespec ts;
+            ts.tv_sec = poll_interval_us_ / 1000000;
+            ts.tv_nsec = (poll_interval_us_ % 1000000) * 1000;
+            nanosleep(&ts, nullptr);
+        }
+
+        // Return 1 if we have data, 0 otherwise
+        return recv_buffer_.available() > 0 ? 1 : 0;
+    }
+
+    /**
+     * Get ready file descriptor (not applicable for XDP)
+     * Always returns -1 as XDP doesn't use file descriptors
+     */
+    int get_ready_fd() const {
+        return -1;
+    }
+
+    // =========================================================================
+    // SSL integration (TransportPolicy interface)
+    // =========================================================================
+
+    /**
+     * Get transport pointer for userspace BIO
+     * Used by UserspaceTransportBIO to call send/recv
+     */
+    void* get_transport_ptr() { return this; }
+
+    /**
+     * Check if kTLS is supported (no for XDP - no kernel socket)
+     */
+    bool supports_ktls() const { return false; }
+
     // XDP/BPF configuration
     void add_exchange_ip(const char* ip) { xdp_.add_exchange_ip(ip); }
     void add_exchange_port(uint16_t port) { xdp_.add_exchange_port(port); }
@@ -755,6 +941,9 @@ private:
     // Connection state
     bool connected_;
 
+    // Polling configuration
+    int poll_interval_us_ = 0;  // 0 = busy poll (default for HFT)
+
     // Current TX frame
     websocket::xdp::XDPFrame* current_tx_frame_ = nullptr;
 
@@ -768,3 +957,101 @@ private:
 
 } // namespace transport
 } // namespace websocket
+
+// ============================================================================
+// C++20 TransportPolicyConcept - Compile-Time Validation
+// ============================================================================
+
+#if __cplusplus >= 202002L
+#include <concepts>
+
+namespace websocket {
+namespace transport {
+
+/**
+ * TransportPolicyConcept - Defines required interface for transport policies
+ *
+ * All transport policies must provide:
+ *   - init(...) - Initialize transport (variadic for different transports)
+ *   - connect(host, port) - Establish TCP connection
+ *   - send(buf, len) - Send data
+ *   - recv(buf, len) - Receive data
+ *   - close() - Close connection
+ *   - is_connected() - Check connection state
+ *   - wait() - Wait for data availability
+ *   - set_wait_timeout(timeout_ms) - Configure wait timeout
+ *   - get_fd() - Get file descriptor (-1 for userspace transports)
+ *   - get_transport_ptr() - Get transport pointer for custom BIO
+ *   - supports_ktls() - Check kTLS support
+ *
+ * Note: init() has different signatures for different transports:
+ *   - BSDSocketTransport: init() - no arguments
+ *   - XDPUserspaceTransport: init(interface, bpf_path) - two arguments
+ */
+template<typename T>
+concept TransportPolicyConcept = requires(T transport, const char* host, uint16_t port,
+                                          const void* buf, void* recv_buf, size_t len,
+                                          int timeout_ms) {
+    // Connection lifecycle
+    { transport.connect(host, port) } -> std::same_as<void>;
+    { transport.close() } -> std::same_as<void>;
+    { transport.is_connected() } -> std::convertible_to<bool>;
+
+    // Data transfer
+    { transport.send(buf, len) } -> std::convertible_to<ssize_t>;
+    { transport.recv(recv_buf, len) } -> std::convertible_to<ssize_t>;
+
+    // Event loop integration
+    { transport.wait() } -> std::convertible_to<int>;
+    { transport.set_wait_timeout(timeout_ms) } -> std::same_as<void>;
+
+    // Transport introspection
+    { transport.get_fd() } -> std::convertible_to<int>;
+    { transport.get_transport_ptr() } -> std::convertible_to<void*>;
+    { transport.supports_ktls() } -> std::convertible_to<bool>;
+};
+
+/**
+ * FdBasedTransportConcept - Additional requirements for fd-based transports
+ *
+ * Extends TransportPolicyConcept with:
+ *   - start_event_loop() - Register fd with event loop
+ *   - get_ready_fd() - Get fd that triggered event
+ */
+template<typename T>
+concept FdBasedTransportConcept = TransportPolicyConcept<T> && requires(T transport) {
+    { transport.start_event_loop() } -> std::same_as<void>;
+    { transport.get_ready_fd() } -> std::convertible_to<int>;
+};
+
+/**
+ * UserspaceTransportConcept - Additional requirements for userspace transports
+ *
+ * Extends TransportPolicyConcept with:
+ *   - poll() - Process pending packets
+ *   - add_exchange_ip(ip) - Configure BPF filter for exchange IP
+ *   - add_exchange_port(port) - Configure BPF filter for exchange port
+ */
+template<typename T>
+concept UserspaceTransportConcept = TransportPolicyConcept<T> && requires(T transport,
+                                                                           const char* ip,
+                                                                           uint16_t port) {
+    { transport.poll() } -> std::same_as<void>;
+    { transport.add_exchange_ip(ip) } -> std::same_as<void>;
+    { transport.add_exchange_port(port) } -> std::same_as<void>;
+};
+
+// Verify BSDSocketTransport conforms to concepts
+template<typename EventPolicy>
+concept BSDSocketTransportValid = FdBasedTransportConcept<BSDSocketTransport<EventPolicy>>;
+
+// Note: XDPUserspaceTransport validation is conditional on USE_XDP
+#ifdef USE_XDP
+static_assert(UserspaceTransportConcept<XDPUserspaceTransport>,
+              "XDPUserspaceTransport must conform to UserspaceTransportConcept");
+#endif
+
+} // namespace transport
+} // namespace websocket
+
+#endif // C++20

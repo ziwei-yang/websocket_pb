@@ -961,23 +961,20 @@ using SelectPolicy = websocket::event_policies::SelectPolicy;
 // ============================================================================
 // Default Event Policy Selection
 // ============================================================================
-// NOTE: Policy selection is now handled in ws_configs.hpp via compile-time flags
-// (USE_SELECT, ENABLE_IO_URING, etc.). These old defaults are commented out to
-// avoid conflicts with the new flexible policy system.
+// Platform-specific event policy aliases for use in unit tests and generic code.
+// ws_configs.hpp uses DefaultEventPolicy for the full policy composition.
 
-// #if defined(EVENT_POLICY_LINUX)
-//     // Linux with epoll (default)
-//     using DefaultEventPolicy = websocket::event_policies::EpollPolicy;
-//     using EventPolicy = websocket::event_policies::EpollPolicy;
-// #elif defined(EVENT_POLICY_BSD)
-//     // macOS/BSD with kqueue
-//     using DefaultEventPolicy = websocket::event_policies::KqueuePolicy;
-//     using EventPolicy = websocket::event_policies::KqueuePolicy;
-// #else
-//     // Fallback to select
-//     using DefaultEventPolicy = websocket::event_policies::SelectPolicy;
-//     using EventPolicy = websocket::event_policies::SelectPolicy;
-// #endif
+#if defined(__linux__)
+    #ifdef USE_SELECT
+        using EventPolicy = websocket::event_policies::SelectPolicy;
+    #else
+        using EventPolicy = websocket::event_policies::EpollPolicy;
+    #endif
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    using EventPolicy = websocket::event_policies::KqueuePolicy;
+#else
+    using EventPolicy = websocket::event_policies::SelectPolicy;
+#endif
 
 // ============================================================================
 // Event Policy Concepts (C++20)

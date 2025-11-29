@@ -251,13 +251,14 @@ void print_results() {
             printf(" (user-space)\n");
         }
 
-        // IO Backend and Event Policy
+        // IO Backend and Transport Policy
 #ifdef ENABLE_IO_URING
         printf("  IO Backend:         io_uring (async I/O)\n");
 #else
         printf("  IO Backend:         EventPolicy-based I/O\n");
-        printf("  Event Policy:       %s\n", DefaultWebSocket::EventPolicy::name());
 #endif
+        // Transport Policy
+        printf("  Transport Policy:   %s\n", DefaultWebSocket::TransportPolicy::event_policy_name());
 
         // Ringbuffer configuration
         printf("  RX Buffer:          ");

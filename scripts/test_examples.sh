@@ -1,1 +1,0 @@
-../../websocket_dpdk_zwy/scripts/test_examples.sh

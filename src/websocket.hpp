@@ -1,5 +1,20 @@
 // websocket.hpp
 // High-performance WebSocket client using policy-based design
+//
+// TransportPolicy Design:
+//   WebSocketClient now uses TransportPolicy instead of separate EventPolicy.
+//   TransportPolicy encapsulates both transport mechanism (BSD socket or XDP)
+//   and event waiting strategy (epoll/select/io_uring or busy-polling).
+//
+// Supported Transports:
+//   - BSDSocketTransport<EventPolicy>: BSD sockets + event loop (kernel TCP/IP)
+//   - XDPUserspaceTransport: XDP + userspace TCP/IP stack (kernel bypass)
+//
+// SSL Integration (compile-time dispatch):
+//   - BSD sockets: Uses fd-based SSL handshake (supports kTLS)
+//   - XDP: Uses UserspaceTransportBIO for SSL over userspace transport
+//   - Dispatch is done at compile-time using is_fd_based_transport<T> trait
+//
 #pragma once
 
 #include "ws_policies.hpp"
@@ -12,6 +27,7 @@
 #include <cstring>
 #include <cstdio>
 #include <stdexcept>
+#include <type_traits>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
@@ -26,9 +42,41 @@
 #include <linux/sockios.h>
 #endif
 
+// ============================================================================
+// Transport Type Traits (Compile-Time Dispatch)
+// ============================================================================
+
+namespace websocket {
+namespace traits {
+
+/**
+ * Primary template: Default to userspace transport (XDP, DPDK, etc.)
+ * Userspace transports don't have a kernel file descriptor.
+ */
+template<typename T, typename = void>
+struct is_fd_based_transport : std::false_type {};
+
+/**
+ * Specialization: BSD socket transports have get_fd() returning >= 0
+ * Detected by checking if T has get_fd() method returning int.
+ */
+template<typename T>
+struct is_fd_based_transport<T,
+    std::enable_if_t<std::is_same_v<decltype(std::declval<T>().get_fd()), int>>>
+    : std::true_type {};
+
+/**
+ * Helper variable template for cleaner syntax
+ */
+template<typename T>
+inline constexpr bool is_fd_based_transport_v = is_fd_based_transport<T>::value;
+
+} // namespace traits
+} // namespace websocket
+
 template<
     typename SSLPolicy_,
-    typename EventPolicy_,
+    typename TransportPolicy_,     // Unified transport (BSD+event or XDP)
     typename RxBufferPolicy_,      // Separate RX buffer (can have different size)
     typename TxBufferPolicy_       // Separate TX buffer (can have different size)
 >
@@ -36,7 +84,7 @@ class WebSocketClient {
 public:
     // Type aliases for policy introspection
     using SSLPolicy = SSLPolicy_;
-    using EventPolicy = EventPolicy_;
+    using TransportPolicy = TransportPolicy_;
     using RxBufferPolicy = RxBufferPolicy_;
     using TxBufferPolicy = TxBufferPolicy_;
 
@@ -47,14 +95,11 @@ public:
     using MessageCallback = std::function<void(const uint8_t*, size_t, const timing_record_t&)>;
 
     WebSocketClient()
-        : fd_(-1)
-        , connected_(false)
+        : connected_(false)
         , msg_count_(0)
     {
         rx_buffer_.init();  // Buffer initializes with its template parameter size
         tx_buffer_.init();
-        event_loop_.init();
-        event_loop_.set_wait_timeout(1000);  // Set default 1 second timeout
         ssl_.init();
 
         // Initialize timing record
@@ -68,148 +113,101 @@ public:
     // Connect to WebSocket server with optional custom HTTP headers
     void connect(const char* host, uint16_t port, const char* path,
                  const HeaderMap& custom_headers = {}) {
-        // 1. Create socket
-        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd_ < 0) {
-            throw std::runtime_error("Failed to create socket");
-        }
+        // Compile-time constant for transport type dispatch
+        constexpr bool is_fd_based = websocket::traits::is_fd_based_transport_v<TransportPolicy_>;
 
-        // Enable TCP_NODELAY for low-latency (disable Nagle's algorithm)
-        int flag = 1;
-        if (::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
-            printf("[WARN] Failed to set TCP_NODELAY: %s\n", strerror(errno));
-            // Continue anyway - not critical
-        }
+        // 1. Initialize transport (event loop for BSD, XDP resources for XDP)
+        transport_.init();
 
-        // Enable RX timestamping (must be done before data arrives)
-        enable_hw_timestamping(fd_);
+        // 2. TCP connect (kernel TCP for BSD, userspace TCP for XDP)
+        transport_.connect(host, port);
 
-        // 2. TCP connect
-        struct addrinfo hints = {};
-        struct addrinfo* result = nullptr;
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        int ret = getaddrinfo(host, nullptr, &hints, &result);
-        if (ret != 0) {
-            ::close(fd_);
-            throw std::runtime_error(std::string("getaddrinfo() failed: ") + gai_strerror(ret));
-        }
-
-        // Validate getaddrinfo result
-        if (!result || !result->ai_addr) {
-            if (result) freeaddrinfo(result);
-            ::close(fd_);
-            throw std::runtime_error("getaddrinfo() returned invalid result");
-        }
-
-        auto* addr = (struct sockaddr_in*)result->ai_addr;
-        addr->sin_port = htons(port);
-
-        // Set socket to non-blocking mode before connect (for timeout support)
-        int flags = fcntl(fd_, F_GETFL, 0);
-        if (flags < 0 || fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
-            freeaddrinfo(result);
-            ::close(fd_);
-            throw std::runtime_error("Failed to set non-blocking mode");
-        }
-
-        // Attempt non-blocking connect
-        ret = ::connect(fd_, (struct sockaddr*)addr, sizeof(*addr));
-        freeaddrinfo(result);
-
-        // Handle non-blocking connect
-        if (ret < 0 && errno != EINPROGRESS) {
-            ::close(fd_);
-            throw std::runtime_error(std::string("connect() failed: ") + strerror(errno));
-        }
-
-        // Wait for connection with 5-second timeout
-        if (ret < 0) {  // EINPROGRESS - connection in progress
-            fd_set write_fds, error_fds;
-            FD_ZERO(&write_fds);
-            FD_ZERO(&error_fds);
-            FD_SET(fd_, &write_fds);
-            FD_SET(fd_, &error_fds);
-
-            struct timeval tv;
-            tv.tv_sec = 5;   // 5 second timeout
-            tv.tv_usec = 0;
-
-            ret = select(fd_ + 1, nullptr, &write_fds, &error_fds, &tv);
-
-            if (ret <= 0) {
-                ::close(fd_);
-                if (ret == 0) {
-                    throw std::runtime_error("connect() timeout after 5 seconds");
-                } else {
-                    throw std::runtime_error(std::string("select() failed: ") + strerror(errno));
-                }
-            }
-
-            // Check if connection succeeded or failed
-            int sock_error = 0;
-            socklen_t len = sizeof(sock_error);
-            if (getsockopt(fd_, SOL_SOCKET, SO_ERROR, &sock_error, &len) < 0) {
-                ::close(fd_);
-                throw std::runtime_error("getsockopt() failed");
-            }
-
-            if (sock_error != 0) {
-                ::close(fd_);
-                throw std::runtime_error(std::string("connect() failed: ") + strerror(sock_error));
+        // 3. Enable HW timestamping for BSD sockets (compile-time dispatch)
+        if constexpr (is_fd_based) {
+            int fd = transport_.get_fd();
+            if (fd >= 0) {
+                enable_hw_timestamping(fd);
             }
         }
 
-        // Restore blocking mode for SSL handshake
-        if (fcntl(fd_, F_SETFL, flags) < 0) {
-            ::close(fd_);
-            throw std::runtime_error("Failed to restore blocking mode");
-        }
+        // 4. SSL/TLS handshake - compile-time dispatch based on transport type
+        ssl_handshake_dispatch();
 
-        // 3. SSL/TLS handshake
-        ssl_.handshake(fd_);
-
-        // 4. Report TLS mode (kTLS auto-enabled by OpenSSL if available)
-        if (ssl_.ktls_enabled()) {
-            printf("[KTLS] Kernel TLS offload active\n");
+        // 5. Report TLS mode (compile-time optimized)
+        if constexpr (is_fd_based) {
+            if (transport_.supports_ktls() && ssl_.ktls_enabled()) {
+                printf("[KTLS] Kernel TLS offload active\n");
+            } else {
+                printf("[TLS] Standard user-space TLS mode\n");
+            }
         } else {
-            printf("[TLS] Standard user-space TLS mode\n");
+            // Userspace transports never support kTLS
+            printf("[TLS] Standard user-space TLS mode (userspace transport)\n");
         }
 
-        // 5. HTTP upgrade to WebSocket
+        // 6. HTTP upgrade to WebSocket
         send_http_upgrade(host, path, custom_headers);
         recv_http_response();
 
-        // 6. Set non-blocking mode
-        flags = fcntl(fd_, F_GETFL, 0);  // Reuse existing flags variable
-        if (flags < 0 || fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
-            ::close(fd_);
-            throw std::runtime_error("Failed to set non-blocking mode");
+        // 7. Start event loop monitoring for BSD sockets (compile-time dispatch)
+        if constexpr (is_fd_based) {
+            transport_.start_event_loop();
         }
 
-        // 7. Register with event loop
-        event_loop_.add_read(fd_);
+        // 8. Configure wait timeout (1 second default)
+        transport_.set_wait_timeout(1000);
 
         connected_ = true;
         printf("[WS] Connected to %s:%d%s\n", host, port, path);
     }
 
+private:
+    /**
+     * SSL handshake dispatch - compile-time selection between fd-based and userspace BIO
+     *
+     * For BSD sockets (is_fd_based_transport_v = true):
+     *   Uses ssl_.handshake(fd) with kernel file descriptor
+     *   Supports kTLS offload on Linux
+     *
+     * For userspace transports (is_fd_based_transport_v = false):
+     *   Uses ssl_.handshake_userspace_transport(&transport_)
+     *   Uses custom OpenSSL BIO for userspace TCP stack
+     */
+    void ssl_handshake_dispatch() {
+        if constexpr (websocket::traits::is_fd_based_transport_v<TransportPolicy_>) {
+            // BSD socket: use fd-based handshake (supports kTLS)
+            int fd = transport_.get_fd();
+            ssl_.handshake(fd);
+        } else {
+            // XDP/Userspace: use userspace transport BIO
+            ssl_.handshake_userspace_transport(&transport_);
+        }
+    }
+
+public:
+
     // Main event loop - runs until disconnected
     void run(MessageCallback on_message) {
+        // Compile-time constant for transport type dispatch
+        constexpr bool is_fd_based = websocket::traits::is_fd_based_transport_v<TransportPolicy_>;
+
         on_message_ = on_message;
 
         while (connected_) {
-            // Wait for events (uses pre-configured timeout)
-            int ready = event_loop_.wait_with_timeout();
+            // Wait for events (epoll/select/io_uring for BSD, busy-poll for XDP)
+            int ready = transport_.wait();
             if (ready <= 0) continue;
 
-            int ready_fd = event_loop_.get_ready_fd();
-            if (ready_fd != fd_) continue;
+            // For BSD sockets: verify ready fd and drain HW timestamps (compile-time dispatch)
+            if constexpr (is_fd_based) {
+                int fd = transport_.get_fd();
+                int ready_fd = transport_.get_ready_fd();
+                if (ready_fd != fd) continue;
 
-            // Stage 1: Drain hardware RX timestamps from NIC/kernel queue
-            // Populates oldest, latest, and count to detect timestamp queue buildup
-            drain_hw_timestamps(fd_, &timing_);
+                // Stage 1: Drain hardware RX timestamps from NIC/kernel queue
+                // Only applicable for BSD sockets (XDP has no kernel timestamps)
+                drain_hw_timestamps(fd, &timing_);
+            }
 
             // Stage 2: Record CPU cycle when event loop processing starts
             timing_.event_cycle = rdtsc();
@@ -228,10 +226,9 @@ public:
 
     // Graceful disconnect
     void disconnect() {
-        if (fd_ >= 0) {
+        if (connected_ || transport_.is_connected()) {
             ssl_.shutdown();
-            ::close(fd_);
-            fd_ = -1;
+            transport_.close();
             connected_ = false;
             printf("[WS] Disconnected\n");
         }
@@ -423,13 +420,16 @@ private:
         }
     }
 
+    // Access to transport for advanced configuration (e.g., XDP init)
+    TransportPolicy_& transport() { return transport_; }
+    const TransportPolicy_& transport() const { return transport_; }
+
 private:
     SSLPolicy_ ssl_;
-    EventPolicy_ event_loop_;
-    RxBufferPolicy_ rx_buffer_;  // Separate RX buffer type/size
-    TxBufferPolicy_ tx_buffer_;  // Separate TX buffer type/size
+    TransportPolicy_ transport_;     // Unified transport (owns connection + event loop)
+    RxBufferPolicy_ rx_buffer_;      // Separate RX buffer type/size
+    TxBufferPolicy_ tx_buffer_;      // Separate TX buffer type/size
 
-    int fd_;
     bool connected_;
     uint64_t msg_count_;
     MessageCallback on_message_;

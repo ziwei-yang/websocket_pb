@@ -126,24 +126,22 @@ TEST_NEW_BUG_FIXES_SRC := $(TEST_DIR)/test_new_bug_fixes.cpp
 # XDP test source files
 TEST_XDP_TRANSPORT_SRC := $(TEST_DIR)/test_xdp_transport.cpp
 TEST_XDP_FRAME_SRC := $(TEST_DIR)/test_xdp_frame.cpp
+TEST_XDP_SEND_RECV_SRC := $(TEST_DIR)/test_xdp_send_recv.cpp
+
+# Userspace TCP/IP stack test source files
+TEST_CORE_HTTP_SRC := $(TEST_DIR)/test_core_http.cpp
+TEST_IP_LAYER_SRC := $(TEST_DIR)/test_ip_layer.cpp
+TEST_IP_OPTIMIZATIONS_SRC := $(TEST_DIR)/test_ip_optimizations.cpp
+TEST_STACK_CHECKSUM_SRC := $(TEST_DIR)/test_stack_checksum.cpp
+TEST_TCP_STATE_SRC := $(TEST_DIR)/test_tcp_state.cpp
 
 # Integration test source files
 TEST_BINANCE_SRC := $(INTEGRATION_DIR)/binance.cpp
 TEST_XDP_BINANCE_SRC := $(INTEGRATION_DIR)/xdp_binance.cpp
-TEST_XDP_FRAME_ZEROCOPY_SRC := $(INTEGRATION_DIR)/xdp_frame_zerocopy.cpp
-TEST_XDP_USERSPACE_WEBSOCKET_SRC := $(INTEGRATION_DIR)/test_xdp_userspace_websocket.cpp
-
-# Minimal example source file
-EXAMPLE_MINIMAL_SRC := test/example.cpp
 
 # Benchmark source files
 BENCHMARK_DIR := ./test/benchmark
 BENCHMARK_BINANCE_SRC := $(BENCHMARK_DIR)/binance.cpp
-
-# Diagnostic tools
-CHECK_HW_TIMESTAMP_SRC := test/check_hw_timestamp.cpp
-TEST_NIC_TIMESTAMP_SRC := test/test_nic_timestamp.cpp
-TEST_NIC_TIMESTAMP_SIMPLE_SRC := test/test_nic_timestamp_simple.cpp
 
 # Binary output
 EXAMPLE_BIN := $(BUILD_DIR)/ws_example
@@ -152,20 +150,22 @@ TEST_EVENT_BIN := $(BUILD_DIR)/test_event
 TEST_BUG_FIXES_BIN := $(BUILD_DIR)/test_bug_fixes
 TEST_NEW_BUG_FIXES_BIN := $(BUILD_DIR)/test_new_bug_fixes
 TEST_BINANCE_BIN := $(BUILD_DIR)/test_binance_integration
-EXAMPLE_MINIMAL_BIN := $(BUILD_DIR)/example
 BENCHMARK_BINANCE_BIN := $(BUILD_DIR)/benchmark_binance
-CHECK_HW_TIMESTAMP_BIN := $(BUILD_DIR)/check_hw_timestamp
-TEST_NIC_TIMESTAMP_BIN := $(BUILD_DIR)/test_nic_timestamp
-TEST_NIC_TIMESTAMP_SIMPLE_BIN := $(BUILD_DIR)/test_timestamp_simple
 
 # XDP test binaries
 TEST_XDP_TRANSPORT_BIN := $(BUILD_DIR)/test_xdp_transport
 TEST_XDP_FRAME_BIN := $(BUILD_DIR)/test_xdp_frame
+TEST_XDP_SEND_RECV_BIN := $(BUILD_DIR)/test_xdp_send_recv
 TEST_XDP_BINANCE_BIN := $(BUILD_DIR)/test_xdp_binance_integration
-TEST_XDP_FRAME_ZEROCOPY_BIN := $(BUILD_DIR)/test_xdp_frame_zerocopy
-TEST_XDP_USERSPACE_WEBSOCKET_BIN := $(BUILD_DIR)/test_xdp_userspace_websocket
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-integration test-binance example run-example benchmark-binance check-hw-timestamp test-nic-timestamp test-timestamp-simple test-xdp test-xdp-transport test-xdp-frame test-xdp-binance test-xdp-userspace-websocket bpf
+# Userspace TCP/IP stack test binaries
+TEST_CORE_HTTP_BIN := $(BUILD_DIR)/test_core_http
+TEST_IP_LAYER_BIN := $(BUILD_DIR)/test_ip_layer
+TEST_IP_OPTIMIZATIONS_BIN := $(BUILD_DIR)/test_ip_optimizations
+TEST_STACK_CHECKSUM_BIN := $(BUILD_DIR)/test_stack_checksum
+TEST_TCP_STATE_BIN := $(BUILD_DIR)/test_tcp_state
+
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state bpf check-ktls release debug epoll
 
 all: $(EXAMPLE_BIN)
 
@@ -240,21 +240,6 @@ test-binance: $(TEST_BINANCE_BIN)
 	@echo "📡 Connecting to wss://stream.binance.com:443..."
 	./$(TEST_BINANCE_BIN)
 
-# Build minimal example
-$(EXAMPLE_MINIMAL_BIN): $(EXAMPLE_MINIMAL_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling minimal example..."
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-	@echo "✅ Example build complete: $@"
-
-# Build and run minimal example
-example: $(EXAMPLE_MINIMAL_BIN)
-	@echo "Building minimal example..."
-
-run-example: $(EXAMPLE_MINIMAL_BIN)
-	@echo "🚀 Running minimal WebSocket example..."
-	@echo "📡 Connecting to wss://stream.binance.com:443..."
-	./$(EXAMPLE_MINIMAL_BIN)
-
 # Build Binance benchmark
 $(BENCHMARK_BINANCE_BIN): $(BENCHMARK_BINANCE_SRC) | $(BUILD_DIR)
 	@echo "🔨 Compiling Binance latency benchmark..."
@@ -266,50 +251,6 @@ benchmark-binance: $(BENCHMARK_BINANCE_BIN)
 	@echo "📊 Running Binance WebSocket latency benchmark..."
 	@echo "📡 Warmup: 100 messages, Benchmark: 300 messages"
 	./$(BENCHMARK_BINANCE_BIN)
-
-# Build hardware timestamp checker
-$(CHECK_HW_TIMESTAMP_BIN): $(CHECK_HW_TIMESTAMP_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling hardware timestamp diagnostic tool..."
-	$(CXX) $(CXXFLAGS) -o $@ $^
-	@echo "✅ Diagnostic tool build complete: $@"
-
-# Run hardware timestamp checker
-check-hw-timestamp: $(CHECK_HW_TIMESTAMP_BIN)
-	@echo "🔍 Checking hardware timestamping capabilities..."
-	./$(CHECK_HW_TIMESTAMP_BIN)
-
-# Build NIC timestamp test
-$(TEST_NIC_TIMESTAMP_BIN): $(TEST_NIC_TIMESTAMP_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling NIC timestamp test..."
-	$(CXX) $(CXXFLAGS) -o $@ $^
-	@echo "✅ Test build complete: $@"
-
-# Run NIC timestamp test
-test-nic-timestamp: $(TEST_NIC_TIMESTAMP_BIN)
-	@echo "⚡ Testing hardware NIC timestamping..."
-	@echo "   NOTE: Requires root/sudo for hardware timestamps"
-	@echo "   Usage: sudo ./$(TEST_NIC_TIMESTAMP_BIN) <interface> [port]"
-	@echo ""
-	@echo "   Example:"
-	@echo "     sudo ./$(TEST_NIC_TIMESTAMP_BIN) eth0 8888"
-	@echo ""
-	@echo "   Then send test packets:"
-	@echo "     echo 'test' | nc -u localhost 8888"
-
-# Build simple timestamp test (no root required)
-$(TEST_NIC_TIMESTAMP_SIMPLE_BIN): $(TEST_NIC_TIMESTAMP_SIMPLE_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling simple timestamp test..."
-	$(CXX) $(CXXFLAGS) -o $@ $^
-	@echo "✅ Test build complete: $@"
-
-# Run simple timestamp test
-test-timestamp-simple: $(TEST_NIC_TIMESTAMP_SIMPLE_BIN)
-	@echo "⚡ Simple software timestamp test (no root required)"
-	@echo "   Usage: ./$(TEST_NIC_TIMESTAMP_SIMPLE_BIN) [port]"
-	@echo ""
-	@echo "   Example:"
-	@echo "     Terminal 1: ./$(TEST_NIC_TIMESTAMP_SIMPLE_BIN) 8888"
-	@echo "     Terminal 2: echo 'test' | nc -u localhost 8888"
 
 # ============================================================================
 # XDP Integration Tests
@@ -359,14 +300,85 @@ test-xdp-frame: $(TEST_XDP_FRAME_BIN)
 	@echo "🧪 Running XDP frame unit tests..."
 	./$(TEST_XDP_FRAME_BIN)
 
-# Run all XDP tests
-test-xdp: test-xdp-transport test-xdp-frame
+# Build XDP send/recv tests
+$(TEST_XDP_SEND_RECV_BIN): $(TEST_XDP_SEND_RECV_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling XDP send/recv unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
 
-# Build XDP + Userspace Stack integration test
-$(TEST_XDP_USERSPACE_WEBSOCKET_BIN): $(TEST_XDP_USERSPACE_WEBSOCKET_SRC) | $(BUILD_DIR)
-	@echo "🔨 Compiling XDP + Userspace TCP/IP Stack integration test..."
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-	@echo "✅ Integration test build complete: $@"
+# Run XDP send/recv tests
+test-xdp-send-recv: $(TEST_XDP_SEND_RECV_BIN)
+	@echo "🧪 Running XDP send/recv unit tests..."
+	./$(TEST_XDP_SEND_RECV_BIN)
+
+# ============================================================================
+# Userspace TCP/IP Stack Unit Tests
+# ============================================================================
+
+# Build core HTTP tests
+$(TEST_CORE_HTTP_BIN): $(TEST_CORE_HTTP_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling core HTTP unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run core HTTP tests
+test-core-http: $(TEST_CORE_HTTP_BIN)
+	@echo "🧪 Running core HTTP unit tests..."
+	./$(TEST_CORE_HTTP_BIN)
+
+# Build IP layer tests
+$(TEST_IP_LAYER_BIN): $(TEST_IP_LAYER_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling IP layer unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run IP layer tests
+test-ip-layer: $(TEST_IP_LAYER_BIN)
+	@echo "🧪 Running IP layer unit tests..."
+	./$(TEST_IP_LAYER_BIN)
+
+# Build IP optimizations tests
+$(TEST_IP_OPTIMIZATIONS_BIN): $(TEST_IP_OPTIMIZATIONS_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling IP optimizations unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run IP optimizations tests
+test-ip-optimizations: $(TEST_IP_OPTIMIZATIONS_BIN)
+	@echo "🧪 Running IP optimizations unit tests..."
+	./$(TEST_IP_OPTIMIZATIONS_BIN)
+
+# Build stack checksum tests
+$(TEST_STACK_CHECKSUM_BIN): $(TEST_STACK_CHECKSUM_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling stack checksum unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run stack checksum tests
+test-stack-checksum: $(TEST_STACK_CHECKSUM_BIN)
+	@echo "🧪 Running stack checksum unit tests..."
+	./$(TEST_STACK_CHECKSUM_BIN)
+
+# Build TCP state tests
+$(TEST_TCP_STATE_BIN): $(TEST_TCP_STATE_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling TCP state unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run TCP state tests
+test-tcp-state: $(TEST_TCP_STATE_BIN)
+	@echo "🧪 Running TCP state unit tests..."
+	./$(TEST_TCP_STATE_BIN)
+
+# ============================================================================
+# Unified Test Target - Run All Unit Tests
+# ============================================================================
+
+test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state
+	@echo ""
+	@echo "╔════════════════════════════════════════════════════════════════════╗"
+	@echo "║                    ALL UNIT TESTS COMPLETED                        ║"
+	@echo "╚════════════════════════════════════════════════════════════════════╝"
 
 # ============================================================================
 # BPF (eBPF) Program Compilation
@@ -393,31 +405,6 @@ bpf: $(BPF_OBJ)
 # Clean BPF objects
 clean-bpf:
 	rm -f $(BPF_OBJ)
-
-# Run XDP + Userspace Stack integration test
-test-xdp-userspace-websocket: $(TEST_XDP_USERSPACE_WEBSOCKET_BIN) $(BPF_OBJ)
-	@echo "🧪 Running XDP + Userspace TCP/IP Stack integration test..."
-	@echo "📋 Prerequisites:"
-	@echo "   1. Root privileges: sudo"
-	@echo "   2. BPF program will be loaded automatically (packet filtering)"
-	@echo "   3. Network interface must be up"
-	@echo ""
-	@echo "🚀 Recommended: Use the test runner script instead:"
-	@echo "   sudo ./scripts/test_xdp_complete_stack.sh --setup-flow --cleanup"
-	@echo ""
-	@echo "✅ All XDP unit tests completed"
-
-# ============================================================================
-# Integration Tests
-# ============================================================================
-
-# Run all integration tests
-test-integration: test-binance
-	@echo "✅ All integration tests completed"
-
-# Run all tests (unit + integration)
-test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-xdp
-	@echo "✅ All unit tests completed"
 
 # Clean build artifacts
 clean: clean-bpf
@@ -465,34 +452,40 @@ help:
 	@echo "WebSocket Policy-Based Library - Makefile"
 	@echo "=========================================="
 	@echo ""
-	@echo "Targets:"
-	@echo "  make              - Build all examples"
+	@echo "Build Targets:"
+	@echo "  make              - Build main example (build/ws_example)"
 	@echo "  make run          - Build and run WebSocket example"
-	@echo "  make run-example  - Build and run WebSocket example"
-	@echo "  make test         - Build and run all unit tests"
-	@echo "  make test-ringbuffer - Build and run ringbuffer unit tests"
-	@echo "  make test-event   - Build and run event policy unit tests"
-	@echo "  make test-xdp     - Build and run XDP unit tests"
-	@echo "  make test-xdp-binance - Build and run XDP Binance integration test"
-	@echo "  make test-binance - Build and run Binance integration test (first 20 msgs)"
-	@echo "  make test-integration - Build and run all integration tests"
-	@echo "  make check-hw-timestamp - Check hardware timestamping capabilities"
-	@echo "  make test-nic-timestamp - Build NIC timestamp test (requires sudo to run)"
-	@echo "  make clean        - Remove build artifacts"
+	@echo "  make bpf          - Compile eBPF program for XDP"
 	@echo "  make release      - Build optimized release version"
 	@echo "  make debug        - Build with debug symbols"
+	@echo "  make epoll        - Build with epoll (no io_uring)"
+	@echo "  make clean        - Remove build artifacts"
+	@echo ""
+	@echo "Unit Tests:"
+	@echo "  make test               - Run ALL unit tests"
+	@echo "  make test-ringbuffer    - Test ring buffer implementation"
+	@echo "  make test-event         - Test event policies (epoll/kqueue/select)"
+	@echo "  make test-bug-fixes     - Verify bug fixes #1-10"
+	@echo "  make test-new-bug-fixes - Verify bug fixes #11-20"
+	@echo "  make test-xdp-transport - Test XDP transport layer"
+	@echo "  make test-xdp-frame     - Test XDP frame handling"
+	@echo "  make test-xdp-send-recv - Test XDP send/receive operations"
+	@echo "  make test-core-http     - Test HTTP parsing for WebSocket"
+	@echo "  make test-ip-layer      - Test userspace IP layer"
+	@echo "  make test-ip-optimizations - Test IP layer optimizations"
+	@echo "  make test-stack-checksum - Test TCP/IP checksum calculations"
+	@echo "  make test-tcp-state     - Test TCP state machine"
+	@echo ""
+	@echo "Integration Tests:"
+	@echo "  make test-binance       - BSD socket test with Binance (20 msgs)"
+	@echo "  make test-xdp-binance   - XDP zero-copy test with Binance (requires sudo)"
+	@echo ""
+	@echo "Benchmark:"
+	@echo "  make benchmark-binance  - Latency benchmark (100 warmup, 300 samples)"
+	@echo ""
+	@echo "Diagnostics:"
 	@echo "  make check-ktls   - Check if kTLS is available (Linux)"
 	@echo "  make help         - Show this help message"
-	@echo ""
-	@echo "Platform-specific default configurations:"
-	@echo "  Linux   : io_uring + LibreSSL (use USE_IOURING=0 for epoll)"
-	@echo "  macOS   : kqueue + LibreSSL"
-	@echo ""
-	@echo "Output directory:"
-	@echo "  ./build/          - All binaries and test executables"
-	@echo ""
-	@echo "Examples:"
-	@echo "  ./build/ws_example       - WebSocket client example"
 	@echo ""
 	@echo "Environment variables:"
 	@echo "  USE_IOURING=0     - Disable io_uring, use epoll (Linux only)"
@@ -502,7 +495,6 @@ help:
 	@echo "  CXX=clang++       - Use Clang compiler"
 	@echo ""
 	@echo "Quick start:"
-	@echo "  make run                     # Run WebSocket example"
-	@echo "  make test                    # Run all tests"
-	@echo "  CXX=clang++ make             # Build with Clang"
-	@echo "  USE_XDP=1 make test-xdp-binance  # Run XDP Binance test"
+	@echo "  make run                          # Run WebSocket example"
+	@echo "  USE_OPENSSL=1 make test-binance   # BSD socket test"
+	@echo "  USE_XDP=1 USE_OPENSSL=1 make test-xdp-binance  # XDP test"
