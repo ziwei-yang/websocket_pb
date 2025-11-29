@@ -1,12 +1,12 @@
 // src/stack/tcp/tcp_retransmit.hpp
-// TCP Retransmit Queue and Receive Buffer (Internal)
+// TCP Retransmit Queue and Zero-Copy Receive Buffer (Internal)
 //
 // INTERNAL: These classes are used by transport policy, not by stack.
 // Transport policy owns TCP state, including retransmit queue and receive buffer.
 //
 // Provides:
 //   - RetransmitQueue: Tracks unacknowledged segments for retransmission
-//   - ReceiveBuffer: Simple buffer for in-order TCP data reception
+//   - ZeroCopyReceiveBuffer: Zero-copy buffer holding UMEM frame pointers
 //
 // Note: Simplified for HFT (low packet loss, in-order delivery expected)
 
@@ -164,73 +164,138 @@ private:
     }
 };
 
-// Receive buffer for out-of-order segments (simplified)
-// For HFT, we expect in-order delivery, so this is minimal
-class ReceiveBuffer {
+// ============================================================================
+// Zero-Copy Receive Buffer
+// ============================================================================
+//
+// Instead of copying TCP payload into a linear buffer, this keeps pointers
+// to UMEM frames and reads directly from them. Frames are released back to
+// the FILL ring only after SSL has fully consumed them.
+//
+// Benefits:
+//   - Eliminates one memcpy (TCP payload → buffer)
+//   - Data stays in UMEM until final consumer (SSL) reads it
+//
+// Trade-offs:
+//   - UMEM frames held longer (until SSL consumes)
+//   - More complex frame lifetime management
+//   - Higher FILL ring pressure under load
+
+// Callback type for releasing frames back to XDP
+using FrameReleaseCallback = void(*)(uint64_t umem_addr, void* user_data);
+
+// Reference to a received frame's TCP payload
+struct FrameRef {
+    const uint8_t* data;    // Pointer to TCP payload in UMEM
+    uint16_t len;           // Payload length
+    uint16_t offset;        // Current read offset within payload
+    uint64_t umem_addr;     // UMEM address for releasing to FILL ring
+};
+
+class ZeroCopyReceiveBuffer {
 private:
-    static constexpr size_t BUFFER_SIZE = 65536;  // 64KB buffer
-    uint8_t buffer_[BUFFER_SIZE];
-    size_t write_pos_ = 0;
-    size_t read_pos_ = 0;
+    static constexpr size_t MAX_FRAMES = 256;  // Max frames in flight
+
+    FrameRef frames_[MAX_FRAMES];   // Circular buffer of frame refs
+    size_t head_ = 0;               // Next frame to read from
+    size_t tail_ = 0;               // Next slot to write to
+    size_t count_ = 0;              // Number of frames in buffer
+
+    // Callback for releasing frames
+    FrameReleaseCallback release_cb_ = nullptr;
+    void* release_user_data_ = nullptr;
 
 public:
-    ReceiveBuffer() = default;
+    ZeroCopyReceiveBuffer() = default;
 
-    // Append data to buffer
-    bool append(const uint8_t* data, size_t len) {
-        if (len == 0) return true;
+    // Set the frame release callback
+    // Called when a frame is fully consumed and can be returned to FILL ring
+    void set_release_callback(FrameReleaseCallback cb, void* user_data) {
+        release_cb_ = cb;
+        release_user_data_ = user_data;
+    }
 
-        size_t available = BUFFER_SIZE - write_pos_;
-        if (len > available) {
+    // Add a received frame (zero-copy - just stores pointer)
+    // Returns false if buffer is full
+    bool push_frame(const uint8_t* payload, uint16_t len, uint64_t umem_addr) {
+        if (count_ >= MAX_FRAMES) {
             return false;  // Buffer full
         }
 
-        std::memcpy(buffer_ + write_pos_, data, len);
-        write_pos_ += len;
+        frames_[tail_] = {payload, len, 0, umem_addr};
+        tail_ = (tail_ + 1) % MAX_FRAMES;
+        count_++;
         return true;
     }
 
-    // Read data from buffer
+    // Read data across frames (scatter-gather read)
+    // Only copies when reading - the final necessary copy to output buffer
     ssize_t read(uint8_t* output, size_t max_len) {
-        if (write_pos_ == read_pos_) {
+        if (count_ == 0) {
             return 0;  // No data available
         }
 
-        size_t available = write_pos_ - read_pos_;
-        size_t to_read = std::min(available, max_len);
+        size_t total_read = 0;
 
-        std::memcpy(output, buffer_ + read_pos_, to_read);
-        read_pos_ += to_read;
+        while (total_read < max_len && count_ > 0) {
+            FrameRef& frame = frames_[head_];
 
-        // Reset positions if buffer is empty
-        if (read_pos_ == write_pos_) {
-            read_pos_ = 0;
-            write_pos_ = 0;
+            // How much left in this frame?
+            size_t remaining = frame.len - frame.offset;
+            size_t to_read = std::min(remaining, max_len - total_read);
+
+            // Copy from UMEM to output (only copy)
+            std::memcpy(output + total_read, frame.data + frame.offset, to_read);
+            frame.offset += to_read;
+            total_read += to_read;
+
+            // Frame fully consumed?
+            if (frame.offset >= frame.len) {
+                // Release frame back to FILL ring
+                if (release_cb_) {
+                    release_cb_(frame.umem_addr, release_user_data_);
+                }
+
+                head_ = (head_ + 1) % MAX_FRAMES;
+                count_--;
+            }
         }
 
-        return static_cast<ssize_t>(to_read);
+        return static_cast<ssize_t>(total_read);
     }
 
-    // Get available data size
+    // Get total available bytes across all frames
     size_t available() const {
-        return write_pos_ - read_pos_;
+        size_t total = 0;
+        size_t idx = head_;
+        for (size_t i = 0; i < count_; i++) {
+            total += frames_[idx].len - frames_[idx].offset;
+            idx = (idx + 1) % MAX_FRAMES;
+        }
+        return total;
     }
 
-    // Check if buffer is empty
+    // Check if buffer has no data
     bool empty() const {
-        return write_pos_ == read_pos_;
+        return count_ == 0;
     }
 
-    // Get free space
-    size_t free_space() const {
-        // After reading, we compact the buffer
-        return BUFFER_SIZE - (write_pos_ - read_pos_);
+    // Get number of frames held
+    size_t frame_count() const {
+        return count_;
     }
 
-    // Clear buffer
+    // Clear buffer and release all frames
     void clear() {
-        write_pos_ = 0;
-        read_pos_ = 0;
+        while (count_ > 0) {
+            if (release_cb_) {
+                release_cb_(frames_[head_].umem_addr, release_user_data_);
+            }
+            head_ = (head_ + 1) % MAX_FRAMES;
+            count_--;
+        }
+        head_ = 0;
+        tail_ = 0;
     }
 };
 

@@ -421,6 +421,71 @@ public:
     }
 
     /**
+     * Release RX frame from ring but defer FILL ring refill (zero-copy mode)
+     *
+     * This releases the RX ring consumer so more frames can be peeked,
+     * but does NOT refill the FILL ring. Caller must call refill_frame()
+     * later when done with the frame data.
+     *
+     * @param frame Frame to release (must be from peek_rx_frame())
+     * @return UMEM address to pass to refill_frame() later, or 0 on error
+     */
+    uint64_t release_rx_frame_deferred(XDPFrame* frame) {
+        if (frame == nullptr || frame != current_rx_frame_) {
+            return 0;
+        }
+
+        // Save the address for later refill
+        uint64_t saved_addr = current_rx_addr_;
+
+        // Release RX descriptor (so we can peek next frame)
+        xsk_ring_cons__release(&rx_ring_, 1);
+
+        // Clear frame state but DON'T refill FILL ring yet
+        rx_frame_.clear();
+        current_rx_frame_ = nullptr;
+        current_rx_addr_ = 0;
+
+        return saved_addr;
+    }
+
+    /**
+     * Refill a frame to FILL ring (deferred zero-copy release)
+     *
+     * Called when SSL has finished consuming data from a frame that was
+     * released with release_rx_frame_deferred().
+     *
+     * @param umem_addr UMEM address returned from release_rx_frame_deferred()
+     */
+    void refill_frame(uint64_t umem_addr) {
+        if (umem_addr == 0) return;
+
+        // Debug: Track refill operations
+        static int deferred_refill_count = 0;
+        deferred_refill_count++;
+        bool print_debug = (deferred_refill_count <= 5 || deferred_refill_count % 10 == 0);
+
+        uint32_t idx_fq;
+        if (xsk_ring_prod__reserve(&fill_ring_, 1, &idx_fq) == 1) {
+            // Get base address by masking off headroom offset
+            uint64_t base_addr = umem_addr & ~(config_.frame_size - 1);
+            *xsk_ring_prod__fill_addr(&fill_ring_, idx_fq) = base_addr;
+            xsk_ring_prod__submit(&fill_ring_, 1);
+
+            // Wake up kernel
+            kick_rx();
+
+            if (print_debug) {
+                printf("[DEFERRED-REFILL] #%d: addr=0x%lx, base=0x%lx\n",
+                       deferred_refill_count, umem_addr, base_addr);
+            }
+        } else {
+            printf("[DEFERRED-REFILL-ERROR] #%d: Failed to reserve FILL ring! addr=0x%lx lost!\n",
+                   deferred_refill_count, umem_addr);
+        }
+    }
+
+    /**
      * Get a free TX frame for writing
      *
      * Returns a frame reference that can be written to directly.

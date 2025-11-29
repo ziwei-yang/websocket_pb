@@ -4,8 +4,7 @@
 // This BIO bridges OpenSSL with transport policies that implement
 // userspace TCP/IP stacks (e.g., XDPUserspaceTransport).
 //
-// Unlike XDP_BIO which operates on raw UMEM frames, this BIO calls
-// the transport policy's send/recv methods which return TCP stream data.
+// Calls the transport policy's send/recv methods which return TCP stream data.
 //
 // Architecture:
 //   SSL_read()  → bio_read()  → transport.recv() → TCP stream data

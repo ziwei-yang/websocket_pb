@@ -297,6 +297,9 @@ public:
             xdp_.set_local_ip(local_ip_str);
         }
 
+        // Set up zero-copy receive buffer callback
+        recv_buffer_.set_release_callback(frame_release_callback, this);
+
         printf("[XDP-Userspace] Initialized on %s\n", interface);
         printf("  Local IP:  %s\n", local_ip_str);
         printf("  Gateway:   %s\n", gateway_ip_str);
@@ -597,9 +600,15 @@ private:
                 break;
 
             case userspace_stack::TCPAction::DATA_RECEIVED:
-                // Append data to receive buffer
+                // Zero-copy: push frame reference to receive buffer
                 if (result.data && result.data_len > 0) {
-                    recv_buffer_.append(result.data, result.data_len);
+                    // Release RX ring but defer FILL ring refill
+                    uint64_t umem_addr = xdp_.release_rx_frame_deferred(frame);
+                    if (umem_addr != 0) {
+                        // Push frame ref - data stays in UMEM until SSL consumes it
+                        recv_buffer_.push_frame(result.data, result.data_len, umem_addr);
+                        frame = nullptr;  // Mark as handled (don't release again)
+                    }
                     tcp_params_.rcv_nxt += result.data_len;
                     send_ack();
                 }
@@ -630,7 +639,10 @@ private:
             tcp_params_.snd_wnd = parsed.window;
         }
 
-        xdp_.release_rx_frame(frame);
+        // Release frame if not already handled by zero-copy path
+        if (frame != nullptr) {
+            xdp_.release_rx_frame(frame);
+        }
     }
 
     // =========================================================================
@@ -738,13 +750,19 @@ private:
     userspace_stack::TCPParams tcp_params_;
     userspace_stack::TCPTimers timers_;
     userspace_stack::RetransmitQueue retransmit_queue_;
-    userspace_stack::ReceiveBuffer recv_buffer_;
+    userspace_stack::ZeroCopyReceiveBuffer recv_buffer_;  // Zero-copy: holds UMEM frame refs
 
     // Connection state
     bool connected_;
 
     // Current TX frame
     websocket::xdp::XDPFrame* current_tx_frame_ = nullptr;
+
+    // Static callback for releasing frames from ZeroCopyReceiveBuffer
+    static void frame_release_callback(uint64_t umem_addr, void* user_data) {
+        auto* self = static_cast<XDPUserspaceTransport*>(user_data);
+        self->xdp_.refill_frame(umem_addr);
+    }
 };
 #endif  // USE_XDP
 

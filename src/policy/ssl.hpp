@@ -9,7 +9,6 @@
 // All policies conform to the SSLPolicyConcept interface:
 //   - void init()
 //   - void handshake(int fd)                              // BSD socket mode
-//   - void handshake_xdp_transport(XDPTransport*)         // XDP zero-copy mode
 //   - void handshake_userspace_transport(TransportPolicy*) // Userspace TCP mode
 //   - ssize_t read(void* buf, size_t len)
 //   - ssize_t write(const void* buf, size_t len)
@@ -45,12 +44,6 @@
     #include <openssl/ssl.h>
     #include <openssl/err.h>
     #include <openssl/bio.h>
-#endif
-
-// Forward declarations for transport layers (only when enabled)
-#ifdef USE_XDP
-namespace websocket { namespace xdp { class XDPTransport; } }
-#include "../xdp/xdp_bio.hpp"
 #endif
 
 // Forward declaration for userspace transport BIO
@@ -192,79 +185,6 @@ struct OpenSSLPolicy {
         }
         #endif
     }
-
-    /**
-     * Perform TLS handshake over XDP transport with zero-copy BIO
-     *
-     * Uses custom XDP_BIO that operates directly on UMEM frames via the
-     * zero-copy frame API (peek_rx_frame, get_tx_frame), enabling true
-     * zero-copy encryption/decryption.
-     *
-     * This replaces the broken socket-based approach that bypassed XDP rings.
-     *
-     * @param transport XDP transport instance
-     * @throws std::runtime_error on handshake failure
-     */
-#ifdef USE_XDP
-    void handshake_xdp_transport(websocket::xdp::XDPTransport* transport) {
-        if (!transport) {
-            throw std::runtime_error("XDP transport is null");
-        }
-
-        ssl_ = SSL_new(ctx_);
-        if (!ssl_) {
-            throw std::runtime_error("SSL_new() failed");
-        }
-
-        // Create custom BIO for XDP transport (zero-copy)
-        BIO_METHOD* bio_method = websocket::xdp::XDP_BIO::create_bio_method();
-        if (!bio_method) {
-            throw std::runtime_error("Failed to create XDP BIO method");
-        }
-
-        BIO* bio = websocket::xdp::XDP_BIO::create_bio(bio_method, transport);
-        if (!bio) {
-            BIO_meth_free(bio_method);
-            throw std::runtime_error("Failed to create XDP BIO");
-        }
-
-        // Associate XDP BIO with SSL object (replaces socket FD)
-        SSL_set_bio(ssl_, bio, bio);
-
-        // Perform TLS handshake (non-blocking, polling-based)
-        int max_retries = 100;
-        int retries = 0;
-
-        while (retries < max_retries) {
-            int ret = SSL_do_handshake(ssl_);
-
-            if (ret == 1) {
-                // Handshake successful
-                ktls_enabled_ = false;  // kTLS not compatible with custom BIO
-                BIO_meth_free(bio_method);
-                printf("[XDP] SSL handshake complete (using XDP_BIO zero-copy)\n");
-                return;
-            }
-
-            int err = SSL_get_error(ssl_, ret);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                // Would block, retry after brief sleep
-                usleep(1000);  // 1ms
-                retries++;
-                continue;
-            }
-
-            // Fatal error
-            char err_buf[256];
-            ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
-            BIO_meth_free(bio_method);
-            throw std::runtime_error(std::string("XDP SSL handshake failed: ") + err_buf);
-        }
-
-        BIO_meth_free(bio_method);
-        throw std::runtime_error("XDP SSL handshake timeout");
-    }
-#endif  // USE_XDP
 
     /**
      * Perform TLS handshake over userspace transport
@@ -606,75 +526,6 @@ struct LibreSSLPolicy {
     }
 
     /**
-     * Perform TLS handshake over XDP transport with zero-copy BIO
-     *
-     * LibreSSL version - uses same XDP_BIO approach as OpenSSL (API compatible).
-     * Enables true zero-copy encryption/decryption via UMEM frames.
-     *
-     * @param transport XDP transport instance
-     * @throws std::runtime_error on handshake failure
-     */
-#ifdef USE_XDP
-    void handshake_xdp_transport(websocket::xdp::XDPTransport* transport) {
-        if (!transport) {
-            throw std::runtime_error("XDP transport is null");
-        }
-
-        ssl_ = SSL_new(ctx_);
-        if (!ssl_) {
-            throw std::runtime_error("SSL_new() failed");
-        }
-
-        // Create custom BIO for XDP transport (zero-copy)
-        BIO_METHOD* bio_method = websocket::xdp::XDP_BIO::create_bio_method();
-        if (!bio_method) {
-            throw std::runtime_error("Failed to create XDP BIO method");
-        }
-
-        BIO* bio = websocket::xdp::XDP_BIO::create_bio(bio_method, transport);
-        if (!bio) {
-            BIO_meth_free(bio_method);
-            throw std::runtime_error("Failed to create XDP BIO");
-        }
-
-        // Associate XDP BIO with SSL object
-        SSL_set_bio(ssl_, bio, bio);
-
-        // Perform TLS handshake (non-blocking, polling-based)
-        int max_retries = 100;
-        int retries = 0;
-
-        while (retries < max_retries) {
-            int ret = SSL_do_handshake(ssl_);
-
-            if (ret == 1) {
-                // Handshake successful
-                BIO_meth_free(bio_method);
-                printf("[XDP] SSL handshake complete (LibreSSL + XDP_BIO zero-copy)\n");
-                return;
-            }
-
-            int err = SSL_get_error(ssl_, ret);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                // Would block, retry
-                usleep(1000);  // 1ms
-                retries++;
-                continue;
-            }
-
-            // Fatal error
-            char err_buf[256];
-            ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
-            BIO_meth_free(bio_method);
-            throw std::runtime_error(std::string("XDP SSL handshake failed: ") + err_buf);
-        }
-
-        BIO_meth_free(bio_method);
-        throw std::runtime_error("XDP SSL handshake timeout");
-    }
-#endif  // USE_XDP
-
-    /**
      * Read decrypted data from SSL connection
      *
      * @param buf Buffer to store data
@@ -896,31 +747,6 @@ struct WolfSSLPolicy {
             throw std::runtime_error(std::string("wolfSSL_connect() failed: ") + err_buf);
         }
     }
-
-    /**
-     * Perform TLS handshake over XDP transport
-     *
-     * XDP uses kernel TCP/IP stack and provides a regular socket FD,
-     * so it works with WolfSSL (unlike DPDK which requires custom I/O callbacks).
-     *
-     * @param transport XDP transport instance
-     * @throws std::runtime_error on handshake failure
-     */
-#ifdef USE_XDP
-    void handshake_xdp_transport(websocket::xdp::XDPTransport* transport) {
-        if (!transport) {
-            throw std::runtime_error("XDP transport is null");
-        }
-
-        int fd = transport->get_fd();
-        if (fd < 0) {
-            throw std::runtime_error("XDP transport has invalid FD");
-        }
-
-        // Use regular handshake since XDP uses kernel TCP/IP stack
-        handshake(fd);
-    }
-#endif  // USE_XDP
 
     /**
      * Read decrypted data from SSL connection

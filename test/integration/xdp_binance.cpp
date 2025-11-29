@@ -1,0 +1,355 @@
+// test/integration/xdp_binance.cpp
+// XDP + Userspace TCP + SSL + WebSocket Integration Test
+//
+// Policy-Based Design Architecture:
+//   Application → TransportPolicy (XDPUserspaceTransport) → SSLPolicy → WebSocket
+//
+// This test validates complete kernel bypass using:
+//   - XDP driver mode (native)
+//   - Userspace TCP/IP stack
+//   - SSL/TLS over userspace TCP
+//   - WebSocket protocol
+//
+// Target: wss://stream.binance.com:443/stream?streams=btcusdt@trade
+//
+// Requirements:
+//   - Root or CAP_NET_RAW + CAP_BPF
+//   - XDP-capable NIC (e.g., Intel I225/I226)
+//   - Compile with USE_XDP=1
+
+#include "../../src/policy/transport.hpp"
+#include "../../src/policy/ssl.hpp"
+#include "../../src/core/http.hpp"
+#include "../../src/core/timing.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <atomic>
+#include <unistd.h>
+#include <vector>
+#include <netdb.h>
+#include <arpa/inet.h>
+
+using namespace websocket::transport;
+using namespace websocket::ssl;
+using namespace websocket::http;
+
+// Test configuration
+constexpr const char* BINANCE_HOST = "stream.binance.com";
+constexpr uint16_t BINANCE_PORT = 443;
+constexpr const char* BINANCE_PATH = "/stream?streams=btcusdt@trade";
+
+// Global test state
+std::atomic<bool> test_complete{false};
+std::atomic<int> message_count{0};
+constexpr int MAX_MESSAGES = 5;
+
+/**
+ * Resolve hostname to list of IP addresses
+ */
+std::vector<std::string> resolve_hostname(const char* hostname) {
+    std::vector<std::string> ips;
+
+    struct addrinfo hints = {};
+    struct addrinfo* result = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int ret = getaddrinfo(hostname, nullptr, &hints, &result);
+    if (ret != 0 || !result) {
+        if (result) freeaddrinfo(result);
+        return ips;
+    }
+
+    for (struct addrinfo* p = result; p != nullptr; p = p->ai_next) {
+        if (p->ai_family == AF_INET) {
+            auto* addr = reinterpret_cast<struct sockaddr_in*>(p->ai_addr);
+            char ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
+            ips.push_back(ip_str);
+        }
+    }
+
+    freeaddrinfo(result);
+    return ips;
+}
+
+/**
+ * Main test: XDP + Userspace TCP + SSL + WebSocket
+ */
+int main(int argc, char** argv) {
+    printf("╔════════════════════════════════════════════════════════════════════╗\n");
+    printf("║    XDP Userspace TCP + SSL + WebSocket (Policy-Based Design)      ║\n");
+    printf("╚════════════════════════════════════════════════════════════════════╝\n\n");
+    printf("Target: wss://%s:%u%s\n", BINANCE_HOST, BINANCE_PORT, BINANCE_PATH);
+    printf("Architecture: XDP (native driver) + Userspace TCP/IP + OpenSSL\n\n");
+
+    // Parse interface from command line (default: enp108s0)
+    const char* interface = "enp108s0";
+    if (argc > 1) {
+        interface = argv[1];
+    }
+
+    try {
+        // ═══════════════════════════════════════════════════════════════════════
+        // Phase 1: Transport Initialization (XDP + Userspace TCP)
+        // ═══════════════════════════════════════════════════════════════════════
+        printf("📦 Phase 1: XDP + Userspace TCP Initialization\n");
+        printf("─────────────────────────────────────────────────────────────────\n");
+
+        XDPUserspaceTransport transport;
+        transport.init(interface, "src/xdp/bpf/exchange_filter.bpf.o");
+
+        // Configure BPF filter for Binance
+        printf("  Resolving Binance IPs...\n");
+        auto binance_ips = resolve_hostname(BINANCE_HOST);
+        printf("  Found %zu IP(s): ", binance_ips.size());
+        for (size_t i = 0; i < binance_ips.size(); i++) {
+            printf("%s%s", binance_ips[i].c_str(), (i < binance_ips.size() - 1) ? ", " : "\n");
+            transport.add_exchange_ip(binance_ips[i].c_str());
+        }
+        transport.add_exchange_port(BINANCE_PORT);
+        printf("  ✅ BPF filter configured\n");
+
+        // Verify XDP driver mode
+        printf("\n  ╔══════════════════════════════════════════════════════════════╗\n");
+        printf("  ║             XDP MODE VERIFICATION                           ║\n");
+        printf("  ╚══════════════════════════════════════════════════════════════╝\n");
+        printf("  Interface:  %s\n", transport.get_interface());
+        printf("  Queue:      %u\n", transport.get_queue_id());
+        printf("  XDP Mode:   %s\n", transport.get_xdp_mode());
+        printf("  BPF Filter: %s\n", transport.is_bpf_enabled() ? "✅ ENABLED" : "❌ DISABLED");
+        printf("  ╚══════════════════════════════════════════════════════════════╝\n\n");
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // Phase 2: TCP Connection (Userspace 3-Way Handshake)
+        // ═══════════════════════════════════════════════════════════════════════
+        printf("📡 Phase 2: Userspace TCP Connection\n");
+        printf("─────────────────────────────────────────────────────────────────\n");
+
+        transport.connect(BINANCE_HOST, BINANCE_PORT);
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // Phase 3: SSL/TLS Handshake (Policy-Based!)
+        // ═══════════════════════════════════════════════════════════════════════
+        printf("🔒 Phase 3: SSL/TLS Handshake\n");
+        printf("─────────────────────────────────────────────────────────────────\n");
+
+        OpenSSLPolicy ssl;
+        ssl.init();
+
+        printf("  Performing TLS handshake over userspace TCP...\n");
+        // ✨ CLEAN POLICY-BASED DESIGN - One line!
+        ssl.handshake_userspace_transport(&transport);
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // Phase 4: HTTP WebSocket Upgrade
+        // ═══════════════════════════════════════════════════════════════════════
+        printf("🌐 Phase 4: HTTP WebSocket Upgrade\n");
+        printf("─────────────────────────────────────────────────────────────────\n");
+
+        // Build upgrade request
+        std::vector<std::pair<std::string, std::string>> headers;
+        char upgrade_req[2048];
+        size_t req_len = build_websocket_upgrade_request(
+            BINANCE_HOST, BINANCE_PATH, headers, upgrade_req, sizeof(upgrade_req)
+        );
+
+        printf("  Sending HTTP upgrade request (%zu bytes)...\n", req_len);
+
+        // Send upgrade request with polling
+        size_t total_sent = 0;
+        while (total_sent < req_len) {
+            transport.poll();
+            ssize_t sent = ssl.write(upgrade_req + total_sent, req_len - total_sent);
+            if (sent > 0) {
+                total_sent += sent;
+            } else if (sent < 0 && errno != EAGAIN) {
+                throw std::runtime_error("Failed to send upgrade request");
+            }
+            usleep(1000);
+        }
+        printf("  ✅ Upgrade request sent\n");
+
+        // Receive upgrade response
+        printf("  Waiting for HTTP 101 response...\n");
+        uint8_t response_buf[4096];
+        bool response_validated = false;
+        int poll_attempts = 0;
+        int max_attempts = 1000;
+
+        while (poll_attempts < max_attempts && !response_validated) {
+            transport.poll();
+            ssize_t received = ssl.read(response_buf, sizeof(response_buf));
+
+            if (received > 0) {
+                if (validate_http_upgrade_response(response_buf, received)) {
+                    printf("  ✅ HTTP 101 Switching Protocols validated\n\n");
+                    response_validated = true;
+                    break;
+                }
+            } else if (received < 0 && errno != EAGAIN) {
+                throw std::runtime_error("SSL read error");
+            }
+
+            usleep(1000);
+            poll_attempts++;
+        }
+
+        if (!response_validated) {
+            throw std::runtime_error("Failed to receive valid HTTP upgrade response");
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // Phase 5: WebSocket Message Streaming
+        // ═══════════════════════════════════════════════════════════════════════
+        printf("💬 Phase 5: WebSocket Message Streaming\n");
+        printf("─────────────────────────────────────────────────────────────────\n\n");
+
+        uint8_t frame_buffer[65536];
+        size_t buffer_offset = 0;
+        int ping_count = 0;
+        int pong_sent = 0;
+
+        while (message_count < MAX_MESSAGES) {
+            // Poll transport
+            transport.poll();
+
+            // Read more data from SSL
+            ssize_t read_len = ssl.read(frame_buffer + buffer_offset,
+                                         sizeof(frame_buffer) - buffer_offset);
+
+            if (read_len > 0) {
+                buffer_offset += read_len;
+
+                // Parse all complete frames in buffer
+                size_t consumed = 0;
+                while (consumed < buffer_offset) {
+                    WebSocketFrame frame;
+                    if (!parse_websocket_frame(frame_buffer + consumed,
+                                                 buffer_offset - consumed, frame)) {
+                        break;  // Incomplete frame
+                    }
+
+                    size_t total_frame_size = frame.header_len + frame.payload_len;
+
+                    // Handle different frame types
+                    if (frame.opcode == 0x01) {  // TEXT
+                        printf("  📨 Message #%d (%lu bytes)\n", message_count.load() + 1, frame.payload_len);
+                        printf("     Data: %.120s%s\n",
+                               frame.payload,
+                               frame.payload_len > 120 ? "..." : "");
+                        message_count++;
+
+                    } else if (frame.opcode == 0x09) {  // PING
+                        printf("  🏓 PING received - sending PONG\n");
+                        ping_count++;
+
+                        uint8_t pong_frame[256];
+                        uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78};
+                        size_t pong_len = build_pong_frame(frame.payload, frame.payload_len,
+                                                            pong_frame, mask);
+
+                        // Send PONG with polling
+                        size_t pong_total = 0;
+                        while (pong_total < pong_len) {
+                            transport.poll();
+                            ssize_t pong_sent_bytes = ssl.write(pong_frame + pong_total,
+                                                                  pong_len - pong_total);
+                            if (pong_sent_bytes > 0) {
+                                pong_total += pong_sent_bytes;
+                            }
+                            usleep(100);
+                        }
+                        pong_sent++;
+
+                    } else if (frame.opcode == 0x08) {  // CLOSE
+                        printf("  🚪 CLOSE frame received\n");
+                        test_complete = true;
+                        break;
+                    }
+
+                    consumed += total_frame_size;
+                }
+
+                // Shift remaining data
+                if (consumed > 0 && consumed < buffer_offset) {
+                    memmove(frame_buffer, frame_buffer + consumed, buffer_offset - consumed);
+                    buffer_offset -= consumed;
+                } else if (consumed == buffer_offset) {
+                    buffer_offset = 0;
+                }
+
+                if (test_complete) break;
+
+            } else if (read_len < 0 && errno != EAGAIN) {
+                throw std::runtime_error("SSL read error during streaming");
+            }
+
+            usleep(1000);
+        }
+
+        printf("\n");
+        printf("─────────────────────────────────────────────────────────────────\n");
+        printf("  ✅ WebSocket streaming complete\n");
+        printf("     Messages: %d\n", message_count.load());
+        printf("     PINGs: %d, PONGs: %d\n", ping_count, pong_sent);
+        printf("\n");
+
+        // Display BPF statistics
+        printf("📊 BPF Packet Statistics\n");
+        printf("─────────────────────────────────────────────────────────────────\n");
+        transport.print_bpf_stats();
+        printf("\n");
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // Cleanup
+        // ═══════════════════════════════════════════════════════════════════════
+        printf("🧹 Cleanup\n");
+        printf("─────────────────────────────────────────────────────────────────\n");
+        ssl.shutdown();
+        transport.close();
+        printf("  ✅ Cleanup complete\n\n");
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // Test Summary
+        // ═══════════════════════════════════════════════════════════════════════
+        printf("╔════════════════════════════════════════════════════════════════════╗\n");
+        printf("║                      TEST PASSED ✅                                ║\n");
+        printf("╚════════════════════════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("All phases completed successfully:\n");
+        printf("  ✅ XDP + Userspace TCP initialization\n");
+        printf("  ✅ Userspace TCP 3-way handshake\n");
+        printf("  ✅ SSL/TLS handshake over userspace TCP (policy-based)\n");
+        printf("  ✅ HTTP WebSocket upgrade\n");
+        printf("  ✅ WebSocket message streaming\n");
+        printf("\n");
+        printf("🎉 Complete kernel bypass achieved!\n");
+        printf("   XDP (native driver) + Userspace TCP/IP + SSL/TLS\n");
+        printf("\n");
+        printf("✨ Clean policy-based design demonstrated:\n");
+        printf("   ssl.handshake_userspace_transport(&transport);\n");
+        printf("\n");
+
+        return 0;
+
+    } catch (const std::exception& e) {
+        printf("\n");
+        printf("╔════════════════════════════════════════════════════════════════════╗\n");
+        printf("║                      TEST FAILED ❌                                ║\n");
+        printf("╚════════════════════════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("Error: %s\n\n", e.what());
+
+        printf("Common issues:\n");
+        printf("  - Permission denied: Run with sudo\n");
+        printf("  - Interface not found: Specify correct interface (e.g., ./xdp_binance enp108s0)\n");
+        printf("  - XDP not supported: Ensure NIC supports XDP native mode\n");
+        printf("  - Gateway not reachable: Check network configuration\n");
+        printf("\n");
+
+        return 1;
+    }
+}
