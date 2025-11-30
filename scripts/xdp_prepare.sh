@@ -71,6 +71,27 @@ set_nic_queue() {
     fi
 }
 
+# Enable hardware timestamping for XDP metadata kfuncs
+enable_hw_timestamp() {
+    echo "Enabling NIC hardware timestamping..."
+
+    # Check if hwstamp_ctl is available
+    if ! command -v hwstamp_ctl &>/dev/null; then
+        print_warning "hwstamp_ctl not found. Install linuxptp package for HW timestamps."
+        return 0
+    fi
+
+    # Enable RX hardware timestamping (rx_filter=1 = HWTSTAMP_FILTER_ALL)
+    local output=$(sudo hwstamp_ctl -i "$IFACE" -r 1 2>&1)
+    local new_filter=$(echo "$output" | grep "rx_filter" | tail -1 | awk '{print $2}')
+
+    if [[ "$new_filter" == "1" ]]; then
+        print_status "Hardware RX timestamping enabled (rx_filter=1)"
+    else
+        print_warning "Could not enable hardware timestamping (rx_filter=$new_filter)"
+    fi
+}
+
 # Detach any existing XDP program
 detach_xdp() {
     echo "Detaching any existing XDP program..."
@@ -137,15 +158,56 @@ show_nic_info() {
     echo ""
 }
 
+# Start NIC clock sync daemon (syncs CPU CLOCK_REALTIME → NIC PHC)
+start_clock_sync() {
+    echo "Starting NIC clock sync daemon..."
+
+    # Find PHC device for this interface
+    local phc_device=""
+    for ptp in /sys/class/ptp/ptp*; do
+        if [[ -d "$ptp/device/net" ]]; then
+            local ptp_iface=$(ls "$ptp/device/net/" 2>/dev/null | head -n 1)
+            if [[ "$ptp_iface" == "$IFACE" ]]; then
+                local ptp_num=$(basename "$ptp" | sed 's/ptp//')
+                phc_device="/dev/ptp${ptp_num}"
+                break
+            fi
+        fi
+    done
+
+    if [[ -z "$phc_device" ]]; then
+        print_warning "Could not find PHC device for $IFACE. Clock sync skipped."
+        return 0
+    fi
+
+    # Check if nic_local_clock_sync.sh exists
+    local script_dir="$(dirname "$0")"
+    local sync_script="${script_dir}/nic_local_clock_sync.sh"
+
+    if [[ ! -x "$sync_script" ]]; then
+        print_warning "Clock sync script not found: $sync_script"
+        return 0
+    fi
+
+    # Start the clock sync daemon
+    if "$sync_script" start "$phc_device" 2>/dev/null; then
+        print_status "Clock sync daemon started (CPU → $phc_device)"
+    else
+        print_warning "Failed to start clock sync daemon"
+    fi
+}
+
 # Main
 print_header
 check_interface
 check_root
 check_xdp_support
 set_nic_queue
+enable_hw_timestamp
 detach_xdp
 check_bpf_object
 show_nic_info
+start_clock_sync
 
 print_status "XDP preparation complete for $IFACE"
 echo ""

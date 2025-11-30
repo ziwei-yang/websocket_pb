@@ -1,9 +1,14 @@
 // src/xdp/bpf/exchange_filter.bpf.c
-// eBPF program to filter exchange traffic to AF_XDP socket
+// eBPF program to filter exchange traffic to AF_XDP socket with NIC hardware timestamps
 //
 // This program runs in the kernel at the XDP hook (earliest possible point).
 // It parses packets and redirects exchange traffic to AF_XDP socket while
 // passing other traffic (SSH, DNS, HTTP) to the kernel network stack.
+//
+// NIC Hardware Timestamps:
+// - Uses bpf_xdp_metadata_rx_timestamp() kfunc to get NIC RX timestamp
+// - Requires BPF_F_XDP_DEV_BOUND_ONLY flag when loading (kernel 6.3+, igc support 6.5+)
+// - Stores timestamp in XDP metadata area before packet data
 //
 // Compile with:
 //   clang -O2 -g -target bpf -D__TARGET_ARCH_x86_64 -I/usr/include/bpf -c exchange_filter.bpf.c -o exchange_filter.bpf.o
@@ -15,6 +20,19 @@
 #include <linux/in.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+
+// XDP metadata kfunc (kernel 6.3+)
+// Requires BPF_F_XDP_DEV_BOUND_ONLY flag when loading
+extern int bpf_xdp_metadata_rx_timestamp(const struct xdp_md *ctx, __u64 *timestamp) __ksym;
+
+// XDP metadata structure stored before packet data
+// After bpf_xdp_adjust_meta(), this structure is placed in the metadata area.
+// Layout in UMEM: [xdp_user_metadata][packet data]
+//                 ^                  ^
+//                 data_meta          data
+struct xdp_user_metadata {
+    __u64 rx_timestamp_ns;   // Hardware RX timestamp (nanoseconds, 0 if unavailable)
+};
 
 // BPF Map: AF_XDP socket map for XDP_REDIRECT
 // Key: queue_id, Value: xsk file descriptor
@@ -71,6 +89,8 @@ struct {
 #define STAT_NON_TCP_PACKETS    7
 #define STAT_INCOMING_CHECK     8  // Incoming packets (dst_ip = local_ip)
 #define STAT_IP_MATCH           9  // Exchange IP+port matched
+#define STAT_TIMESTAMP_OK      10  // HW timestamp extracted successfully
+#define STAT_TIMESTAMP_FAIL    11  // HW timestamp extraction failed
 
 // Helper to increment statistics
 static __always_inline void inc_stat(__u32 index) {
@@ -201,6 +221,35 @@ int exchange_packet_filter(struct xdp_md *ctx) {
 
     // Increment total packet counter
     inc_stat(STAT_TOTAL_PACKETS);
+
+    // Step 1: Create metadata area for storing HW timestamp
+    // Kernel fix 714070c4cb7a enables device-bound programs to redirect to XSKMAP
+#if 1
+    ret = bpf_xdp_adjust_meta(ctx, -(int)sizeof(struct xdp_user_metadata));
+    if (ret == 0) {
+        // Metadata area created successfully
+        void *data = (void *)(long)ctx->data;
+        void *data_meta = (void *)(long)ctx->data_meta;
+
+        // Verify metadata area is valid
+        struct xdp_user_metadata *meta = data_meta;
+        if ((void *)(meta + 1) <= data) {
+            // Step 2: Extract hardware RX timestamp from NIC
+            __u64 timestamp = 0;
+            ret = bpf_xdp_metadata_rx_timestamp(ctx, &timestamp);
+
+            if (ret == 0 && timestamp != 0) {
+                // Success - store timestamp in metadata area
+                meta->rx_timestamp_ns = timestamp;
+                inc_stat(STAT_TIMESTAMP_OK);
+            } else {
+                // Failed or not available - store 0
+                meta->rx_timestamp_ns = 0;
+                inc_stat(STAT_TIMESTAMP_FAIL);
+            }
+        }
+    }
+#endif
 
     // Parse Ethernet header
     ret = parse_ethernet(ctx, &pctx);

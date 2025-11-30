@@ -28,7 +28,6 @@ benchmark_results/
 *.csv
 
 # Core dumps
-core
 core.*
 
 # Temporary files

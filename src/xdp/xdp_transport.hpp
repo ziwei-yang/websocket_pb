@@ -358,8 +358,18 @@ public:
         // Setup rx_frame_ directly from descriptor (no FramePool lookup needed)
         uint64_t base_addr = rx_desc->addr & ~(config_.frame_size - 1);
         rx_frame_.addr = base_addr;
+
+        // BPF program uses bpf_xdp_adjust_meta() to store timestamp before packet data
+        // Layout: [xdp_user_metadata (8 bytes)][packet data]
+        //         ^                            ^
+        //         data_meta                    data (rx_desc->addr)
+        // The timestamp is stored at rx_desc->addr - 8 (sizeof(__u64))
         rx_frame_.data = (uint8_t*)umem_area_ + rx_desc->addr;
         rx_frame_.len = rx_desc->len;
+
+        // Read hardware timestamp from metadata area (8 bytes before packet data)
+        uint64_t* ts_ptr = (uint64_t*)((uint8_t*)umem_area_ + rx_desc->addr - 8);
+        rx_frame_.hw_timestamp_ns = *ts_ptr;
         rx_frame_.capacity = config_.frame_size - XDP_HEADROOM;
         rx_frame_.offset = 0;
         rx_frame_.owned = true;

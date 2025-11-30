@@ -9,7 +9,14 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <linux/if_link.h>
+#include <linux/bpf.h>
 #include <net/if.h>
+
+// BPF_F_XDP_DEV_BOUND_ONLY flag for device-bound XDP programs
+// Required for XDP metadata kfuncs (bpf_xdp_metadata_rx_timestamp, etc.)
+#ifndef BPF_F_XDP_DEV_BOUND_ONLY
+#define BPF_F_XDP_DEV_BOUND_ONLY (1U << 6)
+#endif
 #include <string>
 #include <vector>
 #include <cstring>
@@ -29,6 +36,10 @@ enum BPFStat {
     STAT_IPV4_PACKETS = 5,
     STAT_TCP_PACKETS = 6,
     STAT_NON_TCP_PACKETS = 7,
+    STAT_INCOMING_CHECK = 8,
+    STAT_IP_MATCH = 9,
+    STAT_TIMESTAMP_OK = 10,
+    STAT_TIMESTAMP_FAIL = 11,
 };
 
 struct BPFStats {
@@ -40,6 +51,8 @@ struct BPFStats {
     uint64_t ipv4_packets;
     uint64_t tcp_packets;
     uint64_t non_tcp_packets;
+    uint64_t timestamp_ok;
+    uint64_t timestamp_fail;
 };
 
 class BPFLoader {
@@ -91,26 +104,25 @@ public:
             throw std::runtime_error("BPFLoader: Failed to open BPF object file");
         }
 
-        // Note: We do NOT set ifindex here (device-bound programs)
-        // The standard exchange_filter.bpf.o works without device binding
-        // Only programs with metadata kfuncs need device binding, but those
-        // aren't supported by igc driver yet, so we skip ifindex setting
+        // Find the XDP program first (before loading)
+        bpf_prog_ = bpf_object__find_program_by_name(bpf_obj_, "exchange_packet_filter");
+        if (!bpf_prog_) {
+            bpf_object__close(bpf_obj_);
+            bpf_obj_ = nullptr;
+            throw std::runtime_error("BPFLoader: Failed to find XDP program 'exchange_packet_filter'");
+        }
+
+        // Device-bound loading for XDP metadata kfuncs (bpf_xdp_metadata_rx_timestamp)
+        // Requires kernel 6.3+ with fix 714070c4cb7a for XDP_REDIRECT to XSKMAP
+        bpf_program__set_ifindex(bpf_prog_, ifindex_);
+        bpf_program__set_flags(bpf_prog_, BPF_F_XDP_DEV_BOUND_ONLY);
+        printf("[BPF] Device-bound loading ENABLED (ifindex=%d)\n", ifindex_);
 
         // Load BPF program into kernel
         if (bpf_object__load(bpf_obj_)) {
             bpf_object__close(bpf_obj_);
             bpf_obj_ = nullptr;
             throw std::runtime_error("BPFLoader: Failed to load BPF program into kernel");
-        }
-
-        // Find the XDP program (try timestamp version first, then fall back to standard)
-        bpf_prog_ = bpf_object__find_program_by_name(bpf_obj_, "exchange_packet_filter_ts");
-        if (!bpf_prog_) {
-            bpf_prog_ = bpf_object__find_program_by_name(bpf_obj_, "exchange_packet_filter");
-        }
-        if (!bpf_prog_) {
-            cleanup();
-            throw std::runtime_error("BPFLoader: Failed to find XDP program (tried 'exchange_packet_filter_ts' and 'exchange_packet_filter')");
         }
 
         prog_fd_ = bpf_program__fd(bpf_prog_);
@@ -427,6 +439,16 @@ public:
             stats.non_tcp_packets = value;
         }
 
+        key = STAT_TIMESTAMP_OK;
+        if (bpf_map_lookup_elem(stats_fd_, &key, &value) == 0) {
+            stats.timestamp_ok = value;
+        }
+
+        key = STAT_TIMESTAMP_FAIL;
+        if (bpf_map_lookup_elem(stats_fd_, &key, &value) == 0) {
+            stats.timestamp_fail = value;
+        }
+
         return stats;
     }
 
@@ -447,6 +469,8 @@ public:
         printf("  Non-TCP packets:   %lu\n", stats.non_tcp_packets);
         printf("  Parse errors:      %lu\n", stats.parse_errors);
         printf("  Dropped packets:   %lu\n", stats.dropped_packets);
+        printf("  HW timestamp OK:   %lu\n", stats.timestamp_ok);
+        printf("  HW timestamp fail: %lu\n", stats.timestamp_fail);
     }
 
     // Get map FDs (for advanced usage)

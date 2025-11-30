@@ -372,6 +372,7 @@ public:
         , stack_()
         , state_(userspace_stack::TCPState::CLOSED)
         , connected_(false)
+        , last_rx_hw_timestamp_ns_(0)
     {}
 
     ~XDPUserspaceTransport() {
@@ -697,6 +698,12 @@ public:
     bool is_bpf_enabled() const { return xdp_.is_bpf_enabled(); }
     void print_bpf_stats() const { xdp_.print_bpf_stats(); }
 
+    /**
+     * Get last RX hardware timestamp (Stage 1)
+     * @return Hardware timestamp in nanoseconds (CLOCK_MONOTONIC domain), 0 if unavailable
+     */
+    uint64_t get_last_rx_hw_timestamp() const { return last_rx_hw_timestamp_ns_; }
+
 private:
     // =========================================================================
     // PACKET SENDING (uses stack's pure packet building)
@@ -757,6 +764,11 @@ private:
     void poll_rx_and_process() {
         websocket::xdp::XDPFrame* frame = xdp_.peek_rx_frame();
         if (!frame) return;
+
+        // Stage 1: Capture hardware timestamp from XDP metadata
+        if (frame->hw_timestamp_ns > 0) {
+            last_rx_hw_timestamp_ns_ = frame->hw_timestamp_ns;
+        }
 
         // Parse the TCP packet using stack's pure parsing
         auto parsed = stack_.parse_tcp(frame->data, frame->len,
@@ -940,6 +952,9 @@ private:
 
     // Connection state
     bool connected_;
+
+    // Stage 1: Hardware timestamp from NIC (nanoseconds)
+    uint64_t last_rx_hw_timestamp_ns_;
 
     // Polling configuration
     int poll_interval_us_ = 0;  // 0 = busy poll (default for HFT)

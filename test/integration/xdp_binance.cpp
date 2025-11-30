@@ -45,6 +45,9 @@ std::atomic<bool> test_complete{false};
 std::atomic<int> message_count{0};
 constexpr int MAX_MESSAGES = 5;
 
+// TSC frequency for timing conversion
+uint64_t g_tsc_freq_hz = 0;
+
 /**
  * Resolve hostname to list of IP addresses
  */
@@ -92,6 +95,13 @@ int main(int argc, char** argv) {
     }
 
     try {
+        // ═══════════════════════════════════════════════════════════════════════
+        // TSC Calibration (for timing measurements)
+        // ═══════════════════════════════════════════════════════════════════════
+        printf("⏱️  Calibrating CPU TSC frequency...\n");
+        g_tsc_freq_hz = calibrate_tsc_freq();
+        printf("✅ TSC frequency: %.2f GHz\n\n", g_tsc_freq_hz / 1e9);
+
         // ═══════════════════════════════════════════════════════════════════════
         // Phase 1: Transport Initialization (XDP + Userspace TCP)
         // ═══════════════════════════════════════════════════════════════════════
@@ -212,13 +222,32 @@ int main(int argc, char** argv) {
         int ping_count = 0;
         int pong_sent = 0;
 
+        // Timing record for each message
+        timing_record_t timing;
+        memset(&timing, 0, sizeof(timing));
+
         while (message_count < MAX_MESSAGES) {
-            // Poll transport
+            // Stage 2: Event loop start
+            timing.event_cycle = rdtsc();
+
+            // Poll transport (this captures Stage 1 HW timestamp internally)
             transport.poll();
+
+            // Stage 1: Get hardware timestamp from XDP metadata
+            timing.hw_timestamp_latest_ns = transport.get_last_rx_hw_timestamp();
+            if (timing.hw_timestamp_latest_ns > 0) {
+                timing.hw_timestamp_count = 1;
+            }
+
+            // Stage 3: Before SSL read
+            timing.recv_start_cycle = rdtsc();
 
             // Read more data from SSL
             ssize_t read_len = ssl.read(frame_buffer + buffer_offset,
                                          sizeof(frame_buffer) - buffer_offset);
+
+            // Stage 4: After SSL read
+            timing.recv_end_cycle = rdtscp();
 
             if (read_len > 0) {
                 buffer_offset += read_len;
@@ -232,14 +261,99 @@ int main(int argc, char** argv) {
                         break;  // Incomplete frame
                     }
 
+                    // Stage 5: Frame parsed
+                    timing.frame_parsed_cycle = rdtscp();
+
                     size_t total_frame_size = frame.header_len + frame.payload_len;
 
                     // Handle different frame types
                     if (frame.opcode == 0x01) {  // TEXT
-                        printf("  📨 Message #%d (%lu bytes)\n", message_count.load() + 1, frame.payload_len);
-                        printf("     Data: %.120s%s\n",
+                        // Stage 6: Callback entry
+                        uint64_t stage6_cycle = rdtscp();
+                        (void)get_monotonic_timestamp_ns();  // Reserved for future HW timestamp delta
+
+                        // Store frame info in timing record
+                        timing.payload_len = frame.payload_len;
+                        timing.opcode = frame.opcode;
+
+                        printf("\n  ╔════════════════════════════════════════════════════════════╗\n");
+                        printf("  ║ Message #%d (%lu bytes)                                    \n",
+                               message_count.load() + 1, frame.payload_len);
+                        printf("  ╚════════════════════════════════════════════════════════════╝\n");
+                        printf("  📨 Data: %.100s%s\n",
                                frame.payload,
-                               frame.payload_len > 120 ? "..." : "");
+                               frame.payload_len > 100 ? "..." : "");
+
+                        // Display timing breakdown
+                        printf("\n  ⏱️  Latency Breakdown (6 Stages):\n");
+                        printf("  ────────────────────────────────────────────────────────────\n");
+
+                        // Stage 1: Hardware timestamp from NIC
+                        // Note: bpf_xdp_metadata_rx_timestamp() returns CLOCK_REALTIME on igc driver
+                        if (timing.hw_timestamp_latest_ns > 0) {
+                            // Get current clocks for domain conversion
+                            struct timespec ts_real, ts_mono;
+                            clock_gettime(CLOCK_REALTIME, &ts_real);
+                            clock_gettime(CLOCK_MONOTONIC, &ts_mono);
+                            uint64_t realtime_now_ns = (uint64_t)ts_real.tv_sec * 1000000000ULL + ts_real.tv_nsec;
+                            uint64_t monotonic_now_ns = (uint64_t)ts_mono.tv_sec * 1000000000ULL + ts_mono.tv_nsec;
+
+                            // Convert HW timestamp from CLOCK_REALTIME to CLOCK_MONOTONIC
+                            int64_t hw_ts_mono_ns = (int64_t)timing.hw_timestamp_latest_ns -
+                                                    (int64_t)realtime_now_ns + (int64_t)monotonic_now_ns;
+
+                            printf("    [Stage 1] NIC HW timestamp: %.6f s (converted to MONOTONIC)\n",
+                                   hw_ts_mono_ns / 1e9);
+
+                            // Calculate Stage 1→2 latency (NIC → Event loop)
+                            // Convert stage2 to CLOCK_MONOTONIC using stage6 reference
+                            uint64_t stage2_to_6_ns = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz);
+                            int64_t stage2_mono_ns = (int64_t)monotonic_now_ns - (int64_t)stage2_to_6_ns;
+                            int64_t stage1_to_2_ns = stage2_mono_ns - hw_ts_mono_ns;
+                            printf("    [Stage 1→2] NIC→Event:      %.3f μs\n",
+                                   stage1_to_2_ns / 1000.0);
+                        } else {
+                            printf("    [Stage 1] NIC HW timestamp: N/A (not available)\n");
+                        }
+
+                        // Stage 2→3 (event loop overhead)
+                        if (timing.recv_start_cycle > timing.event_cycle) {
+                            uint64_t delta = timing.recv_start_cycle - timing.event_cycle;
+                            printf("    [Stage 2→3] Event→Recv:     %.3f μs\n",
+                                   cycles_to_ns(delta, g_tsc_freq_hz) / 1000.0);
+                        }
+
+                        // Stage 3→4 (SSL decryption)
+                        if (timing.recv_end_cycle > timing.recv_start_cycle) {
+                            uint64_t delta = timing.recv_end_cycle - timing.recv_start_cycle;
+                            printf("    [Stage 3→4] SSL decrypt:    %.3f μs\n",
+                                   cycles_to_ns(delta, g_tsc_freq_hz) / 1000.0);
+                        }
+
+                        // Stage 4→5 (WebSocket parsing)
+                        if (timing.frame_parsed_cycle > timing.recv_end_cycle) {
+                            uint64_t delta = timing.frame_parsed_cycle - timing.recv_end_cycle;
+                            printf("    [Stage 4→5] WS parse:       %.3f μs\n",
+                                   cycles_to_ns(delta, g_tsc_freq_hz) / 1000.0);
+                        }
+
+                        // Stage 5→6 (to callback)
+                        if (stage6_cycle > timing.frame_parsed_cycle) {
+                            uint64_t delta = stage6_cycle - timing.frame_parsed_cycle;
+                            printf("    [Stage 5→6] To callback:    %.3f μs\n",
+                                   cycles_to_ns(delta, g_tsc_freq_hz) / 1000.0);
+                        }
+
+                        // Total latency (Stage 2→6)
+                        if (stage6_cycle > timing.event_cycle) {
+                            uint64_t total = stage6_cycle - timing.event_cycle;
+                            printf("    ────────────────────────────────────────────────────────\n");
+                            printf("    [Total]     Event→Callback: %.3f μs\n",
+                                   cycles_to_ns(total, g_tsc_freq_hz) / 1000.0);
+                        }
+
+                        printf("  ────────────────────────────────────────────────────────────\n");
+
                         message_count++;
 
                     } else if (frame.opcode == 0x09) {  // PING
