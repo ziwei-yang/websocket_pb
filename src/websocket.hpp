@@ -74,6 +74,17 @@ inline constexpr bool is_fd_based_transport_v = is_fd_based_transport<T>::value;
 } // namespace traits
 } // namespace websocket
 
+// Forward declare XDPUserspaceTransport for trait specialization
+#ifdef USE_XDP
+namespace websocket { namespace transport { class XDPUserspaceTransport; } }
+
+// Explicit specialization: XDPUserspaceTransport is NOT fd-based (userspace transport)
+namespace websocket { namespace traits {
+template<>
+struct is_fd_based_transport<websocket::transport::XDPUserspaceTransport, void> : std::false_type {};
+} }
+#endif
+
 template<
     typename SSLPolicy_,
     typename TransportPolicy_,     // Unified transport (BSD+event or XDP)
@@ -96,6 +107,7 @@ public:
 
     WebSocketClient()
         : connected_(false)
+        , xdp_initialized_(false)
         , msg_count_(0)
     {
         rx_buffer_.init();  // Buffer initializes with its template parameter size
@@ -110,14 +122,87 @@ public:
         disconnect();
     }
 
+    /**
+     * Initialize XDP transport with interface and BPF filter configuration
+     *
+     * This method is only available when using XDP transport (USE_XDP=1).
+     * Must be called before connect() when using XDP mode.
+     *
+     * @param interface  Network interface name (e.g., "enp108s0")
+     * @param bpf_obj    Path to BPF object file (e.g., "src/xdp/bpf/exchange_filter.bpf.o")
+     * @param ip         Exchange IP address to filter (e.g., "54.250.108.226")
+     * @param port       Exchange port to filter (e.g., 443)
+     *
+     * Example:
+     *   client.init_xdp("enp108s0", "src/xdp/bpf/exchange_filter.bpf.o",
+     *                   "54.250.108.226", 443);
+     *   client.connect("stream.binance.com", 443, "/stream?streams=btcusdt@trade");
+     */
+    template<typename T = TransportPolicy_>
+    typename std::enable_if<!websocket::traits::is_fd_based_transport_v<T>, void>::type
+    init_xdp(const char* interface, const char* bpf_obj,
+             const char* ip, uint16_t port) {
+        printf("[XDP] Initializing AF_XDP transport...\n");
+        printf("[XDP]   Interface: %s\n", interface);
+        printf("[XDP]   BPF object: %s\n", bpf_obj);
+        printf("[XDP]   Filter IP: %s, Port: %u\n", ip, port);
+
+        // Initialize XDP transport with interface and BPF program
+        transport_.init(interface, bpf_obj);
+
+        // Configure BPF filter for exchange traffic
+        transport_.add_exchange_ip(ip);
+        transport_.add_exchange_port(port);
+
+        xdp_initialized_ = true;
+        printf("[XDP] Transport initialized successfully\n");
+    }
+
+    /**
+     * Initialize XDP transport with multiple exchange IPs
+     *
+     * Useful when an exchange resolves to multiple IP addresses.
+     */
+    template<typename T = TransportPolicy_>
+    typename std::enable_if<!websocket::traits::is_fd_based_transport_v<T>, void>::type
+    init_xdp(const char* interface, const char* bpf_obj,
+             const std::vector<std::string>& ips, uint16_t port) {
+        printf("[XDP] Initializing AF_XDP transport...\n");
+        printf("[XDP]   Interface: %s\n", interface);
+        printf("[XDP]   BPF object: %s\n", bpf_obj);
+        printf("[XDP]   Filter IPs: %zu addresses, Port: %u\n", ips.size(), port);
+
+        // Initialize XDP transport with interface and BPF program
+        transport_.init(interface, bpf_obj);
+
+        // Configure BPF filter for all exchange IPs
+        for (const auto& ip : ips) {
+            transport_.add_exchange_ip(ip.c_str());
+            printf("[XDP]     Added IP: %s\n", ip.c_str());
+        }
+        transport_.add_exchange_port(port);
+
+        xdp_initialized_ = true;
+        printf("[XDP] Transport initialized successfully\n");
+    }
+
     // Connect to WebSocket server with optional custom HTTP headers
     void connect(const char* host, uint16_t port, const char* path,
                  const HeaderMap& custom_headers = {}) {
         // Compile-time constant for transport type dispatch
         constexpr bool is_fd_based = websocket::traits::is_fd_based_transport_v<TransportPolicy_>;
 
-        // 1. Initialize transport (event loop for BSD, XDP resources for XDP)
-        transport_.init();
+        // 1. Initialize transport (skip if XDP was already initialized via init_xdp())
+        if constexpr (is_fd_based) {
+            // BSD sockets: always initialize here
+            transport_.init();
+        } else {
+            // XDP: must be initialized via init_xdp() first
+            if (!xdp_initialized_) {
+                throw std::runtime_error(
+                    "XDP transport not initialized. Call init_xdp() before connect()");
+            }
+        }
 
         // 2. TCP connect (kernel TCP for BSD, userspace TCP for XDP)
         transport_.connect(host, port);
@@ -207,6 +292,18 @@ public:
                 // Stage 1: Drain hardware RX timestamps from NIC/kernel queue
                 // Only applicable for BSD sockets (XDP has no kernel timestamps)
                 drain_hw_timestamps(fd, &timing_);
+            } else {
+                // Stage 1: Get hardware RX timestamps from XDP metadata
+                // XDP captures timestamp via bpf_xdp_metadata_rx_timestamp() kfunc
+                // For multi-packet messages, oldest = first packet, latest = most recent
+                uint32_t count = transport_.get_hw_timestamp_count();
+                if (count > 0) {
+                    timing_.hw_timestamp_oldest_ns = transport_.get_oldest_rx_hw_timestamp();
+                    timing_.hw_timestamp_latest_ns = transport_.get_latest_rx_hw_timestamp();
+                    timing_.hw_timestamp_count = count;
+                    // Reset for next message
+                    transport_.reset_hw_timestamps();
+                }
             }
 
             // Stage 2: Record CPU cycle when event loop processing starts
@@ -374,21 +471,73 @@ private:
     void send_http_upgrade(const char* host, const char* path,
                           const HeaderMap& custom_headers) {
         using namespace websocket::http;
+        constexpr bool is_fd_based = websocket::traits::is_fd_based_transport_v<TransportPolicy_>;
 
         char request[4096];
         size_t len = build_websocket_upgrade_request(host, path, custom_headers,
                                                        request, sizeof(request));
 
-        ssize_t n = ssl_.write(request, len);
-        if (n <= 0) {
-            throw std::runtime_error("Failed to send HTTP upgrade");
+        if constexpr (is_fd_based) {
+            // BSD sockets: single blocking write
+            ssize_t n = ssl_.write(request, len);
+            if (n <= 0) {
+                throw std::runtime_error("Failed to send HTTP upgrade");
+            }
+        } else {
+            // XDP/Userspace: polling loop required
+            size_t total_sent = 0;
+            int max_attempts = 2000;
+            int attempts = 0;
+
+            while (total_sent < len && attempts < max_attempts) {
+                transport_.poll();
+                ssize_t sent = ssl_.write(request + total_sent, len - total_sent);
+
+                if (sent > 0) {
+                    total_sent += sent;
+                } else if (sent < 0 && errno != EAGAIN) {
+                    throw std::runtime_error("Failed to send HTTP upgrade");
+                }
+
+                usleep(1000);  // 1ms between polls
+                attempts++;
+            }
+
+            if (total_sent < len) {
+                throw std::runtime_error("Failed to send complete HTTP upgrade");
+            }
         }
     }
 
     // Receive HTTP 101 Switching Protocols response
     void recv_http_response() {
+        constexpr bool is_fd_based = websocket::traits::is_fd_based_transport_v<TransportPolicy_>;
+
         uint8_t buf[4097];  // +1 for null terminator
-        ssize_t n = ssl_.read(buf, sizeof(buf) - 1);  // Reserve space for '\0'
+        ssize_t n = 0;
+
+        if constexpr (is_fd_based) {
+            // BSD sockets: single blocking read
+            n = ssl_.read(buf, sizeof(buf) - 1);
+        } else {
+            // XDP/Userspace: polling loop required
+            int max_attempts = 2000;
+            int attempts = 0;
+
+            while (attempts < max_attempts) {
+                transport_.poll();
+                n = ssl_.read(buf, sizeof(buf) - 1);
+
+                if (n > 0) {
+                    break;  // Got data
+                } else if (n < 0 && errno != EAGAIN) {
+                    throw std::runtime_error("SSL read error during HTTP response");
+                }
+
+                usleep(1000);  // 1ms between polls
+                attempts++;
+            }
+        }
 
         if (n <= 0) {
             throw std::runtime_error("Failed to receive HTTP response");
@@ -431,6 +580,7 @@ private:
     TxBufferPolicy_ tx_buffer_;      // Separate TX buffer type/size
 
     bool connected_;
+    bool xdp_initialized_;           // True if init_xdp() was called (XDP mode only)
     uint64_t msg_count_;
     MessageCallback on_message_;
     timing_record_t timing_;  // Timing information for current message

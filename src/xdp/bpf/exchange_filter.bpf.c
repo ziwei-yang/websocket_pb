@@ -222,35 +222,6 @@ int exchange_packet_filter(struct xdp_md *ctx) {
     // Increment total packet counter
     inc_stat(STAT_TOTAL_PACKETS);
 
-    // Step 1: Create metadata area for storing HW timestamp
-    // Kernel fix 714070c4cb7a enables device-bound programs to redirect to XSKMAP
-#if 1
-    ret = bpf_xdp_adjust_meta(ctx, -(int)sizeof(struct xdp_user_metadata));
-    if (ret == 0) {
-        // Metadata area created successfully
-        void *data = (void *)(long)ctx->data;
-        void *data_meta = (void *)(long)ctx->data_meta;
-
-        // Verify metadata area is valid
-        struct xdp_user_metadata *meta = data_meta;
-        if ((void *)(meta + 1) <= data) {
-            // Step 2: Extract hardware RX timestamp from NIC
-            __u64 timestamp = 0;
-            ret = bpf_xdp_metadata_rx_timestamp(ctx, &timestamp);
-
-            if (ret == 0 && timestamp != 0) {
-                // Success - store timestamp in metadata area
-                meta->rx_timestamp_ns = timestamp;
-                inc_stat(STAT_TIMESTAMP_OK);
-            } else {
-                // Failed or not available - store 0
-                meta->rx_timestamp_ns = 0;
-                inc_stat(STAT_TIMESTAMP_FAIL);
-            }
-        }
-    }
-#endif
-
     // Parse Ethernet header
     ret = parse_ethernet(ctx, &pctx);
     if (ret < 0) {
@@ -293,11 +264,26 @@ int exchange_packet_filter(struct xdp_md *ctx) {
     if (is_exchange_packet(&pctx)) {
         inc_stat(STAT_EXCHANGE_PACKETS);
 
+        // TEST: Full kfunc + adjust_meta to see if this causes redirect failures
+        ret = bpf_xdp_adjust_meta(ctx, -(int)sizeof(struct xdp_user_metadata));
+        if (ret == 0) {
+            void *data = (void *)(long)ctx->data;
+            void *data_meta = (void *)(long)ctx->data_meta;
+            struct xdp_user_metadata *meta = data_meta;
+            if ((void *)(meta + 1) <= data) {
+                __u64 timestamp = 0;
+                ret = bpf_xdp_metadata_rx_timestamp(ctx, &timestamp);
+                if (ret == 0 && timestamp != 0) {
+                    meta->rx_timestamp_ns = timestamp;
+                    inc_stat(STAT_TIMESTAMP_OK);
+                } else {
+                    meta->rx_timestamp_ns = 0;
+                    inc_stat(STAT_TIMESTAMP_FAIL);
+                }
+            }
+        }
+
         // Redirect to AF_XDP socket on queue 0
-        // We always use queue 0 regardless of which queue the packet arrived on,
-        // since we only have one AF_XDP socket registered on queue 0.
-        // This avoids issues with RSS (Receive Side Scaling) distributing packets
-        // across multiple queues.
         __u32 queue_id = 0;
         int redirect_ret = bpf_redirect_map(&xsks_map, queue_id, 0);
         bpf_printk("REDIRECT to XSK queue 0, ret=%d", redirect_ret);

@@ -2,12 +2,29 @@
 # XDP Preparation Script
 # Prepares the NIC and environment for AF_XDP zero-copy operation
 #
-# Usage: ./scripts/xdp_prepare.sh <interface>
+# Usage: ./scripts/xdp_prepare.sh [--reload] <interface>
 # Example: ./scripts/xdp_prepare.sh enp108s0
+#          ./scripts/xdp_prepare.sh --reload enp108s0  # Reload NIC driver first
+#
+# The --reload flag is useful when XDP gets stuck after a previous session.
+# This is a known issue with the igc driver.
 
 set -e
 
-IFACE="${1:-enp108s0}"
+# Parse arguments
+RELOAD_DRIVER=0
+IFACE="enp108s0"
+
+for arg in "$@"; do
+    case "$arg" in
+        --reload)
+            RELOAD_DRIVER=1
+            ;;
+        *)
+            IFACE="$arg"
+            ;;
+    esac
+done
 
 # Color codes
 RED='\033[0;31m'
@@ -48,6 +65,37 @@ check_interface() {
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         print_warning "Not running as root. Some operations may require sudo."
+    fi
+}
+
+# Reload NIC driver (fixes stuck XDP state on igc driver)
+reload_nic_driver() {
+    local driver=$(ethtool -i "$IFACE" 2>/dev/null | grep "driver:" | awk '{print $2}')
+
+    if [[ -z "$driver" ]]; then
+        print_warning "Could not detect NIC driver"
+        return 0
+    fi
+
+    # Only reload if --reload flag was passed or driver is known to need it
+    if [[ "$RELOAD_DRIVER" == "1" ]]; then
+        echo "Reloading NIC driver ($driver) to reset XDP state..."
+
+        if sudo modprobe -r "$driver" 2>/dev/null && sleep 2 && sudo modprobe "$driver" 2>/dev/null; then
+            sleep 5  # Wait for interface to come back up (increased from 3s)
+            # Wait for interface to have an IP address
+            local retry=0
+            while [[ $retry -lt 10 ]]; do
+                if ip addr show "$IFACE" 2>/dev/null | grep -q "inet "; then
+                    break
+                fi
+                sleep 1
+                ((retry++))
+            done
+            print_status "NIC driver $driver reloaded"
+        else
+            print_warning "Could not reload driver $driver (may require manual intervention)"
+        fi
     fi
 }
 
@@ -96,18 +144,19 @@ enable_hw_timestamp() {
 detach_xdp() {
     echo "Detaching any existing XDP program..."
 
-    # Check if XDP program is attached
+    # Always try both xdp and xdpdrv off to ensure complete cleanup
+    # (stale programs from previous runs may not be detected by ip link show)
+    sudo ip link set "$IFACE" xdp off 2>/dev/null || true
+    sudo ip link set "$IFACE" xdpdrv off 2>/dev/null || true
+
+    # Verify cleanup
     local xdp_info=$(ip link show "$IFACE" | grep -o "xdp[^ ]*" || true)
 
     if [[ -n "$xdp_info" ]]; then
-        if sudo ip link set "$IFACE" xdp off 2>/dev/null; then
-            print_status "Detached existing XDP program"
-        else
-            print_error "Failed to detach XDP program"
-            exit 1
-        fi
+        print_error "Failed to detach XDP program: $xdp_info"
+        exit 1
     else
-        print_status "No XDP program attached"
+        print_status "XDP programs detached (xdp off + xdpdrv off)"
     fi
 }
 
@@ -201,6 +250,7 @@ start_clock_sync() {
 print_header
 check_interface
 check_root
+reload_nic_driver
 check_xdp_support
 set_nic_queue
 enable_hw_timestamp

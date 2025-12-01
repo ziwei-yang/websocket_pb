@@ -88,11 +88,25 @@ int main(int argc, char** argv) {
     printf("Target: wss://%s:%u%s\n", BINANCE_HOST, BINANCE_PORT, BINANCE_PATH);
     printf("Architecture: XDP (native driver) + Userspace TCP/IP + OpenSSL\n\n");
 
-    // Parse interface from command line (default: enp108s0)
+    // Parse command line args
+    // Usage: ./test_xdp_binance_integration [interface] [--busy-poll]
     const char* interface = "enp108s0";
-    if (argc > 1) {
-        interface = argv[1];
+    bool use_busy_poll = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--busy-poll") == 0 || strcmp(argv[i], "-b") == 0) {
+            use_busy_poll = true;
+        } else {
+            interface = argv[i];
+        }
     }
+
+    websocket::xdp::NapiMode napi_mode = use_busy_poll
+        ? websocket::xdp::NapiMode::BUSY_POLL
+        : websocket::xdp::NapiMode::NAPI_IRQ;
+
+    printf("NAPI Mode: %s\n", use_busy_poll ? "BUSY_POLL" : "NAPI_IRQ");
+    printf("Interface: %s\n\n", interface);
 
     try {
         // ═══════════════════════════════════════════════════════════════════════
@@ -109,7 +123,7 @@ int main(int argc, char** argv) {
         printf("─────────────────────────────────────────────────────────────────\n");
 
         XDPUserspaceTransport transport;
-        transport.init(interface, "src/xdp/bpf/exchange_filter.bpf.o");
+        transport.init(interface, "src/xdp/bpf/exchange_filter.bpf.o", napi_mode);
 
         // Configure BPF filter for Binance
         printf("  Resolving Binance IPs...\n");
@@ -233,10 +247,11 @@ int main(int argc, char** argv) {
             // Poll transport (this captures Stage 1 HW timestamp internally)
             transport.poll();
 
-            // Stage 1: Get hardware timestamp from XDP metadata
-            timing.hw_timestamp_latest_ns = transport.get_last_rx_hw_timestamp();
-            if (timing.hw_timestamp_latest_ns > 0) {
-                timing.hw_timestamp_count = 1;
+            // Stage 1: Get hardware timestamps from XDP metadata
+            timing.hw_timestamp_count = transport.get_hw_timestamp_count();
+            if (timing.hw_timestamp_count > 0) {
+                timing.hw_timestamp_oldest_ns = transport.get_oldest_rx_hw_timestamp();
+                timing.hw_timestamp_latest_ns = transport.get_latest_rx_hw_timestamp();
             }
 
             // Stage 3: Before SSL read

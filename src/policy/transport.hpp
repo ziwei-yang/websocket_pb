@@ -372,7 +372,9 @@ public:
         , stack_()
         , state_(userspace_stack::TCPState::CLOSED)
         , connected_(false)
-        , last_rx_hw_timestamp_ns_(0)
+        , oldest_rx_hw_timestamp_ns_(0)
+        , latest_rx_hw_timestamp_ns_(0)
+        , hw_timestamp_count_(0)
     {}
 
     ~XDPUserspaceTransport() {
@@ -385,9 +387,16 @@ public:
 
     /**
      * Initialize XDP transport with userspace stack
+     *
+     * @param interface Network interface name (e.g., "eth0", "enp108s0")
+     * @param bpf_path Path to BPF object file
+     * @param napi_mode NAPI polling mode:
+     *   - NAPI_IRQ: Default, interrupt-driven (lower CPU, higher latency jitter)
+     *   - BUSY_POLL: Timer-driven polling (lower latency, uses more CPU)
      */
     void init(const char* interface = "eth0",
-              const char* bpf_path = "src/xdp/bpf/exchange_filter.bpf.o") {
+              const char* bpf_path = "src/xdp/bpf/exchange_filter.bpf.o",
+              websocket::xdp::NapiMode napi_mode = websocket::xdp::NapiMode::NAPI_IRQ) {
         // Configure XDP
         websocket::xdp::XDPConfig config;
         config.interface = interface;
@@ -396,6 +405,7 @@ public:
         config.num_frames = 4096;
         config.zero_copy = true;
         config.batch_size = 64;
+        config.napi_mode = napi_mode;
 
         xdp_.init(config, bpf_path);
 
@@ -582,12 +592,14 @@ public:
      * Close TCP connection
      */
     void close() {
+        printf("[TCP-CLOSE] close() called, current state=%d\n", static_cast<int>(state_));
         if (state_ == userspace_stack::TCPState::CLOSED) {
             return;
         }
 
         if (state_ == userspace_stack::TCPState::ESTABLISHED) {
             // Send FIN
+            printf("[TCP-CLOSE] Sending FIN from state ESTABLISHED\n");
             send_fin();
             retransmit_queue_.add_segment(tcp_params_.snd_nxt,
                                           userspace_stack::TCP_FLAG_FIN | userspace_stack::TCP_FLAG_ACK,
@@ -699,10 +711,34 @@ public:
     void print_bpf_stats() const { xdp_.print_bpf_stats(); }
 
     /**
-     * Get last RX hardware timestamp (Stage 1)
-     * @return Hardware timestamp in nanoseconds (CLOCK_MONOTONIC domain), 0 if unavailable
+     * Get oldest RX hardware timestamp since last reset (Stage 1)
+     * For multi-packet messages, this is the timestamp of the first packet
+     * @return Hardware timestamp in nanoseconds (CLOCK_REALTIME domain for XDP), 0 if unavailable
      */
-    uint64_t get_last_rx_hw_timestamp() const { return last_rx_hw_timestamp_ns_; }
+    uint64_t get_oldest_rx_hw_timestamp() const { return oldest_rx_hw_timestamp_ns_; }
+
+    /**
+     * Get latest RX hardware timestamp since last reset (Stage 1)
+     * For multi-packet messages, this is the timestamp of the most recent packet
+     * @return Hardware timestamp in nanoseconds (CLOCK_REALTIME domain for XDP), 0 if unavailable
+     */
+    uint64_t get_latest_rx_hw_timestamp() const { return latest_rx_hw_timestamp_ns_; }
+
+    /**
+     * Get count of packets with hardware timestamps since last reset
+     * @return Number of packets timestamped (>1 indicates multi-packet message)
+     */
+    uint32_t get_hw_timestamp_count() const { return hw_timestamp_count_; }
+
+    /**
+     * Reset hardware timestamp tracking for new message
+     * Call this after copying timestamps to timing_record_t
+     */
+    void reset_hw_timestamps() {
+        oldest_rx_hw_timestamp_ns_ = 0;
+        latest_rx_hw_timestamp_ns_ = 0;
+        hw_timestamp_count_ = 0;
+    }
 
 private:
     // =========================================================================
@@ -765,9 +801,22 @@ private:
         websocket::xdp::XDPFrame* frame = xdp_.peek_rx_frame();
         if (!frame) return;
 
+        static int rx_count = 0;
+        rx_count++;
+        if (rx_count <= 10 || rx_count % 100 == 0) {
+            printf("[TCP-RX-DEBUG] Received packet #%d: len=%zu\n", rx_count, frame->len);
+        }
+
         // Stage 1: Capture hardware timestamp from XDP metadata
+        // Track oldest (first packet) and latest (most recent) for multi-packet messages
         if (frame->hw_timestamp_ns > 0) {
-            last_rx_hw_timestamp_ns_ = frame->hw_timestamp_ns;
+            if (hw_timestamp_count_ == 0) {
+                // First packet - set both oldest and latest
+                oldest_rx_hw_timestamp_ns_ = frame->hw_timestamp_ns;
+            }
+            // Always update latest
+            latest_rx_hw_timestamp_ns_ = frame->hw_timestamp_ns;
+            hw_timestamp_count_++;
         }
 
         // Parse the TCP packet using stack's pure parsing
@@ -777,11 +826,27 @@ private:
                                        tcp_params_.remote_port);
 
         if (parsed.valid) {
+            // Debug: Print TCP packet info
+            static int valid_count = 0;
+            valid_count++;
+            if (valid_count <= 20 || valid_count % 100 == 0) {
+                printf("[TCP-RX] #%d seq=%u, ack=%u, flags=0x%02x, payload_len=%zu, state=%d, rcv_nxt=%u\n",
+                       valid_count, parsed.seq, parsed.ack, parsed.flags,
+                       parsed.payload_len, static_cast<int>(state_), tcp_params_.rcv_nxt);
+            }
+
             // Process through state machine (pure function)
             auto result = stack_.process_tcp(state_, tcp_params_, parsed);
 
+            // Debug: Show action
+            if (valid_count <= 20) {
+                printf("[TCP-SM] action=%d, data=%p, data_len=%zu\n",
+                       static_cast<int>(result.action), (void*)result.data, result.data_len);
+            }
+
             // Handle state transition
             if (result.state_changed) {
+                printf("[TCP-STATE] %d -> %d\n", static_cast<int>(state_), static_cast<int>(result.new_state));
                 state_ = result.new_state;
             }
 
@@ -799,12 +864,17 @@ private:
 
             case userspace_stack::TCPAction::DATA_RECEIVED:
                 // Zero-copy: push frame reference to receive buffer
+                printf("[DATA-RX] DATA_RECEIVED: data=%p, data_len=%zu, rcv_nxt=%u\n",
+                       (void*)result.data, result.data_len, tcp_params_.rcv_nxt);
                 if (result.data && result.data_len > 0) {
                     // Release RX ring but defer FILL ring refill
                     uint64_t umem_addr = xdp_.release_rx_frame_deferred(frame);
+                    printf("[DATA-RX] umem_addr=%lx\n", (unsigned long)umem_addr);
                     if (umem_addr != 0) {
                         // Push frame ref - data stays in UMEM until SSL consumes it
                         recv_buffer_.push_frame(result.data, result.data_len, umem_addr);
+                        printf("[DATA-RX] Pushed %zu bytes to recv_buffer, available=%zu\n",
+                               result.data_len, recv_buffer_.available());
                         frame = nullptr;  // Mark as handled (don't release again)
                     }
                     tcp_params_.rcv_nxt += result.data_len;
@@ -953,8 +1023,11 @@ private:
     // Connection state
     bool connected_;
 
-    // Stage 1: Hardware timestamp from NIC (nanoseconds)
-    uint64_t last_rx_hw_timestamp_ns_;
+    // Stage 1: Hardware timestamps from NIC (nanoseconds, CLOCK_REALTIME domain)
+    // Track oldest/latest for multi-packet messages
+    uint64_t oldest_rx_hw_timestamp_ns_;  // First packet timestamp
+    uint64_t latest_rx_hw_timestamp_ns_;  // Most recent packet timestamp
+    uint32_t hw_timestamp_count_;         // Packets received since last reset
 
     // Polling configuration
     int poll_interval_us_ = 0;  // 0 = busy poll (default for HFT)

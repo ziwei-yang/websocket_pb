@@ -54,6 +54,14 @@ namespace xdp {
 /**
  * XDP Transport Configuration
  */
+/**
+ * NAPI polling mode for packet reception
+ */
+enum class NapiMode {
+    NAPI_IRQ,       // Default: NAPI triggered by hardware interrupts
+    BUSY_POLL       // NAPI runs on timer, no interrupts (lower latency, uses more CPU)
+};
+
 struct XDPConfig {
     const char* interface;      // Network interface (e.g., "eth0")
     uint32_t queue_id;          // RX/TX queue ID (usually 0)
@@ -61,6 +69,11 @@ struct XDPConfig {
     uint32_t num_frames;        // Number of UMEM frames (default: 4096)
     bool zero_copy;             // Enable zero-copy mode (requires driver support)
     uint32_t batch_size;        // Batch size for TX/RX (default: 64)
+    NapiMode napi_mode;         // NAPI polling mode (default: NAPI_IRQ)
+
+    // BUSY_POLL mode settings (only used when napi_mode == BUSY_POLL)
+    uint32_t gro_flush_timeout_ns;    // GRO flush timeout in nanoseconds (default: 100000)
+    uint32_t napi_defer_hard_irqs;    // Number of IRQs to defer before switching to polling (default: 10)
 
     XDPConfig()
         : interface("eth0")
@@ -69,6 +82,9 @@ struct XDPConfig {
         , num_frames(4096)
         , zero_copy(true)   // Enable zero-copy by default for HFT (igc driver supports it)
         , batch_size(64)
+        , napi_mode(NapiMode::NAPI_IRQ)  // Default to interrupt-driven
+        , gro_flush_timeout_ns(100000)   // 100us for busy poll
+        , napi_defer_hard_irqs(10)       // Defer 10 IRQs before polling
     {}
 };
 
@@ -98,6 +114,93 @@ public:
     // Use 256 bytes headroom - maximum supported by igc driver for XDP_ZEROCOPY mode
     // Note: Higher values (e.g., 512) cause EOPNOTSUPP when using zero-copy
     static constexpr uint32_t XDP_HEADROOM = 256;
+
+    /**
+     * Configure kernel NAPI mode for the interface
+     *
+     * NAPI_IRQ mode (default):
+     *   - napi_defer_hard_irqs = 0
+     *   - gro_flush_timeout = 0
+     *   - NAPI triggered by hardware interrupts
+     *
+     * BUSY_POLL mode:
+     *   - napi_defer_hard_irqs = N (defer N interrupts before polling)
+     *   - gro_flush_timeout = T (timer-based NAPI polling interval in ns)
+     *   - NAPI runs on timer, lower latency but uses more CPU
+     *
+     * @param interface Network interface name
+     * @param config XDP configuration with NAPI mode settings
+     * @return true on success, false on failure
+     */
+    static bool configure_napi_mode(const char* interface, const XDPConfig& config) {
+        char path[256];
+
+        // Configure napi_defer_hard_irqs
+        snprintf(path, sizeof(path), "/sys/class/net/%s/napi_defer_hard_irqs", interface);
+        FILE* f = fopen(path, "w");
+        if (!f) {
+            fprintf(stderr, "[NAPI] Warning: Cannot open %s: %s\n", path, strerror(errno));
+            return false;
+        }
+
+        uint32_t defer_irqs = (config.napi_mode == NapiMode::BUSY_POLL)
+            ? config.napi_defer_hard_irqs : 0;
+        fprintf(f, "%u", defer_irqs);
+        fclose(f);
+
+        // Configure gro_flush_timeout
+        snprintf(path, sizeof(path), "/sys/class/net/%s/gro_flush_timeout", interface);
+        f = fopen(path, "w");
+        if (!f) {
+            fprintf(stderr, "[NAPI] Warning: Cannot open %s: %s\n", path, strerror(errno));
+            return false;
+        }
+
+        uint32_t flush_timeout = (config.napi_mode == NapiMode::BUSY_POLL)
+            ? config.gro_flush_timeout_ns : 0;
+        fprintf(f, "%u", flush_timeout);
+        fclose(f);
+
+        const char* mode_str = (config.napi_mode == NapiMode::BUSY_POLL)
+            ? "BUSY_POLL" : "NAPI_IRQ";
+        printf("[NAPI] Configured %s mode: napi_defer_hard_irqs=%u, gro_flush_timeout=%u ns\n",
+               mode_str, defer_irqs, flush_timeout);
+
+        return true;
+    }
+
+    /**
+     * Get current NAPI mode settings from kernel
+     *
+     * @param interface Network interface name
+     * @param defer_irqs Output: current napi_defer_hard_irqs value
+     * @param flush_timeout Output: current gro_flush_timeout value
+     * @return true on success
+     */
+    static bool get_napi_mode(const char* interface, uint32_t& defer_irqs, uint32_t& flush_timeout) {
+        char path[256];
+        char buf[64];
+
+        // Read napi_defer_hard_irqs
+        snprintf(path, sizeof(path), "/sys/class/net/%s/napi_defer_hard_irqs", interface);
+        FILE* f = fopen(path, "r");
+        if (!f) return false;
+        if (fgets(buf, sizeof(buf), f)) {
+            defer_irqs = atoi(buf);
+        }
+        fclose(f);
+
+        // Read gro_flush_timeout
+        snprintf(path, sizeof(path), "/sys/class/net/%s/gro_flush_timeout", interface);
+        f = fopen(path, "r");
+        if (!f) return false;
+        if (fgets(buf, sizeof(buf), f)) {
+            flush_timeout = atoi(buf);
+        }
+        fclose(f);
+
+        return true;
+    }
 
     XDPTransport()
         : xsk_(nullptr)
@@ -134,6 +237,15 @@ public:
     void init(const XDPConfig& config,
               const char* bpf_obj_path = nullptr) {
         config_ = config;
+
+        // Configure NAPI mode (NAPI_IRQ or BUSY_POLL)
+        // This sets kernel sysfs parameters for the interface
+        if (!configure_napi_mode(config_.interface, config_)) {
+            printf("[XDP] Warning: Failed to configure NAPI mode (may need root)\n");
+        } else {
+            printf("[XDP] NAPI mode configured: %s\n",
+                   config_.napi_mode == NapiMode::BUSY_POLL ? "BUSY_POLL" : "NAPI_IRQ");
+        }
 
         // If BPF path provided, load AND ATTACH BPF program FIRST (before creating socket)
         // This is critical: the XDP program must be attached BEFORE creating the XSK socket
@@ -208,7 +320,9 @@ public:
             // When INHIBIT_PROG_LOAD is set, xdp_flags should be 0 (we've already attached our program)
             xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
             xsk_cfg.xdp_flags = 0;  // Don't touch XDP program - we've already attached it
-            xsk_cfg.bind_flags = XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP;  // Zero-copy mode with wakeup
+            // XDP_USE_NEED_WAKEUP is critical for igc driver - it allows the kernel to
+            // signal when it needs wakeup via the ring flags
+            xsk_cfg.bind_flags = XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP;
         } else {
             xsk_cfg.libbpf_flags = 0;
             xsk_cfg.xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
@@ -230,6 +344,16 @@ public:
             }
             throw std::runtime_error(std::string("Failed to create XDP socket: ") + strerror(-ret));
         }
+
+        // Enable kernel busy poll for better TX completion processing
+        // This helps igc driver process TX during poll() calls
+        int xdp_fd = xsk_socket__fd(xsk_);
+        int busy_poll = 1;
+        setsockopt(xdp_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &busy_poll, sizeof(busy_poll));
+        int busy_poll_budget = 64;
+        setsockopt(xdp_fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &busy_poll_budget, sizeof(busy_poll_budget));
+        int busy_poll_usec = 50;  // Busy poll for 50us before blocking
+        setsockopt(xdp_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_usec, sizeof(busy_poll_usec));
 
         // If BPF enabled, register the socket in the BPF map
         // (BPF program was already attached before socket creation)
@@ -321,19 +445,25 @@ public:
         // Debug: Check fill ring status before trying to receive
         static int debug_call_count = 0;
         debug_call_count++;
-        bool print_debug = (debug_call_count <= 100 || debug_call_count % 1000 == 0);
+        bool print_debug = (debug_call_count <= 10 || debug_call_count % 500 == 0);
         if (print_debug) {
-            uint32_t fill_avail = xsk_prod_nb_free(&fill_ring_, config_.num_frames);
+            // Get ring info
+            uint32_t fill_free = xsk_prod_nb_free(&fill_ring_, config_.num_frames);
             uint32_t rx_avail = xsk_cons_nb_avail(&rx_ring_, config_.num_frames);
-            printf("[XDP-DEBUG] peek_rx_frame call #%d: fill_ring_free=%u, rx_ring_avail=%u\n",
-                   debug_call_count, fill_avail, rx_avail);
+            // Also check actual ring pointers
+            uint32_t* fill_prod = fill_ring_.producer;
+            uint32_t* fill_cons = fill_ring_.consumer;
+            uint32_t* rx_prod = rx_ring_.producer;
+            uint32_t* rx_cons = rx_ring_.consumer;
+            printf("[XDP-DEBUG] #%d: fill(prod=%u,cons=%u,free=%u) rx(prod=%u,cons=%u,avail=%u) xsk_fd=%d\n",
+                   debug_call_count, *fill_prod, *fill_cons, fill_free,
+                   *rx_prod, *rx_cons, rx_avail, xsk_socket__fd(xsk_));
             fflush(stdout);
         }
 
-        // NOTE: No kick_rx() here - kernel is kicked only when:
-        //   1. After init (FILL ring initially populated)
-        //   2. After release_rx_frame() (FILL ring refilled)
-        // This avoids unnecessary syscalls on every peek attempt.
+        // Always kick_rx() to wake up kernel when checking for packets
+        // With XDP_USE_NEED_WAKEUP, kernel may be sleeping waiting for wakeup
+        kick_rx();
 
         // Check RX ring for received packets
         uint32_t idx_rx;
@@ -574,6 +704,8 @@ public:
         uint32_t idx;
         if (xsk_ring_prod__reserve(&tx_ring_, 1, &idx) != 1) {
             // TX ring is full - return frame to free pool
+            printf("[TX-ERROR] TX ring FULL! Dropping frame (addr=%lx, len=%zu)\n",
+                   (unsigned long)frame->addr, len);
             free_frames_.push_back(frame->addr);
             frame->clear();  // No FramePool, just clear the frame
             errno = EAGAIN;
@@ -591,9 +723,14 @@ public:
 
         // Debug: Log TX submission and packet contents
         static int tx_count = 0;
-        if (++tx_count <= 3) {
+        tx_count++;
+        if (tx_count <= 10) {
+            uint32_t* tx_prod = tx_ring_.producer;
+            uint32_t* tx_cons = tx_ring_.consumer;
             printf("[TX-DEBUG] Submitted TX descriptor #%d: addr=0x%llx, len=%u, idx=%u\n",
                    tx_count, (unsigned long long)tx_desc->addr, tx_desc->len, idx);
+            printf("[TX-RING] After submit #%d: tx_prod=%u, tx_cons=%u, pending=%u\n",
+                   tx_count, *tx_prod, *tx_cons, *tx_prod - *tx_cons);
 
             // Dump first 64 bytes of packet (data is at frame->data, already includes headroom)
             uint8_t* pkt = frame->data;
@@ -834,21 +971,36 @@ private:
         uint32_t idx_cq;
         uint32_t nb_completed = xsk_ring_cons__peek(&comp_ring_, config_.batch_size, &idx_cq);
 
+        // Debug: Always log CQ status for first 20 calls
+        static int poll_count = 0;
+        poll_count++;
+        if (poll_count <= 20) {
+            uint32_t* cq_prod = comp_ring_.producer;
+            uint32_t* cq_cons = comp_ring_.consumer;
+            printf("[CQ-DEBUG] poll #%d: prod=%u, cons=%u, nb_completed=%u\n",
+                   poll_count, *cq_prod, *cq_cons, nb_completed);
+        }
+
         if (nb_completed == 0) {
             return;
         }
 
         // Debug: Log completion
         static int reclaim_count = 0;
-        if (++reclaim_count <= 3) {
-            printf("[TX-DEBUG] Reclaimed %u completed frames from CQ (call #%d)\n",
-                   nb_completed, reclaim_count);
-        }
+        reclaim_count++;
+        printf("[TX-DEBUG] Reclaimed %u completed frames from CQ (call #%d)\n",
+               nb_completed, reclaim_count);
 
         // Add completed frames back to free list
+        // NOTE: The completion addr includes XDP_HEADROOM offset,
+        // so we need to subtract it to get the base frame address
+        // IMPORTANT: Insert at the FRONT of the free list to avoid immediately
+        // reusing just-completed frames (gives DMA time to fully release)
         for (uint32_t i = 0; i < nb_completed; i++) {
-            uint64_t addr = *xsk_ring_cons__comp_addr(&comp_ring_, idx_cq++);
-            free_frames_.push_back(addr);
+            uint64_t desc_addr = *xsk_ring_cons__comp_addr(&comp_ring_, idx_cq++);
+            // Convert descriptor addr back to frame base address
+            uint64_t frame_addr = desc_addr - XDP_HEADROOM;
+            free_frames_.insert(free_frames_.begin(), frame_addr);
         }
 
         xsk_ring_cons__release(&comp_ring_, nb_completed);
@@ -860,17 +1012,20 @@ private:
      * @return Frame address, or UINT64_MAX if no frames available
      */
     uint64_t get_free_frame() {
-        if (free_frames_.empty()) {
-            // Try to allocate from free pool
-            if (next_free_frame_ >= config_.num_frames) {
-                return UINT64_MAX;  // No frames available
-            }
+        // IMPORTANT: Prefer sequential allocation to avoid reusing just-completed
+        // frames. The igc driver in zero-copy mode may still be accessing completed
+        // frames briefly after CQ reports completion. Using fresh frames avoids
+        // DMA race conditions.
+        if (next_free_frame_ < config_.num_frames) {
             uint64_t addr = next_free_frame_ * config_.frame_size;
             next_free_frame_++;
             return addr;
         }
 
-        // Reuse a previously freed frame
+        // Fall back to reclaimed frames only when sequential allocation exhausted
+        if (free_frames_.empty()) {
+            return UINT64_MAX;  // No frames available
+        }
         uint64_t addr = free_frames_.back();
         free_frames_.pop_back();
         return addr;
@@ -879,19 +1034,53 @@ private:
     /**
      * Kick the kernel to process TX ring
      *
-     * Uses sendto() on AF_XDP socket to trigger transmission
+     * With XDP_ZEROCOPY + XDP_USE_NEED_WAKEUP on igc driver, TX is processed
+     * during NAPI poll. We need to trigger NAPI by:
+     * 1. Calling sendto() to signal TX readiness
+     * 2. Using poll() to wait for kernel to process
+     * 3. Calling recvfrom() as a fallback to trigger NAPI via RX path
      */
     void kick_tx() {
         int xdp_fd = xsk_socket__fd(xsk_);
 
-        // Send dummy packet to kick kernel
-        // This triggers the kernel to process the TX ring
-        // Note: Always call sendto() - the kernel will ignore if not needed
         static int kick_count = 0;
+        kick_count++;
+
+        // Check if we need to wake up the kernel (with XDP_USE_NEED_WAKEUP)
+        bool needs_wakeup = xsk_ring_prod__needs_wakeup(&tx_ring_);
+
+        // Primary kick via sendto() - notifies kernel of pending TX
+        // This schedules NAPI but doesn't immediately run it
         int ret = sendto(xdp_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
-        if (++kick_count <= 3) {
-            printf("[TX-DEBUG] kick_tx() call #%d: fd=%d, ret=%d, errno=%d\n",
-                   kick_count, xdp_fd, ret, (ret < 0) ? errno : 0);
+
+        // Reclaim any immediately available completions
+        reclaim_completed_frames();
+
+        // For igc driver: NAPI runs asynchronously. We need to yield CPU time
+        // for kernel to run softirqs that process NAPI. Using poll() with
+        // a longer timeout allows the kernel scheduler to run NAPI.
+        struct pollfd fds = {};
+        fds.fd = xdp_fd;
+        fds.events = POLLIN | POLLOUT;
+
+        // Try multiple poll cycles to give NAPI time to run
+        int poll_ret = 0;
+        for (int i = 0; i < 3; i++) {
+            // Each poll() call yields to kernel, allowing NAPI to process
+            poll_ret = poll(&fds, 1, 1);  // 1ms timeout
+            reclaim_completed_frames();
+
+            uint32_t pending = *tx_ring_.producer - *tx_ring_.consumer;
+            if (pending == 0) break;  // All TX completed
+
+            // Yield more aggressively to let softirq run
+            sched_yield();
+        }
+
+        uint32_t pending = *tx_ring_.producer - *tx_ring_.consumer;
+        if (kick_count <= 10 || kick_count % 50 == 0) {
+            printf("[TX-DEBUG] kick_tx() #%d: fd=%d, ret=%d, poll=%d, needs_wakeup=%d, pending=%u\n",
+                   kick_count, xdp_fd, ret, poll_ret, needs_wakeup, pending);
         }
     }
 

@@ -114,9 +114,11 @@ public:
 
         // Device-bound loading for XDP metadata kfuncs (bpf_xdp_metadata_rx_timestamp)
         // Requires kernel 6.3+ with fix 714070c4cb7a for XDP_REDIRECT to XSKMAP
+        //
+        // TEST: Re-enable device-bound to check if issue is device-bound or adjust_meta
         bpf_program__set_ifindex(bpf_prog_, ifindex_);
         bpf_program__set_flags(bpf_prog_, BPF_F_XDP_DEV_BOUND_ONLY);
-        printf("[BPF] Device-bound loading ENABLED (ifindex=%d)\n", ifindex_);
+        printf("[BPF] Device-bound loading ENABLED (testing without adjust_meta)\n");
 
         // Load BPF program into kernel
         if (bpf_object__load(bpf_obj_)) {

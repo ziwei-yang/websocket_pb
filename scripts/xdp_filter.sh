@@ -60,6 +60,43 @@ route_exists() {
     ip route show "$ip" dev "$iface" &>/dev/null
 }
 
+# Check if iptables RST rule exists
+rst_rule_exists() {
+    local ip="$1"
+    local iface="$2"
+    sudo iptables -C OUTPUT -o "$iface" -p tcp --tcp-flags RST RST -d "$ip" -j DROP 2>/dev/null
+}
+
+# Add iptables rule to block kernel RST packets
+add_rst_block() {
+    local ip="$1"
+    local iface="$2"
+
+    if rst_rule_exists "$ip" "$iface"; then
+        print_info "RST block rule already exists for $ip"
+        return 0
+    fi
+
+    if sudo iptables -I OUTPUT -o "$iface" -p tcp --tcp-flags RST RST -d "$ip" -j DROP 2>/dev/null; then
+        echo "$ip" >> "$STATE_DIR/rst_rules"
+        print_status "Added RST block: $ip on $iface"
+        return 0
+    else
+        print_warning "Could not add RST block rule for $ip"
+        return 1
+    fi
+}
+
+# Remove iptables RST block rule
+remove_rst_block() {
+    local ip="$1"
+    local iface="$2"
+
+    if sudo iptables -D OUTPUT -o "$iface" -p tcp --tcp-flags RST RST -d "$ip" -j DROP 2>/dev/null; then
+        print_status "Removed RST block: $ip on $iface"
+    fi
+}
+
 # Add route for IP via interface
 add_route() {
     local ip="$1"
@@ -164,15 +201,17 @@ setup_filter() {
     # Update /etc/hosts
     update_hosts "$domain" "$primary_ip"
 
-    # Add routes for all resolved IPs
+    # Add routes and RST blocks for all resolved IPs
     echo ""
-    echo "Setting up route bypasses..."
+    echo "Setting up route bypasses and RST blocks..."
     local route_count=0
     while IFS= read -r ip; do
         if [[ -n "$ip" ]]; then
             if add_route "$ip" "$gateway" "$iface"; then
                 ((route_count++)) || true
             fi
+            # Block kernel RST packets for this IP (required for userspace TCP)
+            add_rst_block "$ip" "$iface"
         fi
     done <<< "$ips"
 
@@ -222,6 +261,19 @@ reset_filter() {
         rm -f "$ROUTES_FILE"
     else
         print_info "No routes to remove"
+    fi
+
+    # Remove RST block rules
+    if [[ -f "$STATE_DIR/rst_rules" ]]; then
+        echo "Removing RST block rules..."
+        while IFS= read -r ip; do
+            if [[ -n "$ip" ]]; then
+                remove_rst_block "$ip" "$iface"
+            fi
+        done < "$STATE_DIR/rst_rules"
+        rm -f "$STATE_DIR/rst_rules"
+    else
+        print_info "No RST block rules to remove"
     fi
 
     # Cleanup hosts

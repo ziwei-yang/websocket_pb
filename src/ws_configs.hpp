@@ -77,8 +77,14 @@
     using DefaultEventPolicy = EpollPolicy;
 #endif
 
-// Default Transport Policy: BSD socket + event loop (kernel TCP/IP stack)
+// Default Transport Policy: XDP zero-copy when USE_XDP, otherwise BSD socket
+#ifdef USE_XDP
+// XDP zero-copy mode: AF_XDP + userspace TCP/IP (kernel bypass)
+using DefaultTransportPolicy = websocket::transport::XDPUserspaceTransport;
+#else
+// BSD socket + event loop (kernel TCP/IP stack)
 using DefaultTransportPolicy = websocket::transport::BSDSocketTransport<DefaultEventPolicy>;
+#endif
 
 using LinuxOptimized = WebSocketClient<
     DefaultSSLPolicy,
@@ -313,12 +319,12 @@ using websocket::transport::FdBasedTransportConcept;
 using websocket::transport::UserspaceTransportConcept;
 
 // Compile-time validation of default transport
-static_assert(FdBasedTransportConcept<DefaultTransportPolicy>,
-              "DefaultTransportPolicy must conform to FdBasedTransportConcept");
-
 #ifdef USE_XDP
-static_assert(UserspaceTransportConcept<XDPTransportPolicy>,
-              "XDPTransportPolicy must conform to UserspaceTransportConcept");
+static_assert(UserspaceTransportConcept<DefaultTransportPolicy>,
+              "DefaultTransportPolicy (XDP) must conform to UserspaceTransportConcept");
+#else
+static_assert(FdBasedTransportConcept<DefaultTransportPolicy>,
+              "DefaultTransportPolicy (BSD) must conform to FdBasedTransportConcept");
 #endif
 
 #endif // C++20
