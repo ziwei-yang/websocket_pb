@@ -2,9 +2,11 @@
 // AF_XDP (eXpress Data Path) Transport Layer
 //
 // This provides zero-copy packet I/O using AF_XDP sockets for HFT use cases:
-//   - Zero-copy packet I/O via UMEM (User Memory)
+//   - Zero-copy packet I/O via UMEM (User Memory) with XDP_ZEROCOPY flag
 //   - Complete kernel bypass with userspace TCP/IP stack
 //   - Sub-microsecond latency (~1-2 μs NIC to app)
+//   - Native driver mode (XDP_FLAGS_DRV_MODE) for maximum performance
+//   - NIC hardware timestamp support via bpf_xdp_metadata_rx_timestamp()
 //
 // Architecture:
 //   Application → Userspace TCP/IP Stack → XDP Transport → AF_XDP Socket → NIC
@@ -12,11 +14,19 @@
 // Primary API (Zero-Copy):
 //   - peek_rx_frame() / release_rx_frame() - Zero-copy RX
 //   - get_tx_frame() / send_frame() - Zero-copy TX
+//   - poll_wait() - Userspace busy-polling with SO_BUSY_POLL
+//
+// igc Driver TX Completion Workaround:
+//   The igc driver (Intel I225/I226 NICs) has a TX completion stall bug in
+//   XDP zero-copy mode. TX completions only happen during NAPI poll which
+//   requires RX traffic. This is worked around by an RX trickle thread that
+//   sends self-addressed UDP packets at 500 Hz to keep NAPI polling active.
+//   See start_rx_trickle() for implementation details.
 //
 // Requirements:
 //   - Linux kernel 5.4+ (AF_XDP zero-copy support)
 //   - libbpf, libxdp
-//   - XDP-capable NIC (e.g., Intel igc/i40e/ixgbe)
+//   - XDP-capable NIC with zero-copy support (e.g., Intel igc/i40e/ixgbe)
 //   - CAP_NET_RAW + CAP_BPF or root privileges
 
 #pragma once
@@ -38,10 +48,18 @@
 #include <net/if.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <poll.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <thread>
+#include <atomic>
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
+#include <net/ethernet.h>
 #include "xdp_frame.hpp"
 #include "bpf_loader.hpp"
 #endif
@@ -54,14 +72,6 @@ namespace xdp {
 /**
  * XDP Transport Configuration
  */
-/**
- * NAPI polling mode for packet reception
- */
-enum class NapiMode {
-    NAPI_IRQ,       // Default: NAPI triggered by hardware interrupts
-    BUSY_POLL       // NAPI runs on timer, no interrupts (lower latency, uses more CPU)
-};
-
 struct XDPConfig {
     const char* interface;      // Network interface (e.g., "eth0")
     uint32_t queue_id;          // RX/TX queue ID (usually 0)
@@ -69,11 +79,15 @@ struct XDPConfig {
     uint32_t num_frames;        // Number of UMEM frames (default: 4096)
     bool zero_copy;             // Enable zero-copy mode (requires driver support)
     uint32_t batch_size;        // Batch size for TX/RX (default: 64)
-    NapiMode napi_mode;         // NAPI polling mode (default: NAPI_IRQ)
 
-    // BUSY_POLL mode settings (only used when napi_mode == BUSY_POLL)
-    uint32_t gro_flush_timeout_ns;    // GRO flush timeout in nanoseconds (default: 100000)
-    uint32_t napi_defer_hard_irqs;    // Number of IRQs to defer before switching to polling (default: 10)
+    // SO_BUSY_POLL settings for userspace busy-polling
+    uint32_t busy_poll_usec;          // SO_BUSY_POLL timeout in microseconds (default: 50)
+    uint32_t busy_poll_budget;        // SO_BUSY_POLL_BUDGET packets per poll (default: 64)
+
+    // RX Trickle settings for zero-copy mode TX completion workaround
+    // See detailed comment in start_rx_trickle() for rationale
+    bool rx_trickle_enabled;          // Enable RX trickle for zero-copy TX workaround (default: true when zero_copy)
+    uint32_t rx_trickle_interval_us;  // Interval between trickle packets in microseconds (default: 2000 = 500 Hz)
 
     XDPConfig()
         : interface("eth0")
@@ -82,9 +96,10 @@ struct XDPConfig {
         , num_frames(4096)
         , zero_copy(true)   // Enable zero-copy by default for HFT (igc driver supports it)
         , batch_size(64)
-        , napi_mode(NapiMode::NAPI_IRQ)  // Default to interrupt-driven
-        , gro_flush_timeout_ns(100000)   // 100us for busy poll
-        , napi_defer_hard_irqs(10)       // Defer 10 IRQs before polling
+        , busy_poll_usec(50)             // 50us busy-poll duration
+        , busy_poll_budget(64)           // 64 packets per poll
+        , rx_trickle_enabled(true)       // Enable RX trickle by default for zero-copy mode
+        , rx_trickle_interval_us(2000)   // 500 Hz (2ms interval)
     {}
 };
 
@@ -115,99 +130,11 @@ public:
     // Note: Higher values (e.g., 512) cause EOPNOTSUPP when using zero-copy
     static constexpr uint32_t XDP_HEADROOM = 256;
 
-    /**
-     * Configure kernel NAPI mode for the interface
-     *
-     * NAPI_IRQ mode (default):
-     *   - napi_defer_hard_irqs = 0
-     *   - gro_flush_timeout = 0
-     *   - NAPI triggered by hardware interrupts
-     *
-     * BUSY_POLL mode:
-     *   - napi_defer_hard_irqs = N (defer N interrupts before polling)
-     *   - gro_flush_timeout = T (timer-based NAPI polling interval in ns)
-     *   - NAPI runs on timer, lower latency but uses more CPU
-     *
-     * @param interface Network interface name
-     * @param config XDP configuration with NAPI mode settings
-     * @return true on success, false on failure
-     */
-    static bool configure_napi_mode(const char* interface, const XDPConfig& config) {
-        char path[256];
-
-        // Configure napi_defer_hard_irqs
-        snprintf(path, sizeof(path), "/sys/class/net/%s/napi_defer_hard_irqs", interface);
-        FILE* f = fopen(path, "w");
-        if (!f) {
-            fprintf(stderr, "[NAPI] Warning: Cannot open %s: %s\n", path, strerror(errno));
-            return false;
-        }
-
-        uint32_t defer_irqs = (config.napi_mode == NapiMode::BUSY_POLL)
-            ? config.napi_defer_hard_irqs : 0;
-        fprintf(f, "%u", defer_irqs);
-        fclose(f);
-
-        // Configure gro_flush_timeout
-        snprintf(path, sizeof(path), "/sys/class/net/%s/gro_flush_timeout", interface);
-        f = fopen(path, "w");
-        if (!f) {
-            fprintf(stderr, "[NAPI] Warning: Cannot open %s: %s\n", path, strerror(errno));
-            return false;
-        }
-
-        uint32_t flush_timeout = (config.napi_mode == NapiMode::BUSY_POLL)
-            ? config.gro_flush_timeout_ns : 0;
-        fprintf(f, "%u", flush_timeout);
-        fclose(f);
-
-        const char* mode_str = (config.napi_mode == NapiMode::BUSY_POLL)
-            ? "BUSY_POLL" : "NAPI_IRQ";
-        printf("[NAPI] Configured %s mode: napi_defer_hard_irqs=%u, gro_flush_timeout=%u ns\n",
-               mode_str, defer_irqs, flush_timeout);
-
-        return true;
-    }
-
-    /**
-     * Get current NAPI mode settings from kernel
-     *
-     * @param interface Network interface name
-     * @param defer_irqs Output: current napi_defer_hard_irqs value
-     * @param flush_timeout Output: current gro_flush_timeout value
-     * @return true on success
-     */
-    static bool get_napi_mode(const char* interface, uint32_t& defer_irqs, uint32_t& flush_timeout) {
-        char path[256];
-        char buf[64];
-
-        // Read napi_defer_hard_irqs
-        snprintf(path, sizeof(path), "/sys/class/net/%s/napi_defer_hard_irqs", interface);
-        FILE* f = fopen(path, "r");
-        if (!f) return false;
-        if (fgets(buf, sizeof(buf), f)) {
-            defer_irqs = atoi(buf);
-        }
-        fclose(f);
-
-        // Read gro_flush_timeout
-        snprintf(path, sizeof(path), "/sys/class/net/%s/gro_flush_timeout", interface);
-        f = fopen(path, "r");
-        if (!f) return false;
-        if (fgets(buf, sizeof(buf), f)) {
-            flush_timeout = atoi(buf);
-        }
-        fclose(f);
-
-        return true;
-    }
-
     XDPTransport()
         : xsk_(nullptr)
         , umem_(nullptr)
         , umem_area_(nullptr)
         , umem_size_(0)
-        , socket_fd_(-1)
         , connected_(false)
         , ifindex_(0)
         , next_free_frame_(0)
@@ -215,6 +142,9 @@ public:
         , current_rx_addr_(0)
         , bpf_loader_(nullptr)
         , bpf_enabled_(false)
+        , rx_trickle_running_(false)
+        , rx_trickle_fd_(-1)
+        , poll_fd_{}
     {
         free_frames_.reserve(4096);  // Pre-allocate for performance
     }
@@ -237,15 +167,6 @@ public:
     void init(const XDPConfig& config,
               const char* bpf_obj_path = nullptr) {
         config_ = config;
-
-        // Configure NAPI mode (NAPI_IRQ or BUSY_POLL)
-        // This sets kernel sysfs parameters for the interface
-        if (!configure_napi_mode(config_.interface, config_)) {
-            printf("[XDP] Warning: Failed to configure NAPI mode (may need root)\n");
-        } else {
-            printf("[XDP] NAPI mode configured: %s\n",
-                   config_.napi_mode == NapiMode::BUSY_POLL ? "BUSY_POLL" : "NAPI_IRQ");
-        }
 
         // If BPF path provided, load AND ATTACH BPF program FIRST (before creating socket)
         // This is critical: the XDP program must be attached BEFORE creating the XSK socket
@@ -320,13 +241,19 @@ public:
             // When INHIBIT_PROG_LOAD is set, xdp_flags should be 0 (we've already attached our program)
             xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
             xsk_cfg.xdp_flags = 0;  // Don't touch XDP program - we've already attached it
-            // XDP_USE_NEED_WAKEUP is critical for igc driver - it allows the kernel to
-            // signal when it needs wakeup via the ring flags
-            xsk_cfg.bind_flags = XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP;
+            // Use XDP_ZEROCOPY with XDP_USE_NEED_WAKEUP for zero-copy mode
+            // NOTE: igc driver has a TX completion stall bug in zero-copy mode - TX completions
+            // only happen during NAPI poll which requires RX traffic. We use an RX trickle
+            // thread (see start_rx_trickle()) to work around this.
+            xsk_cfg.bind_flags = config_.zero_copy
+                ? (XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP)
+                : XDP_COPY;
         } else {
             xsk_cfg.libbpf_flags = 0;
             xsk_cfg.xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST;
-            xsk_cfg.bind_flags = config_.zero_copy ? XDP_ZEROCOPY : XDP_COPY;
+            xsk_cfg.bind_flags = config_.zero_copy
+                ? (XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP)
+                : XDP_COPY;
         }
 
         // Create AF_XDP socket
@@ -345,15 +272,21 @@ public:
             throw std::runtime_error(std::string("Failed to create XDP socket: ") + strerror(-ret));
         }
 
-        // Enable kernel busy poll for better TX completion processing
-        // This helps igc driver process TX during poll() calls
         int xdp_fd = xsk_socket__fd(xsk_);
+
+        // Enable SO_BUSY_POLL for userspace busy-polling
+        // poll() syscall will busy-poll in kernel for specified duration
         int busy_poll = 1;
         setsockopt(xdp_fd, SOL_SOCKET, SO_PREFER_BUSY_POLL, &busy_poll, sizeof(busy_poll));
-        int busy_poll_budget = 64;
-        setsockopt(xdp_fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &busy_poll_budget, sizeof(busy_poll_budget));
-        int busy_poll_usec = 50;  // Busy poll for 50us before blocking
-        setsockopt(xdp_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_usec, sizeof(busy_poll_usec));
+        int budget = static_cast<int>(config_.busy_poll_budget);
+        setsockopt(xdp_fd, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &budget, sizeof(budget));
+        int usec = static_cast<int>(config_.busy_poll_usec);
+        setsockopt(xdp_fd, SOL_SOCKET, SO_BUSY_POLL, &usec, sizeof(usec));
+        printf("[XDP] SO_BUSY_POLL=%d us, budget=%d\n", usec, budget);
+
+        // Cache pollfd for poll_wait() (avoid recreating on every call)
+        poll_fd_.fd = xdp_fd;
+        poll_fd_.events = POLLIN | POLLOUT;
 
         // If BPF enabled, register the socket in the BPF map
         // (BPF program was already attached before socket creation)
@@ -389,11 +322,7 @@ public:
         }
 
         xsk_ring_prod__submit(&fill_ring_, frames_to_populate);
-
-        // CRITICAL FIX: Wake up kernel after initial FILL ring population!
-        // Without this, kernel doesn't know frames are available for RX
-        kick_rx();
-        printf("[XDP] ✅ Kicked RX after initial FILL ring population\n");
+        printf("[XDP] ✅ FILL ring populated with %u frames\n", frames_to_populate);
 
         // CRITICAL FIX: Mark frames in fill ring as "used" by advancing the allocator
         // Otherwise TX will reuse the same frames that RX owns, causing corruption
@@ -409,10 +338,37 @@ public:
 
         // Mark as "connected" for userspace stack usage (no TCP socket needed)
         connected_ = true;
-        socket_fd_ = 1;  // Dummy value (not used for TX/RX frames)
 
         printf("[XDP] Initialized on %s (queue %u, %u frames)\n",
                config_.interface, config_.queue_id, config_.num_frames);
+
+        // Start RX trickle thread for zero-copy mode TX completion workaround
+        if (config_.zero_copy && config_.rx_trickle_enabled) {
+            start_rx_trickle();
+        }
+    }
+
+    /**
+     * Poll for RX/TX events with userspace busy-polling
+     *
+     * Uses poll() on the AF_XDP socket to trigger SO_BUSY_POLL behavior.
+     * SO_BUSY_POLL causes the kernel to busy-poll during the poll() syscall,
+     * which processes both RX and TX completions.
+     *
+     * Always uses timeout=0 (non-blocking) to avoid timer setup overhead.
+     * SO_BUSY_POLL duration (set via setsockopt) controls the polling time.
+     *
+     * @return 1 if events ready, 0 on timeout, -1 on error
+     */
+    int poll_wait() {
+        if (!xsk_) return -1;
+
+        int ret = poll(&poll_fd_, 1, 0);  // Always non-blocking, SO_BUSY_POLL controls duration
+
+        // After poll(), reclaim any TX completions
+        reclaim_completed_frames();
+
+        return ret;
     }
 
     // ========================================================================
@@ -432,7 +388,7 @@ public:
      * @return Pointer to XDPFrame, or nullptr if no data available
      */
     XDPFrame* peek_rx_frame() {
-        if (!connected_ || socket_fd_ < 0) {
+        if (!connected_ || !xsk_) {
             errno = ENOTCONN;
             return nullptr;
         }
@@ -442,36 +398,9 @@ public:
             return current_rx_frame_;
         }
 
-        // Debug: Check fill ring status before trying to receive
-        static int debug_call_count = 0;
-        debug_call_count++;
-        bool print_debug = (debug_call_count <= 10 || debug_call_count % 500 == 0);
-        if (print_debug) {
-            // Get ring info
-            uint32_t fill_free = xsk_prod_nb_free(&fill_ring_, config_.num_frames);
-            uint32_t rx_avail = xsk_cons_nb_avail(&rx_ring_, config_.num_frames);
-            // Also check actual ring pointers
-            uint32_t* fill_prod = fill_ring_.producer;
-            uint32_t* fill_cons = fill_ring_.consumer;
-            uint32_t* rx_prod = rx_ring_.producer;
-            uint32_t* rx_cons = rx_ring_.consumer;
-            printf("[XDP-DEBUG] #%d: fill(prod=%u,cons=%u,free=%u) rx(prod=%u,cons=%u,avail=%u) xsk_fd=%d\n",
-                   debug_call_count, *fill_prod, *fill_cons, fill_free,
-                   *rx_prod, *rx_cons, rx_avail, xsk_socket__fd(xsk_));
-            fflush(stdout);
-        }
-
-        // Always kick_rx() to wake up kernel when checking for packets
-        // With XDP_USE_NEED_WAKEUP, kernel may be sleeping waiting for wakeup
-        kick_rx();
-
         // Check RX ring for received packets
         uint32_t idx_rx;
         uint32_t nb_pkts = xsk_ring_cons__peek(&rx_ring_, 1, &idx_rx);
-
-        if (print_debug) {
-            printf("[PEEK-DEBUG] Peeked RX ring: nb_pkts=%u\n", nb_pkts);
-        }
 
         if (nb_pkts == 0) {
             // No packets available
@@ -517,93 +446,50 @@ public:
      * peek_rx_frame() when done reading frame data.
      *
      * @param frame Frame to release (must be from peek_rx_frame())
+     * @param deferred If true, defer FILL ring refill - returns UMEM address for later refill_frame() call.
+     *                 If false (default), immediately refill FILL ring.
+     * @return When deferred=true: UMEM address to pass to refill_frame() later, or 0 on error.
+     *         When deferred=false: always returns 0.
      */
-    void release_rx_frame(XDPFrame* frame) {
-        if (frame == nullptr || frame != current_rx_frame_) {
-            return;
-        }
-
-        // Debug: Track refill operations
-        static int refill_count = 0;
-        refill_count++;
-        bool print_debug = (refill_count <= 5 || refill_count % 10 == 0);
-
-        // Release RX descriptor (this was peeked in peek_rx_frame)
-        xsk_ring_cons__release(&rx_ring_, 1);
-
-        // Refill fill ring with the SAME address the kernel gave us (includes headroom)
-        // CRITICAL: Must use current_rx_addr_ (from RX descriptor) not frame->addr (base address)
-        // The kernel adds headroom (0x100) when writing packets, so we must refill with that address
-        uint32_t idx_fq;
-        if (xsk_ring_prod__reserve(&fill_ring_, 1, &idx_fq) == 1) {
-            // Get base address by subtracting headroom
-            uint64_t base_addr = current_rx_addr_ & ~(config_.frame_size - 1);
-            *xsk_ring_prod__fill_addr(&fill_ring_, idx_fq) = base_addr;
-            xsk_ring_prod__submit(&fill_ring_, 1);
-
-            // CRITICAL FIX: Wake up kernel after refilling!
-            // Without this, kernel doesn't know fill ring has new frames -> ENOSPC errors
-            kick_rx();
-
-            if (print_debug) {
-                printf("[REFILL-DEBUG] Refill #%d: RX addr=0x%lx, refilling base=0x%lx (+ kick)\n",
-                       refill_count, current_rx_addr_, base_addr);
-            }
-        } else {
-            printf("[REFILL-ERROR] Refill #%d: Failed to reserve fill ring space! RX addr=0x%lx lost!\n",
-                   refill_count, current_rx_addr_);
-        }
-
-        // Clear frame state (no FramePool to release, just clear pointer)
-        rx_frame_.clear();
-        current_rx_frame_ = nullptr;
-        current_rx_addr_ = 0;
-    }
-
-    /**
-     * Release RX frame from ring but defer FILL ring refill (zero-copy mode)
-     *
-     * This releases the RX ring consumer so more frames can be peeked,
-     * but does NOT refill the FILL ring. Caller must call refill_frame()
-     * later when done with the frame data.
-     *
-     * @param frame Frame to release (must be from peek_rx_frame())
-     * @return UMEM address to pass to refill_frame() later, or 0 on error
-     */
-    uint64_t release_rx_frame_deferred(XDPFrame* frame) {
+    uint64_t release_rx_frame(XDPFrame* frame, bool deferred = false) {
         if (frame == nullptr || frame != current_rx_frame_) {
             return 0;
         }
 
-        // Save the address for later refill
+        // Save address before clearing (needed for both paths)
         uint64_t saved_addr = current_rx_addr_;
 
-        // Release RX descriptor (so we can peek next frame)
+        // Release RX descriptor (this was peeked in peek_rx_frame)
         xsk_ring_cons__release(&rx_ring_, 1);
 
-        // Clear frame state but DON'T refill FILL ring yet
+        if (!deferred) {
+            // Immediate refill: return buffer to FILL ring now
+            uint32_t idx_fq;
+            if (xsk_ring_prod__reserve(&fill_ring_, 1, &idx_fq) == 1) {
+                uint64_t base_addr = saved_addr & ~(config_.frame_size - 1);
+                *xsk_ring_prod__fill_addr(&fill_ring_, idx_fq) = base_addr;
+                xsk_ring_prod__submit(&fill_ring_, 1);
+            }
+        }
+
+        // Clear frame state
         rx_frame_.clear();
         current_rx_frame_ = nullptr;
         current_rx_addr_ = 0;
 
-        return saved_addr;
+        return deferred ? saved_addr : 0;
     }
 
     /**
      * Refill a frame to FILL ring (deferred zero-copy release)
      *
      * Called when SSL has finished consuming data from a frame that was
-     * released with release_rx_frame_deferred().
+     * released with release_rx_frame(frame, true).
      *
-     * @param umem_addr UMEM address returned from release_rx_frame_deferred()
+     * @param umem_addr UMEM address returned from release_rx_frame(frame, true)
      */
     void refill_frame(uint64_t umem_addr) {
         if (umem_addr == 0) return;
-
-        // Debug: Track refill operations
-        static int deferred_refill_count = 0;
-        deferred_refill_count++;
-        bool print_debug = (deferred_refill_count <= 5 || deferred_refill_count % 10 == 0);
 
         uint32_t idx_fq;
         if (xsk_ring_prod__reserve(&fill_ring_, 1, &idx_fq) == 1) {
@@ -611,17 +497,6 @@ public:
             uint64_t base_addr = umem_addr & ~(config_.frame_size - 1);
             *xsk_ring_prod__fill_addr(&fill_ring_, idx_fq) = base_addr;
             xsk_ring_prod__submit(&fill_ring_, 1);
-
-            // Wake up kernel
-            kick_rx();
-
-            if (print_debug) {
-                printf("[DEFERRED-REFILL] #%d: addr=0x%lx, base=0x%lx\n",
-                       deferred_refill_count, umem_addr, base_addr);
-            }
-        } else {
-            printf("[DEFERRED-REFILL-ERROR] #%d: Failed to reserve FILL ring! addr=0x%lx lost!\n",
-                   deferred_refill_count, umem_addr);
         }
     }
 
@@ -635,7 +510,7 @@ public:
      * @return Pointer to XDPFrame, or nullptr if no frames available
      */
     XDPFrame* get_tx_frame() {
-        if (!connected_ || socket_fd_ < 0) {
+        if (!connected_ || !xsk_) {
             errno = ENOTCONN;
             return nullptr;
         }
@@ -677,7 +552,7 @@ public:
      * @return Number of bytes queued, or -1 on error
      */
     ssize_t send_frame(XDPFrame* frame, size_t len) {
-        if (!connected_ || socket_fd_ < 0) {
+        if (!connected_ || !xsk_) {
             errno = ENOTCONN;
             return -1;
         }
@@ -721,31 +596,11 @@ public:
         // Submit the TX descriptor
         xsk_ring_prod__submit(&tx_ring_, 1);
 
-        // Debug: Log TX submission and packet contents
-        static int tx_count = 0;
-        tx_count++;
-        if (tx_count <= 10) {
-            uint32_t* tx_prod = tx_ring_.producer;
-            uint32_t* tx_cons = tx_ring_.consumer;
-            printf("[TX-DEBUG] Submitted TX descriptor #%d: addr=0x%llx, len=%u, idx=%u\n",
-                   tx_count, (unsigned long long)tx_desc->addr, tx_desc->len, idx);
-            printf("[TX-RING] After submit #%d: tx_prod=%u, tx_cons=%u, pending=%u\n",
-                   tx_count, *tx_prod, *tx_cons, *tx_prod - *tx_cons);
-
-            // Dump first 64 bytes of packet (data is at frame->data, already includes headroom)
-            uint8_t* pkt = frame->data;
-            printf("[TX-DEBUG] Packet dump (first 64 bytes):\n");
-            for (uint32_t i = 0; i < std::min(64u, tx_desc->len); i += 16) {
-                printf("  %04x: ", i);
-                for (uint32_t j = i; j < std::min(i + 16, tx_desc->len); j++) {
-                    printf("%02x ", pkt[j]);
-                }
-                printf("\n");
-            }
+        // Send inline trickle packet to trigger NAPI for TX completion
+        // (igc driver workaround - TX completions only happen during NAPI poll)
+        if (rx_trickle_fd_ >= 0) {
+            ::send(rx_trickle_fd_, trickle_packet_, trickle_packet_len_, MSG_DONTWAIT);
         }
-
-        // Kick the kernel to process TX ring
-        kick_tx();
 
         // Mark frame as no longer owned by application
         frame->owned = false;
@@ -758,12 +613,12 @@ public:
     // ========================================================================
 
     /**
-     * Get underlying socket file descriptor (for event polling)
+     * Get underlying AF_XDP socket file descriptor (for event polling)
      *
-     * @return Socket FD
+     * @return XDP socket FD, or -1 if not initialized
      */
     int get_fd() const {
-        return socket_fd_;
+        return xsk_ ? xsk_socket__fd(xsk_) : -1;
     }
 
     /**
@@ -777,13 +632,27 @@ public:
      * Close XDP transport
      */
     void close() {
-        if (socket_fd_ >= 0) {
-            ::close(socket_fd_);
-            socket_fd_ = -1;
-        }
+        // Stop RX trickle thread first (before closing sockets)
+        stop_rx_trickle();
 
+        // cleanup() handles xsk_socket__delete() which closes the AF_XDP socket
         cleanup();
         connected_ = false;
+    }
+
+    /**
+     * Stop RX trickle thread (public API)
+     *
+     * Call this after SSL/WebSocket handshake completes to stop the background
+     * trickle thread. After handshake, inline trickle in send_frame() provides
+     * TX completion triggers, so the thread is no longer needed.
+     *
+     * This reduces CPU overhead by eliminating the 500 Hz self-ping thread.
+     * The inline trickle after send_frame() will continue to trigger NAPI
+     * for TX completions as needed.
+     */
+    void stop_rx_trickle_thread() {
+        stop_rx_trickle();
     }
 
     static const char* name() {
@@ -964,6 +833,243 @@ private:
         }
     }
 
+    // ========================================================================
+    // RX Trickle Implementation
+    // ========================================================================
+    //
+    // RATIONALE: igc driver (Intel I225/I226 NICs) zero-copy TX completion bug
+    // -------------------------------------------------------------------------
+    // In XDP zero-copy mode (XDP_ZEROCOPY), the igc driver processes TX
+    // completions during NAPI polling. However, NAPI only runs when:
+    //   1. Hardware interrupt triggers (RX packet arrives)
+    //   2. Busy-poll is active (requires RX traffic to have work)
+    //
+    // Without RX traffic, TX completions never happen, causing:
+    //   - Packets stuck in TX ring (pending > 0)
+    //   - SSL handshake timeout (server ACKs never processed)
+    //   - Connection stall
+    //
+    // The TX completion path in igc driver:
+    //   igc_poll() -> igc_clean_tx_ring() -> xsk_tx_completed()
+    //
+    // This only runs during NAPI poll, which requires:
+    //   1. igc_xsk_wakeup() to schedule NAPI (via sendto())
+    //   2. NAPI to actually run (triggered by IRQ or busy-poll)
+    //   3. napi_busy_loop() to process both RX and TX
+    //
+    // WORKAROUND: RX Trickle
+    // ----------------------
+    // We inject minimal RX traffic using raw socket self-ping to the
+    // interface's own MAC address. This triggers NAPI polls which
+    // process both RX and TX completions.
+    //
+    // The trickle packet is a minimal UDP packet:
+    //   - Ethernet: self MAC -> self MAC
+    //   - IP: 127.0.0.1 -> 127.0.0.1 (loopback, won't be routed)
+    //   - UDP: port 65534 -> 65534 (unused high port)
+    //   - Payload: 1 byte
+    //
+    // At 500 Hz (2ms interval), this generates ~50KB/s of traffic,
+    // which is negligible compared to HFT workloads.
+    //
+    // ALTERNATIVE SOLUTIONS:
+    // 1. Use XDP_COPY mode (adds ~1-2µs latency per packet)
+    // 2. Wait for Intel to fix igc driver (unknown timeline)
+    // 3. Use different NIC with better XDP support (e.g., Mellanox)
+    // ========================================================================
+
+    /**
+     * Start RX trickle thread for zero-copy TX completion workaround
+     */
+    void start_rx_trickle() {
+        if (rx_trickle_running_.load()) {
+            return;  // Already running
+        }
+
+        // Get interface MAC address
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        strncpy(ifr.ifr_name, config_.interface, IFNAMSIZ - 1);
+
+        int tmp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (tmp_fd < 0) {
+            printf("[RX-TRICKLE] Warning: Cannot create socket for MAC lookup: %s\n", strerror(errno));
+            return;
+        }
+
+        if (ioctl(tmp_fd, SIOCGIFHWADDR, &ifr) < 0) {
+            printf("[RX-TRICKLE] Warning: Cannot get MAC address for %s: %s\n",
+                   config_.interface, strerror(errno));
+            ::close(tmp_fd);
+            return;
+        }
+        ::close(tmp_fd);
+
+        // Store MAC address for packet construction
+        memcpy(local_mac_, ifr.ifr_hwaddr.sa_data, 6);
+
+        // Create raw socket for sending trickle packets
+        rx_trickle_fd_ = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+        if (rx_trickle_fd_ < 0) {
+            printf("[RX-TRICKLE] Warning: Cannot create raw socket: %s\n", strerror(errno));
+            return;
+        }
+
+        // Bind to interface
+        struct sockaddr_ll sll;
+        memset(&sll, 0, sizeof(sll));
+        sll.sll_family = AF_PACKET;
+        sll.sll_ifindex = ifindex_;
+        sll.sll_protocol = htons(ETH_P_ALL);
+
+        if (bind(rx_trickle_fd_, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
+            printf("[RX-TRICKLE] Warning: Cannot bind raw socket to %s: %s\n",
+                   config_.interface, strerror(errno));
+            ::close(rx_trickle_fd_);
+            rx_trickle_fd_ = -1;
+            return;
+        }
+
+        // Build trickle packet (minimal UDP to self)
+        build_trickle_packet();
+
+        // Start trickle thread
+        rx_trickle_running_.store(true);
+        rx_trickle_thread_ = std::thread([this]() {
+            printf("[RX-TRICKLE] Thread started (interval=%u us, ~%u Hz)\n",
+                   config_.rx_trickle_interval_us, 1000000 / config_.rx_trickle_interval_us);
+
+            uint64_t packets_sent = 0;
+            while (rx_trickle_running_.load()) {
+                // Send trickle packet
+                ssize_t sent = send(rx_trickle_fd_, trickle_packet_, trickle_packet_len_, 0);
+                if (sent > 0) {
+                    packets_sent++;
+                }
+
+                // Sleep for configured interval
+                usleep(config_.rx_trickle_interval_us);
+            }
+
+            printf("[RX-TRICKLE] Thread stopped (sent %lu packets)\n", packets_sent);
+        });
+
+        printf("[RX-TRICKLE] Started on %s (MAC=%02x:%02x:%02x:%02x:%02x:%02x)\n",
+               config_.interface,
+               local_mac_[0], local_mac_[1], local_mac_[2],
+               local_mac_[3], local_mac_[4], local_mac_[5]);
+
+        // Wait for trickle thread to send at least one packet before returning.
+        // This ensures NAPI poll is triggered before any TX operations (e.g., SYN packet),
+        // which is critical for TX completion processing on igc driver in zero-copy mode.
+        usleep(config_.rx_trickle_interval_us * 2);  // Wait ~2 intervals to ensure packet sent
+    }
+
+    /**
+     * Stop RX trickle thread
+     */
+    void stop_rx_trickle() {
+        if (!rx_trickle_running_.load()) {
+            return;  // Not running
+        }
+
+        rx_trickle_running_.store(false);
+
+        if (rx_trickle_thread_.joinable()) {
+            rx_trickle_thread_.join();
+        }
+
+        if (rx_trickle_fd_ >= 0) {
+            ::close(rx_trickle_fd_);
+            rx_trickle_fd_ = -1;
+        }
+
+        printf("[RX-TRICKLE] Stopped\n");
+    }
+
+    /**
+     * Build minimal trickle packet (Ethernet + IP + UDP + 1 byte payload)
+     *
+     * Layout:
+     *   [Ethernet Header (14 bytes)]
+     *     - dst MAC: local MAC (self-addressed)
+     *     - src MAC: local MAC
+     *     - EtherType: 0x0800 (IPv4)
+     *   [IP Header (20 bytes)]
+     *     - version: 4, IHL: 5
+     *     - total length: 29 (20 IP + 8 UDP + 1 payload)
+     *     - TTL: 1 (won't be routed)
+     *     - protocol: UDP (17)
+     *     - src/dst: 127.0.0.1 (loopback)
+     *   [UDP Header (8 bytes)]
+     *     - src/dst port: 65534
+     *     - length: 9 (8 header + 1 payload)
+     *   [Payload (1 byte)]
+     *     - 0x00
+     */
+    void build_trickle_packet() {
+        memset(trickle_packet_, 0, sizeof(trickle_packet_));
+
+        // Ethernet header (14 bytes)
+        uint8_t* eth = trickle_packet_;
+        memcpy(eth, local_mac_, 6);        // dst MAC = self
+        memcpy(eth + 6, local_mac_, 6);    // src MAC = self
+        eth[12] = 0x08;                    // EtherType = IPv4
+        eth[13] = 0x00;
+
+        // IP header (20 bytes)
+        uint8_t* ip = eth + 14;
+        ip[0] = 0x45;              // version=4, IHL=5
+        ip[1] = 0x00;              // DSCP/ECN
+        ip[2] = 0x00;              // total length (high byte)
+        ip[3] = 0x1D;              // total length = 29 (20+8+1)
+        ip[4] = 0x00;              // identification
+        ip[5] = 0x00;
+        ip[6] = 0x40;              // flags (Don't Fragment)
+        ip[7] = 0x00;              // fragment offset
+        ip[8] = 0x01;              // TTL = 1 (won't be routed)
+        ip[9] = 0x11;              // protocol = UDP (17)
+        ip[10] = 0x00;             // header checksum (will calculate)
+        ip[11] = 0x00;
+        // src IP = 127.0.0.1
+        ip[12] = 127; ip[13] = 0; ip[14] = 0; ip[15] = 1;
+        // dst IP = 127.0.0.1
+        ip[16] = 127; ip[17] = 0; ip[18] = 0; ip[19] = 1;
+
+        // Calculate IP header checksum
+        uint32_t sum = 0;
+        for (int i = 0; i < 20; i += 2) {
+            sum += (ip[i] << 8) | ip[i + 1];
+        }
+        while (sum >> 16) {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        uint16_t checksum = ~sum;
+        ip[10] = checksum >> 8;
+        ip[11] = checksum & 0xFF;
+
+        // UDP header (8 bytes)
+        uint8_t* udp = ip + 20;
+        udp[0] = 0xFF;             // src port = 65534 (high byte)
+        udp[1] = 0xFE;             // src port = 65534 (low byte)
+        udp[2] = 0xFF;             // dst port = 65534 (high byte)
+        udp[3] = 0xFE;             // dst port = 65534 (low byte)
+        udp[4] = 0x00;             // length = 9 (8 + 1)
+        udp[5] = 0x09;
+        udp[6] = 0x00;             // checksum (0 = disabled)
+        udp[7] = 0x00;
+
+        // Payload (1 byte)
+        udp[8] = 0x00;
+
+        // Total packet length: 14 (eth) + 20 (ip) + 8 (udp) + 1 (payload) = 43 bytes
+        trickle_packet_len_ = 43;
+    }
+
+    // ========================================================================
+    // End RX Trickle Implementation
+    // ========================================================================
+
     /**
      * Reclaim completed TX frames from completion ring
      */
@@ -971,25 +1077,9 @@ private:
         uint32_t idx_cq;
         uint32_t nb_completed = xsk_ring_cons__peek(&comp_ring_, config_.batch_size, &idx_cq);
 
-        // Debug: Always log CQ status for first 20 calls
-        static int poll_count = 0;
-        poll_count++;
-        if (poll_count <= 20) {
-            uint32_t* cq_prod = comp_ring_.producer;
-            uint32_t* cq_cons = comp_ring_.consumer;
-            printf("[CQ-DEBUG] poll #%d: prod=%u, cons=%u, nb_completed=%u\n",
-                   poll_count, *cq_prod, *cq_cons, nb_completed);
-        }
-
         if (nb_completed == 0) {
             return;
         }
-
-        // Debug: Log completion
-        static int reclaim_count = 0;
-        reclaim_count++;
-        printf("[TX-DEBUG] Reclaimed %u completed frames from CQ (call #%d)\n",
-               nb_completed, reclaim_count);
 
         // Add completed frames back to free list
         // NOTE: The completion addr includes XDP_HEADROOM offset,
@@ -1031,77 +1121,7 @@ private:
         return addr;
     }
 
-    /**
-     * Kick the kernel to process TX ring
-     *
-     * With XDP_ZEROCOPY + XDP_USE_NEED_WAKEUP on igc driver, TX is processed
-     * during NAPI poll. We need to trigger NAPI by:
-     * 1. Calling sendto() to signal TX readiness
-     * 2. Using poll() to wait for kernel to process
-     * 3. Calling recvfrom() as a fallback to trigger NAPI via RX path
-     */
-    void kick_tx() {
-        int xdp_fd = xsk_socket__fd(xsk_);
-
-        static int kick_count = 0;
-        kick_count++;
-
-        // Check if we need to wake up the kernel (with XDP_USE_NEED_WAKEUP)
-        bool needs_wakeup = xsk_ring_prod__needs_wakeup(&tx_ring_);
-
-        // Primary kick via sendto() - notifies kernel of pending TX
-        // This schedules NAPI but doesn't immediately run it
-        int ret = sendto(xdp_fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
-
-        // Reclaim any immediately available completions
-        reclaim_completed_frames();
-
-        // For igc driver: NAPI runs asynchronously. We need to yield CPU time
-        // for kernel to run softirqs that process NAPI. Using poll() with
-        // a longer timeout allows the kernel scheduler to run NAPI.
-        struct pollfd fds = {};
-        fds.fd = xdp_fd;
-        fds.events = POLLIN | POLLOUT;
-
-        // Try multiple poll cycles to give NAPI time to run
-        int poll_ret = 0;
-        for (int i = 0; i < 3; i++) {
-            // Each poll() call yields to kernel, allowing NAPI to process
-            poll_ret = poll(&fds, 1, 1);  // 1ms timeout
-            reclaim_completed_frames();
-
-            uint32_t pending = *tx_ring_.producer - *tx_ring_.consumer;
-            if (pending == 0) break;  // All TX completed
-
-            // Yield more aggressively to let softirq run
-            sched_yield();
-        }
-
-        uint32_t pending = *tx_ring_.producer - *tx_ring_.consumer;
-        if (kick_count <= 10 || kick_count % 50 == 0) {
-            printf("[TX-DEBUG] kick_tx() #%d: fd=%d, ret=%d, poll=%d, needs_wakeup=%d, pending=%u\n",
-                   kick_count, xdp_fd, ret, poll_ret, needs_wakeup, pending);
-        }
-    }
-
-    /**
-     * Wake up kernel to process RX packets
-     *
-     * When XDP_USE_NEED_WAKEUP is set, we need to check the wakeup flag
-     * and call recvfrom() when the kernel needs a kick.
-     */
-    void kick_rx() {
-        // Check if kernel needs wakeup (when XDP_USE_NEED_WAKEUP is set)
-        if (xsk_ring_prod__needs_wakeup(&fill_ring_)) {
-            int xdp_fd = xsk_socket__fd(xsk_);
-
-            // Wake up kernel to process RX
-            // Using recvfrom() with MSG_DONTWAIT to avoid blocking
-            recvfrom(xdp_fd, nullptr, 0, MSG_DONTWAIT, nullptr, nullptr);
-        }
-    }
-
-    // Configuration
+    // Configuration (private)
     XDPConfig config_;                      // XDP configuration (interface, queue, frame size, etc.)
 
     // AF_XDP Socket
@@ -1118,8 +1138,7 @@ private:
     struct xsk_ring_cons rx_ring_;         // Consumer: Received packets (kernel → app)
     struct xsk_ring_prod tx_ring_;         // Producer: Packets to transmit (app → kernel)
 
-    // TCP Connection State
-    int socket_fd_;                         // TCP socket file descriptor for connection
+    // Connection State
     bool connected_;                        // Connection state flag
     unsigned int ifindex_;                  // Network interface index
 
@@ -1136,6 +1155,17 @@ private:
     // BPF packet filtering (optional)
     BPFLoader* bpf_loader_;                 // BPF loader for packet filtering (nullptr if disabled)
     bool bpf_enabled_;                      // Whether BPF filtering is enabled
+
+    // RX Trickle thread (for zero-copy TX completion workaround)
+    std::atomic<bool> rx_trickle_running_;  // Trickle thread running flag
+    std::thread rx_trickle_thread_;         // Trickle thread handle
+    int rx_trickle_fd_;                     // Raw socket FD for trickle packets
+    uint8_t local_mac_[6];                  // Local MAC address for self-ping
+    uint8_t trickle_packet_[64];            // Pre-built trickle packet
+    size_t trickle_packet_len_;             // Trickle packet length
+
+    // Cached poll state (avoid recreating struct on every poll_wait call)
+    struct pollfd poll_fd_;                 // Cached pollfd for poll_wait()
 };
 
 #else  // !USE_XDP

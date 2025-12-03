@@ -5,17 +5,29 @@
 //   Application → TransportPolicy (XDPUserspaceTransport) → SSLPolicy → WebSocket
 //
 // This test validates complete kernel bypass using:
-//   - XDP driver mode (native)
-//   - Userspace TCP/IP stack
+//   - AF_XDP zero-copy mode (XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP)
+//   - Native driver mode (XDP_FLAGS_DRV_MODE)
+//   - Userspace TCP/IP stack (complete kernel bypass)
 //   - SSL/TLS over userspace TCP
 //   - WebSocket protocol
+//   - 6-stage latency breakdown with NIC hardware timestamps
 //
 // Target: wss://stream.binance.com:443/stream?streams=btcusdt@trade
 //
+// Polling Mode:
+//   Uses userspace busy-polling with SO_BUSY_POLL for lowest latency.
+//
+// Zero-Copy TX Completion Workaround:
+//   The igc driver (Intel I225/I226) has a TX completion stall bug in zero-copy
+//   mode. TX completions only happen during NAPI poll which requires RX traffic.
+//   XDPTransport uses an RX trickle thread (self-ping at 500 Hz) to keep NAPI
+//   polling active.
+//
 // Requirements:
 //   - Root or CAP_NET_RAW + CAP_BPF
-//   - XDP-capable NIC (e.g., Intel I225/I226)
-//   - Compile with USE_XDP=1
+//   - XDP-capable NIC (e.g., Intel I225/I226 with igc driver)
+//   - Compile with USE_XDP=1 USE_OPENSSL=1
+//   - Run ./scripts/xdp_prepare.sh <interface> before testing
 
 #include "../../src/policy/transport.hpp"
 #include "../../src/policy/ssl.hpp"
@@ -89,23 +101,19 @@ int main(int argc, char** argv) {
     printf("Architecture: XDP (native driver) + Userspace TCP/IP + OpenSSL\n\n");
 
     // Parse command line args
-    // Usage: ./test_xdp_binance_integration [interface] [--busy-poll]
+    // Usage: ./test_xdp_binance_integration [interface]
     const char* interface = "enp108s0";
-    bool use_busy_poll = false;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--busy-poll") == 0 || strcmp(argv[i], "-b") == 0) {
-            use_busy_poll = true;
-        } else {
-            interface = argv[i];
+        // Silently ignore deprecated --napi-timer and --user-poll flags
+        if (strcmp(argv[i], "--napi-timer") == 0 || strcmp(argv[i], "-t") == 0 ||
+            strcmp(argv[i], "--user-poll") == 0 || strcmp(argv[i], "-u") == 0) {
+            continue;
         }
+        interface = argv[i];
     }
 
-    websocket::xdp::NapiMode napi_mode = use_busy_poll
-        ? websocket::xdp::NapiMode::BUSY_POLL
-        : websocket::xdp::NapiMode::NAPI_IRQ;
-
-    printf("NAPI Mode: %s\n", use_busy_poll ? "BUSY_POLL" : "NAPI_IRQ");
+    printf("Polling Mode: Userspace SO_BUSY_POLL\n");
     printf("Interface: %s\n\n", interface);
 
     try {
@@ -123,7 +131,7 @@ int main(int argc, char** argv) {
         printf("─────────────────────────────────────────────────────────────────\n");
 
         XDPUserspaceTransport transport;
-        transport.init(interface, "src/xdp/bpf/exchange_filter.bpf.o", napi_mode);
+        transport.init(interface, "src/xdp/bpf/exchange_filter.bpf.o");
 
         // Configure BPF filter for Binance
         printf("  Resolving Binance IPs...\n");
@@ -231,6 +239,10 @@ int main(int argc, char** argv) {
         printf("💬 Phase 5: WebSocket Message Streaming\n");
         printf("─────────────────────────────────────────────────────────────────\n\n");
 
+        // Reset HW timestamps before message streaming
+        // (clear any stale timestamps from handshake/upgrade phases)
+        transport.reset_hw_timestamps();
+
         uint8_t frame_buffer[65536];
         size_t buffer_offset = 0;
         int ping_count = 0;
@@ -244,30 +256,47 @@ int main(int argc, char** argv) {
             // Stage 2: Event loop start
             timing.event_cycle = rdtsc();
 
-            // Poll transport (this captures Stage 1 HW timestamp internally)
+            // Poll transport first (handles TX completions, etc.)
             transport.poll();
-
-            // Stage 1: Get hardware timestamps from XDP metadata
-            timing.hw_timestamp_count = transport.get_hw_timestamp_count();
-            if (timing.hw_timestamp_count > 0) {
-                timing.hw_timestamp_oldest_ns = transport.get_oldest_rx_hw_timestamp();
-                timing.hw_timestamp_latest_ns = transport.get_latest_rx_hw_timestamp();
-            }
 
             // Stage 3: Before SSL read
             timing.recv_start_cycle = rdtsc();
 
             // Read more data from SSL
+            // This internally calls transport.recv() via BIO, which records HW timestamps
             ssize_t read_len = ssl.read(frame_buffer + buffer_offset,
                                          sizeof(frame_buffer) - buffer_offset);
 
             // Stage 4: After SSL read
             timing.recv_end_cycle = rdtscp();
 
+            // Stage 1: Get hardware timestamps captured during ssl.read()
+            timing.hw_timestamp_count = transport.get_hw_timestamp_count();
+            if (timing.hw_timestamp_count > 0) {
+                timing.hw_timestamp_oldest_ns = transport.get_oldest_rx_hw_timestamp();
+                timing.hw_timestamp_latest_ns = transport.get_latest_rx_hw_timestamp();
+            } else {
+                // Clear stale timestamps when no packets received this iteration
+                timing.hw_timestamp_oldest_ns = 0;
+                timing.hw_timestamp_latest_ns = 0;
+            }
+            // Reset after capturing for next iteration
+            transport.reset_hw_timestamps();
+
             if (read_len > 0) {
                 buffer_offset += read_len;
 
-                // Parse all complete frames in buffer
+                // ============================================================
+                // Phase 1: Parse all complete frames in buffer
+                // ============================================================
+                struct ParsedFrame {
+                    WebSocketFrame frame;
+                    size_t total_size;
+                    uint64_t parse_cycle;
+                };
+                std::vector<ParsedFrame> text_frames;
+                std::vector<ParsedFrame> control_frames;  // PING, CLOSE, etc.
+
                 size_t consumed = 0;
                 while (consumed < buffer_offset) {
                     WebSocketFrame frame;
@@ -276,52 +305,75 @@ int main(int argc, char** argv) {
                         break;  // Incomplete frame
                     }
 
-                    // Stage 5: Frame parsed
-                    timing.frame_parsed_cycle = rdtscp();
-
+                    uint64_t parse_cycle = rdtscp();
                     size_t total_frame_size = frame.header_len + frame.payload_len;
 
-                    // Handle different frame types
                     if (frame.opcode == 0x01) {  // TEXT
-                        // Stage 6: Callback entry
-                        uint64_t stage6_cycle = rdtscp();
-                        (void)get_monotonic_timestamp_ns();  // Reserved for future HW timestamp delta
+                        text_frames.push_back({frame, total_frame_size, parse_cycle});
+                    } else {
+                        control_frames.push_back({frame, total_frame_size, parse_cycle});
+                    }
 
-                        // Store frame info in timing record
-                        timing.payload_len = frame.payload_len;
-                        timing.opcode = frame.opcode;
+                    consumed += total_frame_size;
+                }
+
+                // ============================================================
+                // Phase 2: Print batch summary for TEXT frames
+                // ============================================================
+                if (!text_frames.empty()) {
+                    size_t total_payload = 0;
+                    for (const auto& pf : text_frames) {
+                        total_payload += pf.frame.payload_len;
+                    }
+
+                    printf("\n  ┌─ SSL_read: %zd bytes → %zu frame%s, %u packet%s ─┐\n",
+                           read_len,
+                           text_frames.size(),
+                           text_frames.size() > 1 ? "s" : "",
+                           timing.hw_timestamp_count,
+                           timing.hw_timestamp_count != 1 ? "s" : "");
+
+                    // Print each frame's details
+                    for (size_t i = 0; i < text_frames.size(); i++) {
+                        const auto& pf = text_frames[i];
+                        uint64_t stage6_cycle = rdtscp();
+
+                        // Update timing record for this frame
+                        timing.frame_parsed_cycle = pf.parse_cycle;
+                        timing.payload_len = pf.frame.payload_len;
+                        timing.opcode = pf.frame.opcode;
 
                         printf("\n  ╔════════════════════════════════════════════════════════════╗\n");
-                        printf("  ║ Message #%d (%lu bytes)                                    \n",
-                               message_count.load() + 1, frame.payload_len);
+                        if (text_frames.size() > 1) {
+                            printf("  ║ Message #%d (%lu bytes) [%zu/%zu in batch]                 \n",
+                                   message_count.load() + 1, pf.frame.payload_len, i + 1, text_frames.size());
+                        } else {
+                            printf("  ║ Message #%d (%lu bytes)                                    \n",
+                                   message_count.load() + 1, pf.frame.payload_len);
+                        }
                         printf("  ╚════════════════════════════════════════════════════════════╝\n");
                         printf("  📨 Data: %.100s%s\n",
-                               frame.payload,
-                               frame.payload_len > 100 ? "..." : "");
+                               pf.frame.payload,
+                               pf.frame.payload_len > 100 ? "..." : "");
 
                         // Display timing breakdown
                         printf("\n  ⏱️  Latency Breakdown (6 Stages):\n");
                         printf("  ────────────────────────────────────────────────────────────\n");
 
                         // Stage 1: Hardware timestamp from NIC
-                        // Note: bpf_xdp_metadata_rx_timestamp() returns CLOCK_REALTIME on igc driver
                         if (timing.hw_timestamp_latest_ns > 0) {
-                            // Get current clocks for domain conversion
                             struct timespec ts_real, ts_mono;
                             clock_gettime(CLOCK_REALTIME, &ts_real);
                             clock_gettime(CLOCK_MONOTONIC, &ts_mono);
                             uint64_t realtime_now_ns = (uint64_t)ts_real.tv_sec * 1000000000ULL + ts_real.tv_nsec;
                             uint64_t monotonic_now_ns = (uint64_t)ts_mono.tv_sec * 1000000000ULL + ts_mono.tv_nsec;
 
-                            // Convert HW timestamp from CLOCK_REALTIME to CLOCK_MONOTONIC
                             int64_t hw_ts_mono_ns = (int64_t)timing.hw_timestamp_latest_ns -
                                                     (int64_t)realtime_now_ns + (int64_t)monotonic_now_ns;
 
                             printf("    [Stage 1] NIC HW timestamp: %.6f s (converted to MONOTONIC)\n",
                                    hw_ts_mono_ns / 1e9);
 
-                            // Calculate Stage 1→2 latency (NIC → Event loop)
-                            // Convert stage2 to CLOCK_MONOTONIC using stage6 reference
                             uint64_t stage2_to_6_ns = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz);
                             int64_t stage2_mono_ns = (int64_t)monotonic_now_ns - (int64_t)stage2_to_6_ns;
                             int64_t stage1_to_2_ns = stage2_mono_ns - hw_ts_mono_ns;
@@ -331,35 +383,30 @@ int main(int argc, char** argv) {
                             printf("    [Stage 1] NIC HW timestamp: N/A (not available)\n");
                         }
 
-                        // Stage 2→3 (event loop overhead)
                         if (timing.recv_start_cycle > timing.event_cycle) {
                             uint64_t delta = timing.recv_start_cycle - timing.event_cycle;
                             printf("    [Stage 2→3] Event→Recv:     %.3f μs\n",
                                    cycles_to_ns(delta, g_tsc_freq_hz) / 1000.0);
                         }
 
-                        // Stage 3→4 (SSL decryption)
                         if (timing.recv_end_cycle > timing.recv_start_cycle) {
                             uint64_t delta = timing.recv_end_cycle - timing.recv_start_cycle;
                             printf("    [Stage 3→4] SSL decrypt:    %.3f μs\n",
                                    cycles_to_ns(delta, g_tsc_freq_hz) / 1000.0);
                         }
 
-                        // Stage 4→5 (WebSocket parsing)
                         if (timing.frame_parsed_cycle > timing.recv_end_cycle) {
                             uint64_t delta = timing.frame_parsed_cycle - timing.recv_end_cycle;
                             printf("    [Stage 4→5] WS parse:       %.3f μs\n",
                                    cycles_to_ns(delta, g_tsc_freq_hz) / 1000.0);
                         }
 
-                        // Stage 5→6 (to callback)
                         if (stage6_cycle > timing.frame_parsed_cycle) {
                             uint64_t delta = stage6_cycle - timing.frame_parsed_cycle;
                             printf("    [Stage 5→6] To callback:    %.3f μs\n",
                                    cycles_to_ns(delta, g_tsc_freq_hz) / 1000.0);
                         }
 
-                        // Total latency (Stage 2→6)
                         if (stage6_cycle > timing.event_cycle) {
                             uint64_t total = stage6_cycle - timing.event_cycle;
                             printf("    ────────────────────────────────────────────────────────\n");
@@ -370,21 +417,27 @@ int main(int argc, char** argv) {
                         printf("  ────────────────────────────────────────────────────────────\n");
 
                         message_count++;
+                    }
+                }
 
-                    } else if (frame.opcode == 0x09) {  // PING
+                // ============================================================
+                // Phase 3: Handle control frames (PING, CLOSE, etc.)
+                // ============================================================
+                for (const auto& pf : control_frames) {
+                    if (pf.frame.opcode == 0x09) {  // PING
                         printf("  🏓 PING received - sending PONG\n");
                         ping_count++;
 
-                        uint8_t pong_frame[256];
+                        uint8_t pong_buffer[256];
                         uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78};
-                        size_t pong_len = build_pong_frame(frame.payload, frame.payload_len,
-                                                            pong_frame, mask);
+                        size_t pong_len = build_pong_frame(pf.frame.payload, pf.frame.payload_len,
+                                                            pong_buffer, mask);
 
                         // Send PONG with polling
                         size_t pong_total = 0;
                         while (pong_total < pong_len) {
                             transport.poll();
-                            ssize_t pong_sent_bytes = ssl.write(pong_frame + pong_total,
+                            ssize_t pong_sent_bytes = ssl.write(pong_buffer + pong_total,
                                                                   pong_len - pong_total);
                             if (pong_sent_bytes > 0) {
                                 pong_total += pong_sent_bytes;
@@ -393,16 +446,14 @@ int main(int argc, char** argv) {
                         }
                         pong_sent++;
 
-                    } else if (frame.opcode == 0x08) {  // CLOSE
+                    } else if (pf.frame.opcode == 0x08) {  // CLOSE
                         printf("  🚪 CLOSE frame received\n");
                         test_complete = true;
                         break;
                     }
-
-                    consumed += total_frame_size;
                 }
 
-                // Shift remaining data
+                // Shift remaining data to front of buffer
                 if (consumed > 0 && consumed < buffer_offset) {
                     memmove(frame_buffer, frame_buffer + consumed, buffer_offset - consumed);
                     buffer_offset -= consumed;
@@ -416,7 +467,7 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("SSL read error during streaming");
             }
 
-            usleep(1000);
+            // Pure busy-poll for lowest latency (no usleep)
         }
 
         printf("\n");

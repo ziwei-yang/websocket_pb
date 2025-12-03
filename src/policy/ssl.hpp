@@ -16,6 +16,15 @@
 //   - int get_fd() const
 //   - void shutdown()
 //
+// Userspace Transport Mode (XDP):
+//   When using XDPUserspaceTransport (AF_XDP zero-copy mode), SSL operates over
+//   a custom BIO that bridges OpenSSL to the userspace TCP/IP stack. The handshake
+//   is done via handshake_userspace_transport(&transport) which:
+//     1. Creates a custom BIO using UserspaceTransportBIO
+//     2. Polls the transport for TX completion (critical for igc driver)
+//     3. Performs non-blocking handshake with retry loop
+//   Note: kTLS is not available for userspace transports (no kernel socket).
+//
 // Namespace: websocket::ssl
 
 #pragma once
@@ -1081,8 +1090,10 @@ static_assert(SSLPolicyConcept<websocket::ssl::WolfSSLPolicy>);
 static_assert(SSLPolicyConcept<WolfSSLPolicy>);
 #endif
 
-static_assert(SSLPolicyConcept<SSLPolicy>);
-static_assert(SSLPolicyConcept<DefaultSSLPolicy>);
+// SSLPolicy and DefaultSSLPolicy are defined in ws_configs.hpp
+// These static_asserts are now done there to avoid dependency issues
+// static_assert(SSLPolicyConcept<SSLPolicy>);
+// static_assert(SSLPolicyConcept<DefaultSSLPolicy>);
 
 #endif // C++20
 

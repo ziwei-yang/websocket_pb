@@ -3,7 +3,7 @@
 //
 // This header provides transport implementations for different network stacks:
 //   - BSDSocketTransport<EventPolicy>: BSD sockets + event loop (kernel TCP/IP stack)
-//   - XDPUserspaceTransport: XDP + Userspace TCP/IP stack (complete kernel bypass)
+//   - XDPUserspaceTransport: AF_XDP zero-copy + userspace TCP/IP stack (complete kernel bypass)
 //
 // Architecture (XDPUserspaceTransport):
 //   Transport Policy (this file)
@@ -17,6 +17,13 @@
 //                 ├── parse_tcp() - parse raw frames
 //                 └── process_tcp() - pure state machine
 //
+// XDP Mode Features:
+//   - AF_XDP zero-copy mode (XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP)
+//   - Native driver mode (XDP_FLAGS_DRV_MODE) for maximum performance
+//   - NAPI modes: NAPI_IRQ, NAPI_TIMER, USER_POLL (SO_BUSY_POLL)
+//   - NIC hardware timestamps via bpf_xdp_metadata_rx_timestamp()
+//   - RX trickle workaround for igc driver TX completion stall
+//
 // TransportPolicy concept (unified interface):
 //   - void init()
 //   - void connect(const char* host, uint16_t port)
@@ -28,7 +35,7 @@
 //   - int wait()                              // Wait for data (epoll/select or busy-poll)
 //   - int get_fd() const                      // For BSD sockets, -1 for XDP
 //   - void* get_transport_ptr()               // For userspace transport BIO
-//   - bool supports_ktls() const              // kTLS availability
+//   - bool supports_ktls() const              // kTLS availability (false for XDP)
 
 #pragma once
 
@@ -390,13 +397,9 @@ public:
      *
      * @param interface Network interface name (e.g., "eth0", "enp108s0")
      * @param bpf_path Path to BPF object file
-     * @param napi_mode NAPI polling mode:
-     *   - NAPI_IRQ: Default, interrupt-driven (lower CPU, higher latency jitter)
-     *   - BUSY_POLL: Timer-driven polling (lower latency, uses more CPU)
      */
     void init(const char* interface = "eth0",
-              const char* bpf_path = "src/xdp/bpf/exchange_filter.bpf.o",
-              websocket::xdp::NapiMode napi_mode = websocket::xdp::NapiMode::NAPI_IRQ) {
+              const char* bpf_path = "src/xdp/bpf/exchange_filter.bpf.o") {
         // Configure XDP
         websocket::xdp::XDPConfig config;
         config.interface = interface;
@@ -405,7 +408,6 @@ public:
         config.num_frames = 4096;
         config.zero_copy = true;
         config.batch_size = 64;
-        config.napi_mode = napi_mode;
 
         xdp_.init(config, bpf_path);
 
@@ -470,7 +472,18 @@ public:
         uint32_t remote_ip = ntohl(addr->sin_addr.s_addr);
         freeaddrinfo(result);
 
-        printf("[XDP-Userspace] Connecting to %s:%u via userspace TCP...\n", host, port);
+        // Convert IP to string for BPF filter and logging
+        char remote_ip_str[INET_ADDRSTRLEN];
+        struct in_addr in_addr_tmp;
+        in_addr_tmp.s_addr = htonl(remote_ip);
+        inet_ntop(AF_INET, &in_addr_tmp, remote_ip_str, sizeof(remote_ip_str));
+
+        // Ensure resolved IP is in BPF filter (DNS round-robin may return different IPs)
+        if (xdp_.is_bpf_enabled()) {
+            xdp_.add_exchange_ip(remote_ip_str);
+        }
+
+        printf("[XDP-Userspace] Connecting to %s:%u (%s) via userspace TCP...\n", host, port, remote_ip_str);
 
         // Setup TCP parameters
         tcp_params_.remote_ip = remote_ip;
@@ -480,11 +493,6 @@ public:
         tcp_params_.rcv_nxt = 0;
         tcp_params_.snd_wnd = userspace_stack::TCP_MAX_WINDOW;
         tcp_params_.rcv_wnd = userspace_stack::TCP_MAX_WINDOW;
-
-        // Send SYN
-        printf("[TCP] Sending SYN to %s:%u (local port %u, seq=%u)\n",
-               userspace_stack::UserspaceStack::ip_to_string(remote_ip).c_str(),
-               port, tcp_params_.local_port, tcp_params_.snd_nxt);
 
         send_syn();
         state_ = userspace_stack::TCPState::SYN_SENT;
@@ -539,18 +547,14 @@ public:
         const uint8_t* data = static_cast<const uint8_t*>(buf);
         size_t sent = 0;
 
+        // NOTE: Caller must poll for ACKs via wait() to advance snd_una and open send window.
+        // This function only sends data; it does not process incoming ACKs.
         while (sent < len) {
-            // Poll for incoming packets (ACKs)
-            poll_rx_and_process();
-
-            // Calculate chunk size (MSS limit)
             size_t remaining = len - sent;
             size_t chunk_size = std::min(remaining, static_cast<size_t>(tcp_params_.snd_mss));
 
-            // Build and send data packet
             send_data(data + sent, chunk_size);
 
-            // Add to retransmit queue
             retransmit_queue_.add_segment(tcp_params_.snd_nxt,
                                           userspace_stack::TCP_FLAG_ACK | userspace_stack::TCP_FLAG_PSH,
                                           data + sent, static_cast<uint16_t>(chunk_size));
@@ -558,9 +562,6 @@ public:
             tcp_params_.snd_nxt += chunk_size;
             sent += chunk_size;
         }
-
-        // Poll after sending
-        poll_rx_and_process();
 
         return static_cast<ssize_t>(sent);
     }
@@ -578,6 +579,10 @@ public:
             return 0;
         }
 
+        // Use poll() to trigger SO_BUSY_POLL
+        // This is critical for TX completion processing with igc driver
+        xdp_.poll_wait();
+
         // Poll for incoming packets
         poll_rx_and_process();
 
@@ -592,14 +597,11 @@ public:
      * Close TCP connection
      */
     void close() {
-        printf("[TCP-CLOSE] close() called, current state=%d\n", static_cast<int>(state_));
         if (state_ == userspace_stack::TCPState::CLOSED) {
             return;
         }
 
         if (state_ == userspace_stack::TCPState::ESTABLISHED) {
-            // Send FIN
-            printf("[TCP-CLOSE] Sending FIN from state ESTABLISHED\n");
             send_fin();
             retransmit_queue_.add_segment(tcp_params_.snd_nxt,
                                           userspace_stack::TCP_FLAG_FIN | userspace_stack::TCP_FLAG_ACK,
@@ -633,8 +635,15 @@ public:
 
     /**
      * Poll for RX and handle retransmits (call periodically)
+     *
+     * Uses poll() on AF_XDP socket to trigger SO_BUSY_POLL behavior
+     * which processes both RX and TX completions.
+     * This is critical during SSL handshake where TX completion timing affects success.
      */
     void poll() {
+        // Use poll() to trigger SO_BUSY_POLL for TX completions
+        xdp_.poll_wait();
+
         poll_rx_and_process();
         check_retransmit();
     }
@@ -660,12 +669,23 @@ public:
      *
      * Polls XDP for incoming packets and processes them.
      * For HFT, use set_wait_timeout(0) for pure busy-polling.
+     *
+     * Uses poll() on AF_XDP socket to trigger SO_BUSY_POLL behavior
+     * which processes both RX and TX completions.
      */
     int wait() {
+        // Use poll() to trigger SO_BUSY_POLL
+        // This is critical for TX completion processing with igc driver
+        // SO_BUSY_POLL causes kernel to busy-poll for configured duration
+        xdp_.poll_wait();
+
+        // Always check for RX data - poll() with timeout=0 may return 0
+        // even when data is available from previous busy-poll iterations
         poll_rx_and_process();
         check_retransmit();
 
         // Sleep if configured (reduces CPU at cost of latency)
+        // Note: For USER_POLL mode, this is usually 0 (pure busy-poll)
         if (poll_interval_us_ > 0) {
             struct timespec ts;
             ts.tv_sec = poll_interval_us_ / 1000000;
@@ -709,6 +729,7 @@ public:
     uint32_t get_queue_id() const { return xdp_.get_queue_id(); }
     bool is_bpf_enabled() const { return xdp_.is_bpf_enabled(); }
     void print_bpf_stats() const { xdp_.print_bpf_stats(); }
+    void stop_rx_trickle_thread() { xdp_.stop_rx_trickle_thread(); }
 
     /**
      * Get oldest RX hardware timestamp since last reset (Stage 1)
@@ -798,118 +819,80 @@ private:
     // =========================================================================
 
     void poll_rx_and_process() {
+        // Process ALL available packets in the RX ring
         websocket::xdp::XDPFrame* frame = xdp_.peek_rx_frame();
-        if (!frame) return;
 
-        static int rx_count = 0;
-        rx_count++;
-        if (rx_count <= 10 || rx_count % 100 == 0) {
-            printf("[TCP-RX-DEBUG] Received packet #%d: len=%zu\n", rx_count, frame->len);
-        }
-
-        // Stage 1: Capture hardware timestamp from XDP metadata
-        // Track oldest (first packet) and latest (most recent) for multi-packet messages
-        if (frame->hw_timestamp_ns > 0) {
-            if (hw_timestamp_count_ == 0) {
-                // First packet - set both oldest and latest
-                oldest_rx_hw_timestamp_ns_ = frame->hw_timestamp_ns;
-            }
-            // Always update latest
-            latest_rx_hw_timestamp_ns_ = frame->hw_timestamp_ns;
-            hw_timestamp_count_++;
-        }
-
-        // Parse the TCP packet using stack's pure parsing
-        auto parsed = stack_.parse_tcp(frame->data, frame->len,
-                                       tcp_params_.local_port,
-                                       tcp_params_.remote_ip,
-                                       tcp_params_.remote_port);
-
-        if (parsed.valid) {
-            // Debug: Print TCP packet info
-            static int valid_count = 0;
-            valid_count++;
-            if (valid_count <= 20 || valid_count % 100 == 0) {
-                printf("[TCP-RX] #%d seq=%u, ack=%u, flags=0x%02x, payload_len=%zu, state=%d, rcv_nxt=%u\n",
-                       valid_count, parsed.seq, parsed.ack, parsed.flags,
-                       parsed.payload_len, static_cast<int>(state_), tcp_params_.rcv_nxt);
-            }
-
-            // Process through state machine (pure function)
-            auto result = stack_.process_tcp(state_, tcp_params_, parsed);
-
-            // Debug: Show action
-            if (valid_count <= 20) {
-                printf("[TCP-SM] action=%d, data=%p, data_len=%zu\n",
-                       static_cast<int>(result.action), (void*)result.data, result.data_len);
-            }
-
-            // Handle state transition
-            if (result.state_changed) {
-                printf("[TCP-STATE] %d -> %d\n", static_cast<int>(state_), static_cast<int>(result.new_state));
-                state_ = result.new_state;
-            }
-
-            // Handle action
-            switch (result.action) {
-            case userspace_stack::TCPAction::SEND_ACK:
-                // Update rcv_nxt before sending ACK
-                if (parsed.flags & userspace_stack::TCP_FLAG_SYN) {
-                    tcp_params_.rcv_nxt = parsed.seq + 1;
-                } else if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
-                    tcp_params_.rcv_nxt++;
+        while (frame) {
+            // Capture hardware timestamp from XDP metadata
+            if (frame->hw_timestamp_ns > 0) {
+                if (hw_timestamp_count_ == 0) {
+                    oldest_rx_hw_timestamp_ns_ = frame->hw_timestamp_ns;
                 }
-                send_ack();
-                break;
+                latest_rx_hw_timestamp_ns_ = frame->hw_timestamp_ns;
+                hw_timestamp_count_++;
+            }
 
-            case userspace_stack::TCPAction::DATA_RECEIVED:
-                // Zero-copy: push frame reference to receive buffer
-                printf("[DATA-RX] DATA_RECEIVED: data=%p, data_len=%zu, rcv_nxt=%u\n",
-                       (void*)result.data, result.data_len, tcp_params_.rcv_nxt);
-                if (result.data && result.data_len > 0) {
-                    // Release RX ring but defer FILL ring refill
-                    uint64_t umem_addr = xdp_.release_rx_frame_deferred(frame);
-                    printf("[DATA-RX] umem_addr=%lx\n", (unsigned long)umem_addr);
-                    if (umem_addr != 0) {
-                        // Push frame ref - data stays in UMEM until SSL consumes it
-                        recv_buffer_.push_frame(result.data, result.data_len, umem_addr);
-                        printf("[DATA-RX] Pushed %zu bytes to recv_buffer, available=%zu\n",
-                               result.data_len, recv_buffer_.available());
-                        frame = nullptr;  // Mark as handled (don't release again)
+            auto parsed = stack_.parse_tcp(frame->data, frame->len,
+                                           tcp_params_.local_port,
+                                           tcp_params_.remote_ip,
+                                           tcp_params_.remote_port);
+
+            if (parsed.valid) {
+                auto result = stack_.process_tcp(state_, tcp_params_, parsed);
+
+                if (result.state_changed) {
+                    state_ = result.new_state;
+                }
+
+                switch (result.action) {
+                case userspace_stack::TCPAction::SEND_ACK:
+                    if (parsed.flags & userspace_stack::TCP_FLAG_SYN) {
+                        tcp_params_.rcv_nxt = parsed.seq + 1;
+                    } else if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
+                        tcp_params_.rcv_nxt++;
                     }
-                    tcp_params_.rcv_nxt += result.data_len;
                     send_ack();
+                    break;
+
+                case userspace_stack::TCPAction::DATA_RECEIVED:
+                    if (result.data && result.data_len > 0) {
+                        uint64_t umem_addr = xdp_.release_rx_frame(frame, true);
+                        if (umem_addr != 0) {
+                            recv_buffer_.push_frame(result.data, result.data_len, umem_addr);
+                            frame = nullptr;
+                        }
+                        tcp_params_.rcv_nxt += result.data_len;
+                        send_ack();
+                    }
+                    break;
+
+                case userspace_stack::TCPAction::CLOSED:
+                    connected_ = false;
+                    break;
+
+                default:
+                    break;
                 }
-                break;
 
-            case userspace_stack::TCPAction::CONNECTED:
-                printf("[TCP] Connection ESTABLISHED!\n");
-                break;
+                // Process ACKs (update snd_una, remove from retransmit queue)
+                if (parsed.flags & userspace_stack::TCP_FLAG_ACK) {
+                    if (userspace_stack::seq_gt(parsed.ack, tcp_params_.snd_una)) {
+                        retransmit_queue_.remove_acked(parsed.ack);
+                        tcp_params_.snd_una = parsed.ack;
+                    }
+                }
 
-            case userspace_stack::TCPAction::CLOSED:
-                printf("[TCP] Connection closed\n");
-                connected_ = false;
-                break;
-
-            default:
-                break;
+                // Update window
+                tcp_params_.snd_wnd = parsed.window;
             }
 
-            // Process ACKs (update snd_una, remove from retransmit queue)
-            if (parsed.flags & userspace_stack::TCP_FLAG_ACK) {
-                if (userspace_stack::seq_gt(parsed.ack, tcp_params_.snd_una)) {
-                    retransmit_queue_.remove_acked(parsed.ack);
-                    tcp_params_.snd_una = parsed.ack;
-                }
+            // Release frame if not already handled by zero-copy path
+            if (frame != nullptr) {
+                xdp_.release_rx_frame(frame);
             }
 
-            // Update window
-            tcp_params_.snd_wnd = parsed.window;
-        }
-
-        // Release frame if not already handled by zero-copy path
-        if (frame != nullptr) {
-            xdp_.release_rx_frame(frame);
+            // Try to get next packet
+            frame = xdp_.peek_rx_frame();
         }
     }
 

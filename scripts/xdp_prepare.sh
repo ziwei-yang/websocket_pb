@@ -119,6 +119,65 @@ set_nic_queue() {
     fi
 }
 
+# Disable GRO/LRO for lowest latency (prevents packet batching)
+disable_gro_lro() {
+    echo "Disabling GRO/LRO for lowest latency..."
+
+    # Disable GRO (Generic Receive Offload) - adds 5-50μs latency
+    local gro_before=$(ethtool -k "$IFACE" 2>/dev/null | grep "generic-receive-offload:" | awk '{print $2}')
+    if sudo ethtool -K "$IFACE" gro off 2>/dev/null; then
+        if [[ "$gro_before" == "on" ]]; then
+            print_status "GRO disabled (was: on) - saves 5-50μs per packet"
+        else
+            print_status "GRO already disabled"
+        fi
+    else
+        print_warning "Could not disable GRO (may be fixed or unsupported)"
+    fi
+
+    # Disable LRO (Large Receive Offload)
+    local lro_before=$(ethtool -k "$IFACE" 2>/dev/null | grep "large-receive-offload:" | awk '{print $2}')
+    if sudo ethtool -K "$IFACE" lro off 2>/dev/null; then
+        if [[ "$lro_before" == "on" ]]; then
+            print_status "LRO disabled (was: on)"
+        else
+            print_status "LRO already disabled"
+        fi
+    else
+        if [[ "$lro_before" != "off" ]]; then
+            print_warning "Could not disable LRO (may be fixed or unsupported)"
+        fi
+    fi
+}
+
+# Disable interrupt coalescing for immediate packet delivery
+disable_coalescing() {
+    echo "Disabling interrupt coalescing..."
+
+    local params=("rx-usecs" "rx-frames" "tx-usecs" "tx-frames")
+    local changes=0
+
+    for param in "${params[@]}"; do
+        local current=$(ethtool -c "$IFACE" 2>/dev/null | grep "^$param:" | awk '{print $2}')
+        if [[ -z "$current" || "$current" == "n/a" ]]; then
+            continue
+        fi
+
+        if sudo ethtool -C "$IFACE" "$param" 0 2>/dev/null; then
+            if [[ "$current" != "0" ]]; then
+                print_status "$param: $current → 0"
+                ((changes++)) || true
+            fi
+        fi
+    done
+
+    if [[ $changes -eq 0 ]]; then
+        print_status "Interrupt coalescing already at optimal (0)"
+    else
+        print_status "Disabled coalescing on $changes parameter(s)"
+    fi
+}
+
 # Enable hardware timestamping for XDP metadata kfuncs
 enable_hw_timestamp() {
     echo "Enabling NIC hardware timestamping..."
@@ -253,6 +312,8 @@ check_root
 reload_nic_driver
 check_xdp_support
 set_nic_queue
+disable_gro_lro
+disable_coalescing
 enable_hw_timestamp
 detach_xdp
 check_bpf_object

@@ -2,18 +2,32 @@
 // High-performance WebSocket client using policy-based design
 //
 // TransportPolicy Design:
-//   WebSocketClient now uses TransportPolicy instead of separate EventPolicy.
-//   TransportPolicy encapsulates both transport mechanism (BSD socket or XDP)
-//   and event waiting strategy (epoll/select/io_uring or busy-polling).
+//   WebSocketClient uses TransportPolicy to encapsulate both transport mechanism
+//   (BSD socket or XDP) and event waiting strategy (epoll/select/io_uring or busy-polling).
 //
 // Supported Transports:
 //   - BSDSocketTransport<EventPolicy>: BSD sockets + event loop (kernel TCP/IP)
-//   - XDPUserspaceTransport: XDP + userspace TCP/IP stack (kernel bypass)
+//   - XDPUserspaceTransport: AF_XDP zero-copy + userspace TCP/IP stack (complete kernel bypass)
+//
+// XDP Mode Features (AF_XDP Zero-Copy):
+//   - Native driver mode (XDP_FLAGS_DRV_MODE) with zero-copy (XDP_ZEROCOPY)
+//   - Complete kernel bypass using userspace TCP/IP stack
+//   - NIC hardware timestamp support (Stage 1 latency measurement)
+//   - NAPI modes: NAPI_IRQ, NAPI_TIMER, USER_POLL (lowest latency)
+//   - RX trickle workaround for igc driver TX completion stall (see xdp_transport.hpp)
 //
 // SSL Integration (compile-time dispatch):
 //   - BSD sockets: Uses fd-based SSL handshake (supports kTLS)
 //   - XDP: Uses UserspaceTransportBIO for SSL over userspace transport
 //   - Dispatch is done at compile-time using is_fd_based_transport<T> trait
+//
+// 6-Stage Latency Measurement:
+//   Stage 1: NIC hardware timestamp (XDP metadata or SO_TIMESTAMPING)
+//   Stage 2: Event loop entry (rdtsc)
+//   Stage 3: Before SSL read (rdtsc)
+//   Stage 4: After SSL read (rdtscp)
+//   Stage 5: WebSocket frame parsed (rdtscp)
+//   Stage 6: User callback entry (rdtscp)
 //
 #pragma once
 
@@ -234,12 +248,18 @@ public:
         send_http_upgrade(host, path, custom_headers);
         recv_http_response();
 
-        // 7. Start event loop monitoring for BSD sockets (compile-time dispatch)
+        // 7. Stop RX trickle thread for XDP (compile-time dispatch)
+        // After handshake, inline trickle in send_frame() triggers NAPI for TX completions
+        if constexpr (!is_fd_based) {
+            transport_.stop_rx_trickle_thread();
+        }
+
+        // 8. Start event loop monitoring for BSD sockets (compile-time dispatch)
         if constexpr (is_fd_based) {
             transport_.start_event_loop();
         }
 
-        // 8. Configure wait timeout (1 second default)
+        // 9. Configure wait timeout (1 second default)
         transport_.set_wait_timeout(1000);
 
         connected_ = true;
