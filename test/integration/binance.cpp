@@ -32,85 +32,165 @@ DefaultWebSocket* g_client = nullptr;
 // TSC frequency for timing conversion
 uint64_t g_tsc_freq_hz = 0;
 
-void on_message(const uint8_t* data, size_t len, const timing_record_t& timing) {
-    // ┌─────────────────────────────────────────────────────┐
-    // │ STAGE 6: Callback entry - record both timestamps   │
-    // └─────────────────────────────────────────────────────┘
-    uint64_t stage6_cycle = rdtscp();                           // For TSC deltas
-    uint64_t stage6_monotonic_ns = get_monotonic_timestamp_ns();  // For CLOCK_MONOTONIC delta
+// Pre-calculated timing for each message
+struct MessageTiming {
+    uint64_t parse_cycle;
+    uint64_t callback_cycle;
+    double stage5_to_6_us;      // Parse → Callback
+    double stage1_to_2_us;      // NIC → Event (if available)
+    double total_us;            // Event → Callback
+    bool hw_ts_available;
+};
 
-    int current_count = message_count.fetch_add(1) + 1;
+void on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& timing) {
+    // Stage 6: Callback entry - capture immediately
+    uint64_t stage6_cycle = rdtscp();
+    uint64_t stage6_monotonic_ns = get_monotonic_timestamp_ns();
 
-    printf("\n╔════════════════════════════════════════════════════════════════════╗\n");
-    printf("║ Message %d/%d - %zu bytes                                        \n",
-           current_count, MAX_MESSAGES, len);
-    printf("╚════════════════════════════════════════════════════════════════════╝\n");
+    // ═══════════════════════════════════════════════════════════════════
+    // PHASE 1: Calculate all timing (no I/O)
+    // ═══════════════════════════════════════════════════════════════════
 
-    // Display message content (truncated if too long)
-    printf("\n📩 Payload:\n");
-    printf("----------------------------------------\n");
-    if (len > 500) {
-        printf("%.*s...[truncated]\n", 500, data);
-    } else {
-        printf("%.*s\n", static_cast<int>(len), data);
+    // Pre-calculate shared timing values
+    double stage2_to_3_us = 0, stage3_to_4_us = 0;
+    double stage1_to_2_us = 0;
+    bool hw_ts_available = false;
+
+    if (g_tsc_freq_hz > 0) {
+        if (timing.recv_start_cycle > timing.event_cycle) {
+            stage2_to_3_us = cycles_to_ns(timing.recv_start_cycle - timing.event_cycle, g_tsc_freq_hz) / 1000.0;
+        }
+        if (timing.recv_end_cycle > timing.recv_start_cycle) {
+            stage3_to_4_us = cycles_to_ns(timing.recv_end_cycle - timing.recv_start_cycle, g_tsc_freq_hz) / 1000.0;
+        }
+
+        // Stage 1→2 calculation (shared for batch)
+        if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0 && timing.event_cycle > 0) {
+            hw_ts_available = true;
+            uint64_t stage2_to_stage6_ns = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz);
+            uint64_t stage2_monotonic_ns = stage6_monotonic_ns - stage2_to_stage6_ns;
+#ifdef USE_XDP
+            struct timespec ts_real;
+            clock_gettime(CLOCK_REALTIME, &ts_real);
+            uint64_t realtime_now_ns = (uint64_t)ts_real.tv_sec * 1000000000ULL + ts_real.tv_nsec;
+            int64_t hw_timestamp_mono_ns = (int64_t)timing.hw_timestamp_latest_ns -
+                                           (int64_t)realtime_now_ns + (int64_t)stage6_monotonic_ns;
+            stage1_to_2_us = ((int64_t)stage2_monotonic_ns - hw_timestamp_mono_ns) / 1000.0;
+#else
+            stage1_to_2_us = ((int64_t)stage2_monotonic_ns - (int64_t)timing.hw_timestamp_latest_ns) / 1000.0;
+#endif
+        }
     }
-    printf("----------------------------------------\n");
 
-    // Display detailed timing breakdown
-    printf("\n⏱️  Latency Breakdown (CPU cycles → microseconds):\n");
-    printf("══════════════════════════════════════════════════════════════════\n");
-    print_timing_record(timing, g_tsc_freq_hz);
+    // Calculate per-message timing
+    static MessageTiming msg_timings[256];  // Max batch size
+    size_t process_count = (count > 256) ? 256 : count;
 
-    // Calculate and display Stage 6 deltas
-    printf("\n  [Stage 6] Callback:     %lu cycles", stage6_cycle);
-    if (g_tsc_freq_hz > 0 && stage6_cycle > 0 && timing.frame_parsed_cycle > 0) {
-        uint64_t delta = stage6_cycle - timing.frame_parsed_cycle;
-        printf(" → Δ%.3f μs from Stage 5\n", cycles_to_ns(delta, g_tsc_freq_hz) / 1000.0);
-    } else {
-        printf("\n");
+    for (size_t i = 0; i < process_count; i++) {
+        const MessageInfo& msg = msgs[i];
+        MessageTiming& mt = msg_timings[i];
+
+        mt.parse_cycle = msg.parse_cycle;
+        mt.callback_cycle = stage6_cycle;
+        mt.hw_ts_available = hw_ts_available;
+        mt.stage1_to_2_us = stage1_to_2_us;
+
+        if (g_tsc_freq_hz > 0 && stage6_cycle > 0 && msg.parse_cycle > 0) {
+            mt.stage5_to_6_us = cycles_to_ns(stage6_cycle - msg.parse_cycle, g_tsc_freq_hz) / 1000.0;
+        } else {
+            mt.stage5_to_6_us = 0;
+        }
+
+        if (g_tsc_freq_hz > 0 && stage6_cycle > 0 && timing.event_cycle > 0) {
+            mt.total_us = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz) / 1000.0;
+        } else {
+            mt.total_us = 0;
+        }
     }
 
-    // Calculate Stage 1→2 if hardware timestamps available
-    if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0 && timing.event_cycle > 0) {
-        // Calculate Stage 2 time in CLOCK_MONOTONIC domain:
-        // stage2_time = stage6_time - (stage6_cycle - stage2_cycle) / cpu_freq
-        uint64_t stage2_to_stage6_ns = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz);
-        uint64_t stage2_monotonic_ns = stage6_monotonic_ns - stage2_to_stage6_ns;
+    // ═══════════════════════════════════════════════════════════════════
+    // PHASE 2: Print all messages and stats
+    // ═══════════════════════════════════════════════════════════════════
 
 #ifdef USE_XDP
-        // XDP mode: hw_timestamp_latest_ns is in CLOCK_REALTIME domain (NIC PHC synced to system time)
-        // Convert from CLOCK_REALTIME to CLOCK_MONOTONIC for proper comparison
-        struct timespec ts_real;
-        clock_gettime(CLOCK_REALTIME, &ts_real);
-        uint64_t realtime_now_ns = (uint64_t)ts_real.tv_sec * 1000000000ULL + ts_real.tv_nsec;
-        // hw_ts_monotonic = hw_ts_realtime - realtime_now + monotonic_now
-        int64_t hw_timestamp_mono_ns = (int64_t)timing.hw_timestamp_latest_ns -
-                                       (int64_t)realtime_now_ns + (int64_t)stage6_monotonic_ns;
-        int64_t stage1_to_stage2_ns = (int64_t)stage2_monotonic_ns - hw_timestamp_mono_ns;
+    // RX polled stats from timing record (captured before reset in websocket.hpp)
+    printf("\n[RX polled: %lu bytes, %u pkts]",
+           timing.hw_timestamp_byte_count, timing.hw_timestamp_count);
+
+    // Consumed stats (packets consumed via recv() for SSL)
+    uint32_t ssl_pkt_count = 0;
+    if (g_client) {
+        auto& transport = g_client->transport();
+        ssl_pkt_count = transport.get_recv_packet_count();
+        transport.reset_recv_stats();
+    }
+
+    // Display SSL_read stats using consumed packet count
+    printf("\n┌─ SSL_read: %zd bytes → %zu frame%s, %u pkt%s ─┐\n",
+           timing.ssl_read_bytes,
+           count, count > 1 ? "s" : "",
+           ssl_pkt_count, ssl_pkt_count != 1 ? "s" : "");
 #else
-        // BSD socket mode: drain_hw_timestamps() already converts to CLOCK_MONOTONIC
-        int64_t stage1_to_stage2_ns = stage2_monotonic_ns - timing.hw_timestamp_latest_ns;
+    (void)g_client;  // Suppress unused warning in non-XDP mode
+
+    // Display SSL_read stats using hw_timestamp_count from timing record
+    printf("\n┌─ SSL_read: %zd bytes → %zu frame%s, %u pkt%s ─┐\n",
+           timing.ssl_read_bytes,
+           count, count > 1 ? "s" : "",
+           timing.hw_timestamp_count, timing.hw_timestamp_count != 1 ? "s" : "");
 #endif
-        printf("\n  [Stage 1→2] NIC→Event:  %.3f μs (%u packet%s timestamped%s)\n",
-               stage1_to_stage2_ns / 1000.0,
-               timing.hw_timestamp_count,
-               timing.hw_timestamp_count > 1 ? "s" : "",
-               timing.hw_timestamp_count > 1 ? " - QUEUE BUILDUP!" : "");
+
+    // Print per-message: header + payload
+    bool should_exit = false;
+    for (size_t i = 0; i < process_count; i++) {
+        const MessageInfo& msg = msgs[i];
+        int current_count = message_count.fetch_add(1) + 1;
+
+        // Header
+        printf("\n╔════════════════════════════════════════════════════════════════════╗\n");
+        if (count > 1) {
+            printf("║ Message %d/%d - %zu bytes [%zu/%zu in batch]\n",
+                   current_count, MAX_MESSAGES, msg.len, i + 1, count);
+        } else {
+            printf("║ Message %d/%d - %zu bytes\n",
+                   current_count, MAX_MESSAGES, msg.len);
+        }
+        printf("╚════════════════════════════════════════════════════════════════════╝\n");
+
+        // Payload
+        printf("\n📩 Payload:\n");
+        printf("────────────────────────────────────────────────────────────────────\n");
+        if (msg.len > 500) {
+            printf("%.*s...[truncated]\n", 500, msg.payload);
+        } else {
+            printf("%.*s\n", static_cast<int>(msg.len), msg.payload);
+        }
+
+        if (current_count >= MAX_MESSAGES) {
+            should_exit = true;
+        }
+    }
+
+    // Print once per batch: Latency breakdown (shared timing for all messages)
+    const MessageTiming& mt = msg_timings[0];
+    printf("\n⏱️  Latency Breakdown:\n");
+    printf("────────────────────────────────────────────────────────────────────\n");
+    if (mt.hw_ts_available) {
+        printf("  [1→2] NIC → Event:     %7.3f μs  (%u pkt%s)\n",
+               mt.stage1_to_2_us, timing.hw_timestamp_count,
+               timing.hw_timestamp_count > 1 ? "s" : "");
     } else {
-        printf("\n  [Stage 1→2] NIC→Event:  N/A (hardware timestamps not available)\n");
+        printf("  [1→2] NIC → Event:         N/A    (no HW timestamp)\n");
     }
-
-    // Total latency
-    if (g_tsc_freq_hz > 0 && stage6_cycle > 0 && timing.event_cycle > 0) {
-        uint64_t total_cycles = stage6_cycle - timing.event_cycle;
-        printf("  [Total] Event→Callback: %.3f μs\n",
-               cycles_to_ns(total_cycles, g_tsc_freq_hz) / 1000.0);
-    }
-
-    printf("══════════════════════════════════════════════════════════════════\n");
+    printf("  [2→3] Event → Recv:    %7.3f μs\n", stage2_to_3_us);
+    printf("  [3→4] SSL decrypt:     %7.3f μs\n", stage3_to_4_us);
+    printf("  [5→6] Parse → Callback:%7.3f μs\n", mt.stage5_to_6_us);
+    printf("  ─────────────────────────────────\n");
+    printf("  [2→6] Event → Callback:%7.3f μs\n", mt.total_us);
+    printf("════════════════════════════════════════════════════════════════════\n");
 
     // Exit after receiving MAX_MESSAGES
-    if (current_count >= MAX_MESSAGES) {
+    if (should_exit) {
         printf("\n✅ Received %d messages. Test complete!\n", MAX_MESSAGES);
         if (g_client) {
             g_client->disconnect();
@@ -213,7 +293,7 @@ int main(int argc, char** argv) {
         printf("    Measuring latency at 6 stages from network to callback\n\n");
 
         // Run event loop (will exit when disconnect() is called)
-        client.run(on_message);
+        client.run(on_messages);
 
         printf("\n╔════════════════════════════════════════════════════════════════════╗\n");
         printf("║ Test Complete - Statistics                                        ║\n");

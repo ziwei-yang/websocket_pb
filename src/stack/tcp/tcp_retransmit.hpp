@@ -186,10 +186,18 @@ using FrameReleaseCallback = void(*)(uint64_t umem_addr, void* user_data);
 
 // Reference to a received frame's TCP payload
 struct FrameRef {
-    const uint8_t* data;    // Pointer to TCP payload in UMEM
-    uint16_t len;           // Payload length
-    uint16_t offset;        // Current read offset within payload
-    uint64_t umem_addr;     // UMEM address for releasing to FILL ring
+    const uint8_t* data;       // Pointer to TCP payload in UMEM
+    uint16_t len;              // Payload length
+    uint16_t offset;           // Current read offset within payload
+    uint64_t umem_addr;        // UMEM address for releasing to FILL ring
+    uint64_t hw_timestamp_ns;  // NIC hardware RX timestamp (0 if unavailable)
+};
+
+// Statistics from a read() operation
+struct ReadStats {
+    uint32_t packet_count = 0;        // Number of frames consumed
+    uint64_t oldest_timestamp_ns = 0; // Oldest HW timestamp in consumed frames
+    uint64_t latest_timestamp_ns = 0; // Latest HW timestamp in consumed frames
 };
 
 class ZeroCopyReceiveBuffer {
@@ -205,6 +213,9 @@ private:
     FrameReleaseCallback release_cb_ = nullptr;
     void* release_user_data_ = nullptr;
 
+    // Stats from last read() operation
+    ReadStats last_read_stats_;
+
 public:
     ZeroCopyReceiveBuffer() = default;
 
@@ -217,12 +228,13 @@ public:
 
     // Add a received frame (zero-copy - just stores pointer)
     // Returns false if buffer is full
-    bool push_frame(const uint8_t* payload, uint16_t len, uint64_t umem_addr) {
+    bool push_frame(const uint8_t* payload, uint16_t len, uint64_t umem_addr,
+                    uint64_t hw_timestamp_ns = 0) {
         if (count_ >= MAX_FRAMES) {
             return false;  // Buffer full
         }
 
-        frames_[tail_] = {payload, len, 0, umem_addr};
+        frames_[tail_] = {payload, len, 0, umem_addr, hw_timestamp_ns};
         tail_ = (tail_ + 1) % MAX_FRAMES;
         count_++;
         return true;
@@ -230,7 +242,11 @@ public:
 
     // Read data across frames (scatter-gather read)
     // Only copies when reading - the final necessary copy to output buffer
+    // Tracks ReadStats for frames consumed during this read
     ssize_t read(uint8_t* output, size_t max_len) {
+        // Reset stats at start of each read
+        last_read_stats_ = {};
+
         if (count_ == 0) {
             return 0;  // No data available
         }
@@ -239,6 +255,15 @@ public:
 
         while (total_read < max_len && count_ > 0) {
             FrameRef& frame = frames_[head_];
+
+            // Track stats when starting to read from a new frame (offset == 0)
+            if (frame.offset == 0 && frame.hw_timestamp_ns > 0) {
+                last_read_stats_.packet_count++;
+                if (last_read_stats_.oldest_timestamp_ns == 0) {
+                    last_read_stats_.oldest_timestamp_ns = frame.hw_timestamp_ns;
+                }
+                last_read_stats_.latest_timestamp_ns = frame.hw_timestamp_ns;
+            }
 
             // How much left in this frame?
             size_t remaining = frame.len - frame.offset;
@@ -263,6 +288,9 @@ public:
 
         return static_cast<ssize_t>(total_read);
     }
+
+    // Get stats from the last read() operation
+    const ReadStats& get_last_read_stats() const { return last_read_stats_; }
 
     // Get total available bytes across all frames
     size_t available() const {

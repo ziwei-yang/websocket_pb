@@ -116,8 +116,9 @@ public:
     // HTTP header customization support
     using HeaderMap = std::vector<std::pair<std::string, std::string>>;
 
-    // Message callback now includes timing information
-    using MessageCallback = std::function<void(const uint8_t*, size_t, const timing_record_t&)>;
+    // Batch message callback - receives array of messages with per-message timing
+    // timing_record_t contains batch-level SSL timing, MessageInfo has per-message parse_cycle
+    using MessageCallback = std::function<void(const MessageInfo*, size_t, const timing_record_t&)>;
 
     WebSocketClient()
         : connected_(false)
@@ -321,6 +322,7 @@ public:
                     timing_.hw_timestamp_oldest_ns = transport_.get_oldest_rx_hw_timestamp();
                     timing_.hw_timestamp_latest_ns = transport_.get_latest_rx_hw_timestamp();
                     timing_.hw_timestamp_count = count;
+                    timing_.hw_timestamp_byte_count = transport_.get_hw_timestamp_byte_count();
                     // Reset for next message
                     transport_.reset_hw_timestamps();
                 }
@@ -384,29 +386,53 @@ private:
         // Stage 3: Record timestamp before SSL_read/recv
         timing_.recv_start_cycle = rdtsc();
 
-        // Read directly into ring buffer (zero-copy)
+        // First read
         ssize_t n = ssl_.read(write_ptr, available);
-
-        // Stage 4: Record timestamp after SSL_read/recv completed
-        timing_.recv_end_cycle = rdtscp();
 
         if (n > 0) {
             rx_buffer_.commit_write(n);
+            ssize_t total_read = n;
+
+            // Continue reading while more data available (drain all SSL records)
+            // This ensures multiple WebSocket frames are batched together
+            while (true) {
+                write_ptr = rx_buffer_.next_write_region(&available);
+                if (available == 0) break;  // Buffer full
+
+                n = ssl_.read(write_ptr, available);
+                if (n > 0) {
+                    rx_buffer_.commit_write(n);
+                    total_read += n;
+                } else {
+                    // No more data (EAGAIN) or error - stop reading
+                    break;
+                }
+            }
+
+            // Stage 4: Record timestamp after all SSL_read completed
+            timing_.recv_end_cycle = rdtscp();
+            timing_.ssl_read_bytes = total_read;
             return true;
         } else if (n == 0) {
             // Connection closed gracefully
+            timing_.recv_end_cycle = rdtscp();
+            timing_.ssl_read_bytes = 0;
             connected_ = false;
             return false;
         } else {
-            // Would block or error (SSL returns -1 for both SSL_ERROR_WANT_READ and errors)
-            // For non-blocking sockets, -1 with EAGAIN is normal - just continue
-            return true;  // Continue event loop, not an error
+            // Would block (EAGAIN) or error - just continue event loop
+            timing_.recv_end_cycle = rdtscp();
+            timing_.ssl_read_bytes = 0;
+            return true;
         }
     }
 
     // Process WebSocket frames from ring buffer
     void process_frames() {
         using namespace websocket::http;
+
+        // Reset batch for this processing round
+        batch_count_ = 0;
 
         while (rx_buffer_.readable() >= 2) {  // Minimum frame header size
             size_t available_len = 0;
@@ -438,11 +464,6 @@ private:
 
             size_t frame_len = frame.header_len + frame.payload_len;
 
-            // Stage 5: Frame parsing completed
-            timing_.frame_parsed_cycle = rdtscp();
-            timing_.payload_len = frame.payload_len;
-            timing_.opcode = frame.opcode;
-
             // Handle different frame types
             if (frame.opcode == 0x09) {  // PING frame
                 // Silently respond with PONG (no logging for production HFT performance)
@@ -450,10 +471,16 @@ private:
                 rx_buffer_.commit_read(frame_len);
             }
             else if (frame.opcode == 0x01 || frame.opcode == 0x02) {  // Text or Binary frame
-                // Invoke user callback with zero-copy pointer and timing data
-                // Stage 6 is implemented inside the callback by user code
-                if (on_message_) {
-                    on_message_(frame.payload, frame.payload_len, timing_);
+                // Collect into batch instead of immediate callback
+                if (batch_count_ < MAX_BATCH_SIZE) {
+                    // Stage 5: Record parse time for this message
+                    message_batch_[batch_count_] = {
+                        frame.payload,
+                        frame.payload_len,
+                        rdtscp(),      // Per-message parse cycle
+                        frame.opcode
+                    };
+                    batch_count_++;
                 }
                 msg_count_++;
                 rx_buffer_.commit_read(frame_len);
@@ -483,6 +510,11 @@ private:
                        frame.opcode, (size_t)frame.payload_len);
                 rx_buffer_.commit_read(frame_len);
             }
+        }
+
+        // Invoke batch callback if we collected any messages
+        if (batch_count_ > 0 && on_message_) {
+            on_message_(message_batch_, batch_count_, timing_);
         }
     }
 
@@ -589,7 +621,8 @@ private:
         }
     }
 
-    // Access to transport for advanced configuration (e.g., XDP init)
+public:
+    // Access to transport for advanced configuration (e.g., XDP init, stats)
     TransportPolicy_& transport() { return transport_; }
     const TransportPolicy_& transport() const { return transport_; }
 
@@ -603,5 +636,10 @@ private:
     bool xdp_initialized_;           // True if init_xdp() was called (XDP mode only)
     uint64_t msg_count_;
     MessageCallback on_message_;
-    timing_record_t timing_;  // Timing information for current message
+    timing_record_t timing_;  // Batch-level timing (SSL read timing shared by all messages)
+
+    // Batch message collection
+    static constexpr size_t MAX_BATCH_SIZE = 256;
+    MessageInfo message_batch_[MAX_BATCH_SIZE];
+    size_t batch_count_ = 0;
 };

@@ -53,6 +53,7 @@
 #include <cstdio>
 #include <chrono>
 #include <thread>
+#include "../core/timing.hpp"  // rdtsc(), calibrate_tsc_freq()
 
 namespace websocket {
 namespace transport {
@@ -382,6 +383,7 @@ public:
         , oldest_rx_hw_timestamp_ns_(0)
         , latest_rx_hw_timestamp_ns_(0)
         , hw_timestamp_count_(0)
+        , hw_timestamp_byte_ct_(0)
     {}
 
     ~XDPUserspaceTransport() {
@@ -587,7 +589,28 @@ public:
         poll_rx_and_process();
 
         // Read from receive buffer
-        return recv_buffer_.read(static_cast<uint8_t*>(buf), len);
+        ssize_t result = recv_buffer_.read(static_cast<uint8_t*>(buf), len);
+
+        // Aggregate per-frame stats into cumulative stats
+        if (result > 0) {
+            const auto& stats = recv_buffer_.get_last_read_stats();
+#ifdef DEBUG_PACKET_COUNT
+            printf("[RECV-DEBUG] read=%zd bytes, this_read: %u pkts (oldest=%lu, latest=%lu), "
+                   "cumulative: %u→%u pkts, buffer_frames=%zu\n",
+                   result, stats.packet_count, stats.oldest_timestamp_ns, stats.latest_timestamp_ns,
+                   consumed_recv_packet_count_, consumed_recv_packet_count_ + stats.packet_count,
+                   recv_buffer_.frame_count());
+#endif
+            consumed_recv_packet_count_ += stats.packet_count;
+            if (consumed_recv_oldest_timestamp_ns_ == 0 && stats.oldest_timestamp_ns > 0) {
+                consumed_recv_oldest_timestamp_ns_ = stats.oldest_timestamp_ns;
+            }
+            if (stats.latest_timestamp_ns > 0) {
+                consumed_recv_latest_timestamp_ns_ = stats.latest_timestamp_ns;
+            }
+        }
+
+        return result;
     }
 
     int get_fd() const { return -1; }
@@ -656,45 +679,62 @@ public:
      * Set timeout for wait operations
      * @param timeout_us Timeout in microseconds (0 = busy poll)
      *
-     * For XDP, this controls the sleep between poll iterations.
-     * 0 = pure busy-poll (lowest latency, highest CPU)
+     * For XDP, this controls the busy-poll loop duration.
+     * 0 = infinite busy-poll (lowest latency, highest CPU)
+     *
+     * TSC calibration is done here (one-time) rather than in wait() hot path.
      */
     void set_wait_timeout(int timeout_us) {
         poll_interval_us_ = timeout_us;
+
+        // One-time TSC frequency calibration (done at setup, not in hot path)
+        if (tsc_freq_hz_ == 0) {
+            tsc_freq_hz_ = calibrate_tsc_freq();
+        }
+
+        // Pre-calculate timeout in cycles
+        if (poll_interval_us_ > 0 && tsc_freq_hz_ > 0) {
+            timeout_cycles_ = ((uint64_t)poll_interval_us_ * tsc_freq_hz_) / 1000000ULL;
+        } else {
+            timeout_cycles_ = 0;  // 0 = infinite busy-poll
+        }
     }
 
     /**
      * Wait for data to be available
      * @return 1 if data available in recv buffer, 0 otherwise
      *
-     * Polls XDP for incoming packets and processes them.
-     * For HFT, use set_wait_timeout(0) for pure busy-polling.
+     * Loops poll_wait() until data is available or timeout.
+     * Uses pre-calculated TSC cycles for precise timing.
+     * Only processes RX when poll_wait() indicates events ready.
      *
-     * Uses poll() on AF_XDP socket to trigger SO_BUSY_POLL behavior
-     * which processes both RX and TX completions.
+     * For HFT, use set_wait_timeout(0) for pure busy-polling (loops forever).
      */
     int wait() {
-        // Use poll() to trigger SO_BUSY_POLL
-        // This is critical for TX completion processing with igc driver
-        // SO_BUSY_POLL causes kernel to busy-poll for configured duration
-        xdp_.poll_wait();
+        uint64_t start_cycle = rdtsc();
 
-        // Always check for RX data - poll() with timeout=0 may return 0
-        // even when data is available from previous busy-poll iterations
-        poll_rx_and_process();
+        do {
+            // poll_wait() triggers SO_BUSY_POLL in kernel
+            // This is critical for TX completion processing with igc driver
+            int ret = xdp_.poll_wait();
+
+            // Only process RX when poll_wait() indicates events ready
+            if (ret > 0) {
+                poll_rx_and_process();
+            }
+
+            // Check if we have data ready
+            if (recv_buffer_.available() > 0) {
+                check_retransmit();
+                return 1;
+            }
+
+            // If timeout_cycles_ is 0, loop forever (pure busy-poll)
+            // Otherwise, check if we've exceeded timeout
+        } while (timeout_cycles_ == 0 || (rdtsc() - start_cycle) < timeout_cycles_);
+
         check_retransmit();
-
-        // Sleep if configured (reduces CPU at cost of latency)
-        // Note: For USER_POLL mode, this is usually 0 (pure busy-poll)
-        if (poll_interval_us_ > 0) {
-            struct timespec ts;
-            ts.tv_sec = poll_interval_us_ / 1000000;
-            ts.tv_nsec = (poll_interval_us_ % 1000000) * 1000;
-            nanosleep(&ts, nullptr);
-        }
-
-        // Return 1 if we have data, 0 otherwise
-        return recv_buffer_.available() > 0 ? 1 : 0;
+        return 0;  // Timeout, no data
     }
 
     /**
@@ -752,6 +792,12 @@ public:
     uint32_t get_hw_timestamp_count() const { return hw_timestamp_count_; }
 
     /**
+     * Get count of bytes polled since last reset
+     * @return Number of bytes received via poll_rx_and_process()
+     */
+    uint64_t get_hw_timestamp_byte_count() const { return hw_timestamp_byte_ct_; }
+
+    /**
      * Reset hardware timestamp tracking for new message
      * Call this after copying timestamps to timing_record_t
      */
@@ -759,6 +805,38 @@ public:
         oldest_rx_hw_timestamp_ns_ = 0;
         latest_rx_hw_timestamp_ns_ = 0;
         hw_timestamp_count_ = 0;
+        hw_timestamp_byte_ct_ = 0;
+    }
+
+    // =========================================================================
+    // Cumulative recv stats (per-frame tracking across SSL buffer)
+    // These track packets actually consumed via recv(), not just packets received
+    // =========================================================================
+
+    /**
+     * Get cumulative packet count from recv() calls since last reset
+     * Tracks packets whose data was actually consumed, accounting for SSL buffering
+     */
+    uint32_t get_recv_packet_count() const { return consumed_recv_packet_count_; }
+
+    /**
+     * Get oldest hardware timestamp from recv() calls since last reset
+     */
+    uint64_t get_recv_oldest_timestamp() const { return consumed_recv_oldest_timestamp_ns_; }
+
+    /**
+     * Get latest hardware timestamp from recv() calls since last reset
+     */
+    uint64_t get_recv_latest_timestamp() const { return consumed_recv_latest_timestamp_ns_; }
+
+    /**
+     * Reset cumulative recv stats for new message batch
+     * Call this after processing a batch of messages from ssl.read()
+     */
+    void reset_recv_stats() {
+        consumed_recv_packet_count_ = 0;
+        consumed_recv_oldest_timestamp_ns_ = 0;
+        consumed_recv_latest_timestamp_ns_ = 0;
     }
 
 private:
@@ -856,9 +934,17 @@ private:
 
                 case userspace_stack::TCPAction::DATA_RECEIVED:
                     if (result.data && result.data_len > 0) {
+                        // Track bytes polled for hw_timestamp stats
+                        hw_timestamp_byte_ct_ += result.data_len;
+                        // Save timestamp before releasing frame
+                        uint64_t frame_timestamp = frame->hw_timestamp_ns;
+#ifdef DEBUG_PACKET_COUNT
+                        printf("[PUSH-DEBUG] push_frame: %zu bytes, ts=%lu (ts_ok=%s)\n",
+                               result.data_len, frame_timestamp, frame_timestamp > 0 ? "YES" : "NO");
+#endif
                         uint64_t umem_addr = xdp_.release_rx_frame(frame, true);
                         if (umem_addr != 0) {
-                            recv_buffer_.push_frame(result.data, result.data_len, umem_addr);
+                            recv_buffer_.push_frame(result.data, result.data_len, umem_addr, frame_timestamp);
                             frame = nullptr;
                         }
                         tcp_params_.rcv_nxt += result.data_len;
@@ -1011,9 +1097,18 @@ private:
     uint64_t oldest_rx_hw_timestamp_ns_;  // First packet timestamp
     uint64_t latest_rx_hw_timestamp_ns_;  // Most recent packet timestamp
     uint32_t hw_timestamp_count_;         // Packets received since last reset
+    uint64_t hw_timestamp_byte_ct_;       // Bytes received since last reset
+
+    // Cumulative recv stats (aggregated across multiple recv() calls)
+    // Tracks packets actually consumed via recv_buffer_.read()
+    uint32_t consumed_recv_packet_count_ = 0;
+    uint64_t consumed_recv_oldest_timestamp_ns_ = 0;
+    uint64_t consumed_recv_latest_timestamp_ns_ = 0;
 
     // Polling configuration
     int poll_interval_us_ = 0;  // 0 = busy poll (default for HFT)
+    uint64_t tsc_freq_hz_ = 0;  // TSC frequency for timeout calculation
+    uint64_t timeout_cycles_ = 0;  // Pre-calculated timeout in TSC cycles
 
     // Current TX frame
     websocket::xdp::XDPFrame* current_tx_frame_ = nullptr;

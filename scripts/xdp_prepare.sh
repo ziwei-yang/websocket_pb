@@ -266,6 +266,34 @@ show_nic_info() {
     echo ""
 }
 
+# Refresh ARP cache for gateway (ensures bidirectional ARP is fresh)
+# This prevents connection timeouts when gateway's ARP for our IP is stale
+refresh_gateway_arp() {
+    echo "Refreshing gateway ARP cache..."
+
+    # Get gateway IP for this interface
+    local gateway_ip=$(ip route show dev "$IFACE" | grep "^default" | awk '{print $3}' | head -1)
+
+    # If no default route on this interface, try to find any gateway
+    if [[ -z "$gateway_ip" ]]; then
+        gateway_ip=$(ip route show dev "$IFACE" | grep "via" | awk '{print $3}' | head -1)
+    fi
+
+    if [[ -z "$gateway_ip" ]]; then
+        print_warning "Could not determine gateway IP for $IFACE"
+        return 0
+    fi
+
+    # Ping gateway to refresh bidirectional ARP
+    # This ensures both our ARP cache and the gateway's ARP cache are fresh
+    if ping -c 2 -I "$IFACE" "$gateway_ip" &>/dev/null; then
+        local arp_state=$(ip neigh show dev "$IFACE" | grep "$gateway_ip" | awk '{print $NF}')
+        print_status "Gateway ARP refreshed: $gateway_ip ($arp_state)"
+    else
+        print_warning "Could not ping gateway $gateway_ip on $IFACE"
+    fi
+}
+
 # Start NIC clock sync daemon (syncs CPU CLOCK_REALTIME → NIC PHC)
 start_clock_sync() {
     echo "Starting NIC clock sync daemon..."
@@ -316,6 +344,7 @@ disable_gro_lro
 disable_coalescing
 enable_hw_timestamp
 detach_xdp
+refresh_gateway_arp
 check_bpf_object
 show_nic_info
 start_clock_sync

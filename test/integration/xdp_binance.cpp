@@ -55,7 +55,7 @@ constexpr const char* BINANCE_PATH = "/stream?streams=btcusdt@trade";
 // Global test state
 std::atomic<bool> test_complete{false};
 std::atomic<int> message_count{0};
-constexpr int MAX_MESSAGES = 5;
+constexpr int MAX_MESSAGES = 20;
 
 // TSC frequency for timing conversion
 uint64_t g_tsc_freq_hz = 0;
@@ -239,9 +239,10 @@ int main(int argc, char** argv) {
         printf("💬 Phase 5: WebSocket Message Streaming\n");
         printf("─────────────────────────────────────────────────────────────────\n\n");
 
-        // Reset HW timestamps before message streaming
+        // Reset stats before message streaming
         // (clear any stale timestamps from handshake/upgrade phases)
-        transport.reset_hw_timestamps();
+        transport.reset_hw_timestamps();  // Legacy per-iteration tracking
+        transport.reset_recv_stats();      // New per-frame cumulative tracking
 
         uint8_t frame_buffer[65536];
         size_t buffer_offset = 0;
@@ -270,18 +271,9 @@ int main(int argc, char** argv) {
             // Stage 4: After SSL read
             timing.recv_end_cycle = rdtscp();
 
-            // Stage 1: Get hardware timestamps captured during ssl.read()
-            timing.hw_timestamp_count = transport.get_hw_timestamp_count();
-            if (timing.hw_timestamp_count > 0) {
-                timing.hw_timestamp_oldest_ns = transport.get_oldest_rx_hw_timestamp();
-                timing.hw_timestamp_latest_ns = transport.get_latest_rx_hw_timestamp();
-            } else {
-                // Clear stale timestamps when no packets received this iteration
-                timing.hw_timestamp_oldest_ns = 0;
-                timing.hw_timestamp_latest_ns = 0;
-            }
-            // Reset after capturing for next iteration
-            transport.reset_hw_timestamps();
+            // NOTE: Don't capture/reset stats here - we need to accumulate across multiple
+            // ssl.read() calls until we have complete frames to process. Stats are captured
+            // and reset only when we print batch results (after parsing complete frames).
 
             if (read_len > 0) {
                 buffer_offset += read_len;
@@ -321,12 +313,31 @@ int main(int argc, char** argv) {
                 // Phase 2: Print batch summary for TEXT frames
                 // ============================================================
                 if (!text_frames.empty()) {
+                    // NOW capture stats - we have complete frames to process
+                    // This accumulates all packets processed since last reset (across ssl.read() calls)
+                    timing.hw_timestamp_count = transport.get_recv_packet_count();
+                    if (timing.hw_timestamp_count > 0) {
+                        timing.hw_timestamp_oldest_ns = transport.get_recv_oldest_timestamp();
+                        timing.hw_timestamp_latest_ns = transport.get_recv_latest_timestamp();
+                    } else {
+                        timing.hw_timestamp_oldest_ns = 0;
+                        timing.hw_timestamp_latest_ns = 0;
+                    }
+                    // Reset for next batch (after capturing)
+                    transport.reset_recv_stats();
+
                     size_t total_payload = 0;
                     for (const auto& pf : text_frames) {
                         total_payload += pf.frame.payload_len;
                     }
 
-                    printf("\n  ┌─ SSL_read: %zd bytes → %zu frame%s, %u packet%s ─┐\n",
+                    // Show legacy per-iteration stats (bytes/packets polled since last reset)
+                    uint64_t polled_bytes = transport.get_hw_timestamp_byte_count();
+                    uint32_t polled_packets = transport.get_hw_timestamp_count();
+                    printf("\n  [RX polled: %lu bytes, %u packets]\n", polled_bytes, polled_packets);
+                    transport.reset_hw_timestamps();  // Reset for next batch
+
+                    printf("  ┌─ SSL_read: %zd bytes → %zu frame%s, %u packet%s ─┐\n",
                            read_len,
                            text_frames.size(),
                            text_frames.size() > 1 ? "s" : "",

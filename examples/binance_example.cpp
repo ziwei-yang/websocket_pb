@@ -80,50 +80,41 @@ int main() {
         time_t start_time = time(nullptr);
         double last_price = 0.0;
 
-        // Run event loop with message callback
-        client.run([&](const uint8_t* data, size_t len, const timing_record_t& timing) {
-            // Zero-copy access to message data
-            // timing.opcode contains frame type: 0x01=text, 0x02=binary
-            // Binance sends text (JSON), but you can check timing.opcode to distinguish
-            msg_count++;
+        // Run event loop with batch message callback
+        client.run([&](const MessageInfo* msgs, size_t count, const timing_record_t& timing) {
+            // Process all messages in the batch
+            for (size_t i = 0; i < count; i++) {
+                const MessageInfo& msg = msgs[i];
+                msg_count++;
 
-            // Optional: Handle different message types
-            // if (timing.opcode == 0x01) {
-            //     // Text message (JSON)
-            //     std::string_view text(reinterpret_cast<const char*>(data), len);
-            // } else if (timing.opcode == 0x02) {
-            //     // Binary message (protobuf, msgpack, etc.)
-            //     std::span<const uint8_t> binary(data, len);
-            // }
+                // Extract price from JSON (simple parsing)
+                double price = extract_price(msg.payload, msg.len);
 
-            // Extract price from JSON (simple parsing)
-            double price = extract_price(data, len);
+                if (price > 0.0 && price != last_price) {
+                    printf("💰 BTC/USDT: $%.2f  (msg #%lu)\n", price, msg_count);
+                    last_price = price;
+                }
 
-            if (price > 0.0 && price != last_price) {
-                printf("💰 BTC/USDT: $%.2f  (msg #%lu)\n", price, msg_count);
-                last_price = price;
-            }
+                // Display statistics every 100 messages
+                if (msg_count % 100 == 0) {
+                    time_t elapsed = time(nullptr) - start_time;
+                    double msg_per_sec = (double)msg_count / elapsed;
 
-            // Display raw JSON every 100 messages
-            if (msg_count % 100 == 0) {
-                time_t elapsed = time(nullptr) - start_time;
-                double msg_per_sec = (double)msg_count / elapsed;
+                    printf("\n📈 Statistics:\n");
+                    printf("   Messages: %lu\n", msg_count);
+                    printf("   Elapsed: %ld seconds\n", elapsed);
+                    printf("   Rate: %.2f msg/sec\n", msg_per_sec);
+                    printf("\n");
+                }
 
-                printf("\n📈 Statistics:\n");
-                printf("   Messages: %lu\n", msg_count);
-                printf("   Elapsed: %ld seconds\n", elapsed);
-                printf("   Rate: %.2f msg/sec\n", msg_per_sec);
-                printf("\n");
-            }
+                // Stop after receiving 1000 messages (for demo)
+                if (msg_count >= 1000) {
+                    running = false;
+                }
 
-            // Stop after receiving 1000 messages (for demo)
-            if (msg_count >= 1000) {
-                running = false;
-            }
-
-            if (!running) {
-                // Trigger disconnect
-                throw std::runtime_error("User requested shutdown");
+                if (!running) {
+                    throw std::runtime_error("User requested shutdown");
+                }
             }
         });
 

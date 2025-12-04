@@ -29,16 +29,27 @@ typedef struct {
     uint64_t hw_timestamp_latest_ns;  // Latest packet timestamp in queue (most recent arrival)
     uint32_t hw_timestamp_count;      // Number of packets with timestamps found in queue
                                       // If count > 1, indicates timestamp queue buildup (potential staleness)
+    uint64_t hw_timestamp_byte_count; // Total bytes polled from NIC (for stats display)
 
     uint64_t event_cycle;             // Stage 2: Event loop start (TSC cycles)
     uint64_t recv_start_cycle;        // Stage 3: Before SSL_read/recv call (TSC cycles)
     uint64_t recv_end_cycle;          // Stage 4: When SSL_read/recv completed (TSC cycles)
+    ssize_t ssl_read_bytes;           // Bytes returned by SSL_read (for stats display)
     uint64_t frame_parsed_cycle;      // Stage 5: When frame parsing completed (TSC cycles)
     // Stage 6: Implemented in user callback - records both CPU cycle and CLOCK_MONOTONIC
     size_t payload_len;
     uint8_t opcode;                   // WebSocket frame opcode (0x01=text, 0x02=binary, 0x08=close, 0x09=ping, 0x0A=pong)
                                       // Use this to distinguish between text and binary messages in callbacks
 } timing_record_t;
+
+// Per-message info in a batch callback
+// Each message has its own parse timestamp, but shares batch-level SSL timing
+struct MessageInfo {
+    const uint8_t* payload;   // Pointer to message payload (zero-copy)
+    size_t len;               // Payload length in bytes
+    uint64_t parse_cycle;     // Stage 5: TSC when this frame was parsed
+    uint8_t opcode;           // 0x01=text, 0x02=binary
+};
 
 // Read CPU Time Stamp Counter (TSC) - x86/x64 only
 // Returns CPU cycles since boot (not wall clock time)
