@@ -245,7 +245,8 @@ struct OpenSSLPolicy {
             int ret = SSL_do_handshake(ssl_);
 
             if (ret == 1) {
-                // Handshake successful
+                // Handshake successful - stop trickle thread, switch to inline trickle
+                transport->stop_rx_trickle_thread();
                 ktls_enabled_ = false;
                 printf("[SSL] Handshake complete (userspace transport)\n");
                 return;

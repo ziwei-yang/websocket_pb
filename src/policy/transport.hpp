@@ -516,6 +516,10 @@ public:
                 throw std::runtime_error("Connection timeout");
             }
 
+            // Trigger NAPI via poll_wait() for TX completions + RX processing
+            // Required: igc driver stall bug - TX completions only happen during NAPI
+            xdp_.poll_wait();
+
             // Poll XDP for RX frames and process
             poll_rx_and_process();
 
@@ -590,6 +594,18 @@ public:
 
         // Read from receive buffer
         ssize_t result = recv_buffer_.read(static_cast<uint8_t*>(buf), len);
+
+        // If no data available, check TCP state to determine if connection is closed
+        if (result == 0) {
+            // If connection is still established, return EAGAIN (would block)
+            // Otherwise, return 0 (connection closed by peer)
+            if (state_ == userspace_stack::TCPState::ESTABLISHED) {
+                errno = EAGAIN;
+                return -1;
+            }
+            // Connection closing or closed - return 0 to signal EOF
+            return 0;
+        }
 
         // Aggregate per-frame stats into cumulative stats
         if (result > 0) {
@@ -714,14 +730,15 @@ public:
         uint64_t start_cycle = rdtsc();
 
         do {
-            // poll_wait() triggers SO_BUSY_POLL in kernel
-            // This is critical for TX completion processing with igc driver
-            int ret = xdp_.poll_wait();
+            // poll_wait() triggers SO_BUSY_POLL and sends inline trickle to trigger NAPI
+            // The inline trickle is critical for igc driver: SO_BUSY_POLL alone doesn't
+            // trigger NAPI for AF_XDP RX delivery and TX completions. The trickle packet
+            // ensures NAPI runs, which processes both RX and TX rings.
+            xdp_.poll_wait();
 
-            // Only process RX when poll_wait() indicates events ready
-            if (ret > 0) {
-                poll_rx_and_process();
-            }
+            // Always process RX ring after poll_wait() - NAPI may have delivered packets
+            // even if poll() returns 0 (events ready check happens before NAPI completes)
+            poll_rx_and_process();
 
             // Check if we have data ready
             if (recv_buffer_.available() > 0) {

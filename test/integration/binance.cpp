@@ -19,8 +19,6 @@
 #include <atomic>
 #include <vector>
 #include <string>
-#include <netdb.h>
-#include <arpa/inet.h>
 
 // Global message counter
 std::atomic<int> message_count{0};
@@ -198,35 +196,6 @@ void on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& t
     }
 }
 
-// Resolve hostname to IP addresses (for XDP BPF filter)
-#ifdef USE_XDP
-std::vector<std::string> resolve_hostname(const char* hostname) {
-    std::vector<std::string> ips;
-
-    struct addrinfo hints = {};
-    struct addrinfo* result = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    int ret = getaddrinfo(hostname, nullptr, &hints, &result);
-    if (ret != 0 || !result) {
-        if (result) freeaddrinfo(result);
-        return ips;
-    }
-
-    for (struct addrinfo* p = result; p != nullptr; p = p->ai_next) {
-        if (p->ai_family == AF_INET) {
-            auto* addr = reinterpret_cast<struct sockaddr_in*>(p->ai_addr);
-            char ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
-            ips.push_back(ip_str);
-        }
-    }
-
-    freeaddrinfo(result);
-    return ips;
-}
-#endif
 
 int main(int argc, char** argv) {
     printf("╔════════════════════════════════════════════════════════════════════╗\n");
@@ -271,16 +240,8 @@ int main(int argc, char** argv) {
         g_client = &client;
 
 #ifdef USE_XDP
-        // XDP mode: Initialize transport before connect
-        printf("🔌 Resolving stream.binance.com for BPF filter...\n");
-        auto binance_ips = resolve_hostname("stream.binance.com");
-        if (binance_ips.empty()) {
-            throw std::runtime_error("Failed to resolve stream.binance.com");
-        }
-        printf("   Found %zu IP(s)\n", binance_ips.size());
-
-        // Initialize XDP with resolved IPs
-        client.init_xdp(interface, bpf_obj, binance_ips, 443);
+        // XDP mode: Initialize transport before connect (resolves DNS internally)
+        client.init_xdp(interface, bpf_obj, "stream.binance.com", 443);
         printf("\n");
 #endif
 

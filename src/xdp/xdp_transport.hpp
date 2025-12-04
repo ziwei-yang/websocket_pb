@@ -96,10 +96,10 @@ struct XDPConfig {
         , num_frames(4096)
         , zero_copy(true)   // Enable zero-copy by default for HFT (igc driver supports it)
         , batch_size(64)
-        , busy_poll_usec(50)             // 50us busy-poll duration
+        , busy_poll_usec(1000)           // 1000us busy-poll duration (testing)
         , busy_poll_budget(64)           // 64 packets per poll
         , rx_trickle_enabled(true)       // Enable RX trickle by default for zero-copy mode
-        , rx_trickle_interval_us(2000)   // 500 Hz (2ms interval)
+        , rx_trickle_interval_us(2000)   // 500 Hz (2ms interval) - optimal for igc driver
     {}
 };
 
@@ -145,6 +145,7 @@ public:
         , rx_trickle_running_(false)
         , rx_trickle_fd_(-1)
         , poll_fd_{}
+        , poll_wait_count_(0)
     {
         free_frames_.reserve(4096);  // Pre-allocate for performance
     }
@@ -342,7 +343,7 @@ public:
         printf("[XDP] Initialized on %s (queue %u, %u frames)\n",
                config_.interface, config_.queue_id, config_.num_frames);
 
-        // Start RX trickle thread for zero-copy mode TX completion workaround
+        // Start RX trickle for igc driver TX completion workaround
         if (config_.zero_copy && config_.rx_trickle_enabled) {
             start_rx_trickle();
         }
@@ -364,6 +365,12 @@ public:
         if (!xsk_) return -1;
 
         int ret = poll(&poll_fd_, 1, 0);  // Always non-blocking, SO_BUSY_POLL controls duration
+
+        // Inline trickle every 8 poll_wait() calls (~400us at 50us/poll)
+        // Triggers NAPI poll for TX completions (igc driver workaround)
+        if (rx_trickle_fd_ >= 0 && (++poll_wait_count_ & 0x07) == 0) {
+            ::send(rx_trickle_fd_, trickle_packet_, trickle_packet_len_, MSG_DONTWAIT);
+        }
 
         // After poll(), reclaim any TX completions
         reclaim_completed_frames();
@@ -596,12 +603,6 @@ public:
         // Submit the TX descriptor
         xsk_ring_prod__submit(&tx_ring_, 1);
 
-        // Send inline trickle packet to trigger NAPI for TX completion
-        // (igc driver workaround - TX completions only happen during NAPI poll)
-        if (rx_trickle_fd_ >= 0) {
-            ::send(rx_trickle_fd_, trickle_packet_, trickle_packet_len_, MSG_DONTWAIT);
-        }
-
         // Mark frame as no longer owned by application
         frame->owned = false;
 
@@ -644,12 +645,12 @@ public:
      * Stop RX trickle thread (public API)
      *
      * Call this after SSL/WebSocket handshake completes to stop the background
-     * trickle thread. After handshake, inline trickle in send_frame() provides
-     * TX completion triggers, so the thread is no longer needed.
+     * trickle thread. After handshake, inline trickle in poll_wait() and
+     * send_frame() provides NAPI triggers, so the thread is no longer needed.
      *
      * This reduces CPU overhead by eliminating the 500 Hz self-ping thread.
-     * The inline trickle after send_frame() will continue to trigger NAPI
-     * for TX completions as needed.
+     * Inline trickle continues to trigger NAPI for both RX delivery and TX
+     * completions in receive-only and send-heavy workloads.
      */
     void stop_rx_trickle_thread() {
         stop_rx_trickle();
@@ -806,6 +807,12 @@ public:
 
 private:
     void cleanup() {
+        // Close RX trickle socket (used by both background thread and inline trickle)
+        if (rx_trickle_fd_ >= 0) {
+            ::close(rx_trickle_fd_);
+            rx_trickle_fd_ = -1;
+        }
+
         // Clean up BPF first (detach before deleting socket)
         if (bpf_loader_) {
             delete bpf_loader_;
@@ -967,6 +974,10 @@ private:
 
     /**
      * Stop RX trickle thread
+     *
+     * NOTE: This only stops the background thread. The rx_trickle_fd_ socket is
+     * intentionally kept open for inline trickle use in poll_wait(). The socket
+     * is closed in cleanup() when the XDP transport is fully destroyed.
      */
     void stop_rx_trickle() {
         if (!rx_trickle_running_.load()) {
@@ -979,12 +990,11 @@ private:
             rx_trickle_thread_.join();
         }
 
-        if (rx_trickle_fd_ >= 0) {
-            ::close(rx_trickle_fd_);
-            rx_trickle_fd_ = -1;
-        }
+        // NOTE: Do NOT close rx_trickle_fd_ here - it's still needed for
+        // inline trickle in poll_wait() to trigger NAPI during receive-only
+        // workloads. The socket is closed in cleanup().
 
-        printf("[RX-TRICKLE] Stopped\n");
+        printf("[RX-TRICKLE] Stopped (socket kept open for inline trickle)\n");
     }
 
     /**
@@ -1166,6 +1176,7 @@ private:
 
     // Cached poll state (avoid recreating struct on every poll_wait call)
     struct pollfd poll_fd_;                 // Cached pollfd for poll_wait()
+    uint8_t poll_wait_count_;               // Counter for inline trickle throttling
 };
 
 #else  // !USE_XDP

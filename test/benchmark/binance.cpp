@@ -6,6 +6,15 @@
 //   1. Warmup: 100 messages (discard)
 //   2. Benchmark: 300 messages (collect statistics)
 //   3. Analyze: Min/Max/Mean/Median/P90/P95/P99 for all 6 stages
+//
+// Build modes:
+//   BSD sockets:  make benchmark-binance
+//   XDP mode:     USE_XDP=1 USE_OPENSSL=1 make benchmark-binance
+//
+// Usage:
+//   BSD sockets:  ./build/benchmark_binance [warmup_count] [benchmark_count]
+//   XDP mode:     sudo ./build/benchmark_binance <interface> [bpf_obj] [warmup_count] [benchmark_count]
+//                 sudo ./build/benchmark_binance enp108s0 100 300
 
 #include "../../src/ws_configs.hpp"
 #include "../../src/core/timing.hpp"
@@ -15,6 +24,7 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <string>
 
 // Configuration (adjustable via command line or defaults)
 constexpr int DEFAULT_WARMUP_COUNT = 100;
@@ -110,116 +120,135 @@ void print_stats_table(const char* stage_name, const Stats& stats) {
            stats.p99);
 }
 
-// Message callback
-void on_message(const uint8_t* data, size_t len, const timing_record_t& timing) {
+// Batch message callback
+void on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& timing) {
     // ┌─────────────────────────────────────────────────────┐
     // │ STAGE 6: Callback entry - record both timestamps   │
     // └─────────────────────────────────────────────────────┘
     uint64_t stage6_cycle = rdtscp();                      // For Stage 2→6 delta (TSC)
     uint64_t stage6_monotonic_ns = get_monotonic_timestamp_ns();  // For Stage 1→6 delta (CLOCK_MONOTONIC)
 
-    (void)data;  // Unused
-    (void)len;   // Unused
+    // Pre-calculate shared timing values (batch-level)
+    double stage2_to_3_us = 0, stage3_to_4_us = 0;
+    double stage1_to_2_us = 0;
+    bool hw_ts_available = false;
 
-    int current_count = message_count.fetch_add(1) + 1;
-
-    // Progress indicator
-    if (current_count <= WARMUP_COUNT) {
-        if (current_count % 10 == 0) {
-            printf("\r[WARMUP] %d/%d messages...", current_count, WARMUP_COUNT);
-            fflush(stdout);
+    if (g_tsc_freq_hz > 0) {
+        // Stage 2 → Stage 3: Event loop to recv start
+        if (timing.recv_start_cycle > timing.event_cycle) {
+            stage2_to_3_us = cycles_to_ns(timing.recv_start_cycle - timing.event_cycle, g_tsc_freq_hz) / 1000.0;
         }
-        if (current_count == WARMUP_COUNT) {
-            printf("\r[WARMUP] Complete! Collected %d messages    \n", WARMUP_COUNT);
-            printf("[BENCHMARK] Starting data collection...\n");
+
+        // Stage 3 → Stage 4: SSL decryption
+        if (timing.recv_end_cycle > timing.recv_start_cycle) {
+            stage3_to_4_us = cycles_to_ns(timing.recv_end_cycle - timing.recv_start_cycle, g_tsc_freq_hz) / 1000.0;
+        }
+
+        // Stage 1 → Stage 2: NIC RX to event loop start
+        if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0 && timing.event_cycle > 0) {
+            hw_ts_available = true;
+            uint64_t stage2_to_stage6_ns = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz);
+            uint64_t stage2_monotonic_ns = stage6_monotonic_ns - stage2_to_stage6_ns;
+
+#ifdef USE_XDP
+            // XDP mode: hw_timestamp is CLOCK_REALTIME, convert to CLOCK_MONOTONIC
+            struct timespec ts_real;
+            clock_gettime(CLOCK_REALTIME, &ts_real);
+            uint64_t realtime_now_ns = (uint64_t)ts_real.tv_sec * 1000000000ULL + ts_real.tv_nsec;
+            int64_t hw_timestamp_mono_ns = (int64_t)timing.hw_timestamp_latest_ns -
+                                           (int64_t)realtime_now_ns + (int64_t)stage6_monotonic_ns;
+            stage1_to_2_us = ((int64_t)stage2_monotonic_ns - hw_timestamp_mono_ns) / 1000.0;
+#else
+            // BSD socket mode: hw_timestamp is already CLOCK_MONOTONIC
+            int64_t delta_ns = stage2_monotonic_ns - timing.hw_timestamp_latest_ns;
+            stage1_to_2_us = delta_ns / 1000.0;
+#endif
         }
     }
-    // Note: No progress printing during benchmark phase to avoid affecting timing measurements
 
-    // Skip warmup messages
-    if (current_count <= WARMUP_COUNT) {
-        return;
-    }
+    // Process each message in batch
+    bool should_exit = false;
+    for (size_t i = 0; i < count; i++) {
+        const MessageInfo& msg = msgs[i];
+        int current_count = message_count.fetch_add(1) + 1;
 
-    // Calculate latencies for this message
-    LatencyData latency;
-
-    // Stage 1 → Stage 2: NIC RX to event loop start
-    // Use latest timestamp (most recent packet arrival) for latency measurement
-    if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0 && timing.event_cycle > 0) {
-        // Calculate Stage 2 time in CLOCK_MONOTONIC domain:
-        // stage2_time = stage6_time - (stage6_cycle - stage2_cycle) / cpu_freq
-        uint64_t stage2_to_stage6_ns = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz);
-        uint64_t stage2_monotonic_ns = stage6_monotonic_ns - stage2_to_stage6_ns;
-        int64_t delta_ns = stage2_monotonic_ns - timing.hw_timestamp_latest_ns;
-        latency.stage1_to_stage2_us = delta_ns / 1000.0;
-
-        // Warn if timestamp queue buildup detected
-        if (timing.hw_timestamp_count > 1) {
-            printf("[WARN] Timestamp queue buildup: %u packets (may affect latency accuracy)\n",
-                   timing.hw_timestamp_count);
+        // Progress indicator (warmup phase only)
+        if (current_count <= WARMUP_COUNT) {
+            if (current_count % 10 == 0) {
+                printf("\r[WARMUP] %d/%d messages...", current_count, WARMUP_COUNT);
+                fflush(stdout);
+            }
+            if (current_count == WARMUP_COUNT) {
+                printf("\r[WARMUP] Complete! Collected %d messages    \n", WARMUP_COUNT);
+                printf("[BENCHMARK] Starting data collection...\n");
+            }
+            continue;  // Skip warmup messages
         }
-    } else {
-        latency.stage1_to_stage2_us = 0;  // Hardware timestamps not available
-    }
 
-    // Stage 2 → Stage 3: Event loop to recv start
-    if (timing.recv_start_cycle > 0 && timing.event_cycle > 0) {
-        uint64_t delta_cycles = timing.recv_start_cycle - timing.event_cycle;
-        latency.stage2_to_stage3_us = cycles_to_ns(delta_cycles, g_tsc_freq_hz) / 1000.0;
-    } else {
-        latency.stage2_to_stage3_us = 0;
-    }
+        // Calculate latencies for this message
+        LatencyData latency;
 
-    // Stage 3 → Stage 4: SSL decryption
-    if (timing.recv_end_cycle > 0 && timing.recv_start_cycle > 0) {
-        uint64_t delta_cycles = timing.recv_end_cycle - timing.recv_start_cycle;
-        latency.stage3_to_stage4_us = cycles_to_ns(delta_cycles, g_tsc_freq_hz) / 1000.0;
-    } else {
-        latency.stage3_to_stage4_us = 0;
-    }
+        // Use shared batch timing for stages 1-4
+        latency.stage1_to_stage2_us = hw_ts_available ? stage1_to_2_us : 0;
+        latency.stage2_to_stage3_us = stage2_to_3_us;
+        latency.stage3_to_stage4_us = stage3_to_4_us;
 
-    // Stage 4 → Stage 5: WebSocket parsing
-    if (timing.frame_parsed_cycle > 0 && timing.recv_end_cycle > 0) {
-        uint64_t delta_cycles = timing.frame_parsed_cycle - timing.recv_end_cycle;
-        latency.stage4_to_stage5_us = cycles_to_ns(delta_cycles, g_tsc_freq_hz) / 1000.0;
-    } else {
-        latency.stage4_to_stage5_us = 0;
-    }
+        // Stage 4 → Stage 5: WebSocket parsing (use per-message parse_cycle)
+        if (msg.parse_cycle > 0 && timing.recv_end_cycle > 0) {
+            uint64_t delta_cycles = msg.parse_cycle - timing.recv_end_cycle;
+            latency.stage4_to_stage5_us = cycles_to_ns(delta_cycles, g_tsc_freq_hz) / 1000.0;
+        } else {
+            latency.stage4_to_stage5_us = 0;
+        }
 
-    // Stage 5 → Stage 6: Callback invocation
-    if (stage6_cycle > 0 && timing.frame_parsed_cycle > 0) {
-        uint64_t delta_cycles = stage6_cycle - timing.frame_parsed_cycle;
-        latency.stage5_to_stage6_us = cycles_to_ns(delta_cycles, g_tsc_freq_hz) / 1000.0;
-    } else {
-        latency.stage5_to_stage6_us = 0;
-    }
+        // Stage 5 → Stage 6: Callback invocation (use per-message parse_cycle)
+        if (stage6_cycle > 0 && msg.parse_cycle > 0) {
+            uint64_t delta_cycles = stage6_cycle - msg.parse_cycle;
+            latency.stage5_to_stage6_us = cycles_to_ns(delta_cycles, g_tsc_freq_hz) / 1000.0;
+        } else {
+            latency.stage5_to_stage6_us = 0;
+        }
 
-    // Total (Stage 2 → Stage 6)
-    if (stage6_cycle > 0 && timing.event_cycle > 0) {
-        uint64_t delta_cycles = stage6_cycle - timing.event_cycle;
-        latency.total_us = cycles_to_ns(delta_cycles, g_tsc_freq_hz) / 1000.0;
-    } else {
-        latency.total_us = 0;
-    }
+        // Total (Stage 2 → Stage 6)
+        if (stage6_cycle > 0 && timing.event_cycle > 0) {
+            uint64_t delta_cycles = stage6_cycle - timing.event_cycle;
+            latency.total_us = cycles_to_ns(delta_cycles, g_tsc_freq_hz) / 1000.0;
+        } else {
+            latency.total_us = 0;
+        }
 
-    // End-to-end (Stage 1 → Stage 6)
-    // Use latest timestamp (most recent packet) for end-to-end measurement
-    if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0) {
-        // Hardware timestamps available: use CLOCK_MONOTONIC delta
-        int64_t delta_ns = stage6_monotonic_ns - timing.hw_timestamp_latest_ns;
-        latency.end_to_end_us = delta_ns / 1000.0;
-    } else {
-        // Hardware timestamps not available: use TSC-only (Stage 2→6)
-        latency.end_to_end_us = latency.total_us;
-    }
+        // End-to-end (Stage 1 → Stage 6)
+        if (hw_ts_available) {
+#ifdef USE_XDP
+            // XDP mode: convert hw_timestamp from CLOCK_REALTIME to CLOCK_MONOTONIC
+            struct timespec ts_real;
+            clock_gettime(CLOCK_REALTIME, &ts_real);
+            uint64_t realtime_now_ns = (uint64_t)ts_real.tv_sec * 1000000000ULL + ts_real.tv_nsec;
+            int64_t hw_timestamp_mono_ns = (int64_t)timing.hw_timestamp_latest_ns -
+                                           (int64_t)realtime_now_ns + (int64_t)stage6_monotonic_ns;
+            int64_t delta_ns = stage6_monotonic_ns - hw_timestamp_mono_ns;
+            latency.end_to_end_us = delta_ns / 1000.0;
+#else
+            // BSD socket mode: hw_timestamp is CLOCK_MONOTONIC
+            int64_t delta_ns = stage6_monotonic_ns - timing.hw_timestamp_latest_ns;
+            latency.end_to_end_us = delta_ns / 1000.0;
+#endif
+        } else {
+            latency.end_to_end_us = latency.total_us;
+        }
 
-    // Store latency data
-    latency_samples.push_back(latency);
+        // Store latency data
+        latency_samples.push_back(latency);
+
+        // Check if benchmark is complete
+        if (current_count >= TOTAL_COUNT) {
+            should_exit = true;
+        }
+    }
 
     // Exit after benchmark is complete
-    if (current_count >= TOTAL_COUNT) {
-        printf("\n[BENCHMARK] Complete! Collected %d samples    \n", BENCHMARK_COUNT);
+    if (should_exit) {
+        printf("\n[BENCHMARK] Complete! Collected %zu samples    \n", latency_samples.size());
         printf("[BENCHMARK] Disconnecting...\n\n");
         if (g_client) {
             g_client->disconnect();
@@ -252,13 +281,16 @@ void print_results() {
         }
 
         // IO Backend and Transport Policy
-#ifdef ENABLE_IO_URING
+#ifdef USE_XDP
+        printf("  IO Backend:         SO_BUSY_POLL\n");
+        printf("  Transport Policy:   AF_XDP zero-copy + Userspace TCP/IP stack\n");
+#elif defined(ENABLE_IO_URING)
         printf("  IO Backend:         io_uring (async I/O)\n");
+        printf("  Transport Policy:   BSDSocket + %s\n", DefaultWebSocket::TransportPolicy::event_policy_name());
 #else
         printf("  IO Backend:         EventPolicy-based I/O\n");
+        printf("  Transport Policy:   BSDSocket + %s\n", DefaultWebSocket::TransportPolicy::event_policy_name());
 #endif
-        // Transport Policy
-        printf("  Transport Policy:   %s\n", DefaultWebSocket::TransportPolicy::event_policy_name());
 
         // Ringbuffer configuration
         printf("  RX Buffer:          ");
@@ -307,39 +339,39 @@ void print_results() {
     printf("  ──────────────────────────────────────────────────────────────────────────────────────────────────\n");
 
     // Print statistics for each stage
-    print_stats_table("Stage 1→2 (NIC→App)", stats_1_to_2);
-    print_stats_table("Stage 2→3 (Event)", stats_2_to_3);
-    print_stats_table("Stage 3→4 (SSL)", stats_3_to_4);
-    print_stats_table("Stage 4→5 (Parse)", stats_4_to_5);
-    print_stats_table("Stage 5→6 (Callback)", stats_5_to_6);
-    printf("  ──────────────────────────────────────────────────────────────────────────────────────────────────\n");
-    print_stats_table("Total (Stage 2→6)", stats_total);
-    print_stats_table("End-to-End (1→6)", stats_e2e);
+    print_stats_table("Stage 1->2 (NIC->App)", stats_1_to_2);
+    print_stats_table("Stage 2->3 (Event)", stats_2_to_3);
+    print_stats_table("Stage 3->4 (SSL)", stats_3_to_4);
+    print_stats_table("Stage 4->5 (Parse)", stats_4_to_5);
+    print_stats_table("Stage 5->6 (Callback)", stats_5_to_6);
+    printf("  --------------------------------------------------------------------------------------------------------\n");
+    print_stats_table("Total (Stage 2->6)", stats_total);
+    print_stats_table("End-to-End (1->6)", stats_e2e);
 
     printf("\n");
 
     // Print latency breakdown
     printf("Latency Breakdown (Mean):\n");
-    printf("  ┌───────────────────────────────────────────────────────────────────┐\n");
+    printf("  +---------------------------------------------------------------------+\n");
 
     double total_mean = stats_1_to_2.mean + stats_total.mean;
     auto print_bar = [&](const char* name, double value, double pct) {
         int bar_len = static_cast<int>(pct / 2);  // Scale to 50 chars max
-        printf("  │ %-20s %8.2f μs [%3.0f%%] ", name, value, pct);
-        for (int i = 0; i < bar_len; i++) printf("█");
+        printf("  | %-20s %8.2f us [%3.0f%%] ", name, value, pct);
+        for (int i = 0; i < bar_len; i++) printf("#");
         printf("\n");
     };
 
     if (total_mean > 0) {
-        print_bar("NIC→Event (1→2)", stats_1_to_2.mean, (stats_1_to_2.mean / total_mean) * 100);
-        print_bar("Event loop (2→3)", stats_2_to_3.mean, (stats_2_to_3.mean / total_mean) * 100);
-        print_bar("SSL decrypt (3→4)", stats_3_to_4.mean, (stats_3_to_4.mean / total_mean) * 100);
-        print_bar("WS parse (4→5)", stats_4_to_5.mean, (stats_4_to_5.mean / total_mean) * 100);
-        print_bar("Callback (5→6)", stats_5_to_6.mean, (stats_5_to_6.mean / total_mean) * 100);
+        print_bar("NIC->Event (1->2)", stats_1_to_2.mean, (stats_1_to_2.mean / total_mean) * 100);
+        print_bar("Event loop (2->3)", stats_2_to_3.mean, (stats_2_to_3.mean / total_mean) * 100);
+        print_bar("SSL decrypt (3->4)", stats_3_to_4.mean, (stats_3_to_4.mean / total_mean) * 100);
+        print_bar("WS parse (4->5)", stats_4_to_5.mean, (stats_4_to_5.mean / total_mean) * 100);
+        print_bar("Callback (5->6)", stats_5_to_6.mean, (stats_5_to_6.mean / total_mean) * 100);
     }
 
-    printf("  └───────────────────────────────────────────────────────────────────┘\n");
-    printf("  Total: %.2f μs\n\n", total_mean);
+    printf("  +---------------------------------------------------------------------+\n");
+    printf("  Total: %.2f us\n\n", total_mean);
 
     // Key insights
     printf("Key Insights:\n");
@@ -363,7 +395,41 @@ void print_results() {
 }
 
 int main(int argc, char* argv[]) {
-    // Parse command line arguments
+#ifdef USE_XDP
+    // XDP mode: interface [bpf_obj] [warmup] [benchmark]
+    const char* interface = "enp108s0";
+    const char* bpf_obj = "src/xdp/bpf/exchange_filter.bpf.o";
+
+    if (argc >= 2) {
+        interface = argv[1];
+    }
+    if (argc >= 3) {
+        // Check if second arg is a number (warmup) or string (bpf_obj)
+        if (argv[2][0] >= '0' && argv[2][0] <= '9') {
+            WARMUP_COUNT = atoi(argv[2]);
+            if (WARMUP_COUNT < 0) WARMUP_COUNT = DEFAULT_WARMUP_COUNT;
+        } else {
+            bpf_obj = argv[2];
+        }
+    }
+    if (argc >= 4) {
+        // Could be warmup or benchmark
+        if (argv[3][0] >= '0' && argv[3][0] <= '9') {
+            if (argc >= 3 && argv[2][0] >= '0' && argv[2][0] <= '9') {
+                // argv[2] was warmup, argv[3] is benchmark
+                BENCHMARK_COUNT = atoi(argv[3]);
+            } else {
+                // argv[2] was bpf_obj, argv[3] is warmup
+                WARMUP_COUNT = atoi(argv[3]);
+            }
+        }
+    }
+    if (argc >= 5) {
+        BENCHMARK_COUNT = atoi(argv[4]);
+        if (BENCHMARK_COUNT < 1) BENCHMARK_COUNT = DEFAULT_BENCHMARK_COUNT;
+    }
+#else
+    // BSD socket mode: [warmup] [benchmark]
     if (argc >= 2) {
         WARMUP_COUNT = atoi(argv[1]);
         if (WARMUP_COUNT < 0) WARMUP_COUNT = DEFAULT_WARMUP_COUNT;
@@ -372,10 +438,15 @@ int main(int argc, char* argv[]) {
         BENCHMARK_COUNT = atoi(argv[2]);
         if (BENCHMARK_COUNT < 1) BENCHMARK_COUNT = DEFAULT_BENCHMARK_COUNT;
     }
+#endif
     TOTAL_COUNT = WARMUP_COUNT + BENCHMARK_COUNT;
 
     printf("╔════════════════════════════════════════════════════════════════════╗\n");
+#ifdef USE_XDP
+    printf("║   Binance WebSocket Latency Benchmark (AF_XDP Zero-Copy Mode)     ║\n");
+#else
     printf("║           Binance WebSocket Latency Benchmark Test                ║\n");
+#endif
     printf("╚════════════════════════════════════════════════════════════════════╝\n\n");
     printf("Target: wss://stream.binance.com:443\n");
     printf("Stream: btcusdt@trade with MICROSECOND timeUnit\n");
@@ -383,8 +454,17 @@ int main(int argc, char* argv[]) {
     printf("  1. Warmup:    %d messages (discard)\n", WARMUP_COUNT);
     printf("  2. Benchmark: %d messages (collect statistics)\n", BENCHMARK_COUNT);
     printf("  3. Analyze:   Min/Max/Mean/Median/P90/P95/P99\n");
+
+#ifdef USE_XDP
+    printf("\nUsage: sudo %s <interface> [bpf_obj] [warmup] [benchmark]\n", argv[0]);
+    printf("Example: sudo %s enp108s0 100 300\n\n", argv[0]);
+    printf("🔧 XDP Mode Configuration:\n");
+    printf("   Interface: %s\n", interface);
+    printf("   BPF Object: %s\n\n", bpf_obj);
+#else
     printf("\nUsage: %s [warmup_count] [benchmark_count]\n", argv[0]);
     printf("Example: %s 20 100  (20 warmup, 100 benchmark)\n\n", argv[0]);
+#endif
 
     try {
         // Calibrate TSC frequency
@@ -399,6 +479,12 @@ int main(int argc, char* argv[]) {
         DefaultWebSocket client;
         g_client = &client;
 
+#ifdef USE_XDP
+        // XDP mode: Initialize transport before connect (resolves DNS internally)
+        client.init_xdp(interface, bpf_obj, "stream.binance.com", 443);
+        printf("\n");
+#endif
+
         // Connect to Binance
         printf("🔌 Connecting to stream.binance.com:443...\n");
         client.connect("stream.binance.com", 443, "/stream?streams=btcusdt@trade&timeUnit=MICROSECOND");
@@ -406,11 +492,11 @@ int main(int argc, char* argv[]) {
         printf("✅ Connected successfully!\n");
         printf("📡 Starting benchmark...\n\n");
 
-        // Run event loop
-        client.run(on_message);
+        // Run event loop with batch callback
+        client.run(on_messages);
 
         // Check if we collected enough samples
-        if (latency_samples.size() < BENCHMARK_COUNT) {
+        if (latency_samples.size() < static_cast<size_t>(BENCHMARK_COUNT)) {
             printf("\n⚠️  Warning: Only collected %zu samples out of %d expected\n",
                    latency_samples.size(), BENCHMARK_COUNT);
             printf("   Connection may have closed prematurely\n");

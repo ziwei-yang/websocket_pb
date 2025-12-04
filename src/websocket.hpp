@@ -138,59 +138,33 @@ public:
     }
 
     /**
-     * Initialize XDP transport with interface and BPF filter configuration
-     *
-     * This method is only available when using XDP transport (USE_XDP=1).
-     * Must be called before connect() when using XDP mode.
+     * Initialize XDP transport with domain name or IP (resolves DNS internally)
      *
      * @param interface  Network interface name (e.g., "enp108s0")
      * @param bpf_obj    Path to BPF object file (e.g., "src/xdp/bpf/exchange_filter.bpf.o")
-     * @param ip         Exchange IP address to filter (e.g., "54.250.108.226")
+     * @param domain     Exchange domain to filter (e.g., "stream.binance.com")
      * @param port       Exchange port to filter (e.g., 443)
-     *
-     * Example:
-     *   client.init_xdp("enp108s0", "src/xdp/bpf/exchange_filter.bpf.o",
-     *                   "54.250.108.226", 443);
-     *   client.connect("stream.binance.com", 443, "/stream?streams=btcusdt@trade");
      */
     template<typename T = TransportPolicy_>
     typename std::enable_if<!websocket::traits::is_fd_based_transport_v<T>, void>::type
     init_xdp(const char* interface, const char* bpf_obj,
-             const char* ip, uint16_t port) {
+             const char* domain, uint16_t port) {
         printf("[XDP] Initializing AF_XDP transport...\n");
         printf("[XDP]   Interface: %s\n", interface);
         printf("[XDP]   BPF object: %s\n", bpf_obj);
-        printf("[XDP]   Filter IP: %s, Port: %u\n", ip, port);
+        printf("[XDP]   Domain: %s, Port: %u\n", domain, port);
+
+        // Resolve domain to IPs
+        auto ips = resolve_hostname(domain);
+        if (ips.empty()) {
+            throw std::runtime_error(std::string("Failed to resolve domain: ") + domain);
+        }
+        printf("[XDP]   Resolved %zu IP(s)\n", ips.size());
 
         // Initialize XDP transport with interface and BPF program
         transport_.init(interface, bpf_obj);
 
-        // Configure BPF filter for exchange traffic
-        transport_.add_exchange_ip(ip);
-        transport_.add_exchange_port(port);
-
-        xdp_initialized_ = true;
-        printf("[XDP] Transport initialized successfully\n");
-    }
-
-    /**
-     * Initialize XDP transport with multiple exchange IPs
-     *
-     * Useful when an exchange resolves to multiple IP addresses.
-     */
-    template<typename T = TransportPolicy_>
-    typename std::enable_if<!websocket::traits::is_fd_based_transport_v<T>, void>::type
-    init_xdp(const char* interface, const char* bpf_obj,
-             const std::vector<std::string>& ips, uint16_t port) {
-        printf("[XDP] Initializing AF_XDP transport...\n");
-        printf("[XDP]   Interface: %s\n", interface);
-        printf("[XDP]   BPF object: %s\n", bpf_obj);
-        printf("[XDP]   Filter IPs: %zu addresses, Port: %u\n", ips.size(), port);
-
-        // Initialize XDP transport with interface and BPF program
-        transport_.init(interface, bpf_obj);
-
-        // Configure BPF filter for all exchange IPs
+        // Configure BPF filter for all resolved IPs
         for (const auto& ip : ips) {
             transport_.add_exchange_ip(ip.c_str());
             printf("[XDP]     Added IP: %s\n", ip.c_str());
@@ -249,11 +223,10 @@ public:
         send_http_upgrade(host, path, custom_headers);
         recv_http_response();
 
-        // 7. Stop RX trickle thread for XDP (compile-time dispatch)
-        // After handshake, inline trickle in send_frame() triggers NAPI for TX completions
-        if constexpr (!is_fd_based) {
-            transport_.stop_rx_trickle_thread();
-        }
+        // 7. RX trickle thread DISABLED - using external trickle_sender tool
+        // if constexpr (!is_fd_based) {
+        //     transport_.stop_rx_trickle_thread();
+        // }
 
         // 8. Start event loop monitoring for BSD sockets (compile-time dispatch)
         if constexpr (is_fd_based) {
@@ -627,6 +600,32 @@ public:
     const TransportPolicy_& transport() const { return transport_; }
 
 private:
+    // Helper to resolve hostname to IP addresses for BPF filter
+    static std::vector<std::string> resolve_hostname(const char* hostname) {
+        std::vector<std::string> ips;
+        struct addrinfo hints = {};
+        struct addrinfo* result = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        int ret = getaddrinfo(hostname, nullptr, &hints, &result);
+        if (ret != 0 || !result) {
+            if (result) freeaddrinfo(result);
+            return ips;
+        }
+
+        for (struct addrinfo* p = result; p != nullptr; p = p->ai_next) {
+            if (p->ai_family == AF_INET) {
+                auto* addr = reinterpret_cast<struct sockaddr_in*>(p->ai_addr);
+                char ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
+                ips.push_back(ip_str);
+            }
+        }
+        freeaddrinfo(result);
+        return ips;
+    }
+
     SSLPolicy_ ssl_;
     TransportPolicy_ transport_;     // Unified transport (owns connection + event loop)
     RxBufferPolicy_ rx_buffer_;      // Separate RX buffer type/size
