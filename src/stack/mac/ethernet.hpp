@@ -55,17 +55,7 @@ struct RxFrameContext {
     size_t len;           // Frame length
 };
 
-class MACLayer {
-private:
-    uint8_t local_mac_[ETH_ADDR_LEN] = {};
-    uint8_t gateway_mac_[ETH_ADDR_LEN] = {};
-    bool gateway_resolved_ = false;
-
-    // Current RX/TX frame contexts (set by transport policy)
-    RxFrameContext* current_rx_ = nullptr;
-    TxFrameContext* current_tx_ = nullptr;
-
-public:
+struct MACLayer {
     MACLayer() = default;
     ~MACLayer() = default;
 
@@ -195,6 +185,15 @@ public:
 
         return true;
     }
+
+private:
+    uint8_t local_mac_[ETH_ADDR_LEN] = {};
+    uint8_t gateway_mac_[ETH_ADDR_LEN] = {};
+    bool gateway_resolved_ = false;
+
+    // Current RX/TX frame contexts (set by transport policy)
+    RxFrameContext* current_rx_ = nullptr;
+    TxFrameContext* current_tx_ = nullptr;
 };
 
 } // namespace userspace_stack

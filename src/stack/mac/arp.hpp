@@ -20,14 +20,7 @@
 
 namespace userspace_stack {
 
-class ARP {
-private:
-    MACLayer* mac_ = nullptr;
-    uint32_t gateway_ip_ = 0;  // Host byte order
-    uint8_t gateway_mac_[6] = {};
-    bool resolved_ = false;
-
-public:
+struct ARP {
     ARP() = default;
 
     // Initialize ARP
@@ -116,6 +109,12 @@ public:
     bool is_resolved() const {
         return resolved_;
     }
+
+private:
+    MACLayer* mac_ = nullptr;
+    uint32_t gateway_ip_ = 0;  // Host byte order
+    uint8_t gateway_mac_[6] = {};
+    bool resolved_ = false;
 };
 
 } // namespace userspace_stack

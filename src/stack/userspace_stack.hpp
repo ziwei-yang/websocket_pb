@@ -58,25 +58,7 @@ namespace userspace_stack {
  * Provides packet building/parsing operations only.
  * All control flow belongs in transport policy.
  */
-class UserspaceStack {
-private:
-    // Stack layers
-    MACLayer mac_;
-    ARP arp_;
-    IPLayer ip_;
-
-    // Configuration
-    uint32_t local_ip_ = 0;      // Host byte order
-    uint32_t gateway_ip_ = 0;    // Host byte order
-    uint32_t netmask_ = 0;       // Host byte order
-    uint8_t local_mac_[6] = {};
-
-    // IP identification counter
-    uint16_t ip_id_ = 0;
-
-    bool initialized_ = false;
-
-public:
+struct UserspaceStack {
     UserspaceStack() = default;
     ~UserspaceStack() = default;
 
@@ -256,6 +238,23 @@ public:
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         return std::string(buf);
     }
+
+private:
+    // Stack layers
+    MACLayer mac_;
+    ARP arp_;
+    IPLayer ip_;
+
+    // Configuration
+    uint32_t local_ip_ = 0;      // Host byte order
+    uint32_t gateway_ip_ = 0;    // Host byte order
+    uint32_t netmask_ = 0;       // Host byte order
+    uint8_t local_mac_[6] = {};
+
+    // IP identification counter
+    uint16_t ip_id_ = 0;
+
+    bool initialized_ = false;
 };
 
 } // namespace userspace_stack

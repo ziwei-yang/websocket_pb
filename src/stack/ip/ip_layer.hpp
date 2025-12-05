@@ -18,6 +18,7 @@
 #include "checksum.hpp"
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <arpa/inet.h>
 
 namespace userspace_stack {
@@ -44,23 +45,7 @@ struct __attribute__((packed)) IPv4Header {
     uint32_t daddr;          // Destination address
 };
 
-class IPLayer {
-private:
-    MACLayer* mac_ = nullptr;
-    ARP* arp_ = nullptr;
-
-    uint32_t local_ip_ = 0;     // Host byte order
-    uint32_t gateway_ip_ = 0;   // Host byte order
-    uint32_t netmask_ = 0;      // Host byte order
-
-    uint16_t ip_id_ = 0;        // IP identification counter
-
-    // Current RX packet being processed
-    const uint8_t* current_rx_payload_ = nullptr;
-    size_t current_rx_len_ = 0;
-    bool has_current_rx_ = false;
-
-public:
+struct IPLayer {
     IPLayer() = default;
     ~IPLayer() = default;
 
@@ -255,6 +240,21 @@ public:
         }
         throw std::runtime_error("Invalid IP address string");
     }
+
+private:
+    MACLayer* mac_ = nullptr;
+    ARP* arp_ = nullptr;
+
+    uint32_t local_ip_ = 0;     // Host byte order
+    uint32_t gateway_ip_ = 0;   // Host byte order
+    uint32_t netmask_ = 0;      // Host byte order
+
+    uint16_t ip_id_ = 0;        // IP identification counter
+
+    // Current RX packet being processed
+    const uint8_t* current_rx_payload_ = nullptr;
+    size_t current_rx_len_ = 0;
+    bool has_current_rx_ = false;
 };
 
 } // namespace userspace_stack

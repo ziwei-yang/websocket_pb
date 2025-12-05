@@ -124,8 +124,7 @@ struct XDPConfig {
  *   process(rx->data, rx->len);
  *   xdp.release_rx_frame(rx);
  */
-class XDPTransport {
-public:
+struct XDPTransport {
     // Use 256 bytes headroom - maximum supported by igc driver for XDP_ZEROCOPY mode
     // Note: Higher values (e.g., 512) cause EOPNOTSUPP when using zero-copy
     static constexpr uint32_t XDP_HEADROOM = 256;
@@ -1182,8 +1181,7 @@ private:
 #else  // !USE_XDP
 
 // Stub when XDP is not enabled
-class XDPTransport {
-public:
+struct XDPTransport {
     void init(const void*) {
         throw std::runtime_error("XDP support not compiled. Build with USE_XDP=1");
     }

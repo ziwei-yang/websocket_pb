@@ -108,14 +108,11 @@ int main() {
                 }
 
                 // Stop after receiving 1000 messages (for demo)
-                if (msg_count >= 1000) {
-                    running = false;
-                }
-
-                if (!running) {
-                    throw std::runtime_error("User requested shutdown");
+                if (msg_count >= 1000 || !running) {
+                    return false;  // Stop the run() loop
                 }
             }
+            return true;  // Continue receiving
         });
 
         // Final statistics

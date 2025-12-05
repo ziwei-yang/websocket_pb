@@ -105,8 +105,7 @@ template<
     typename RxBufferPolicy_,      // Separate RX buffer (can have different size)
     typename TxBufferPolicy_       // Separate TX buffer (can have different size)
 >
-class WebSocketClient {
-public:
+struct WebSocketClient {
     // Type aliases for policy introspection
     using SSLPolicy = SSLPolicy_;
     using TransportPolicy = TransportPolicy_;
@@ -118,7 +117,8 @@ public:
 
     // Batch message callback - receives array of messages with per-message timing
     // timing_record_t contains batch-level SSL timing, MessageInfo has per-message parse_cycle
-    using MessageCallback = std::function<void(const MessageInfo*, size_t, const timing_record_t&)>;
+    // Returns: true to continue receiving, false to exit run() loop
+    using MessageCallback = std::function<bool(const MessageInfo*, size_t, const timing_record_t&)>;
 
     WebSocketClient()
         : connected_(false)
@@ -223,12 +223,7 @@ public:
         send_http_upgrade(host, path, custom_headers);
         recv_http_response();
 
-        // 7. RX trickle thread DISABLED - using external trickle_sender tool
-        // if constexpr (!is_fd_based) {
-        //     transport_.stop_rx_trickle_thread();
-        // }
-
-        // 8. Start event loop monitoring for BSD sockets (compile-time dispatch)
+        // 7. Start event loop monitoring for BSD sockets (compile-time dispatch)
         if constexpr (is_fd_based) {
             transport_.start_event_loop();
         }
@@ -314,7 +309,9 @@ public:
             }
 
             // Process WebSocket frames
-            process_frames();
+            if (!process_frames()) {
+                break;  // Callback requested stop
+            }
 
             // Drain TX outbox after processing RX
             drain_tx_buffer();
@@ -475,7 +472,8 @@ private:
     }
 
     // Process WebSocket frames from ring buffer
-    void process_frames() {
+    // Returns: true to continue, false if callback requested stop
+    bool process_frames() {
         using namespace websocket::http;
 
         // Reset batch for this processing round
@@ -561,8 +559,11 @@ private:
 
         // Invoke batch callback if we collected any messages
         if (batch_count_ > 0 && on_message_) {
-            on_message_(message_batch_, batch_count_, timing_);
+            if (!on_message_(message_batch_, batch_count_, timing_)) {
+                return false;  // Callback requested stop
+            }
         }
+        return true;  // Continue processing
     }
 
 

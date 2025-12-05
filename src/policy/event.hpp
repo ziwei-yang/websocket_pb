@@ -260,15 +260,6 @@ struct EpollPolicy {
     }
 
     /**
-     * Get the events that triggered for the ready file descriptor
-     *
-     * @return Event mask (EPOLLIN, EPOLLOUT, EPOLLERR, etc.)
-     */
-    uint32_t get_ready_events() const {
-        return ready_events_;
-    }
-
-    /**
      * Check if ready event is readable
      */
     bool is_readable() const {
@@ -294,13 +285,6 @@ struct EpollPolicy {
      */
     static constexpr const char* name() {
         return "epoll";
-    }
-
-    void cleanup() {
-        if (epfd_ >= 0) {
-            ::close(epfd_);
-            epfd_ = -1;
-        }
     }
 
     static constexpr int MAX_EVENTS = 64;  // Max events per wait() call
@@ -602,14 +586,15 @@ struct KqueuePolicy {
         return "kqueue";
     }
 
+    static constexpr int MAX_EVENTS = 64;  // Max events per wait() call
+
+private:
     void cleanup() {
         if (kq_ >= 0) {
             ::close(kq_);
             kq_ = -1;
         }
     }
-
-    static constexpr int MAX_EVENTS = 64;  // Max events per wait() call
 
     int kq_;              // kqueue file descriptor
     int ready_fd_;        // Most recently ready file descriptor
@@ -888,15 +873,6 @@ struct SelectPolicy {
     }
 
     /**
-     * Get the events that triggered for the ready file descriptor
-     *
-     * @return Event mask (0x01=read, 0x04=write)
-     */
-    uint32_t get_ready_events() const {
-        return ready_events_;
-    }
-
-    /**
      * Check if ready event is readable
      */
     bool is_readable() const {
@@ -925,9 +901,10 @@ struct SelectPolicy {
         return "select";
     }
 
+private:
     void cleanup() {
-        FD_ZERO(&read_fds_);
-        FD_ZERO(&write_fds_);
+        // select() doesn't have resources to clean up
+        ready_fd_ = -1;
         max_fd_ = -1;
     }
 
@@ -1083,9 +1060,7 @@ uring_event.wait();
 
 // Example 3: Policy-based template
 template <typename EventPolicy>
-class EventLoop {
-    EventPolicy event_;
-public:
+struct EventLoop {
     void run() {
         event_.init();
         event_.add_read(listen_fd_);
@@ -1095,6 +1070,9 @@ public:
             }
         }
     }
+
+private:
+    EventPolicy event_;
 };
 
 // Instantiate with different policies

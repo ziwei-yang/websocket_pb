@@ -30,13 +30,7 @@ struct RetransmitSegment {
     uint8_t retransmit_count;    // Number of retransmissions
 };
 
-class RetransmitQueue {
-private:
-    std::deque<RetransmitSegment> queue_;
-    size_t max_queue_size_ = 256;  // Maximum queue size
-    uint8_t max_retransmits_ = 5;  // Maximum retransmissions before giving up
-
-public:
+struct RetransmitQueue {
     RetransmitQueue() = default;
 
     // Add segment to queue
@@ -162,6 +156,10 @@ private:
         return std::chrono::duration_cast<std::chrono::microseconds>(
             now.time_since_epoch()).count();
     }
+
+    std::deque<RetransmitSegment> queue_;
+    size_t max_queue_size_ = 256;  // Maximum queue size
+    uint8_t max_retransmits_ = 5;  // Maximum retransmissions before giving up
 };
 
 // ============================================================================
@@ -200,23 +198,7 @@ struct ReadStats {
     uint64_t latest_timestamp_ns = 0; // Latest HW timestamp in consumed frames
 };
 
-class ZeroCopyReceiveBuffer {
-private:
-    static constexpr size_t MAX_FRAMES = 256;  // Max frames in flight
-
-    FrameRef frames_[MAX_FRAMES];   // Circular buffer of frame refs
-    size_t head_ = 0;               // Next frame to read from
-    size_t tail_ = 0;               // Next slot to write to
-    size_t count_ = 0;              // Number of frames in buffer
-
-    // Callback for releasing frames
-    FrameReleaseCallback release_cb_ = nullptr;
-    void* release_user_data_ = nullptr;
-
-    // Stats from last read() operation
-    ReadStats last_read_stats_;
-
-public:
+struct ZeroCopyReceiveBuffer {
     ZeroCopyReceiveBuffer() = default;
 
     // Set the frame release callback
@@ -325,6 +307,21 @@ public:
         head_ = 0;
         tail_ = 0;
     }
+
+private:
+    static constexpr size_t MAX_FRAMES = 256;  // Max frames in flight
+
+    FrameRef frames_[MAX_FRAMES];   // Circular buffer of frame refs
+    size_t head_ = 0;               // Next frame to read from
+    size_t tail_ = 0;               // Next slot to write to
+    size_t count_ = 0;              // Number of frames in buffer
+
+    // Callback for releasing frames
+    FrameReleaseCallback release_cb_ = nullptr;
+    void* release_user_data_ = nullptr;
+
+    // Stats from last read() operation
+    ReadStats last_read_stats_;
 };
 
 } // namespace userspace_stack

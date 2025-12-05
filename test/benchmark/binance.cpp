@@ -121,7 +121,7 @@ void print_stats_table(const char* stage_name, const Stats& stats) {
 }
 
 // Batch message callback
-void on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& timing) {
+bool on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& timing) {
     // ┌─────────────────────────────────────────────────────┐
     // │ STAGE 6: Callback entry - record both timestamps   │
     // └─────────────────────────────────────────────────────┘
@@ -253,7 +253,9 @@ void on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& t
         if (g_client) {
             g_client->disconnect();
         }
+        return false;  // Signal to stop the run() loop
     }
+    return true;  // Continue receiving
 }
 
 // Print results

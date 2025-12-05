@@ -96,24 +96,7 @@ using LinuxOptimized = WebSocketClient<
 #endif
 
 // ============================================================================
-// Configuration 2: WolfSSL (Alternative SSL) - DISABLED
-// ============================================================================
-// Best for: Applications requiring WolfSSL
-//
-// Note: WolfSSLPolicy is not currently implemented
-// Uncomment when WolfSSL policy is added
-//
-// #ifdef __linux__
-// using WolfSSLConfig = WebSocketClient<
-//     WolfSSLPolicy,
-//     EpollPolicy,
-//     RingBuffer<8192 * 1024>,
-//     RingBuffer<8192 * 1024>
-// >;
-// #endif
-
-// ============================================================================
-// Configuration 3: macOS/BSD Default (LibreSSL + kqueue, HFT-optimized)
+// Configuration 2: macOS/BSD Default (LibreSSL + kqueue, HFT-optimized)
 // ============================================================================
 // Best for: macOS/BSD development and high-frequency trading systems
 //

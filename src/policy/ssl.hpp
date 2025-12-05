@@ -1026,26 +1026,6 @@ using WolfSSLPolicy = websocket::ssl::WolfSSLPolicy;
 #endif
 
 // ============================================================================
-// Default SSL Policy Selection
-// ============================================================================
-// NOTE: Policy selection is now handled in ws_configs.hpp via compile-time flags
-// These old defaults are commented out to avoid conflicts with the new system.
-
-// #if defined(SSL_POLICY_OPENSSL)
-//     // OpenSSL (default)
-//     using DefaultSSLPolicy = websocket::ssl::OpenSSLPolicy;
-//     using SSLPolicy = websocket::ssl::OpenSSLPolicy;
-// #elif defined(SSL_POLICY_LIBRESSL)
-//     // LibreSSL (macOS, BSD)
-//     using DefaultSSLPolicy = websocket::ssl::LibreSSLPolicy;
-//     using SSLPolicy = websocket::ssl::LibreSSLPolicy;
-// #elif defined(SSL_POLICY_WOLFSSL)
-//     // WolfSSL (embedded, lightweight)
-//     using DefaultSSLPolicy = websocket::ssl::WolfSSLPolicy;
-//     using SSLPolicy = websocket::ssl::WolfSSLPolicy;
-// #endif
-
-// ============================================================================
 // SSL Policy Concepts (C++20)
 // ============================================================================
 
@@ -1091,72 +1071,4 @@ static_assert(SSLPolicyConcept<websocket::ssl::WolfSSLPolicy>);
 static_assert(SSLPolicyConcept<WolfSSLPolicy>);
 #endif
 
-// SSLPolicy and DefaultSSLPolicy are defined in ws_configs.hpp
-// These static_asserts are now done there to avoid dependency issues
-// static_assert(SSLPolicyConcept<SSLPolicy>);
-// static_assert(SSLPolicyConcept<DefaultSSLPolicy>);
-
 #endif // C++20
-
-// ============================================================================
-// Usage Examples
-// ============================================================================
-
-/*
-
-// Example 1: Using platform-default SSL policy
-SSLPolicy ssl;
-ssl.init();
-ssl.handshake(sockfd);
-
-char buf[4096];
-ssize_t n = ssl.read(buf, sizeof(buf));
-if (n > 0) {
-    // Process decrypted data
-}
-
-// Example 2: Explicit policy selection
-websocket::ssl::OpenSSLPolicy openssl;
-openssl.init();
-openssl.handshake(sockfd);
-
-if (openssl.ktls_enabled()) {
-    // Using kernel TLS for better performance!
-}
-
-// Example 3: Policy-based template
-template <typename SSLPolicy>
-class SecureWebSocketClient {
-    SSLPolicy ssl_;
-public:
-    void connect(int fd) {
-        ssl_.init();
-        ssl_.handshake(fd);
-    }
-
-    ssize_t receive(void* buf, size_t len) {
-        return ssl_.read(buf, len);
-    }
-
-    ssize_t send(const void* buf, size_t len) {
-        return ssl_.write(buf, len);
-    }
-};
-
-// Instantiate with different policies
-SecureWebSocketClient<websocket::ssl::OpenSSLPolicy> openssl_client;
-SecureWebSocketClient<websocket::ssl::LibreSSLPolicy> libressl_client;
-SecureWebSocketClient<websocket::ssl::WolfSSLPolicy> wolfssl_client;
-
-// Example 4: Check kTLS support
-SSLPolicy ssl;
-ssl.init();
-ssl.handshake(sockfd);
-
-if (ssl.ktls_enabled()) {
-    std::cout << "Using kernel TLS for zero-copy encryption!" << std::endl;
-} else {
-    std::cout << "Using userspace TLS" << std::endl;
-}
-
-*/

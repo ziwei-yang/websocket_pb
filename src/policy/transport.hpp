@@ -55,6 +55,11 @@
 #include <thread>
 #include "../core/timing.hpp"  // rdtsc(), calibrate_tsc_freq()
 
+// macOS doesn't have MSG_NOSIGNAL, define as 0
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 namespace websocket {
 namespace transport {
 
@@ -70,8 +75,7 @@ namespace transport {
  *   EventPolicy - EpollPolicy, SelectPolicy, IoUringPolicy, or KqueuePolicy
  */
 template<typename EventPolicy>
-class BSDSocketTransport {
-public:
+struct BSDSocketTransport {
     BSDSocketTransport() : fd_(-1), connected_(false) {}
 
     ~BSDSocketTransport() {
@@ -129,6 +133,14 @@ public:
         if (::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) < 0) {
             printf("[WARN] Failed to set TCP_NODELAY: %s\n", strerror(errno));
         }
+
+#ifdef SO_NOSIGPIPE
+        // macOS/BSD: Prevent SIGPIPE on write to closed socket
+        // Linux uses MSG_NOSIGNAL flag in send() instead
+        if (::setsockopt(fd_, SOL_SOCKET, SO_NOSIGPIPE, &flag, sizeof(flag)) < 0) {
+            printf("[WARN] Failed to set SO_NOSIGPIPE: %s\n", strerror(errno));
+        }
+#endif
 
         // Resolve hostname
         struct addrinfo hints = {};
@@ -373,8 +385,7 @@ namespace transport {
  *   - Receive buffer
  *   - XDP I/O operations
  */
-class XDPUserspaceTransport {
-public:
+struct XDPUserspaceTransport {
     XDPUserspaceTransport()
         : xdp_()
         , stack_()
@@ -610,13 +621,6 @@ public:
         // Aggregate per-frame stats into cumulative stats
         if (result > 0) {
             const auto& stats = recv_buffer_.get_last_read_stats();
-#ifdef DEBUG_PACKET_COUNT
-            printf("[RECV-DEBUG] read=%zd bytes, this_read: %u pkts (oldest=%lu, latest=%lu), "
-                   "cumulative: %u→%u pkts, buffer_frames=%zu\n",
-                   result, stats.packet_count, stats.oldest_timestamp_ns, stats.latest_timestamp_ns,
-                   consumed_recv_packet_count_, consumed_recv_packet_count_ + stats.packet_count,
-                   recv_buffer_.frame_count());
-#endif
             consumed_recv_packet_count_ += stats.packet_count;
             if (consumed_recv_oldest_timestamp_ns_ == 0 && stats.oldest_timestamp_ns > 0) {
                 consumed_recv_oldest_timestamp_ns_ = stats.oldest_timestamp_ns;
@@ -955,10 +959,6 @@ private:
                         hw_timestamp_byte_ct_ += result.data_len;
                         // Save timestamp before releasing frame
                         uint64_t frame_timestamp = frame->hw_timestamp_ns;
-#ifdef DEBUG_PACKET_COUNT
-                        printf("[PUSH-DEBUG] push_frame: %zu bytes, ts=%lu (ts_ok=%s)\n",
-                               result.data_len, frame_timestamp, frame_timestamp > 0 ? "YES" : "NO");
-#endif
                         uint64_t umem_addr = xdp_.release_rx_frame(frame, true);
                         if (umem_addr != 0) {
                             recv_buffer_.push_frame(result.data, result.data_len, umem_addr, frame_timestamp);

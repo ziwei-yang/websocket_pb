@@ -431,7 +431,7 @@ TEST(move_assignment) {
     pipe.read_data(buf, sizeof(buf));
 }
 
-TEST(get_ready_events) {
+TEST(is_readable_after_wait) {
     EventPolicy event;
     event.init();
 
@@ -443,8 +443,7 @@ TEST(get_ready_events) {
     int n = event.wait();
     ASSERT_GT(n, 0);
 
-    uint32_t events = event.get_ready_events();
-    ASSERT_NE(events, 0);
+    ASSERT_TRUE(event.is_readable());
 
     // Clean up
     char buf[64];

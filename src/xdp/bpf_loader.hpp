@@ -55,26 +55,7 @@ struct BPFStats {
     uint64_t timestamp_fail;
 };
 
-class BPFLoader {
-private:
-    struct bpf_object* bpf_obj_ = nullptr;
-    struct bpf_program* bpf_prog_ = nullptr;
-    int prog_fd_ = -1;
-    int ifindex_ = -1;
-
-    // Map file descriptors
-    int xsks_map_fd_ = -1;
-    int exchange_ips_fd_ = -1;
-    int exchange_ports_fd_ = -1;
-    int stats_fd_ = -1;
-    int local_ip_fd_ = -1;  // Phase 1: Local IP for destination-based filtering
-
-    bool attached_ = false;
-    uint32_t xdp_flags_ = 0;  // Track flags used during attach
-    std::string interface_;
-    std::string bpf_obj_path_;
-
-public:
+struct BPFLoader {
     BPFLoader() = default;
 
     ~BPFLoader() {
@@ -496,6 +477,24 @@ private:
         exchange_ports_fd_ = -1;
         stats_fd_ = -1;
     }
+
+private:
+    struct bpf_object* bpf_obj_ = nullptr;
+    struct bpf_program* bpf_prog_ = nullptr;
+    int prog_fd_ = -1;
+    int ifindex_ = -1;
+
+    // Map file descriptors
+    int xsks_map_fd_ = -1;
+    int exchange_ips_fd_ = -1;
+    int exchange_ports_fd_ = -1;
+    int stats_fd_ = -1;
+    int local_ip_fd_ = -1;  // Phase 1: Local IP for destination-based filtering
+
+    bool attached_ = false;
+    uint32_t xdp_flags_ = 0;  // Track flags used during attach
+    std::string interface_;
+    std::string bpf_obj_path_;
 };
 
 } // namespace websocket::xdp

@@ -40,7 +40,7 @@ struct MessageTiming {
     bool hw_ts_available;
 };
 
-void on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& timing) {
+bool on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& timing) {
     // Stage 6: Callback entry - capture immediately
     uint64_t stage6_cycle = rdtscp();
     uint64_t stage6_monotonic_ns = get_monotonic_timestamp_ns();
@@ -193,7 +193,9 @@ void on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& t
         if (g_client) {
             g_client->disconnect();
         }
+        return false;  // Signal to stop the run() loop
     }
+    return true;  // Continue receiving
 }
 
 

@@ -31,8 +31,7 @@ namespace xdp {
  *
  * Future optimization: Could poll XDP RX ring directly for lower latency.
  */
-class XDPEventPolicy {
-public:
+struct XDPEventPolicy {
     XDPEventPolicy() : epoll_fd_(-1), running_(false) {}
 
     ~XDPEventPolicy() {
@@ -169,8 +168,7 @@ private:
 #else  // !USE_XDP
 
 // Stub when XDP is not enabled
-class XDPEventPolicy {
-public:
+struct XDPEventPolicy {
     void init() {
         throw std::runtime_error("XDP support not compiled. Build with USE_XDP=1");
     }

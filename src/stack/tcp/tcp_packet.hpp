@@ -67,8 +67,7 @@ struct TCPProcessResult {
  * Stateless operations only - builds and parses TCP packets.
  * All state management and control flow belongs in transport policy.
  */
-class TCPPacket {
-public:
+struct TCPPacket {
     /**
      * Build a TCP segment into the provided buffer
      *

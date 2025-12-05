@@ -35,8 +35,7 @@ namespace policy {
  * by calling the transport policy's send/recv methods.
  */
 template<typename TransportPolicy>
-class UserspaceTransportBIO {
-public:
+struct UserspaceTransportBIO {
     /**
      * Create BIO method for userspace transport
      *
