@@ -71,6 +71,7 @@ struct RingBuffer {
         , write_pos_(0)
         , is_mmap_(false)
         , is_mirrored_(false)
+        , is_external_(false)
         , read_pos_(0)
     {
         // Warn if structure is not cache-line aligned
@@ -80,7 +81,7 @@ struct RingBuffer {
     }
 
     ~RingBuffer() {
-        if (buffer_) {
+        if (buffer_ && !is_external_) {
             if (is_mmap_) {
                 size_t unmap_size = is_mirrored_ ? (2 * Capacity) : Capacity;
                 munmap(buffer_, unmap_size);
@@ -93,20 +94,21 @@ struct RingBuffer {
 
     // Initialize ring buffer (allocates memory)
     void init() {
-        if (buffer_) {
+        if (buffer_ && !is_external_) {
             if (is_mmap_) {
                 size_t unmap_size = is_mirrored_ ? (2 * Capacity) : Capacity;
                 munmap(buffer_, unmap_size);
             } else {
                 free(buffer_);
             }
-            buffer_ = nullptr;
         }
+        buffer_ = nullptr;
 
         read_pos_ = 0;
         write_pos_ = 0;
         is_mirrored_ = false;
         is_mmap_ = false;
+        is_external_ = false;
 
         // Try virtual memory mirroring first (best performance)
         if (try_create_mirrored_buffer() == 0) {
@@ -178,6 +180,36 @@ struct RingBuffer {
         if (!buffer_) {
             throw std::runtime_error("Failed to allocate ring buffer");
         }
+    }
+
+    /**
+     * Initialize ring buffer with external memory (shared memory outbox)
+     * Does NOT own memory - caller responsible for allocation/deallocation
+     *
+     * @param buffer  Pointer to pre-allocated/mapped memory
+     * @param size    Size of memory region (must equal Capacity)
+     */
+    void init_external(void* buffer, size_t size) {
+        if (size != Capacity) {
+            throw std::runtime_error("External buffer size mismatch");
+        }
+
+        // Cleanup existing buffer if any (but not external ones)
+        if (buffer_ && !is_external_) {
+            if (is_mmap_) {
+                size_t unmap_size = is_mirrored_ ? (2 * Capacity) : Capacity;
+                munmap(buffer_, unmap_size);
+            } else {
+                free(buffer_);
+            }
+        }
+
+        buffer_ = static_cast<uint8_t*>(buffer);
+        write_pos_ = 0;
+        read_pos_ = 0;
+        is_mmap_ = false;
+        is_mirrored_ = false;
+        is_external_ = true;
     }
 
     // Get pointer to next writable region (zero-copy write)
@@ -482,9 +514,10 @@ private:
     size_t write_pos_;      // Producer writes frequently
     bool is_mmap_;          // Initialization only (read-only after init)
     bool is_mirrored_;      // Virtual memory mirroring enabled (read-only after init)
+    bool is_external_;      // True if buffer is external (shared memory, don't free)
 
     // Padding to next cache line boundary
-    alignas(CACHE_LINE_SIZE) char _pad_producer[CACHE_LINE_SIZE - sizeof(uint8_t*) - sizeof(size_t) - 2*sizeof(bool)];
+    alignas(CACHE_LINE_SIZE) char _pad_producer[CACHE_LINE_SIZE - sizeof(uint8_t*) - sizeof(size_t) - 3*sizeof(bool)];
 
     //
     // === CONSUMER-OWNED CACHE LINE ===

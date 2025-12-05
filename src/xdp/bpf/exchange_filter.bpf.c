@@ -264,7 +264,8 @@ int exchange_packet_filter(struct xdp_md *ctx) {
     if (is_exchange_packet(&pctx)) {
         inc_stat(STAT_EXCHANGE_PACKETS);
 
-        // TEST: Full kfunc + adjust_meta to see if this causes redirect failures
+        // Extract NIC hardware RX timestamp into metadata area
+        // See: kernel commit 714070c4cb7a (kernel 6.3+)
         ret = bpf_xdp_adjust_meta(ctx, -(int)sizeof(struct xdp_user_metadata));
         if (ret == 0) {
             void *data = (void *)(long)ctx->data;

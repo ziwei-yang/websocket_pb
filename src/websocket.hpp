@@ -275,7 +275,11 @@ public:
         while (connected_) {
             // Wait for events (epoll/select/io_uring for BSD, busy-poll for XDP)
             int ready = transport_.wait();
-            if (ready <= 0) continue;
+            if (ready <= 0) {
+                // Even on timeout, check TX outbox for pending messages
+                drain_tx_buffer();
+                continue;
+            }
 
             // For BSD sockets: verify ready fd and drain HW timestamps (compile-time dispatch)
             if constexpr (is_fd_based) {
@@ -311,6 +315,9 @@ public:
 
             // Process WebSocket frames
             process_frames();
+
+            // Drain TX outbox after processing RX
+            drain_tx_buffer();
         }
 
         printf("[WS] Event loop terminated\n");
@@ -342,6 +349,30 @@ public:
     // Check if kTLS is enabled
     bool ktls_enabled() const {
         return ssl_.ktls_enabled();
+    }
+
+    /**
+     * Set external TX buffer for shared memory outbox (IPC)
+     *
+     * Enables another process to post raw (un-framed) messages to a shared
+     * memory region. WebSocketClient will automatically wrap payloads in
+     * WebSocket frames (opcode, FIN, mask, length) and send via SSL.
+     *
+     * Pass nullptr to disable custom outbox (default behavior).
+     * Must be called before connect() if using external buffer.
+     *
+     * @param buffer  Pointer to shared memory region, or nullptr to disable
+     * @param size    Size of shared memory (must match TxBufferPolicy capacity)
+     * @param opcode  WebSocket opcode for messages (0x01=text, 0x02=binary)
+     */
+    void set_tx_buffer(void* buffer, size_t size, uint8_t opcode = 0x01) {
+        if (buffer == nullptr) {
+            tx_outbox_enabled_ = false;
+            return;
+        }
+        tx_buffer_.init_external(buffer, size);
+        tx_outbox_enabled_ = true;
+        tx_opcode_ = opcode;
     }
 
 private:
@@ -397,6 +428,49 @@ private:
             timing_.recv_end_cycle = rdtscp();
             timing_.ssl_read_bytes = 0;
             return true;
+        }
+    }
+
+    /**
+     * Drain TX outbox - frame and send pending raw messages
+     *
+     * Called from event loop after processing RX. Reads raw payloads from
+     * tx_buffer_, wraps each in a WebSocket frame, and sends via SSL.
+     *
+     * Producer writes raw text/binary data to shared memory ring buffer.
+     * This method wraps in WebSocket frame (opcode, FIN=1, mask, length).
+     */
+    void drain_tx_buffer() {
+        using namespace websocket::http;
+
+        if (!tx_outbox_enabled_) return;
+
+        // Static masking key for HFT performance (single-threaded env)
+        uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78};
+
+        while (tx_buffer_.readable() > 0) {
+            size_t payload_len = 0;
+            const uint8_t* payload = tx_buffer_.next_read_region(&payload_len);
+            if (!payload || payload_len == 0) break;
+
+            // Build WebSocket frame from raw payload
+            // Max frame: 14 bytes header + payload
+            uint8_t frame[14 + 65536];  // Support up to 64KB messages
+            if (payload_len > 65536) {
+                printf("[WARN] TX message too large (%zu bytes), truncating\n", payload_len);
+                payload_len = 65536;
+            }
+
+            size_t frame_len = build_websocket_frame(
+                payload, payload_len, frame, sizeof(frame), mask, tx_opcode_);
+
+            // Send framed message through SSL
+            ssize_t sent = ssl_.write(frame, frame_len);
+            if (sent > 0) {
+                tx_buffer_.commit_read(payload_len);
+            } else {
+                break;  // Would block or error - retry next cycle
+            }
         }
     }
 
@@ -633,6 +707,8 @@ private:
 
     bool connected_;
     bool xdp_initialized_;           // True if init_xdp() was called (XDP mode only)
+    bool tx_outbox_enabled_ = false; // True if external TX outbox is set via set_tx_buffer()
+    uint8_t tx_opcode_ = 0x01;       // WebSocket opcode for TX outbox (0x01=text, 0x02=binary)
     uint64_t msg_count_;
     MessageCallback on_message_;
     timing_record_t timing_;  // Batch-level timing (SSL read timing shared by all messages)

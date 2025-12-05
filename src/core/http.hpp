@@ -432,6 +432,59 @@ inline size_t build_binary_frame(const uint8_t* payload, size_t payload_len,
 }
 
 /**
+ * Build WebSocket frame with specified opcode
+ *
+ * @param payload Payload data
+ * @param payload_len Payload length
+ * @param out_buffer Output buffer
+ * @param buffer_size Buffer size
+ * @param mask_key 4-byte masking key
+ * @param opcode WebSocket opcode (0x01=text, 0x02=binary)
+ * @return Total frame size
+ */
+inline size_t build_websocket_frame(const uint8_t* payload, size_t payload_len,
+                                     uint8_t* out_buffer, size_t buffer_size,
+                                     const uint8_t mask_key[4], uint8_t opcode) {
+    size_t header_len = 2;
+
+    // Byte 0: FIN + opcode
+    out_buffer[0] = 0x80 | (opcode & 0x0F);
+
+    // Byte 1: MASK + payload length
+    if (payload_len <= 125) {
+        out_buffer[1] = 0x80 | (uint8_t)payload_len;
+        header_len = 2;
+    } else if (payload_len <= 65535) {
+        out_buffer[1] = 0x80 | 126;
+        out_buffer[2] = (payload_len >> 8) & 0xFF;
+        out_buffer[3] = payload_len & 0xFF;
+        header_len = 4;
+    } else {
+        out_buffer[1] = 0x80 | 127;
+        for (int i = 0; i < 8; i++) {
+            out_buffer[2 + i] = (payload_len >> (56 - i * 8)) & 0xFF;
+        }
+        header_len = 10;
+    }
+
+    // Masking key
+    memcpy(out_buffer + header_len, mask_key, 4);
+    header_len += 4;
+
+    // Check buffer size
+    if (header_len + payload_len > buffer_size) {
+        return 0;  // Buffer too small
+    }
+
+    // Masked payload
+    for (size_t i = 0; i < payload_len; i++) {
+        out_buffer[header_len + i] = payload[i] ^ mask_key[i % 4];
+    }
+
+    return header_len + payload_len;
+}
+
+/**
  * Build WebSocket CLOSE frame
  *
  * @param status_code Close status code (1000 = normal closure)

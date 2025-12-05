@@ -42,7 +42,6 @@ struct TCPParseResult {
 enum class TCPAction {
     NONE,           // No action needed
     SEND_SYN,       // Send SYN packet
-    SEND_SYN_ACK,   // Send SYN-ACK packet (server mode, not used)
     SEND_ACK,       // Send ACK packet
     SEND_DATA,      // Send data packet
     SEND_FIN,       // Send FIN packet
