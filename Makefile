@@ -40,6 +40,12 @@ ifeq ($(UNAME_S),Linux)
         SSL_INFO := LibreSSL
     endif
 
+    # kTLS Support (Linux only, OpenSSL only)
+    ifdef ENABLE_KTLS
+        CXXFLAGS += -DENABLE_KTLS
+        SSL_INFO := $(SSL_INFO)+kTLS
+    endif
+
     # IO Backend Selection
     ifdef USE_SELECT
         CXXFLAGS += -DUSE_SELECT

@@ -147,9 +147,15 @@ struct OpenSSLPolicy {
         SSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);
 
         #ifdef __linux__
+        #ifdef ENABLE_KTLS
+        // Enable kTLS (kernel TLS offload) when requested
+        // Note: kTLS prevents access to socket-level timestamps
+        SSL_CTX_set_options(ctx_, SSL_OP_ENABLE_KTLS);
+        #else
         // Disable kTLS to allow hardware timestamp retrieval
         // kTLS (kernel TLS) prevents access to socket-level timestamps
         // SSL_CTX_set_options(ctx_, SSL_OP_ENABLE_KTLS);  // DISABLED for timestamp access
+        #endif
         #endif
     }
 
@@ -867,6 +873,102 @@ struct WolfSSLPolicy {
     }
 
     /**
+     * Perform TLS handshake over userspace transport
+     *
+     * Works with any transport policy implementing send/recv/poll interface.
+     * Example: XDPUserspaceTransport, or any custom userspace TCP stack.
+     *
+     * @param transport Transport policy instance
+     * @throws std::runtime_error on handshake failure
+     */
+    template<typename TransportPolicy>
+    void handshake_userspace_transport(TransportPolicy* transport) {
+        if (!transport) {
+            throw std::runtime_error("Transport is null");
+        }
+
+        ssl_ = wolfSSL_new(ctx_);
+        if (!ssl_) {
+            throw std::runtime_error("wolfSSL_new() failed");
+        }
+
+        // Create custom BIO for userspace transport
+        bio_method_ = websocket::policy::UserspaceTransportBIO<TransportPolicy>::create_bio_method();
+        if (!bio_method_) {
+            wolfSSL_free(ssl_);
+            throw std::runtime_error("Failed to create userspace transport BIO method");
+        }
+
+        WOLFSSL_BIO* bio = websocket::policy::UserspaceTransportBIO<TransportPolicy>::create_bio(bio_method_, transport);
+        if (!bio) {
+            wolfSSL_free(ssl_);
+            throw std::runtime_error("Failed to create userspace transport BIO");
+        }
+
+        // Associate BIO with SSL object
+        wolfSSL_set_bio(ssl_, bio, bio);
+
+        // Perform TLS handshake (non-blocking, polling-based)
+        int max_retries = 1000;
+        int retries = 0;
+
+        while (retries < max_retries) {
+            // Poll transport before handshake attempt
+            transport->poll();
+
+            int ret = wolfSSL_connect(ssl_);
+
+            if (ret == SSL_SUCCESS) {
+                // Handshake successful - stop trickle thread, switch to inline trickle
+                transport->stop_rx_trickle_thread();
+                printf("[SSL] Handshake complete (userspace transport)\n");
+                return;
+            }
+
+            int err = wolfSSL_get_error(ssl_, ret);
+            if (retries < 5 || retries % 100 == 0) {
+                printf("[SSL-DEBUG] Handshake attempt #%d: ret=%d, err=%d (%s), errno=%d\n",
+                       retries, ret, err,
+                       err == SSL_ERROR_WANT_READ ? "WANT_READ" :
+                       err == SSL_ERROR_WANT_WRITE ? "WANT_WRITE" :
+                       err == SSL_ERROR_SYSCALL ? "SYSCALL" :
+                       err == SSL_ERROR_SSL ? "SSL" : "OTHER",
+                       errno);
+            }
+
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                // Would block, poll and retry
+                transport->poll();
+                usleep(1000);  // 1ms
+                retries++;
+                continue;
+            }
+
+            // SSL_ERROR_SYSCALL with errno=0 or EAGAIN should be retried
+            if (err == SSL_ERROR_SYSCALL) {
+                if (errno == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    transport->poll();
+                    usleep(1000);  // 1ms
+                    retries++;
+                    continue;
+                }
+            }
+
+            // Fatal error
+            char err_buf[256];
+            wolfSSL_ERR_error_string(err, err_buf);
+            printf("[SSL-ERROR] Fatal error after %d retries: %s\n", retries, err_buf);
+            wolfSSL_free(ssl_);
+            ssl_ = nullptr;
+            throw std::runtime_error(std::string("SSL handshake failed: ") + err_buf);
+        }
+
+        wolfSSL_free(ssl_);
+        ssl_ = nullptr;
+        throw std::runtime_error("SSL handshake timeout");
+    }
+
+    /**
      * Read decrypted data from SSL connection
      *
      * @param buf Buffer to store data
@@ -978,6 +1080,7 @@ struct WolfSSLPolicy {
 
     WOLFSSL_CTX* ctx_;
     WOLFSSL* ssl_;
+    WOLFSSL_BIO_METHOD* bio_method_ = nullptr;  // For userspace transport
 };
 
 #endif // SSL_POLICY_WOLFSSL

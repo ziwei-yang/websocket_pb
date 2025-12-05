@@ -289,6 +289,14 @@ struct EpollPolicy {
 
     static constexpr int MAX_EVENTS = 64;  // Max events per wait() call
 
+private:
+    void cleanup() {
+        if (epfd_ >= 0) {
+            ::close(epfd_);
+            epfd_ = -1;
+        }
+    }
+
     int epfd_;             // epoll file descriptor
     int ready_fd_;         // Most recently ready file descriptor
     uint32_t ready_events_; // Events for ready_fd_

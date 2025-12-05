@@ -10,7 +10,9 @@
 #
 # Arguments (order-independent):
 #   USE_XDP=1       - Enable XDP zero-copy mode (requires sudo)
-#   USE_OPENSSL=1   - Use OpenSSL instead of LibreSSL
+#   USE_OPENSSL=1   - Use OpenSSL (default if no SSL lib specified)
+#   USE_LIBRESSL=1  - Use LibreSSL
+#   USE_WOLFSSL=1   - Use WolfSSL
 #   interface=NAME  - Network interface for XDP mode (default: enp108s0)
 #   warmup=N        - Number of warmup messages (default: 100)
 #   benchmark=N     - Number of benchmark messages (default: 300)
@@ -21,6 +23,8 @@ set -e
 # Default values
 USE_XDP=0
 USE_OPENSSL=0
+USE_LIBRESSL=0
+USE_WOLFSSL=0
 INTERFACE="enp108s0"
 WARMUP=100
 BENCHMARK=300
@@ -34,6 +38,12 @@ for arg in "$@"; do
             ;;
         USE_OPENSSL=1)
             USE_OPENSSL=1
+            ;;
+        USE_LIBRESSL=1)
+            USE_LIBRESSL=1
+            ;;
+        USE_WOLFSSL=1)
+            USE_WOLFSSL=1
             ;;
         interface=*)
             INTERFACE="${arg#interface=}"
@@ -49,7 +59,7 @@ for arg in "$@"; do
             ;;
         *)
             echo "Unknown argument: $arg"
-            echo "Usage: $0 [USE_XDP=1] [USE_OPENSSL=1] [interface=NAME] [warmup=N] [benchmark=N] [cpu=N]"
+            echo "Usage: $0 [USE_XDP=1] [USE_OPENSSL=1] [USE_LIBRESSL=1] [USE_WOLFSSL=1] [interface=NAME] [warmup=N] [benchmark=N] [cpu=N]"
             exit 1
             ;;
     esac
@@ -74,6 +84,12 @@ if [[ "$USE_XDP" == "1" ]]; then
 fi
 if [[ "$USE_OPENSSL" == "1" ]]; then
     BUILD_ENV="$BUILD_ENV USE_OPENSSL=1"
+fi
+if [[ "$USE_LIBRESSL" == "1" ]]; then
+    BUILD_ENV="$BUILD_ENV USE_LIBRESSL=1"
+fi
+if [[ "$USE_WOLFSSL" == "1" ]]; then
+    BUILD_ENV="$BUILD_ENV USE_WOLFSSL=1"
 fi
 
 echo ""
