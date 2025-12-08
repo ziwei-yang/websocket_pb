@@ -46,6 +46,12 @@ ifeq ($(UNAME_S),Linux)
         SSL_INFO := $(SSL_INFO)+kTLS
     endif
 
+    # HftShm Shared Memory Support
+    ifdef USE_HFTSHM
+        CXXFLAGS += -DUSE_HFTSHM -std=c++20
+        $(info Building with HftShm shared memory buffer support)
+    endif
+
     # IO Backend Selection
     ifdef USE_SELECT
         CXXFLAGS += -DUSE_SELECT
@@ -128,6 +134,7 @@ TEST_RINGBUFFER_SRC := $(TEST_DIR)/test_ringbuffer.cpp
 TEST_EVENT_SRC := $(TEST_DIR)/test_event.cpp
 TEST_BUG_FIXES_SRC := $(TEST_DIR)/test_bug_fixes.cpp
 TEST_NEW_BUG_FIXES_SRC := $(TEST_DIR)/test_new_bug_fixes.cpp
+TEST_HFTSHM_SRC := $(TEST_DIR)/test_hftshm_ringbuffer.cpp
 
 # XDP test source files
 TEST_XDP_TRANSPORT_SRC := $(TEST_DIR)/test_xdp_transport.cpp
@@ -155,6 +162,7 @@ TEST_RINGBUFFER_BIN := $(BUILD_DIR)/test_ringbuffer
 TEST_EVENT_BIN := $(BUILD_DIR)/test_event
 TEST_BUG_FIXES_BIN := $(BUILD_DIR)/test_bug_fixes
 TEST_NEW_BUG_FIXES_BIN := $(BUILD_DIR)/test_new_bug_fixes
+TEST_HFTSHM_BIN := $(BUILD_DIR)/test_hftshm_ringbuffer
 TEST_BINANCE_BIN := $(BUILD_DIR)/test_binance_integration
 BENCHMARK_BINANCE_BIN := $(BUILD_DIR)/benchmark_binance
 
@@ -171,7 +179,7 @@ TEST_IP_OPTIMIZATIONS_BIN := $(BUILD_DIR)/test_ip_optimizations
 TEST_STACK_CHECKSUM_BIN := $(BUILD_DIR)/test_stack_checksum
 TEST_TCP_STATE_BIN := $(BUILD_DIR)/test_tcp_state
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state bpf check-ktls release debug epoll
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-hftshm bpf check-ktls release debug epoll
 
 all: $(EXAMPLE_BIN)
 
@@ -377,6 +385,28 @@ test-tcp-state: $(TEST_TCP_STATE_BIN)
 	./$(TEST_TCP_STATE_BIN)
 
 # ============================================================================
+# HftShm RingBuffer Tests (requires hft-shm CLI)
+# ============================================================================
+
+# Build HftShm ringbuffer tests
+$(TEST_HFTSHM_BIN): $(TEST_HFTSHM_SRC) src/core/hftshm_ringbuffer.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling HftShm ringbuffer unit tests..."
+	$(CXX) -std=c++20 -O3 -march=native -Wall -Wextra -I./src -DUSE_HFTSHM -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run HftShm ringbuffer tests
+# Uses test/shmem.toml by default, override with HFT_SHM_CONFIG env var
+HFT_SHM_CONFIG ?= $(CURDIR)/test/shmem.toml
+
+test-hftshm: $(TEST_HFTSHM_BIN)
+	@echo "🧪 Running HftShm ringbuffer unit tests..."
+	@echo "📋 Prerequisites:"
+	@echo "    - hft-shm CLI installed and in PATH"
+	@echo "    - Test segments created: hft-shm init --config test/shmem.toml"
+	@echo ""
+	HFT_SHM_CONFIG="$(HFT_SHM_CONFIG)" ./$(TEST_HFTSHM_BIN)
+
+# ============================================================================
 # Unified Test Target - Run All Unit Tests
 # ============================================================================
 
@@ -481,6 +511,7 @@ help:
 	@echo "  make test-ip-optimizations - Test IP layer optimizations"
 	@echo "  make test-stack-checksum - Test TCP/IP checksum calculations"
 	@echo "  make test-tcp-state     - Test TCP state machine"
+	@echo "  make test-hftshm        - Test HftShmRingBuffer (requires hft-shm CLI)"
 	@echo ""
 	@echo "Integration Tests:"
 	@echo "  make test-binance       - BSD socket test with Binance (20 msgs)"
@@ -498,6 +529,7 @@ help:
 	@echo "  USE_OPENSSL=1     - Use OpenSSL instead of LibreSSL"
 	@echo "  USE_WOLFSSL=1     - Use WolfSSL instead of LibreSSL"
 	@echo "  USE_XDP=1         - Enable XDP support (Linux only, requires libbpf/libxdp)"
+	@echo "  USE_HFTSHM=1      - Enable hft-shm shared memory buffer support"
 	@echo "  CXX=clang++       - Use Clang compiler"
 	@echo ""
 	@echo "Quick start:"

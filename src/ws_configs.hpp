@@ -332,3 +332,57 @@ static_assert(FdBasedTransportConcept<DefaultTransportPolicy>,
 //     RingBuffer<32 * 1024 * 1024>,
 //     RingBuffer<2 * 1024 * 1024>
 // >;
+
+// ============================================================================
+// Configuration: hft-shm Shared Memory Buffers
+// ============================================================================
+// Enable with: USE_HFTSHM=1 USE_WOLFSSL=1 make
+//
+// Uses hft-shm managed shared memory for RX/TX buffers, enabling:
+//   - RX: WebSocketClient writes to shm, external consumers read market data
+//   - TX: External producers write commands to shm, WebSocketClient sends
+//
+// Policy composition:
+//   - SSLPolicy: WolfSSLPolicy (optimized TLS)
+//   - TransportPolicy: BSDSocketTransport<EpollPolicy> (not XDP during dev)
+//   - RxBufferPolicy: HftShmRxBuffer (producer role, writes to shm)
+//   - TxBufferPolicy: HftShmTxBuffer (consumer role, reads from shm)
+//
+// Requirements:
+//   - hft-shm CLI installed and in PATH
+//   - Segments created: hft-shm init --config conf/test.toml
+//   - Segment type must be "ringbuffer"
+//
+// Build:
+//   USE_HFTSHM=1 USE_WOLFSSL=1 make
+
+#ifdef USE_HFTSHM
+#include "core/hftshm_ringbuffer.hpp"
+
+// Shared memory configuration for Binance market data
+// Uses BSDSocketTransport + WolfSSL (not XDP) for development
+using BinanceShmClient = WebSocketClient<
+    WolfSSLPolicy,                                          // WolfSSL for TLS
+    websocket::transport::BSDSocketTransport<EpollPolicy>,  // BSD sockets (not XDP)
+    HftShmRxBuffer<"zwy.mktdata.binance.raw.rx">,           // RX = Producer
+    HftShmTxBuffer<"zwy.mktdata.binance.raw.tx">            // TX = Consumer
+>;
+
+// Mixed: RX to shared memory, TX private
+// Useful when you only need to publish market data to other processes
+using BinanceRxShmClient = WebSocketClient<
+    WolfSSLPolicy,
+    websocket::transport::BSDSocketTransport<EpollPolicy>,
+    HftShmRxBuffer<"zwy.mktdata.binance.raw.rx">,
+    RingBuffer<2 * 1024 * 1024>                             // 2MB private TX
+>;
+
+// Test configuration (uses test.* segments)
+using TestShmClient = WebSocketClient<
+    WolfSSLPolicy,
+    websocket::transport::BSDSocketTransport<EpollPolicy>,
+    HftShmRxBuffer<"test.mktdata.binance.raw.rx">,
+    HftShmTxBuffer<"test.mktdata.binance.raw.tx">
+>;
+
+#endif // USE_HFTSHM

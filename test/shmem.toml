@@ -1,0 +1,16 @@
+# HFT Shared Memory Test Configuration for websocket_pb
+# Used by: make test-hftshm
+
+[test.mktdata.binance.raw.rx]
+type = "ringbuffer"
+capacity = "4MB"
+element_size = 1
+max_consumers = 1
+codec = "string"
+
+[test.mktdata.binance.raw.tx]
+type = "ringbuffer"
+capacity = "8MB"
+element_size = 1
+max_consumers = 1
+codec = "string"

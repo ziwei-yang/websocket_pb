@@ -89,75 +89,69 @@
 // BufferPolicy: Handles ring buffer operations
 // ============================================================================
 // Required methods:
-//   void init(size_t capacity)
-//     - Initialize buffer with given capacity
+//   void init()
+//     - Initialize buffer (capacity is compile-time template param or from shm)
 //
 //   uint8_t* next_write_region(size_t* available_len)
-//     - Get pointer to next writable region (zero-copy)
+//     - Get pointer to next writable region (zero-copy, producer only)
 //
 //   void commit_write(size_t len)
-//     - Commit written bytes
+//     - Commit written bytes (producer only)
 //
 //   const uint8_t* next_read_region(size_t* available_len)
-//     - Get pointer to next readable region (zero-copy)
+//     - Get pointer to next readable region (zero-copy, consumer only)
 //
 //   void commit_read(size_t len)
-//     - Commit consumed bytes
+//     - Commit consumed bytes (consumer only)
 //
 //   size_t readable() const
-//     - Get number of bytes available for reading
+//     - Get number of bytes available for reading (consumer)
 //
 //   size_t writable() const
-//     - Get number of bytes available for writing
+//     - Get number of bytes available for writing (producer)
+//
+//   size_t capacity() const
+//     - Get total buffer capacity in bytes
+//
+//   bool is_mmap() const
+//     - Returns true if buffer uses memory-mapped allocation
+//
+//   bool is_mirrored() const
+//     - Returns true if buffer uses virtual memory mirroring (zero-wraparound)
 //
 // Implementations:
-//   - RingBufferPolicy: Lock-free single-producer single-consumer ring buffer
+//   - RingBuffer<Capacity>: Lock-free SPSC ring buffer (private memory)
+//   - HftShmRxBuffer<Name>: Shared memory ring buffer (producer role)
+//   - HftShmTxBuffer<Name>: Shared memory ring buffer (consumer role)
 
 // ============================================================================
-// C++20 Concept Definitions (optional, for better error messages)
+// C++20 Concept Definitions
 // ============================================================================
+//
+// NOTE: The actual C++20 concept definitions are in the policy implementation files:
+//   - SSLPolicyConcept:    policy/ssl.hpp
+//   - EventPolicyConcept:  policy/event.hpp
+//   - TransportPolicyConcept: policy/transport.hpp
+//
+// BufferPolicyConcept is defined below since it's not in a separate policy file.
+//
 
 #if __cplusplus >= 202002L
 #include <concepts>
 
+// BufferPolicyConcept - defines the interface for RingBuffer and HftShmRingBuffer
 template<typename T>
-concept SocketPolicyConcept = requires(T socket, int fd, const char* host, uint16_t port) {
-    { socket.create() } -> std::convertible_to<int>;
-    { socket.connect(fd, host, port) } -> std::same_as<void>;
-    { socket.set_nonblocking(fd) } -> std::same_as<void>;
-    { socket.close(fd) } -> std::same_as<void>;
-};
-
-template<typename T>
-concept SSLPolicyConcept = requires(T ssl, int fd, void* buf, size_t len) {
-    { ssl.init() } -> std::same_as<void>;
-    { ssl.handshake(fd) } -> std::same_as<void>;
-    { ssl.read(buf, len) } -> std::convertible_to<ssize_t>;
-    { ssl.write(buf, len) } -> std::convertible_to<ssize_t>;
-    { ssl.ktls_enabled() } -> std::convertible_to<bool>;
-    { ssl.get_fd() } -> std::convertible_to<int>;
-    { ssl.shutdown() } -> std::same_as<void>;
-};
-
-template<typename T>
-concept EventPolicyConcept = requires(T event, int fd, uint32_t events, int timeout) {
-    { event.init() } -> std::same_as<void>;
-    { event.add_read(fd) } -> std::same_as<void>;
-    { event.add_write(fd) } -> std::same_as<void>;
-    { event.modify(fd, events) } -> std::same_as<void>;
-    { event.wait(timeout) } -> std::convertible_to<int>;
-    { event.get_ready_fd() } -> std::convertible_to<int>;
-};
-
-template<typename T>
-concept BufferPolicyConcept = requires(T buffer, size_t cap, size_t len, size_t* out_len) {
-    { buffer.init(cap) } -> std::same_as<void>;
+concept BufferPolicyConcept = requires(T buffer, size_t len, size_t* out_len) {
+    { buffer.init() } -> std::same_as<void>;
     { buffer.next_write_region(out_len) } -> std::convertible_to<uint8_t*>;
     { buffer.commit_write(len) } -> std::same_as<void>;
     { buffer.next_read_region(out_len) } -> std::convertible_to<const uint8_t*>;
     { buffer.commit_read(len) } -> std::same_as<void>;
     { buffer.readable() } -> std::convertible_to<size_t>;
     { buffer.writable() } -> std::convertible_to<size_t>;
+    { buffer.capacity() } -> std::convertible_to<size_t>;
+    { buffer.is_mmap() } -> std::convertible_to<bool>;
+    { buffer.is_mirrored() } -> std::convertible_to<bool>;
 };
 
 #endif // C++20

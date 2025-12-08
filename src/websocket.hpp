@@ -125,8 +125,22 @@ struct WebSocketClient {
         , xdp_initialized_(false)
         , msg_count_(0)
     {
-        rx_buffer_.init();  // Buffer initializes with its template parameter size
-        tx_buffer_.init();
+        try {
+            rx_buffer_.init();  // Buffer initializes with its template parameter size
+        } catch (const std::runtime_error& e) {
+            throw std::runtime_error(
+                "RX buffer init failed (shared memory segment missing?): " +
+                std::string(e.what()));
+        }
+
+        try {
+            tx_buffer_.init();
+        } catch (const std::runtime_error& e) {
+            throw std::runtime_error(
+                "TX buffer init failed (shared memory segment missing?): " +
+                std::string(e.what()));
+        }
+
         ssl_.init();
 
         // Initialize timing record
