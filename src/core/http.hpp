@@ -485,6 +485,51 @@ inline size_t build_websocket_frame(const uint8_t* payload, size_t payload_len,
 }
 
 /**
+ * Build WebSocket frame header only (for zero-copy TX)
+ *
+ * Uses mask=0x00000000 so payload doesn't need XOR transformation.
+ * Caller sends header then raw payload in separate writes.
+ *
+ * @param out_header Output buffer for header (must be >= 14 bytes)
+ * @param payload_len Length of payload that will follow
+ * @param opcode WebSocket opcode (0x01=text, 0x02=binary)
+ * @return Header size (6, 8, or 14 bytes depending on payload_len)
+ */
+inline size_t build_websocket_header_zerocopy(uint8_t* out_header,
+                                               size_t payload_len,
+                                               uint8_t opcode) {
+    size_t header_len = 2;
+
+    // Byte 0: FIN + opcode
+    out_header[0] = 0x80 | (opcode & 0x0F);
+
+    // Byte 1: MASK + payload length
+    if (payload_len <= 125) {
+        out_header[1] = 0x80 | static_cast<uint8_t>(payload_len);
+        header_len = 2;
+    } else if (payload_len <= 65535) {
+        out_header[1] = 0x80 | 126;
+        out_header[2] = (payload_len >> 8) & 0xFF;
+        out_header[3] = payload_len & 0xFF;
+        header_len = 4;
+    } else {
+        out_header[1] = 0x80 | 127;
+        for (int i = 0; i < 8; i++) {
+            out_header[2 + i] = (payload_len >> (56 - i * 8)) & 0xFF;
+        }
+        header_len = 10;
+    }
+
+    // Zero masking key (payload XOR 0 = payload, no transformation needed)
+    out_header[header_len++] = 0;
+    out_header[header_len++] = 0;
+    out_header[header_len++] = 0;
+    out_header[header_len++] = 0;
+
+    return header_len;
+}
+
+/**
  * Build WebSocket CLOSE frame
  *
  * @param status_code Close status code (1000 = normal closure)

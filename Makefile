@@ -407,6 +407,27 @@ test-hftshm: $(TEST_HFTSHM_BIN)
 	HFT_SHM_CONFIG="$(HFT_SHM_CONFIG)" ./$(TEST_HFTSHM_BIN)
 
 # ============================================================================
+# HftShm Binance TX/RX Integration Test
+# ============================================================================
+# Single executable - spawns consumer thread, main thread runs producer
+#   - Producer: WebSocketClient writes to RX shm
+#   - Consumer: Reads from RX shm every 1 second
+
+BINANCE_TXRX_SRC := test/integration/binance_txrx.cpp
+BINANCE_TXRX_BIN := $(BUILD_DIR)/binance_txrx
+
+# Build Binance TX/RX test
+$(BINANCE_TXRX_BIN): $(BINANCE_TXRX_SRC) $(HEADERS) src/core/hftshm_ringbuffer.hpp | $(BUILD_DIR)
+	@echo "Building Binance TX/RX integration test..."
+	$(CXX) -std=c++20 $(CXXFLAGS) -DUSE_HFTSHM -o $@ $< $(LDFLAGS)
+
+# Build-only target
+test-binance-shm: $(BINANCE_TXRX_BIN)
+	@echo "Built: $(BINANCE_TXRX_BIN)"
+	@echo ""
+	@echo "Usage: HFT_SHM_CONFIG=test/shmem.toml ./build/binance_txrx"
+
+# ============================================================================
 # Unified Test Target - Run All Unit Tests
 # ============================================================================
 

@@ -9,6 +9,8 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -62,9 +64,82 @@ struct consumer_section {
 
 } // namespace hftshm
 
-// IsRxBuffer: true = this is RX buffer (we are producer), false = TX buffer (we are consumer)
-template<FixedString SegmentName, bool IsRxBuffer, uint8_t ConsumerIndex = 0>
+// Split region for circular buffer access (data may span wrap point)
+struct SplitRegion {
+    uint8_t* ptr1;      // First region (current pos → buffer end)
+    size_t   len1;      // Length of first region
+    uint8_t* ptr2;      // Second region (buffer start), nullptr if no wrap
+    size_t   len2;      // Length of second region (0 if no wrap)
+
+    size_t total() const { return len1 + len2; }
+};
+
+// Import circular buffer helpers from ringbuffer.hpp if available, otherwise define them
+// This allows hftshm_ringbuffer.hpp to be used standalone or with ringbuffer.hpp
+#ifndef CIRCULAR_BUFFER_HELPERS_DEFINED
+#define CIRCULAR_BUFFER_HELPERS_DEFINED
+
+// Max size for circular_read/write: 32 frame descriptors × 12 bytes = 384 bytes
+// These functions are for small metadata only, not payloads
+static constexpr size_t MAX_CIRCULAR_ACCESS_SIZE = 384;
+
+// Write len bytes to circular buffer starting at logical position
+inline void circular_write(uint8_t* buffer, size_t capacity, size_t pos,
+                           const uint8_t* src, size_t len) {
+    assert(len <= MAX_CIRCULAR_ACCESS_SIZE &&
+           "circular_write is for small metadata only; use direct access for payloads");
+    pos = pos % capacity;  // Normalize position
+    size_t first = std::min(len, capacity - pos);
+    std::memcpy(buffer + pos, src, first);
+    if (len > first) {
+        std::memcpy(buffer, src + first, len - first);
+    }
+}
+
+// Read len bytes from circular buffer starting at logical position
+inline void circular_read(const uint8_t* buffer, size_t capacity, size_t pos,
+                          uint8_t* dest, size_t len) {
+    assert(len <= MAX_CIRCULAR_ACCESS_SIZE &&
+           "circular_read is for small metadata only; use direct access for payloads");
+    pos = pos % capacity;  // Normalize position
+    size_t first = std::min(len, capacity - pos);
+    std::memcpy(dest, buffer + pos, first);
+    if (len > first) {
+        std::memcpy(dest + first, buffer, len - first);
+    }
+}
+
+// Get pointer with wrap: returns buffer + (pos % capacity)
+inline uint8_t* circular_ptr(uint8_t* buffer, size_t capacity, size_t pos) {
+    return buffer + (pos % capacity);
+}
+
+inline const uint8_t* circular_ptr(const uint8_t* buffer, size_t capacity, size_t pos) {
+    return buffer + (pos % capacity);
+}
+
+#endif // CIRCULAR_BUFFER_HELPERS_DEFINED
+
+// Self-documenting buffer role enum
+// Producer = you WRITE to buffer, Consumer = you READ from buffer
+enum class HftShmBufferRole {
+    Producer,   // Was RX - for receiving data into buffer
+    Consumer,   // Was TX - for sending data from buffer
+    // Legacy aliases for backward compatibility
+    RX = Producer,
+    TX = Consumer
+};
+
+// Role: Producer = we write to buffer, Consumer = we read from buffer
+template<FixedString SegmentName, HftShmBufferRole Role, uint8_t ConsumerIndex = 0>
 struct HftShmRingBuffer {
+    // SPSC only - multi-consumer not supported
+    static_assert(ConsumerIndex == 0,
+        "HftShmRingBuffer only supports SPSC mode (ConsumerIndex must be 0)");
+
+    // Compile-time traits for detection
+    static constexpr bool is_hftshm = true;
+    static constexpr bool is_rx = (Role == HftShmBufferRole::Producer);
     // Parsed info from hft-shm info command
     struct SegmentInfo {
         std::string hdr_path;
@@ -168,19 +243,34 @@ struct HftShmRingBuffer {
         // Set up sequence pointers from header
         auto* producer = reinterpret_cast<hftshm::producer_section*>(
             static_cast<uint8_t*>(header_) + meta->producer_offset);
+        static constexpr size_t CONSUMER_SECTION_STRIDE = 128;  // From hft-shm layout.hpp
         auto* consumer = reinterpret_cast<hftshm::consumer_section*>(
             static_cast<uint8_t*>(header_) + meta->consumer_0_offset +
-            ConsumerIndex * 128);  // 128 bytes per consumer section
+            ConsumerIndex * CONSUMER_SECTION_STRIDE);
 
         write_seq_ = &producer->published;
         read_seq_ = &consumer->sequence;
+
+        // Force memory synchronization and validate sequences
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+
+        int64_t w = write_seq_->load(std::memory_order_seq_cst);
+        int64_t r = read_seq_->load(std::memory_order_seq_cst);
+
+        // Validate: readable bytes should be >= 0 and <= buffer capacity
+        int64_t readable = w - r;
+        if (readable < 0 || readable > static_cast<int64_t>(data_size_)) {
+            cleanup();
+            throw std::runtime_error(
+                "Invalid sequence values in shared memory: w=" + std::to_string(w) +
+                " r=" + std::to_string(r) + " readable=" + std::to_string(readable) +
+                " capacity=" + std::to_string(data_size_));
+        }
     }
 
-    //=== SPSC Producer Interface (used when IsRxBuffer=true) ===
+    //=== SPSC Producer Interface (used when Role=RX) ===
 
     uint8_t* next_write_region(size_t* available_len) {
-        static_assert(IsRxBuffer, "next_write_region only valid for RX buffer (producer)");
-
         if (!available_len) return nullptr;
 
         size_t avail = writable();
@@ -199,8 +289,6 @@ struct HftShmRingBuffer {
     }
 
     void commit_write(size_t len) {
-        static_assert(IsRxBuffer, "commit_write only valid for RX buffer (producer)");
-
         if (len == 0) return;
 
         // SPSC: we are sole writer, use load+store instead of fetch_add
@@ -210,18 +298,59 @@ struct HftShmRingBuffer {
 
     // Producer checks how much space is available (reads consumer's sequence)
     inline size_t writable() const {
-        static_assert(IsRxBuffer, "writable() only valid for RX buffer (producer)");
-
         int64_t w = write_seq_->load(std::memory_order_relaxed);  // We own this
         int64_t r = read_seq_->load(std::memory_order_acquire);   // Consumer's position
-        return static_cast<size_t>(index_mask_) - static_cast<size_t>(w - r);
+        // Buffer capacity is (index_mask_ + 1), not index_mask_
+        return static_cast<size_t>(index_mask_ + 1) - static_cast<size_t>(w - r);
     }
 
-    //=== SPSC Consumer Interface (used when IsRxBuffer=false) ===
+    // Get writable regions that may span wrap point
+    // Returns total writable space split into two regions if needed
+    SplitRegion next_write_regions(size_t* total_available = nullptr) {
+        SplitRegion result = {nullptr, 0, nullptr, 0};
+
+        size_t avail = writable();
+        if (avail == 0) {
+            if (total_available) *total_available = 0;
+            return result;
+        }
+
+        int64_t w = write_seq_->load(std::memory_order_relaxed);
+        size_t pos = static_cast<size_t>(w) & index_mask_;
+        size_t cap = index_mask_ + 1;
+        size_t to_end = cap - pos;
+
+        if (avail <= to_end) {
+            // No wrap needed
+            result.ptr1 = buffer_ + pos;
+            result.len1 = avail;
+        } else {
+            // Split across wrap
+            result.ptr1 = buffer_ + pos;
+            result.len1 = to_end;
+            result.ptr2 = buffer_;  // Wrap to start
+            result.len2 = avail - to_end;
+        }
+
+        if (total_available) *total_available = avail;
+        return result;
+    }
+
+    // Get buffer base pointer for circular access
+    uint8_t* buffer_base() { return buffer_; }
+    const uint8_t* buffer_base() const { return buffer_; }
+
+    // Get buffer capacity (power of 2)
+    size_t buffer_capacity() const { return index_mask_ + 1; }
+
+    // Get current write position (masked to buffer size)
+    size_t current_write_pos() const {
+        return static_cast<size_t>(write_seq_->load(std::memory_order_relaxed)) & index_mask_;
+    }
+
+    //=== SPSC Consumer Interface (used when Role=TX) ===
 
     const uint8_t* next_read_region(size_t* available_len) {
-        static_assert(!IsRxBuffer, "next_read_region only valid for TX buffer (consumer)");
-
         if (!available_len) return nullptr;
 
         size_t avail = readable();
@@ -240,8 +369,6 @@ struct HftShmRingBuffer {
     }
 
     void commit_read(size_t len) {
-        static_assert(!IsRxBuffer, "commit_read only valid for TX buffer (consumer)");
-
         if (len == 0) return;
 
         // SPSC: we are sole writer of read_seq_, use load+store
@@ -251,16 +378,61 @@ struct HftShmRingBuffer {
 
     // Consumer checks how much data is available (reads producer's sequence)
     inline size_t readable() const {
-        static_assert(!IsRxBuffer, "readable() only valid for TX buffer (consumer)");
-
         int64_t w = write_seq_->load(std::memory_order_acquire);  // Producer's position
         int64_t r = read_seq_->load(std::memory_order_relaxed);   // We own this
         return static_cast<size_t>(w - r);
     }
 
+    // Get readable regions that may span wrap point
+    // Returns total readable data split into two regions if needed
+    SplitRegion next_read_regions(size_t* total_available = nullptr) const {
+        SplitRegion result = {nullptr, 0, nullptr, 0};
+
+        size_t avail = readable();
+        if (avail == 0) {
+            if (total_available) *total_available = 0;
+            return result;
+        }
+
+        int64_t r = read_seq_->load(std::memory_order_relaxed);
+        size_t pos = static_cast<size_t>(r) & index_mask_;
+        size_t cap = index_mask_ + 1;
+        size_t to_end = cap - pos;
+
+        if (avail <= to_end) {
+            // No wrap needed
+            result.ptr1 = const_cast<uint8_t*>(buffer_ + pos);
+            result.len1 = avail;
+        } else {
+            // Split across wrap
+            result.ptr1 = const_cast<uint8_t*>(buffer_ + pos);
+            result.len1 = to_end;
+            result.ptr2 = const_cast<uint8_t*>(buffer_);  // Wrap to start
+            result.len2 = avail - to_end;
+        }
+
+        if (total_available) *total_available = avail;
+        return result;
+    }
+
+    // Get current read position (masked to buffer size)
+    size_t current_read_pos() const {
+        return static_cast<size_t>(read_seq_->load(std::memory_order_relaxed)) & index_mask_;
+    }
+
     //=== Common Interface (matches RingBuffer) ===
 
     size_t capacity() const { return data_size_; }
+
+    // Get current write position (producer's published sequence)
+    size_t write_pos() const {
+        return static_cast<size_t>(write_seq_->load(std::memory_order_acquire));
+    }
+
+    // Get current read position (consumer's sequence)
+    size_t read_pos() const {
+        return static_cast<size_t>(read_seq_->load(std::memory_order_acquire));
+    }
 
     void reset() {
         // Sequences are managed by hft-shm, don't reset
@@ -347,19 +519,15 @@ private:
                 info.type = std::string(val);
             } else if (key == "buffer_size" || key == "capacity") {
                 // Prefer buffer_size from metadata section, but also accept capacity
-                try {
-                    info.buffer_size = std::stoull(std::string(val));
-                } catch (...) {
-                    // Ignore parse errors
-                }
+                uint64_t size = 0;
+                auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), size);
+                if (ec == std::errc()) info.buffer_size = size;
             } else if (key == "hugepage_size") {
                 // Format may be "0B" or "2MB" etc - extract number
-                try {
-                    info.hugepage_size = std::stoull(std::string(val));
-                } catch (...) {
-                    // Ignore parse errors (e.g., "0B" won't parse)
-                    info.hugepage_size = 0;
-                }
+                uint64_t size = 0;
+                auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), size);
+                if (ec == std::errc()) info.hugepage_size = size;
+                // If parse fails (e.g., "0B"), default is already 0
             } else if (key == "status") {
                 // hft-shm uses "status: active" not "initialized: true"
                 info.initialized = (val == "active");
@@ -396,7 +564,10 @@ private:
 // TX buffer: WebSocketClient is consumer (reads data to send)
 
 template<FixedString Name, uint8_t ConsumerIdx = 0>
-using HftShmRxBuffer = HftShmRingBuffer<Name, true, ConsumerIdx>;   // RX = Producer
+using HftShmRxBuffer = HftShmRingBuffer<Name, HftShmBufferRole::Producer, ConsumerIdx>;
 
 template<FixedString Name, uint8_t ConsumerIdx = 0>
-using HftShmTxBuffer = HftShmRingBuffer<Name, false, ConsumerIdx>;  // TX = Consumer
+using HftShmTxBuffer = HftShmRingBuffer<Name, HftShmBufferRole::Consumer, ConsumerIdx>;
+
+// Include batch format types (shared with websocket.hpp)
+#include "shm_types.hpp"

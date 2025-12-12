@@ -4,6 +4,7 @@
 // and optional virtual memory mirroring
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -60,6 +61,53 @@ template<size_t N>
 struct IsPowerOfTwo {
     static constexpr bool value = (N != 0) && ((N & (N - 1)) == 0);
 };
+
+// Circular buffer helper functions (shared between RingBuffer and HftShmRingBuffer)
+// Guard allows both ringbuffer.hpp and hftshm_ringbuffer.hpp to define these
+// (hftshm_ringbuffer.hpp can be used standalone without ringbuffer.hpp)
+#ifndef CIRCULAR_BUFFER_HELPERS_DEFINED
+#define CIRCULAR_BUFFER_HELPERS_DEFINED
+
+// Max size for circular_read/write: 32 frame descriptors × 12 bytes = 384 bytes
+// These functions are for small metadata only, not payloads
+static constexpr size_t MAX_CIRCULAR_ACCESS_SIZE = 384;
+
+// Write len bytes to circular buffer starting at logical position
+inline void circular_write(uint8_t* buffer, size_t capacity, size_t pos,
+                           const uint8_t* src, size_t len) {
+    assert(len <= MAX_CIRCULAR_ACCESS_SIZE &&
+           "circular_write is for small metadata only; use direct access for payloads");
+    pos = pos % capacity;  // Normalize position
+    size_t first = std::min(len, capacity - pos);
+    std::memcpy(buffer + pos, src, first);
+    if (len > first) {
+        std::memcpy(buffer, src + first, len - first);
+    }
+}
+
+// Read len bytes from circular buffer starting at logical position
+inline void circular_read(const uint8_t* buffer, size_t capacity, size_t pos,
+                          uint8_t* dest, size_t len) {
+    assert(len <= MAX_CIRCULAR_ACCESS_SIZE &&
+           "circular_read is for small metadata only; use direct access for payloads");
+    pos = pos % capacity;  // Normalize position
+    size_t first = std::min(len, capacity - pos);
+    std::memcpy(dest, buffer + pos, first);
+    if (len > first) {
+        std::memcpy(dest + first, buffer, len - first);
+    }
+}
+
+// Get pointer with wrap: returns buffer + (pos % capacity)
+inline uint8_t* circular_ptr(uint8_t* buffer, size_t capacity, size_t pos) {
+    return buffer + (pos % capacity);
+}
+
+inline const uint8_t* circular_ptr(const uint8_t* buffer, size_t capacity, size_t pos) {
+    return buffer + (pos % capacity);
+}
+
+#endif // CIRCULAR_BUFFER_HELPERS_DEFINED
 
 // Template parameter: Buffer capacity in bytes (MUST be power of 2)
 template<size_t Capacity>
@@ -385,6 +433,25 @@ struct RingBuffer {
     bool is_mmap() const {
         return is_mmap_;
     }
+
+    // Compile-time trait for buffer type detection (false for standard RingBuffer)
+    static constexpr bool is_hftshm = false;
+
+    // === Circular buffer interface (compatibility with HftShmRingBuffer) ===
+    // These methods enable code to work with both RingBuffer and HftShmRingBuffer
+
+    // Get buffer base pointer for circular access
+    uint8_t* buffer_base() { return buffer_; }
+    const uint8_t* buffer_base() const { return buffer_; }
+
+    // Get buffer capacity (same as capacity(), but matches HftShmRingBuffer API)
+    size_t buffer_capacity() const { return Capacity; }
+
+    // Get current write position (masked to buffer size)
+    size_t current_write_pos() const { return write_pos_; }
+
+    // Get current read position (masked to buffer size)
+    size_t current_read_pos() const { return read_pos_; }
 
     // Disable copy and move
     RingBuffer(const RingBuffer&) = delete;

@@ -87,7 +87,7 @@ struct OpenSSLPolicy {
     OpenSSLPolicy() : ctx_(nullptr), ssl_(nullptr), ktls_enabled_(false), bio_method_(nullptr) {}
 
     ~OpenSSLPolicy() {
-        shutdown();
+        cleanup();  // Full cleanup including ctx_
     }
 
     // Prevent copying
@@ -166,7 +166,22 @@ struct OpenSSLPolicy {
      * @throws std::runtime_error if handshake fails
      */
     void handshake(int fd) {
+        // If ctx_ is null, initialize (first connection or after full cleanup)
+        if (!ctx_) {
+            init();
+        }
+
         ssl_ = SSL_new(ctx_);
+        if (!ssl_) {
+            // ctx_ might be stale after reconnect, try reinitializing
+            if (ctx_) {
+                SSL_CTX_free(ctx_);
+                ctx_ = nullptr;
+            }
+            init();
+            ssl_ = SSL_new(ctx_);
+        }
+
         if (!ssl_) {
             throw std::runtime_error("SSL_new() failed");
         }
@@ -216,9 +231,27 @@ struct OpenSSLPolicy {
             throw std::runtime_error("Transport is null");
         }
 
+        // If ctx_ is null, initialize (first connection or after full cleanup)
+        if (!ctx_) {
+            init();
+        }
+
         ssl_ = SSL_new(ctx_);
         if (!ssl_) {
-            throw std::runtime_error("SSL_new() failed");
+            // ctx_ might be stale after reconnect, try reinitializing
+            if (ctx_) {
+                SSL_CTX_free(ctx_);
+                ctx_ = nullptr;
+            }
+            init();
+            ssl_ = SSL_new(ctx_);
+        }
+
+        if (!ssl_) {
+            unsigned long err = ERR_get_error();
+            char err_buf[256];
+            ERR_error_string_n(err, err_buf, sizeof(err_buf));
+            throw std::runtime_error(std::string("SSL_new() failed: ") + err_buf);
         }
 
         // Create custom BIO for userspace transport
@@ -397,7 +430,8 @@ struct OpenSSLPolicy {
     }
 
     /**
-     * Shutdown SSL connection and free resources
+     * Shutdown SSL connection (keeps ctx_ for reconnection)
+     * Full cleanup happens in destructor
      */
     void shutdown() {
         if (ssl_) {
@@ -405,6 +439,15 @@ struct OpenSSLPolicy {
             SSL_free(ssl_);
             ssl_ = nullptr;
         }
+        // Note: ctx_ and bio_method_ kept for reconnection, freed in destructor
+        ktls_enabled_ = false;
+    }
+
+    /**
+     * Full cleanup - called by destructor
+     */
+    void cleanup() {
+        shutdown();  // Free ssl_ first
 
         if (bio_method_) {
             BIO_meth_free(bio_method_);
@@ -415,8 +458,6 @@ struct OpenSSLPolicy {
             SSL_CTX_free(ctx_);
             ctx_ = nullptr;
         }
-
-        ktls_enabled_ = false;
     }
 
     /**
@@ -458,7 +499,7 @@ struct LibreSSLPolicy {
     LibreSSLPolicy() : ctx_(nullptr), ssl_(nullptr), bio_method_(nullptr) {}
 
     ~LibreSSLPolicy() {
-        shutdown();
+        cleanup();  // Full cleanup including ctx_
     }
 
     // Prevent copying
@@ -525,9 +566,27 @@ struct LibreSSLPolicy {
      * @throws std::runtime_error if handshake fails
      */
     void handshake(int fd) {
+        // If ctx_ is null, initialize (first connection or after full cleanup)
+        if (!ctx_) {
+            init();
+        }
+
         ssl_ = SSL_new(ctx_);
         if (!ssl_) {
-            throw std::runtime_error("SSL_new() failed");
+            // ctx_ might be stale after reconnect, try reinitializing
+            if (ctx_) {
+                SSL_CTX_free(ctx_);
+                ctx_ = nullptr;
+            }
+            init();
+            ssl_ = SSL_new(ctx_);
+        }
+
+        if (!ssl_) {
+            unsigned long err = ERR_get_error();
+            char err_buf[256];
+            ERR_error_string_n(err, err_buf, sizeof(err_buf));
+            throw std::runtime_error(std::string("SSL_new() failed: ") + err_buf);
         }
 
         // Associate socket with SSL object
@@ -560,9 +619,27 @@ struct LibreSSLPolicy {
             throw std::runtime_error("Transport is null");
         }
 
+        // If ctx_ is null, initialize (first connection or after full cleanup)
+        if (!ctx_) {
+            init();
+        }
+
         ssl_ = SSL_new(ctx_);
         if (!ssl_) {
-            throw std::runtime_error("SSL_new() failed");
+            // ctx_ might be stale after reconnect, try reinitializing
+            if (ctx_) {
+                SSL_CTX_free(ctx_);
+                ctx_ = nullptr;
+            }
+            init();
+            ssl_ = SSL_new(ctx_);
+        }
+
+        if (!ssl_) {
+            unsigned long err = ERR_get_error();
+            char err_buf[256];
+            ERR_error_string_n(err, err_buf, sizeof(err_buf));
+            throw std::runtime_error(std::string("SSL_new() failed: ") + err_buf);
         }
 
         // Create custom BIO for userspace transport
@@ -739,7 +816,8 @@ struct LibreSSLPolicy {
     }
 
     /**
-     * Shutdown SSL connection and free resources
+     * Shutdown SSL connection (keeps ctx_ for reconnection)
+     * Full cleanup happens in destructor
      */
     void shutdown() {
         if (ssl_) {
@@ -747,6 +825,14 @@ struct LibreSSLPolicy {
             SSL_free(ssl_);
             ssl_ = nullptr;
         }
+        // Note: ctx_ and bio_method_ kept for reconnection, freed in destructor
+    }
+
+    /**
+     * Full cleanup - called by destructor
+     */
+    void cleanup() {
+        shutdown();  // Free ssl_ first
 
         if (bio_method_) {
             BIO_meth_free(bio_method_);
@@ -795,7 +881,7 @@ struct WolfSSLPolicy {
     WolfSSLPolicy() : ctx_(nullptr), ssl_(nullptr) {}
 
     ~WolfSSLPolicy() {
-        shutdown();
+        cleanup();  // Full cleanup including ctx_
     }
 
     // Prevent copying
@@ -851,9 +937,27 @@ struct WolfSSLPolicy {
      * @throws std::runtime_error if handshake fails
      */
     void handshake(int fd) {
+        // If ctx_ is null, initialize (first connection or after full cleanup)
+        if (!ctx_) {
+            init();
+        }
+
         ssl_ = wolfSSL_new(ctx_);
         if (!ssl_) {
-            throw std::runtime_error("wolfSSL_new() failed");
+            // ctx_ might be stale after reconnect, try reinitializing
+            if (ctx_) {
+                wolfSSL_CTX_free(ctx_);
+                ctx_ = nullptr;
+            }
+            init();
+            ssl_ = wolfSSL_new(ctx_);
+        }
+
+        if (!ssl_) {
+            unsigned long err = wolfSSL_ERR_get_error();
+            char err_buf[256];
+            wolfSSL_ERR_error_string(err, err_buf);
+            throw std::runtime_error(std::string("wolfSSL_new() failed: ") + err_buf);
         }
 
         // Associate socket with SSL object
@@ -887,9 +991,27 @@ struct WolfSSLPolicy {
             throw std::runtime_error("Transport is null");
         }
 
+        // If ctx_ is null, initialize (first connection or after full cleanup)
+        if (!ctx_) {
+            init();
+        }
+
         ssl_ = wolfSSL_new(ctx_);
         if (!ssl_) {
-            throw std::runtime_error("wolfSSL_new() failed");
+            // ctx_ might be stale after reconnect, try reinitializing
+            if (ctx_) {
+                wolfSSL_CTX_free(ctx_);
+                ctx_ = nullptr;
+            }
+            init();
+            ssl_ = wolfSSL_new(ctx_);
+        }
+
+        if (!ssl_) {
+            unsigned long err = wolfSSL_ERR_get_error();
+            char err_buf[256];
+            wolfSSL_ERR_error_string(err, err_buf);
+            throw std::runtime_error(std::string("wolfSSL_new() failed: ") + err_buf);
         }
 
         // Create custom BIO for userspace transport
@@ -1054,7 +1176,8 @@ struct WolfSSLPolicy {
     }
 
     /**
-     * Shutdown SSL connection and free resources
+     * Shutdown SSL connection (keeps ctx_ for reconnection)
+     * Full cleanup happens in destructor
      */
     void shutdown() {
         if (ssl_) {
@@ -1062,6 +1185,14 @@ struct WolfSSLPolicy {
             wolfSSL_free(ssl_);
             ssl_ = nullptr;
         }
+        // Note: ctx_ is kept for reconnection, freed in destructor
+    }
+
+    /**
+     * Full cleanup - called by destructor
+     */
+    void cleanup() {
+        shutdown();  // Free ssl_ first
 
         if (ctx_) {
             wolfSSL_CTX_free(ctx_);

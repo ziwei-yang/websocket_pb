@@ -961,6 +961,10 @@ private:
                         uint64_t frame_timestamp = frame->hw_timestamp_ns;
                         uint64_t umem_addr = xdp_.release_rx_frame(frame, true);
                         if (umem_addr != 0) {
+                            // WARNING: push_frame() return value not checked.
+                            // If recv_buffer_ is full (256 frames), data is silently dropped.
+                            // Since rcv_nxt advances and ACK is sent regardless, sender won't
+                            // retransmit. DATA PERMANENTLY LOST if consumer is too slow.
                             recv_buffer_.push_frame(result.data, result.data_len, umem_addr, frame_timestamp);
                             frame = nullptr;
                         }

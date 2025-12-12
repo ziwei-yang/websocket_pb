@@ -34,6 +34,7 @@
 #include "ws_policies.hpp"
 #include "core/timing.hpp"
 #include "core/http.hpp"
+#include "core/ringbuffer.hpp"  // For circular_read/circular_write helpers
 #include <functional>
 #include <string>
 #include <vector>
@@ -54,6 +55,13 @@
 
 #ifdef __linux__
 #include <linux/sockios.h>
+#endif
+
+// Shared memory batch types (always included for if constexpr branches)
+#include "core/shm_types.hpp"
+
+#ifdef USE_HFTSHM
+#include "core/hftshm_ringbuffer.hpp"
 #endif
 
 // ============================================================================
@@ -112,6 +120,11 @@ struct WebSocketClient {
     using RxBufferPolicy = RxBufferPolicy_;
     using TxBufferPolicy = TxBufferPolicy_;
 
+    // Compile-time detection of HftShm buffers
+    // Both RingBuffer and HftShmRingBuffer have is_hftshm static member
+    static constexpr bool uses_hftshm = RxBufferPolicy_::is_hftshm;
+    static constexpr bool uses_hftshm_tx = TxBufferPolicy_::is_hftshm;
+
     // HTTP header customization support
     using HeaderMap = std::vector<std::pair<std::string, std::string>>;
 
@@ -140,6 +153,9 @@ struct WebSocketClient {
                 "TX buffer init failed (shared memory segment missing?): " +
                 std::string(e.what()));
         }
+
+        // Auto-enable TX outbox for HftShm buffers (have is_hftshm trait)
+        enable_hftshm_tx_outbox();
 
         ssl_.init();
 
@@ -245,8 +261,16 @@ struct WebSocketClient {
         // 9. Configure wait timeout (1 second default)
         transport_.set_wait_timeout(1000);
 
+        // Store connection params for reconnection
+        host_ = host;
+        port_ = port;
+        path_ = path;
+
         connected_ = true;
         printf("[WS] Connected to %s:%d%s\n", host, port, path);
+
+        // Invoke on_connect callback to populate subscription messages
+        invoke_on_connect();
     }
 
 private:
@@ -275,63 +299,101 @@ private:
 public:
 
     // Main event loop - runs until disconnected
+    // If on_close callback is set and returns true, will reconnect automatically
     void run(MessageCallback on_message) {
         // Compile-time constant for transport type dispatch
         constexpr bool is_fd_based = websocket::traits::is_fd_based_transport_v<TransportPolicy_>;
 
         on_message_ = on_message;
 
-        while (connected_) {
-            // Wait for events (epoll/select/io_uring for BSD, busy-poll for XDP)
-            int ready = transport_.wait();
-            if (ready <= 0) {
-                // Even on timeout, check TX outbox for pending messages
+        while (true) {  // Outer reconnect loop
+            // Inner event loop
+            while (connected_ && (!stop_flag_ || *stop_flag_)) {
+                // Wait for events (epoll/select/io_uring for BSD, busy-poll for XDP)
+                // If set_wait_timeout() was called, wait() will respect the timeout
+                int ready = transport_.wait();
+
+                if (ready <= 0) {
+                    // Attempt non-blocking SSL_read to drain TLS record buffer
+                    // This prevents stalls when epoll misses buffered data (edge-triggered)
+                    if (!try_read_on_timeout()) {
+                        break;  // Connection closed
+                    }
+
+                    // Even on timeout, send subscriptions and check TX outbox
+                    send_subscribe_messages();
+                    drain_tx_buffer();
+                    continue;
+                }
+
+                // For BSD sockets: verify ready fd and drain HW timestamps (compile-time dispatch)
+                if constexpr (is_fd_based) {
+                    int fd = transport_.get_fd();
+                    int ready_fd = transport_.get_ready_fd();
+                    if (ready_fd != fd) continue;
+
+                    // Stage 1: Drain hardware RX timestamps from NIC/kernel queue
+                    // Only applicable for BSD sockets (XDP has no kernel timestamps)
+                    drain_hw_timestamps(fd, &timing_);
+                } else {
+                    // Stage 1: Get hardware RX timestamps from XDP metadata
+                    // XDP captures timestamp via bpf_xdp_metadata_rx_timestamp() kfunc
+                    // For multi-packet messages, oldest = first packet, latest = most recent
+                    uint32_t count = transport_.get_hw_timestamp_count();
+                    if (count > 0) {
+                        timing_.hw_timestamp_oldest_ns = transport_.get_oldest_rx_hw_timestamp();
+                        timing_.hw_timestamp_latest_ns = transport_.get_latest_rx_hw_timestamp();
+                        timing_.hw_timestamp_count = count;
+                        timing_.hw_timestamp_byte_count = transport_.get_hw_timestamp_byte_count();
+                        // Reset for next message
+                        transport_.reset_hw_timestamps();
+                    }
+                }
+
+                // Stage 2: Record CPU cycle when event loop processing starts
+                timing_.event_cycle = rdtsc();
+
+                // Read data into ring buffer
+                if (!recv_into_buffer()) {
+                    break;  // Connection closed or error
+                }
+
+                // Process WebSocket frames
+                // For HftShm: always process to write structured entries to buffer
+                // For standard: only if callback is configured
+                if constexpr (uses_hftshm) {
+                    if (!process_frames()) {
+                        break;
+                    }
+                } else {
+                    if (on_message_) {
+                        if (!process_frames()) {
+                            break;  // Callback requested stop
+                        }
+                    }
+                }
+
+                // Send subscriptions then drain TX outbox after processing RX
+                send_subscribe_messages();
                 drain_tx_buffer();
-                continue;
             }
 
-            // For BSD sockets: verify ready fd and drain HW timestamps (compile-time dispatch)
-            if constexpr (is_fd_based) {
-                int fd = transport_.get_fd();
-                int ready_fd = transport_.get_ready_fd();
-                if (ready_fd != fd) continue;
+            printf("[WS] Event loop terminated\n");
 
-                // Stage 1: Drain hardware RX timestamps from NIC/kernel queue
-                // Only applicable for BSD sockets (XDP has no kernel timestamps)
-                drain_hw_timestamps(fd, &timing_);
-            } else {
-                // Stage 1: Get hardware RX timestamps from XDP metadata
-                // XDP captures timestamp via bpf_xdp_metadata_rx_timestamp() kfunc
-                // For multi-packet messages, oldest = first packet, latest = most recent
-                uint32_t count = transport_.get_hw_timestamp_count();
-                if (count > 0) {
-                    timing_.hw_timestamp_oldest_ns = transport_.get_oldest_rx_hw_timestamp();
-                    timing_.hw_timestamp_latest_ns = transport_.get_latest_rx_hw_timestamp();
-                    timing_.hw_timestamp_count = count;
-                    timing_.hw_timestamp_byte_count = transport_.get_hw_timestamp_byte_count();
-                    // Reset for next message
-                    transport_.reset_hw_timestamps();
+            // Check for reconnection: invoke on_close if set, reconnect if it returns true
+            if (on_close_ && on_close_() && (!stop_flag_ || *stop_flag_)) {
+                printf("[WS] Reconnecting...\n");
+                // Clean up old connection before reconnecting
+                disconnect();
+                try {
+                    connect(host_.c_str(), port_, path_.c_str());
+                    continue;  // Resume event loop
+                } catch (const std::exception& e) {
+                    printf("[WS] Reconnect failed: %s\n", e.what());
                 }
             }
-
-            // Stage 2: Record CPU cycle when event loop processing starts
-            timing_.event_cycle = rdtsc();
-
-            // Read data into ring buffer
-            if (!recv_into_buffer()) {
-                break;  // Connection closed or error
-            }
-
-            // Process WebSocket frames
-            if (!process_frames()) {
-                break;  // Callback requested stop
-            }
-
-            // Drain TX outbox after processing RX
-            drain_tx_buffer();
+            break;  // Exit if no on_close, callback returns false, or reconnect failed
         }
-
-        printf("[WS] Event loop terminated\n");
     }
 
     // Graceful disconnect
@@ -340,6 +402,9 @@ public:
             ssl_.shutdown();
             transport_.close();
             connected_ = false;
+            // Reset HftShm state to avoid stale data on reconnect
+            hftshm_batch_start_pos_ = 0;
+            hftshm_data_written_ = 0;
             printf("[WS] Disconnected\n");
         }
     }
@@ -394,52 +459,225 @@ private:
         uint8_t* write_ptr = rx_buffer_.next_write_region(&available);
 
         if (available == 0) {
-            printf("[WARN] Ring buffer full!\n");
             return true;  // Not an error, just buffer full
         }
 
         // Stage 3: Record timestamp before SSL_read/recv
         timing_.recv_start_cycle = rdtsc();
 
-        // First read
-        ssize_t n = ssl_.read(write_ptr, available);
+        if constexpr (uses_hftshm) {
+            // HftShm circular buffer mode: SSL_read directly into ring buffer
+            // Format: [ShmBatchHeader (CLS)][raw_ssl_data padded (N*CLS)][ShmFrameDesc[] padded (M*CLS)]
+            // Data can wrap around buffer boundary seamlessly
+            constexpr size_t HDR_SIZE = sizeof(ShmBatchHeader);  // CACHE_LINE_SIZE
+            constexpr size_t MAX_FRAMES = 32;
+            // Minimum batch: header + 1 CLS of data + 1 CLS of descriptors
+            size_t min_needed = HDR_SIZE + CACHE_LINE_SIZE + CACHE_LINE_SIZE;
 
-        if (n > 0) {
-            rx_buffer_.commit_write(n);
-            ssize_t total_read = n;
+            // Check total writable space (may span wrap point)
+            size_t total_writable = rx_buffer_.writable();
+            if (total_writable < min_needed) {
+                timing_.recv_end_cycle = rdtscp();
+                timing_.ssl_read_bytes = 0;
+                return true;  // Buffer full, wait for consumer
+            }
 
-            // Continue reading while more data available (drain all SSL records)
-            // This ensures multiple WebSocket frames are batched together
-            while (true) {
-                write_ptr = rx_buffer_.next_write_region(&available);
-                if (available == 0) break;  // Buffer full
+            // Get circular buffer info
+            uint8_t* buffer = rx_buffer_.buffer_base();
+            size_t capacity = rx_buffer_.buffer_capacity();
+            size_t write_pos = rx_buffer_.current_write_pos();
 
-                n = ssl_.read(write_ptr, available);
-                if (n > 0) {
-                    rx_buffer_.commit_write(n);
-                    total_read += n;
-                } else {
-                    // No more data (EAGAIN) or error - stop reading
-                    break;
+            // Record batch start position for process_frames()
+            hftshm_batch_start_pos_ = write_pos;
+
+            // Calculate data region (after header)
+            // Reserve space for at least 1 frame descriptor (1 cache line)
+            size_t data_pos = (write_pos + HDR_SIZE) % capacity;
+            size_t data_available = total_writable - HDR_SIZE - CACHE_LINE_SIZE;
+
+            // SSL_read into circular buffer
+            // If data region spans wrap point, do two reads
+            size_t to_end = capacity - data_pos;
+            ssize_t n = 0;
+
+            if (data_available <= to_end) {
+                // No wrap - single read
+                n = ssl_.read(buffer + data_pos, data_available);
+            } else {
+                // Split read: first part to end, then from start if more available
+                n = ssl_.read(buffer + data_pos, to_end);
+                if (n == static_cast<ssize_t>(to_end)) {
+                    // First part full, try to fill second part
+                    ssize_t n2 = ssl_.read(buffer, data_available - to_end);
+                    if (n2 > 0) n += n2;
                 }
             }
 
-            // Stage 4: Record timestamp after all SSL_read completed
-            timing_.recv_end_cycle = rdtscp();
-            timing_.ssl_read_bytes = total_read;
-            return true;
-        } else if (n == 0) {
-            // Connection closed gracefully
-            timing_.recv_end_cycle = rdtscp();
-            timing_.ssl_read_bytes = 0;
-            connected_ = false;
-            return false;
+            if (n > 0) {
+                // Store for process_frames() to parse and commit
+                hftshm_data_written_ = static_cast<size_t>(n);
+                timing_.recv_end_cycle = rdtscp();
+                timing_.ssl_read_bytes = n;
+                return true;
+            } else if (n == 0) {
+                // Connection closed
+                printf("[RECV] Connection closed (SSL_read=0) in recv_into_buffer\n");
+                fflush(stdout);
+                timing_.recv_end_cycle = rdtscp();
+                timing_.ssl_read_bytes = 0;
+                connected_ = false;
+                return false;
+            } else {
+                // SSL_read error (WANT_READ/WANT_WRITE)
+                timing_.recv_end_cycle = rdtscp();
+                timing_.ssl_read_bytes = 0;
+                return true;
+            }
         } else {
-            // Would block (EAGAIN) or error - just continue event loop
-            timing_.recv_end_cycle = rdtscp();
-            timing_.ssl_read_bytes = 0;
-            return true;
+            // Standard mode: Direct SSL_read into buffer
+            ssize_t n = ssl_.read(write_ptr, available);
+
+            if (n > 0) {
+                rx_buffer_.commit_write(n);
+                ssize_t total_read = n;
+
+                // Continue reading while more data available (drain all SSL records)
+                // This ensures multiple WebSocket frames are batched together
+                while (true) {
+                    write_ptr = rx_buffer_.next_write_region(&available);
+                    if (available == 0) break;  // Buffer full
+
+                    n = ssl_.read(write_ptr, available);
+                    if (n > 0) {
+                        rx_buffer_.commit_write(n);
+                        total_read += n;
+                    } else {
+                        // No more data (EAGAIN) or error - stop reading
+                        break;
+                    }
+                }
+
+                // Stage 4: Record timestamp after all SSL_read completed
+                timing_.recv_end_cycle = rdtscp();
+                timing_.ssl_read_bytes = total_read;
+                return true;
+            } else if (n == 0) {
+                // Connection closed gracefully
+                timing_.recv_end_cycle = rdtscp();
+                timing_.ssl_read_bytes = 0;
+                connected_ = false;
+                return false;
+            } else {
+                // Would block (EAGAIN) or error - just continue event loop
+                timing_.recv_end_cycle = rdtscp();
+                timing_.ssl_read_bytes = 0;
+                return true;
+            }
         }
+    }
+
+    // Non-blocking SSL read during timeout - drains TLS buffer to handle ping frames
+    // Returns false if connection closed, true otherwise
+    // This prevents stalls when epoll misses buffered TLS data (edge-triggered mode)
+    // IMPORTANT: Must loop to drain ALL data (edge-triggered epoll won't re-notify)
+    bool try_read_on_timeout() {
+        // Only for HftShm mode (where the issue was observed)
+        if constexpr (!uses_hftshm) {
+            return true;  // Standard mode not affected
+        }
+
+        constexpr size_t HDR_SIZE = sizeof(ShmBatchHeader);
+        constexpr size_t TAILER_RESERVE = 32 * sizeof(ShmFrameDesc) + 1;
+        constexpr size_t MIN_DATA_SPACE = 256;
+        size_t min_needed = HDR_SIZE + MIN_DATA_SPACE + TAILER_RESERVE;
+
+        // Loop to drain all available data from SSL buffer
+        while (true) {
+            // Check total writable space
+            size_t total_writable = rx_buffer_.writable();
+            if (total_writable < min_needed) {
+                return true;  // Buffer full or not enough space
+            }
+
+            // Get circular buffer info
+            uint8_t* buffer = rx_buffer_.buffer_base();
+            size_t capacity = rx_buffer_.buffer_capacity();
+            size_t write_pos = rx_buffer_.current_write_pos();
+
+            // Record batch start position
+            hftshm_batch_start_pos_ = write_pos;
+
+            // Calculate data region
+            size_t data_pos = (write_pos + HDR_SIZE) % capacity;
+            size_t data_available = total_writable - HDR_SIZE - TAILER_RESERVE;
+
+            // SSL_read into circular buffer
+            size_t to_end = capacity - data_pos;
+            ssize_t n = 0;
+
+            if (data_available <= to_end) {
+                n = ssl_.read(buffer + data_pos, data_available);
+            } else {
+                n = ssl_.read(buffer + data_pos, to_end);
+                if (n == static_cast<ssize_t>(to_end)) {
+                    ssize_t n2 = ssl_.read(buffer, data_available - to_end);
+                    if (n2 > 0) n += n2;
+                }
+            }
+
+            if (n > 0) {
+                // Data found - process it and loop to check for more
+                hftshm_data_written_ = static_cast<size_t>(n);
+
+                // Process frames (handles ping/pong)
+                if (!process_frames()) {
+                    return false;  // Callback requested stop or connection closed
+                }
+                // Loop back to try reading more data
+            } else if (n == 0) {
+                // Connection closed by peer
+                connected_ = false;
+                return false;
+            } else {
+                // WANT_READ/WRITE - no more data available, exit loop
+                break;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Invoke on_connect callback to populate subscription messages
+     * Resets state and calls user callback to set subscribe_messages_
+     */
+    void invoke_on_connect() {
+        num_subscribe_messages_ = 0;
+        subscribe_messages_sent_ = false;
+        if (on_connect_) {
+            on_connect_(subscribe_messages_, num_subscribe_messages_);
+        }
+    }
+
+    /**
+     * Send stored subscription messages (called before drain_tx_buffer)
+     * Sends all messages populated by on_connect callback
+     */
+    void send_subscribe_messages() {
+        using namespace websocket::http;
+
+        if (subscribe_messages_sent_ || num_subscribe_messages_ == 0) return;
+
+        for (size_t i = 0; i < num_subscribe_messages_; ++i) {
+            size_t msg_len = strlen(subscribe_messages_[i]);
+            uint8_t header[14];
+            size_t header_len = build_websocket_header_zerocopy(header, msg_len, 0x01);
+
+            if (ssl_.write(header, header_len) <= 0) return;  // Retry next cycle
+            if (ssl_.write(reinterpret_cast<const uint8_t*>(subscribe_messages_[i]),
+                          msg_len) <= 0) return;
+        }
+        subscribe_messages_sent_ = true;
     }
 
     /**
@@ -454,33 +692,35 @@ private:
     void drain_tx_buffer() {
         using namespace websocket::http;
 
-        if (!tx_outbox_enabled_) return;
-
-        // Static masking key for HFT performance (single-threaded env)
-        uint8_t mask[4] = {0x12, 0x34, 0x56, 0x78};
+        // For HftShm TX buffers, always process; otherwise require explicit enable
+        if constexpr (!uses_hftshm_tx) {
+            if (!tx_outbox_enabled_) return;
+        }
 
         while (tx_buffer_.readable() > 0) {
             size_t payload_len = 0;
             const uint8_t* payload = tx_buffer_.next_read_region(&payload_len);
             if (!payload || payload_len == 0) break;
 
-            // Build WebSocket frame from raw payload
-            // Max frame: 14 bytes header + payload
-            uint8_t frame[14 + 65536];  // Support up to 64KB messages
-            if (payload_len > 65536) {
-                printf("[WARN] TX message too large (%zu bytes), truncating\n", payload_len);
-                payload_len = 65536;
+            // Zero-copy TX: Build header only, send header + raw payload separately
+            // mask=0 means payload XOR 0 = payload, no transformation needed
+            uint8_t header[14];  // Max header size: 10 + 4 mask bytes
+            size_t header_len = build_websocket_header_zerocopy(header, payload_len, tx_opcode_);
+
+            // Send header first
+            ssize_t sent = ssl_.write(header, header_len);
+            if (sent <= 0) {
+                break;  // Would block or error - retry next cycle
             }
 
-            size_t frame_len = build_websocket_frame(
-                payload, payload_len, frame, sizeof(frame), mask, tx_opcode_);
-
-            // Send framed message through SSL
-            ssize_t sent = ssl_.write(frame, frame_len);
+            // Send payload directly from TX buffer (zero-copy!)
+            sent = ssl_.write(payload, payload_len);
             if (sent > 0) {
                 tx_buffer_.commit_read(payload_len);
             } else {
-                break;  // Would block or error - retry next cycle
+                // Header sent but payload failed - connection may be in bad state
+                printf("[WARN] TX header sent but payload failed\n");
+                break;
             }
         }
     }
@@ -493,91 +733,301 @@ private:
         // Reset batch for this processing round
         batch_count_ = 0;
 
-        while (rx_buffer_.readable() >= 2) {  // Minimum frame header size
-            size_t available_len = 0;
-            const uint8_t* read_ptr = rx_buffer_.next_read_region(&available_len);
+        if constexpr (uses_hftshm) {
+            // HftShm circular buffer mode: Parse frames with circular access
+            // Format: [ShmBatchHeader (CLS)][raw_ssl_data padded (N*CLS)][ShmFrameDesc[] padded (M*CLS)]
+            // Data may wrap around buffer boundary seamlessly
+            if (hftshm_data_written_ == 0) return true;
 
-            if (available_len < 2) break;
+            constexpr size_t HDR_SIZE = sizeof(ShmBatchHeader);  // CACHE_LINE_SIZE
+            constexpr size_t MAX_FRAMES = 32;
 
-            // Parse WebSocket frame using core utilities
-            WebSocketFrame frame;
-            if (!parse_websocket_frame(read_ptr, available_len, frame)) {
-                break;  // Need more data or invalid frame
-            }
+            uint8_t* buffer = rx_buffer_.buffer_base();
+            size_t capacity = rx_buffer_.buffer_capacity();
+            size_t batch_pos = hftshm_batch_start_pos_;
+            size_t ssl_data_pos = (batch_pos + HDR_SIZE) % capacity;
+            size_t ssl_data_len = hftshm_data_written_;
 
-            // Reject fragmented messages (not supported)
-            if (!frame.fin) {
-                printf("[ERROR] Fragmented WebSocket messages not supported (FIN=0)\n");
-                printf("[ERROR] This library is designed for single-frame messages only\n");
-                connected_ = false;
-                break;
-            }
+            // Collect frame descriptors
+            ShmFrameDesc frame_descs[MAX_FRAMES];
+            uint8_t frame_count = 0;
+            uint16_t suspicious_ctrl_count = 0;  // Track likely frame misalignment
 
-            // Check for integer overflow before calculating frame_len
-            if (frame.payload_len > SIZE_MAX - frame.header_len) {
-                printf("[ERROR] Frame too large: payload_len=%lu exceeds SIZE_MAX\n",
-                       (unsigned long)frame.payload_len);
-                connected_ = false;
-                break;
-            }
+            size_t parse_offset = 0;  // Logical offset within SSL data region
 
-            size_t frame_len = frame.header_len + frame.payload_len;
+            // Fragment accumulation within single SSL read
+            bool local_accumulating = false;
+            uint32_t accum_payload_start = 0;
+            size_t accum_payload_len = 0;
+            uint8_t accum_opcode = 0;
 
-            // Handle different frame types
-            if (frame.opcode == 0x09) {  // PING frame
-                // Silently respond with PONG (no logging for production HFT performance)
-                send_pong(frame.payload, frame.payload_len);
-                rx_buffer_.commit_read(frame_len);
-            }
-            else if (frame.opcode == 0x01 || frame.opcode == 0x02) {  // Text or Binary frame
-                // Collect into batch instead of immediate callback
-                if (batch_count_ < MAX_BATCH_SIZE) {
-                    // Stage 5: Record parse time for this message
-                    message_batch_[batch_count_] = {
-                        frame.payload,
-                        frame.payload_len,
-                        rdtscp(),      // Per-message parse cycle
-                        frame.opcode
-                    };
-                    batch_count_++;
+            while (parse_offset + 2 <= ssl_data_len && frame_count < MAX_FRAMES) {
+                // Read frame header from circular buffer (max 14 bytes)
+                uint8_t header_bytes[14];
+                size_t header_pos = (ssl_data_pos + parse_offset) % capacity;
+                size_t remaining = ssl_data_len - parse_offset;
+                size_t peek_len = std::min(size_t(14), remaining);
+                circular_read(buffer, capacity, header_pos, header_bytes, peek_len);
+
+                WebSocketFrame frame;
+                // Pass 'remaining' as available length so parse_websocket_frame can check
+                // if the full frame (header + payload) fits in the available data
+                if (!parse_websocket_frame(header_bytes, remaining, frame)) {
+                    break;  // Incomplete frame header or payload
                 }
-                msg_count_++;
-                rx_buffer_.commit_read(frame_len);
-            }
-            else if (frame.opcode == 0x0A) {  // PONG frame (response to our ping)
-                // Server sent a pong, just ignore it
-                rx_buffer_.commit_read(frame_len);
-            }
-            else if (frame.opcode == 0x08) {  // Close frame
-                printf("[WS] Received close frame from server\n");
-                if (frame.payload_len > 0 && frame.payload_len < 126) {
-                    // Close frame can have status code and reason
-                    uint16_t status_code = (frame.payload[0] << 8) | frame.payload[1];
-                    printf("[WS] Close status code: %u\n", status_code);
-                    if (frame.payload_len > 2) {
-                        printf("[WS] Close reason: %.*s\n", (int)(frame.payload_len - 2),
-                               frame.payload + 2);
+
+                size_t frame_len = frame.header_len + frame.payload_len;
+                if (parse_offset + frame_len > ssl_data_len) break;  // Incomplete frame
+
+                // For circular payloads, update frame.payload to point into buffer
+                // Note: This pointer may only be valid for first part if wrap occurs
+                size_t payload_pos = (ssl_data_pos + parse_offset + frame.header_len) % capacity;
+                frame.payload = buffer + payload_pos;
+
+                // Handle fragmented WebSocket messages (text/binary only)
+                if ((frame.opcode == 0x01 || frame.opcode == 0x02) && !frame.fin) {
+                    // First fragment: Start accumulation
+                    local_accumulating = true;
+                    accum_payload_start = static_cast<uint32_t>(parse_offset + frame.header_len);
+                    accum_payload_len = frame.payload_len;
+                    accum_opcode = frame.opcode;
+                    parse_offset += frame_len;
+                    continue;
+                }
+
+                if (frame.opcode == 0x00) {
+                    // Continuation fragment
+                    if (local_accumulating) {
+                        accum_payload_len += frame.payload_len;
+                        if (frame.fin) {
+                            // Final fragment: Record complete reassembled message
+                            uint32_t payload_start = accum_payload_start;
+                            uint32_t payload_len = static_cast<uint32_t>(accum_payload_len);
+
+                            if (payload_start + payload_len <= ssl_data_len) {
+                                frame_descs[frame_count].payload_start = payload_start;
+                                frame_descs[frame_count].payload_len = payload_len;
+                                frame_descs[frame_count].opcode = accum_opcode;
+                                frame_count++;
+                                msg_count_++;
+
+                                // Collect for callback (circular pointer)
+                                if (batch_count_ < MAX_BATCH_SIZE) {
+                                    size_t cb_payload_pos = (ssl_data_pos + payload_start) % capacity;
+                                    message_batch_[batch_count_++] = {
+                                        buffer + cb_payload_pos, accum_payload_len,
+                                        rdtscp(), accum_opcode
+                                    };
+                                }
+                            }
+                            local_accumulating = false;
+                        }
+                    }
+                    parse_offset += frame_len;
+                    continue;
+                }
+
+                if (frame.opcode == 0x01 || frame.opcode == 0x02) {  // Text/Binary (complete frame)
+                    uint32_t payload_start = static_cast<uint32_t>(parse_offset + frame.header_len);
+                    uint32_t payload_len = static_cast<uint32_t>(frame.payload_len);
+
+                    // Validate offsets
+                    if (payload_start + payload_len > ssl_data_len) {
+                        printf("[ERROR] Frame offset out of bounds: start=%u len=%u ssl_len=%zu\n",
+                               payload_start, payload_len, ssl_data_len);
+                        break;
+                    }
+
+                    // Record frame descriptor (offsets are relative to ssl_data start)
+                    frame_descs[frame_count].payload_start = payload_start;
+                    frame_descs[frame_count].payload_len = payload_len;
+                    frame_descs[frame_count].opcode = frame.opcode;
+                    frame_count++;
+                    msg_count_++;
+
+                    // Collect for callback (circular pointer)
+                    if (batch_count_ < MAX_BATCH_SIZE) {
+                        message_batch_[batch_count_++] = {
+                            frame.payload, frame.payload_len, rdtscp(), frame.opcode
+                        };
                     }
                 }
-                connected_ = false;
-                rx_buffer_.commit_read(frame_len);
-                break;
-            }
-            else {
-                // Unknown opcode, skip frame
-                printf("[WARN] Unknown opcode: 0x%02X, payload_len: %zu\n",
-                       frame.opcode, (size_t)frame.payload_len);
-                rx_buffer_.commit_read(frame_len);
-            }
-        }
+                else if (frame.opcode == 0x09) {  // PING
+                    if (frame.payload_len <= 20) {
+                        // For PONG, need contiguous payload - copy if wrapped
+                        size_t pong_pos = (ssl_data_pos + parse_offset + frame.header_len) % capacity;
+                        size_t to_end = capacity - pong_pos;
+                        if (frame.payload_len <= to_end) {
+                            send_pong(buffer + pong_pos, frame.payload_len);
+                        } else {
+                            // Payload wraps - copy to temp buffer
+                            uint8_t ping_buf[20];
+                            circular_read(buffer, capacity, pong_pos, ping_buf, frame.payload_len);
+                            send_pong(ping_buf, frame.payload_len);
+                        }
+                    } else {
+                        suspicious_ctrl_count++;
+                    }
+                }
+                else if (frame.opcode == 0x08) {  // CLOSE
+                    // Read close code from circular buffer
+                    uint16_t close_code = 0;
+                    if (frame.payload_len >= 2) {
+                        uint8_t code_bytes[2];
+                        size_t code_pos = (ssl_data_pos + parse_offset + frame.header_len) % capacity;
+                        circular_read(buffer, capacity, code_pos, code_bytes, 2);
+                        close_code = (static_cast<uint16_t>(code_bytes[0]) << 8) |
+                                     static_cast<uint16_t>(code_bytes[1]);
+                    }
+                    bool valid_code = (close_code >= 1000 && close_code <= 1015) ||
+                                      (close_code >= 3000 && close_code <= 4999);
+                    if (valid_code) {
+                        printf("[WS] CLOSE: code=%u msgs=%zu\n", close_code, msg_count_);
+                        connected_ = false;
+                        break;
+                    }
+                    suspicious_ctrl_count++;
+                    parse_offset += frame_len;
+                    continue;
+                }
 
-        // Invoke batch callback if we collected any messages
-        if (batch_count_ > 0 && on_message_) {
-            if (!on_message_(message_batch_, batch_count_, timing_)) {
-                return false;  // Callback requested stop
+                parse_offset += frame_len;
+            }
+
+            // Commit batch if we parsed any complete frames
+            // Partial frames at the end stay in buffer for next SSL_read
+            if (frame_count > 0) {
+                size_t committed_ssl_len = parse_offset;  // SSL data actually consumed
+
+                // Calculate padded sizes for cache alignment
+                // Embedded descriptors are in header, overflow goes after SSL data
+                uint16_t ssl_cls = bytes_to_cls(committed_ssl_len);
+                size_t padded_ssl_len = cls_to_bytes(ssl_cls);
+                size_t overflow_size = overflow_descs_size(frame_count);
+                size_t total_size = HDR_SIZE + padded_ssl_len + overflow_size;
+
+                // Verify we have space for entire cache-aligned batch
+                if (total_size > rx_buffer_.writable()) {
+                    // Not enough space - don't commit this batch
+                    // Next SSL_read will overwrite the uncommitted data
+                    hftshm_data_written_ = 0;
+                    return true;
+                }
+
+                // Build header with embedded frame descriptors
+                ShmBatchHeader hdr{};  // Zero-initialize (clears padding)
+                hdr.ssl_data_len_in_CLS = ssl_cls;
+                hdr.frame_count = frame_count;
+
+                // Copy first EMBEDDED_FRAMES descriptors into header
+                uint8_t embedded_count = std::min(frame_count, static_cast<uint8_t>(EMBEDDED_FRAMES));
+                memcpy(hdr.embedded, frame_descs, embedded_count * sizeof(ShmFrameDesc));
+
+                // Write overflow descriptors if any (after padded SSL data)
+                uint8_t overflow_count = overflow_frame_count(frame_count);
+                if (overflow_count > 0) {
+                    size_t overflow_pos = (ssl_data_pos + padded_ssl_len) % capacity;
+                    circular_write(buffer, capacity, overflow_pos,
+                                   reinterpret_cast<uint8_t*>(frame_descs + EMBEDDED_FRAMES),
+                                   overflow_count * sizeof(ShmFrameDesc));
+                }
+
+                // Write header using circular write
+                circular_write(buffer, capacity, batch_pos,
+                               reinterpret_cast<uint8_t*>(&hdr), HDR_SIZE);
+
+                // Commit total cache-aligned batch size
+                rx_buffer_.commit_write(total_size);
+            }
+            // NOTE: Partial frames at end remain uncommitted in buffer
+            // Next SSL_read will overwrite them (recv_into_buffer uses current_write_pos)
+            // This design intentionally discards partial data - next SSL_read gets fresh data
+
+            hftshm_data_written_ = 0;
+
+            // Invoke callback if set
+            if (batch_count_ > 0 && on_message_) {
+                if (!on_message_(message_batch_, batch_count_, timing_)) {
+                    return false;
+                }
+            }
+        } else {
+            // Standard mode: Read from rx_buffer_, process, commit_read
+            while (rx_buffer_.readable() >= 2) {
+                size_t available_len = 0;
+                const uint8_t* read_ptr = rx_buffer_.next_read_region(&available_len);
+
+                if (available_len < 2) break;
+
+                WebSocketFrame frame;
+                if (!parse_websocket_frame(read_ptr, available_len, frame)) {
+                    break;
+                }
+
+                if (!frame.fin || frame.opcode == 0x00) {
+                    // Skip fragmented/continuation frames
+                    size_t skip_len = frame.header_len + frame.payload_len;
+                    rx_buffer_.commit_read(skip_len);
+                    continue;
+                }
+
+                if (frame.payload_len > SIZE_MAX - frame.header_len) {
+                    printf("[ERROR] Frame too large\n");
+                    connected_ = false;
+                    break;
+                }
+
+                size_t frame_len = frame.header_len + frame.payload_len;
+
+                if (frame.opcode == 0x09) {  // PING
+                    // Binance pings contain millisecond timestamp (~13 bytes)
+                    // Pings may not be sent when data is actively flowing
+                    send_pong(frame.payload, frame.payload_len);
+                    rx_buffer_.commit_read(frame_len);
+                }
+                else if (frame.opcode == 0x01 || frame.opcode == 0x02) {  // Text/Binary
+                    if (batch_count_ < MAX_BATCH_SIZE) {
+                        message_batch_[batch_count_++] = {
+                            frame.payload, frame.payload_len, rdtscp(), frame.opcode
+                        };
+                    }
+                    msg_count_++;
+                    rx_buffer_.commit_read(frame_len);
+                }
+                else if (frame.opcode == 0x0A) {  // PONG
+                    rx_buffer_.commit_read(frame_len);
+                }
+                else if (frame.opcode == 0x08) {  // CLOSE
+                    // Parse close frame: [2-byte status code][reason string]
+                    uint16_t close_code = 0;
+                    if (frame.payload_len >= 2) {
+                        close_code = (static_cast<uint16_t>(frame.payload[0]) << 8) |
+                                     static_cast<uint16_t>(frame.payload[1]);
+                    }
+                    // Standard close codes: 1000-1015, 3000-4999
+                    bool likely_valid = (close_code >= 1000 && close_code <= 1015) ||
+                                        (close_code >= 3000 && close_code <= 4999);
+                    printf("[WS] CLOSE: code=%u msgs=%zu valid=%d reason=%.*s\n",
+                           close_code, msg_count_, likely_valid,
+                           frame.payload_len > 2 ? (int)(frame.payload_len - 2) : 0,
+                           frame.payload_len > 2 ? reinterpret_cast<const char*>(frame.payload + 2) : "");
+                    connected_ = false;
+                    rx_buffer_.commit_read(frame_len);
+                    break;
+                }
+                else {
+                    printf("[WARN] Unknown opcode: 0x%02X\n", frame.opcode);
+                    rx_buffer_.commit_read(frame_len);
+                }
+            }
+
+            if (batch_count_ > 0 && on_message_) {
+                if (!on_message_(message_batch_, batch_count_, timing_)) {
+                    return false;
+                }
             }
         }
-        return true;  // Continue processing
+        return true;
     }
 
 
@@ -684,11 +1134,57 @@ private:
     }
 
 public:
+    // Access to TX buffer for external writes (e.g., sending SUBSCRIBE commands)
+    // Non-const version allows writing to buffer
+    TxBufferPolicy_& get_tx_buffer_mut() { return tx_buffer_; }
+
+    // Set wait timeout for event loop (required when using TX buffer for sending)
+    // Without timeout, wait() blocks indefinitely and drain_tx_buffer() never runs
+    void set_wait_timeout(int ms) {
+        transport_.set_wait_timeout(ms);
+    }
+
+    // Set external stop flag for graceful shutdown (Ctrl+C handling)
+    // When flag becomes false, run() loop exits on next iteration
+    void set_stop_flag(volatile bool* flag) {
+        stop_flag_ = flag;
+    }
+
+    // Set on_close callback for reconnection handling
+    // Callback is invoked when connection closes; return true to reconnect
+    void set_on_close(std::function<bool()> cb) {
+        on_close_ = cb;
+    }
+
+    // Set on_connect callback to populate subscription messages
+    // Callback receives: (subscribe_messages_ array, num_subscribe_messages_ ref)
+    // Called after connect() and after each reconnect
+    void set_on_connect(std::function<void(char(*)[512], size_t&)> cb) {
+        on_connect_ = cb;
+    }
+
     // Access to transport for advanced configuration (e.g., XDP init, stats)
     TransportPolicy_& transport() { return transport_; }
     const TransportPolicy_& transport() const { return transport_; }
 
 private:
+    // SFINAE helper to detect if TxBufferPolicy_ has is_hftshm trait
+    template<typename T, typename = void>
+    struct has_is_hftshm : std::false_type {};
+
+    template<typename T>
+    struct has_is_hftshm<T, std::void_t<decltype(T::is_hftshm)>> : std::true_type {};
+
+    // Enable TX outbox if buffer is HftShm type
+    void enable_hftshm_tx_outbox() {
+        if constexpr (has_is_hftshm<TxBufferPolicy_>::value) {
+            if (TxBufferPolicy_::is_hftshm) {
+                tx_outbox_enabled_ = true;
+                tx_opcode_ = 0x01;  // Text by default
+            }
+        }
+    }
+
     // Helper to resolve hostname to IP addresses for BPF filter
     static std::vector<std::string> resolve_hostname(const char* hostname) {
         std::vector<std::string> ips;
@@ -732,4 +1228,24 @@ private:
     static constexpr size_t MAX_BATCH_SIZE = 256;
     MessageInfo message_batch_[MAX_BATCH_SIZE];
     size_t batch_count_ = 0;
+
+    // Graceful shutdown support
+    volatile bool* stop_flag_ = nullptr;
+
+    // HftShm circular buffer state (only used when uses_hftshm is true)
+    // No more leftover buffer - partial frames stay in ring buffer
+    size_t hftshm_batch_start_pos_ = 0;   // Logical write position where current batch starts
+    size_t hftshm_data_written_ = 0;       // Bytes of SSL data written in current batch (not yet committed)
+
+    // Reconnection support
+    std::string host_;
+    std::string path_;
+    uint16_t port_ = 0;
+    std::function<bool()> on_close_;  // Returns true to reconnect
+
+    // Subscription messages - populated by on_connect callback, sent automatically
+    char subscribe_messages_[128][512];       // Max 128 messages, 512 bytes each
+    size_t num_subscribe_messages_ = 0;       // Count set by callback
+    bool subscribe_messages_sent_ = false;    // Flag: true after all sent
+    std::function<void(char(*)[512], size_t&)> on_connect_;  // Callback to populate subscribe_messages_
 };

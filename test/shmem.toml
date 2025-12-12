@@ -3,14 +3,14 @@
 
 [test.mktdata.binance.raw.rx]
 type = "ringbuffer"
-capacity = "4MB"
+capacity = "256KB"
 element_size = 1
 max_consumers = 1
 codec = "string"
 
 [test.mktdata.binance.raw.tx]
 type = "ringbuffer"
-capacity = "8MB"
+capacity = "256KB"
 element_size = 1
 max_consumers = 1
 codec = "string"
