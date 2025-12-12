@@ -49,8 +49,8 @@ void consumer_thread() {
 
         // Print RX buffer stats
         size_t available = rx.readable();
-        printf("RX(%.0fMB) write pos: %.3fKB read pos: %.3fKB\n",
-               rx.buffer_capacity() / (1024.0 * 1024.0),
+        printf("RX(%zuKB) write: %.1fKB read: %.1fKB\n",
+               rx.buffer_capacity() / 1024,
                rx.current_write_pos() / 1024.0,
                rx.current_read_pos() / 1024.0);
 
@@ -73,14 +73,37 @@ void consumer_thread() {
 
             ++loop_count;  // Track iteration count
 
-            // Skip invalid batches - validation:
-            // - ssl_data_len_in_CLS = 0 means no data
-            // - frame_count = 0 means no frames
-            // - ssl_data_len_in_CLS > 1024 means >64KB SSL data (suspicious for stale data)
-            // - frame_count > 32 means more than MAX_FRAMES (invalid)
-            if (hdr.ssl_data_len_in_CLS == 0 || hdr.frame_count == 0 ||
-                hdr.ssl_data_len_in_CLS > 1024 || hdr.frame_count > 32) {
-                // Likely stale/uninitialized data - break and wait for valid commit
+            // Validate batch header - stop process on failure for debugging
+            // Valid ranges:
+            // - ssl_data_len_in_CLS: 1-16384 (64B to 1MB of SSL data)
+            // - frame_count: 1-255 (uint8_t, non-zero)
+            const char* reject_reason = nullptr;
+            if (hdr.ssl_data_len_in_CLS == 0) {
+                reject_reason = "ssl_data_len_in_CLS=0 (no data)";
+            } else if (hdr.frame_count == 0) {
+                reject_reason = "frame_count=0 (no frames)";
+            } else if (hdr.ssl_data_len_in_CLS > 16384) {
+                reject_reason = "ssl_data_len_in_CLS>16384 (>1MB, likely corrupt)";
+            } else if (hdr.frame_count > 255) {
+                reject_reason = "frame_count>255 (exceeds uint8_t max)";
+            }
+
+            if (reject_reason) {
+                printf("\n[CONSUMER REJECT] %s\n", reject_reason);
+                printf("  Buffer state: capacity=%zuKB, write=%.1fKB, read=%.1fKB, available=%zu\n",
+                       capacity / 1024, rx.current_write_pos() / 1024.0,
+                       rx.current_read_pos() / 1024.0, available);
+                printf("  Position: read_pos=%zu, offset=%zu, physical_pos=%zu\n",
+                       read_pos, offset, (read_pos + offset) % capacity);
+                printf("  Header: ssl_data_len_in_CLS=%u (%zuKB), frame_count=%u\n",
+                       hdr.ssl_data_len_in_CLS, cls_to_bytes(hdr.ssl_data_len_in_CLS) / 1024,
+                       hdr.frame_count);
+                printf("  Stats so far: batches=%d, messages=%d, bytes=%zu\n",
+                       total_batches, total_messages, total_bytes);
+                printf("  Loop iteration: %d\n", loop_count);
+                printf("\n[FATAL] Stopping process for debugging. Shared memory preserved.\n");
+                printf("  Inspect with: hft-shm dump test.mktdata.binance.raw.rx\n\n");
+                running = false;  // Stop producer thread too
                 break;
             }
 
@@ -89,11 +112,19 @@ void consumer_thread() {
             size_t overflow_size = overflow_descs_size(hdr.frame_count);
             size_t batch_size = sizeof(ShmBatchHeader) + padded_ssl_len + overflow_size;
 
-            // Sanity check
+            // Sanity check - stop on failure
             if (batch_size < sizeof(ShmBatchHeader) || batch_size > capacity) {
-                offset += sizeof(ShmBatchHeader);
-                last_valid_offset = offset;
-                continue;
+                printf("\n[CONSUMER REJECT] Invalid batch_size=%zu\n", batch_size);
+                printf("  Constraints: sizeof(ShmBatchHeader)=%zu, capacity=%zu\n",
+                       sizeof(ShmBatchHeader), capacity);
+                printf("  Header: ssl_data_len_in_CLS=%u, frame_count=%u\n",
+                       hdr.ssl_data_len_in_CLS, hdr.frame_count);
+                printf("  Computed: padded_ssl=%zu, overflow=%zu\n",
+                       padded_ssl_len, overflow_size);
+                printf("  Position: read_pos=%zu, offset=%zu\n", read_pos, offset);
+                printf("\n[FATAL] Stopping process for debugging.\n\n");
+                running = false;
+                break;
             }
 
             if (offset + batch_size > available) {
@@ -102,8 +133,13 @@ void consumer_thread() {
 
             total_batches++;
 
+            // Print batch details
+            printf("Batch[%d] Frames %u [HDR %zu][Data %zu][TAIL %zu]\n",
+                   total_batches, hdr.frame_count,
+                   sizeof(ShmBatchHeader), padded_ssl_len, overflow_size);
+
             // Read frame descriptors - first from embedded[], then overflow if needed
-            ShmFrameDesc descs[32];
+            ShmFrameDesc descs[255];  // Match MAX_FRAMES in websocket.hpp
             uint8_t embedded_count = std::min(hdr.frame_count, static_cast<uint8_t>(EMBEDDED_FRAMES));
             uint8_t overflow_count = overflow_frame_count(hdr.frame_count);
 
@@ -126,10 +162,16 @@ void consumer_thread() {
 
                 // Bounds check (ssl_data_len_in_CLS * CLS gives max possible range)
                 if (payload_start + len > padded_ssl_len) {
-                    printf("[%d] BOUNDS ERROR: payload_start=%u len=%u padded_ssl=%zu\n",
-                           total_messages + 1, payload_start, len, padded_ssl_len);
-                    total_messages++;
-                    continue;
+                    printf("\n[CONSUMER REJECT] Frame bounds error\n");
+                    printf("  Frame %d/%u: payload_start=%u, len=%u, end=%u\n",
+                           i, hdr.frame_count, payload_start, len, payload_start + len);
+                    printf("  Constraint: padded_ssl_len=%zu (max valid offset)\n", padded_ssl_len);
+                    printf("  Batch: ssl_data_len_in_CLS=%u, frame_count=%u\n",
+                           hdr.ssl_data_len_in_CLS, hdr.frame_count);
+                    printf("  Position: read_pos=%zu, offset=%zu\n", read_pos, offset);
+                    printf("\n[FATAL] Stopping process for debugging.\n\n");
+                    running = false;
+                    break;
                 }
 
                 // Get payload from circular buffer (zero-copy, no temp buffer)
@@ -142,11 +184,11 @@ void consumer_thread() {
                 if (len <= to_end) {
                     // No wrap - single contiguous region
                     if (len > 80) {
-                        printf("[%d] op=%d len=%u: %.60s .... %.20s\n",
+                        printf("    [%d] op=%d len=%u: %.60s .... %.20s\n",
                                total_messages + 1, descs[i].opcode, len,
                                part1, part1 + len - 20);
                     } else {
-                        printf("[%d] op=%d len=%u: %.*s\n",
+                        printf("    [%d] op=%d len=%u: %.*s\n",
                                total_messages + 1, descs[i].opcode, len,
                                (int)len, part1);
                     }
@@ -159,11 +201,11 @@ void consumer_thread() {
                         // Show first 60 chars (may span both parts) + last 20 chars
                         if (part1_len >= 60) {
                             // First 60 chars all in part1
-                            printf("[%d] op=%d len=%u: %.60s .... ",
+                            printf("    [%d] op=%d len=%u: %.60s .... ",
                                    total_messages + 1, descs[i].opcode, len, part1);
                         } else {
                             // First 60 chars spans both parts
-                            printf("[%d] op=%d len=%u: %.*s%.*s .... ",
+                            printf("    [%d] op=%d len=%u: %.*s%.*s .... ",
                                    total_messages + 1, descs[i].opcode, len,
                                    (int)part1_len, part1,
                                    (int)(60 - part1_len), part2);
@@ -178,7 +220,7 @@ void consumer_thread() {
                         }
                     } else {
                         // Short payload - print both parts
-                        printf("[%d] op=%d len=%u: %.*s%.*s\n",
+                        printf("    [%d] op=%d len=%u: %.*s%.*s\n",
                                total_messages + 1, descs[i].opcode, len,
                                (int)part1_len, part1,
                                (int)part2_len, part2);
@@ -186,6 +228,9 @@ void consumer_thread() {
                 }
                 total_messages++;
             }
+
+            // Check if frame loop was aborted due to error
+            if (!running) break;
 
             offset += batch_size;
             last_valid_offset = offset;

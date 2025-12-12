@@ -161,10 +161,15 @@ struct WebSocketClient {
 
         // Initialize timing record
         memset(&timing_, 0, sizeof(timing_));
+
+        // Allocate initial message batch buffer
+        message_batch_ = new MessageInfo[INITIAL_BATCH_CAPACITY];
     }
 
     ~WebSocketClient() {
         disconnect();
+        delete[] message_batch_;
+        message_batch_ = nullptr;
     }
 
     /**
@@ -470,7 +475,6 @@ private:
             // Format: [ShmBatchHeader (CLS)][raw_ssl_data padded (N*CLS)][ShmFrameDesc[] padded (M*CLS)]
             // Data can wrap around buffer boundary seamlessly
             constexpr size_t HDR_SIZE = sizeof(ShmBatchHeader);  // CACHE_LINE_SIZE
-            constexpr size_t MAX_FRAMES = 32;
             // Minimum batch: header + 1 CLS of data + 1 CLS of descriptors
             size_t min_needed = HDR_SIZE + CACHE_LINE_SIZE + CACHE_LINE_SIZE;
 
@@ -490,22 +494,33 @@ private:
             // Record batch start position for process_frames()
             hftshm_batch_start_pos_ = write_pos;
 
-            // Calculate data region (after header)
-            // Reserve space for at least 1 frame descriptor (1 cache line)
+            // Calculate data region (after header), accounting for leftover from previous batch
+            // New batch's data region starts at (write_pos + HDR_SIZE)
+            // If leftover exists, copy it from old position to new data region start
             size_t data_pos = (write_pos + HDR_SIZE) % capacity;
-            size_t data_available = total_writable - HDR_SIZE - CACHE_LINE_SIZE;
 
-            // SSL_read into circular buffer
+            // Copy leftover bytes from old position to new position
+            // After commit_write(), write_pos advanced but leftover stayed at old location
+            if (leftover_len_ > 0 && leftover_pos_ != data_pos) {
+                circular_copy(buffer, capacity, leftover_pos_, data_pos, leftover_len_);
+            }
+
+            // SSL_read writes after leftover
+            size_t write_offset = leftover_len_;
+            size_t ssl_write_pos = (data_pos + write_offset) % capacity;
+            size_t data_available = total_writable - HDR_SIZE - CACHE_LINE_SIZE - write_offset;
+
+            // SSL_read into circular buffer (after leftover)
             // If data region spans wrap point, do two reads
-            size_t to_end = capacity - data_pos;
+            size_t to_end = capacity - ssl_write_pos;
             ssize_t n = 0;
 
             if (data_available <= to_end) {
                 // No wrap - single read
-                n = ssl_.read(buffer + data_pos, data_available);
+                n = ssl_.read(buffer + ssl_write_pos, data_available);
             } else {
                 // Split read: first part to end, then from start if more available
-                n = ssl_.read(buffer + data_pos, to_end);
+                n = ssl_.read(buffer + ssl_write_pos, to_end);
                 if (n == static_cast<ssize_t>(to_end)) {
                     // First part full, try to fill second part
                     ssize_t n2 = ssl_.read(buffer, data_available - to_end);
@@ -515,7 +530,8 @@ private:
 
             if (n > 0) {
                 // Store for process_frames() to parse and commit
-                hftshm_data_written_ = static_cast<size_t>(n);
+                // Total data = leftover + new SSL_read bytes
+                hftshm_data_written_ = write_offset + static_cast<size_t>(n);
                 timing_.recv_end_cycle = rdtscp();
                 timing_.ssl_read_bytes = n;
                 return true;
@@ -740,7 +756,6 @@ private:
             if (hftshm_data_written_ == 0) return true;
 
             constexpr size_t HDR_SIZE = sizeof(ShmBatchHeader);  // CACHE_LINE_SIZE
-            constexpr size_t MAX_FRAMES = 32;
 
             uint8_t* buffer = rx_buffer_.buffer_base();
             size_t capacity = rx_buffer_.buffer_capacity();
@@ -748,18 +763,21 @@ private:
             size_t ssl_data_pos = (batch_pos + HDR_SIZE) % capacity;
             size_t ssl_data_len = hftshm_data_written_;
 
-            // Collect frame descriptors
+            // Frame descriptors: embedded go directly to header, overflow written at commit
+            // Increased limit: 255 frames max (uint8_t frame_count in ShmBatchHeader)
+            constexpr size_t MAX_FRAMES = 255;
             ShmFrameDesc frame_descs[MAX_FRAMES];
             uint8_t frame_count = 0;
             uint16_t suspicious_ctrl_count = 0;  // Track likely frame misalignment
 
-            size_t parse_offset = 0;  // Logical offset within SSL data region
+            // Parsing starts at offset 0 (includes leftover from previous batch)
+            size_t parse_offset = 0;
 
-            // Fragment accumulation within single SSL read
-            bool local_accumulating = false;
-            uint32_t accum_payload_start = 0;
-            size_t accum_payload_len = 0;
-            uint8_t accum_opcode = 0;
+            // Restore persistent fragment state (if any)
+            bool local_accumulating = persistent_accumulating_;
+            uint8_t accum_opcode = persistent_opcode_;
+            size_t accum_payload_len = persistent_accum_len_;
+            uint32_t accum_payload_start = 0;  // Leftover always starts at offset 0
 
             while (parse_offset + 2 <= ssl_data_len && frame_count < MAX_FRAMES) {
                 // Read frame header from circular buffer (max 14 bytes)
@@ -783,6 +801,12 @@ private:
                 // Note: This pointer may only be valid for first part if wrap occurs
                 size_t payload_pos = (ssl_data_pos + parse_offset + frame.header_len) % capacity;
                 frame.payload = buffer + payload_pos;
+
+                // Debug: Log non-data frames (PING/PONG/CLOSE)
+                if (frame.opcode >= 0x08) {
+                    printf("[WS-CTRL] op=0x%02x len=%lu\n", frame.opcode, frame.payload_len);
+                    fflush(stdout);
+                }
 
                 // Handle fragmented WebSocket messages (text/binary only)
                 if ((frame.opcode == 0x01 || frame.opcode == 0x02) && !frame.fin) {
@@ -812,13 +836,12 @@ private:
                                 msg_count_++;
 
                                 // Collect for callback (circular pointer)
-                                if (batch_count_ < MAX_BATCH_SIZE) {
-                                    size_t cb_payload_pos = (ssl_data_pos + payload_start) % capacity;
-                                    message_batch_[batch_count_++] = {
-                                        buffer + cb_payload_pos, accum_payload_len,
-                                        rdtscp(), accum_opcode
-                                    };
-                                }
+                                ensure_batch_capacity();
+                                size_t cb_payload_pos = (ssl_data_pos + payload_start) % capacity;
+                                message_batch_[batch_count_++] = {
+                                    buffer + cb_payload_pos, accum_payload_len,
+                                    rdtscp(), accum_opcode
+                                };
                             }
                             local_accumulating = false;
                         }
@@ -846,26 +869,27 @@ private:
                     msg_count_++;
 
                     // Collect for callback (circular pointer)
-                    if (batch_count_ < MAX_BATCH_SIZE) {
-                        message_batch_[batch_count_++] = {
-                            frame.payload, frame.payload_len, rdtscp(), frame.opcode
-                        };
-                    }
+                    ensure_batch_capacity();
+                    message_batch_[batch_count_++] = {
+                        frame.payload, frame.payload_len, rdtscp(), frame.opcode
+                    };
                 }
                 else if (frame.opcode == 0x09) {  // PING
-                    if (frame.payload_len <= 20) {
+                    printf("[WS] PING received, len=%u, sending PONG\n", frame.payload_len);
+                    if (frame.payload_len <= 125) {
                         // For PONG, need contiguous payload - copy if wrapped
                         size_t pong_pos = (ssl_data_pos + parse_offset + frame.header_len) % capacity;
                         size_t to_end = capacity - pong_pos;
                         if (frame.payload_len <= to_end) {
                             send_pong(buffer + pong_pos, frame.payload_len);
                         } else {
-                            // Payload wraps - copy to temp buffer
-                            uint8_t ping_buf[20];
+                            // Payload wraps - copy to temp buffer (RFC 6455 max 125 bytes)
+                            uint8_t ping_buf[125];
                             circular_read(buffer, capacity, pong_pos, ping_buf, frame.payload_len);
                             send_pong(ping_buf, frame.payload_len);
                         }
                     } else {
+                        printf("[WS] PING too large (%u bytes), ignoring\n", frame.payload_len);
                         suspicious_ctrl_count++;
                     }
                 }
@@ -909,8 +933,12 @@ private:
                 // Verify we have space for entire cache-aligned batch
                 if (total_size > rx_buffer_.writable()) {
                     // Not enough space - don't commit this batch
-                    // Next SSL_read will overwrite the uncommitted data
+                    fprintf(stderr, "[ERROR] RX buffer full: need %zu bytes, available %zu. "
+                            "Discarding %u frames. Consumer too slow?\n",
+                            total_size, rx_buffer_.writable(), frame_count);
                     hftshm_data_written_ = 0;
+                    leftover_len_ = 0;  // Can't preserve - data will be overwritten
+                    leftover_pos_ = 0;
                     return true;
                 }
 
@@ -939,9 +967,27 @@ private:
                 // Commit total cache-aligned batch size
                 rx_buffer_.commit_write(total_size);
             }
-            // NOTE: Partial frames at end remain uncommitted in buffer
-            // Next SSL_read will overwrite them (recv_into_buffer uses current_write_pos)
-            // This design intentionally discards partial data - next SSL_read gets fresh data
+            // Update leftover state for next SSL_read
+            if (parse_offset < ssl_data_len) {
+                // Partial frame at end - preserve for next batch
+                leftover_len_ = ssl_data_len - parse_offset;
+                leftover_pos_ = (ssl_data_pos + parse_offset) % capacity;
+                persistent_accumulating_ = false;  // Partial frame, not fragment
+                persistent_accum_len_ = 0;
+            } else if (local_accumulating) {
+                // Fragment incomplete - all data becomes leftover
+                leftover_len_ = ssl_data_len;
+                leftover_pos_ = ssl_data_pos;
+                persistent_accumulating_ = true;
+                persistent_opcode_ = accum_opcode;
+                persistent_accum_len_ = accum_payload_len;
+            } else {
+                // All complete - reset leftover state
+                leftover_len_ = 0;
+                leftover_pos_ = 0;
+                persistent_accumulating_ = false;
+                persistent_accum_len_ = 0;
+            }
 
             hftshm_data_written_ = 0;
 
@@ -953,6 +999,9 @@ private:
             }
         } else {
             // Standard mode: Read from rx_buffer_, process, commit_read
+            // NOTE: Standard mode does NOT support fragmented WebSocket messages.
+            // If the server sends fragmented frames, they will be skipped.
+            // Use HftShm mode (USE_HFTSHM=1) for full fragment support.
             while (rx_buffer_.readable() >= 2) {
                 size_t available_len = 0;
                 const uint8_t* read_ptr = rx_buffer_.next_read_region(&available_len);
@@ -965,7 +1014,13 @@ private:
                 }
 
                 if (!frame.fin || frame.opcode == 0x00) {
-                    // Skip fragmented/continuation frames
+                    // Skip fragmented/continuation frames (standard mode limitation)
+                    static bool warned = false;
+                    if (!warned) {
+                        fprintf(stderr, "[WARN] Fragmented WebSocket frame skipped (standard mode). "
+                                "Use HftShm mode for fragment support.\n");
+                        warned = true;
+                    }
                     size_t skip_len = frame.header_len + frame.payload_len;
                     rx_buffer_.commit_read(skip_len);
                     continue;
@@ -986,11 +1041,10 @@ private:
                     rx_buffer_.commit_read(frame_len);
                 }
                 else if (frame.opcode == 0x01 || frame.opcode == 0x02) {  // Text/Binary
-                    if (batch_count_ < MAX_BATCH_SIZE) {
-                        message_batch_[batch_count_++] = {
-                            frame.payload, frame.payload_len, rdtscp(), frame.opcode
-                        };
-                    }
+                    ensure_batch_capacity();
+                    message_batch_[batch_count_++] = {
+                        frame.payload, frame.payload_len, rdtscp(), frame.opcode
+                    };
                     msg_count_++;
                     rx_buffer_.commit_read(frame_len);
                 }
@@ -1185,6 +1239,21 @@ private:
         }
     }
 
+    // Ensure message_batch_ has capacity for at least one more message
+    // Doubles capacity when full (amortized O(1) per message)
+    void ensure_batch_capacity() {
+        if (batch_count_ >= message_batch_capacity_) {
+            size_t new_capacity = message_batch_capacity_ * 2;
+            MessageInfo* new_batch = new MessageInfo[new_capacity];
+            memcpy(new_batch, message_batch_, batch_count_ * sizeof(MessageInfo));
+            delete[] message_batch_;
+            message_batch_ = new_batch;
+            message_batch_capacity_ = new_capacity;
+            fprintf(stderr, "[WARN] message_batch_ resized to %zu (>%zu frames in single batch)\n",
+                    new_capacity, batch_count_);
+        }
+    }
+
     // Helper to resolve hostname to IP addresses for BPF filter
     static std::vector<std::string> resolve_hostname(const char* hostname) {
         std::vector<std::string> ips;
@@ -1224,18 +1293,25 @@ private:
     MessageCallback on_message_;
     timing_record_t timing_;  // Batch-level timing (SSL read timing shared by all messages)
 
-    // Batch message collection
-    static constexpr size_t MAX_BATCH_SIZE = 256;
-    MessageInfo message_batch_[MAX_BATCH_SIZE];
+    // Batch message collection (dynamically resizable)
+    static constexpr size_t INITIAL_BATCH_CAPACITY = 256;
+    size_t message_batch_capacity_ = INITIAL_BATCH_CAPACITY;
+    MessageInfo* message_batch_ = nullptr;
     size_t batch_count_ = 0;
 
     // Graceful shutdown support
     volatile bool* stop_flag_ = nullptr;
 
     // HftShm circular buffer state (only used when uses_hftshm is true)
-    // No more leftover buffer - partial frames stay in ring buffer
     size_t hftshm_batch_start_pos_ = 0;   // Logical write position where current batch starts
     size_t hftshm_data_written_ = 0;       // Bytes of SSL data written in current batch (not yet committed)
+
+    // Unified leftover state (partial frames AND fragments across SSL_reads)
+    size_t leftover_len_ = 0;              // Bytes of partial/incomplete data at batch end
+    size_t leftover_pos_ = 0;              // Circular buffer position where leftover bytes start
+    bool persistent_accumulating_ = false; // Fragment accumulation in progress
+    uint8_t persistent_opcode_ = 0;        // Opcode of incomplete fragment (0x01=text, 0x02=binary)
+    size_t persistent_accum_len_ = 0;      // Total accumulated payload length so far
 
     // Reconnection support
     std::string host_;

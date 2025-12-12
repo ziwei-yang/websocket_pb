@@ -68,9 +68,9 @@ struct IsPowerOfTwo {
 #ifndef CIRCULAR_BUFFER_HELPERS_DEFINED
 #define CIRCULAR_BUFFER_HELPERS_DEFINED
 
-// Max size for circular_read/write: 32 frame descriptors × 12 bytes = 384 bytes
-// These functions are for small metadata only, not payloads
-static constexpr size_t MAX_CIRCULAR_ACCESS_SIZE = 384;
+// Max size for circular_read/write: 255 frame descriptors × 9 bytes = 2295 bytes
+// These functions are for metadata (headers, descriptors), not SSL payloads
+static constexpr size_t MAX_CIRCULAR_ACCESS_SIZE = 2304;
 
 // Write len bytes to circular buffer starting at logical position
 inline void circular_write(uint8_t* buffer, size_t capacity, size_t pos,
@@ -95,6 +95,27 @@ inline void circular_read(const uint8_t* buffer, size_t capacity, size_t pos,
     std::memcpy(dest, buffer + pos, first);
     if (len > first) {
         std::memcpy(dest + first, buffer, len - first);
+    }
+}
+
+// Copy len bytes within circular buffer from src_pos to dst_pos
+// Processes chunk-by-chunk where both src and dst are contiguous
+// memmove handles overlap within each chunk safely
+inline void circular_copy(uint8_t* buffer, size_t capacity, size_t src_pos, size_t dst_pos, size_t len) {
+    if (len == 0) return;
+    src_pos %= capacity;
+    dst_pos %= capacity;
+
+    while (len > 0) {
+        size_t src_chunk = std::min(len, capacity - src_pos);
+        size_t dst_chunk = std::min(len, capacity - dst_pos);
+        size_t chunk = std::min(src_chunk, dst_chunk);
+
+        std::memmove(buffer + dst_pos, buffer + src_pos, chunk);
+
+        src_pos = (src_pos + chunk) % capacity;
+        dst_pos = (dst_pos + chunk) % capacity;
+        len -= chunk;
     }
 }
 
