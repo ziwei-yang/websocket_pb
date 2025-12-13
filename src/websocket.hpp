@@ -410,6 +410,12 @@ public:
             // Reset HftShm state to avoid stale data on reconnect
             hftshm_batch_start_pos_ = 0;
             hftshm_data_written_ = 0;
+            // Reset leftover state for clean reconnection
+            leftover_len_ = 0;
+            leftover_pos_ = 0;
+            persistent_accumulating_ = false;
+            persistent_opcode_ = 0;
+            persistent_accum_len_ = 0;
             printf("[WS] Disconnected\n");
         }
     }
@@ -623,18 +629,28 @@ private:
             // Record batch start position
             hftshm_batch_start_pos_ = write_pos;
 
-            // Calculate data region
+            // Calculate data region (after header), accounting for leftover from previous batch
             size_t data_pos = (write_pos + HDR_SIZE) % capacity;
-            size_t data_available = total_writable - HDR_SIZE - TAILER_RESERVE;
 
-            // SSL_read into circular buffer
-            size_t to_end = capacity - data_pos;
+            // Copy leftover bytes from old position to new position
+            // After commit_write(), write_pos advanced but leftover stayed at old location
+            if (leftover_len_ > 0 && leftover_pos_ != data_pos) {
+                circular_copy(buffer, capacity, leftover_pos_, data_pos, leftover_len_);
+            }
+
+            // SSL_read writes after leftover
+            size_t write_offset = leftover_len_;
+            size_t ssl_write_pos = (data_pos + write_offset) % capacity;
+            size_t data_available = total_writable - HDR_SIZE - TAILER_RESERVE - write_offset;
+
+            // SSL_read into circular buffer (after leftover)
+            size_t to_end = capacity - ssl_write_pos;
             ssize_t n = 0;
 
             if (data_available <= to_end) {
-                n = ssl_.read(buffer + data_pos, data_available);
+                n = ssl_.read(buffer + ssl_write_pos, data_available);
             } else {
-                n = ssl_.read(buffer + data_pos, to_end);
+                n = ssl_.read(buffer + ssl_write_pos, to_end);
                 if (n == static_cast<ssize_t>(to_end)) {
                     ssize_t n2 = ssl_.read(buffer, data_available - to_end);
                     if (n2 > 0) n += n2;
@@ -643,7 +659,8 @@ private:
 
             if (n > 0) {
                 // Data found - process it and loop to check for more
-                hftshm_data_written_ = static_cast<size_t>(n);
+                // Total data = leftover + new SSL_read bytes
+                hftshm_data_written_ = write_offset + static_cast<size_t>(n);
 
                 // Process frames (handles ping/pong)
                 if (!process_frames()) {
