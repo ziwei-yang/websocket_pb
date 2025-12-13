@@ -10,7 +10,7 @@
 #pragma once
 
 #include "websocket.hpp"
-#include "core/ringbuffer.hpp"
+#include "ringbuffer.hpp"
 
 // Unified event policy (epoll, kqueue, select)
 #include "policy/event.hpp"
@@ -334,7 +334,55 @@ static_assert(FdBasedTransportConcept<DefaultTransportPolicy>,
 // >;
 
 // ============================================================================
-// Configuration: hft-shm Shared Memory Buffers
+// Configuration: Runtime Shared Memory (Always Enabled)
+// ============================================================================
+// Uses ShmRingBuffer for runtime path-based shared memory RX buffers.
+// No compile flags required - always available.
+//
+// Producer pattern:
+//   1. Create shared memory files once:
+//      ShmRxBuffer::create("/tmp/binance_rx", 2*1024*1024);  // Creates .hdr + .dat
+//   2. Producer attaches and writes data:
+//      ShmWebSocketClient client("/tmp/binance_rx");
+//      client.connect(...);
+//      client.run(nullptr);  // on_messages callback DISABLED (data flows to shm)
+//
+// Consumer pattern (separate process):
+//   RXRingBufferConsumer consumer;
+//   consumer.init("/tmp/binance_rx");  // Opens .hdr + .dat
+//   consumer.set_on_messages([](const MessageInfo* msgs, size_t n) { ... });
+//   consumer.run();  // Busy-poll
+//
+// Performance characteristics:
+//   - Zero-copy from SSL → shared memory → consumer
+//   - Uses hftshm::metadata format for compatibility
+//   - SPSC (single producer, single consumer) lock-free
+
+#ifdef __linux__
+#include "rx_ringbuffer_consumer.hpp"
+
+// WebSocket client with shared memory RX (runtime path)
+// Constructor takes shmem path, on_messages callback is DISABLED
+using ShmWebSocketClient = WebSocketClient<
+    DefaultSSLPolicy,
+    DefaultTransportPolicy,
+    ShmRxBuffer,                    // Runtime shm RX (path via constructor)
+    RingBuffer<2 * 1024 * 1024>     // 2MB private TX
+>;
+
+// Default private buffer client (2MB RX/TX)
+// on_messages callback is ENABLED - use for direct message processing
+using PrivateWebSocketClient = WebSocketClient<
+    DefaultSSLPolicy,
+    DefaultTransportPolicy,
+    RingBuffer<2 * 1024 * 1024>,    // 2MB private RX
+    RingBuffer<2 * 1024 * 1024>     // 2MB private TX
+>;
+
+#endif // __linux__
+
+// ============================================================================
+// Configuration: hft-shm Shared Memory Buffers (Legacy - USE_HFTSHM)
 // ============================================================================
 // Enable with: USE_HFTSHM=1 USE_WOLFSSL=1 make
 //
@@ -357,7 +405,7 @@ static_assert(FdBasedTransportConcept<DefaultTransportPolicy>,
 //   USE_HFTSHM=1 USE_WOLFSSL=1 make
 
 #ifdef USE_HFTSHM
-#include "core/hftshm_ringbuffer.hpp"
+// HftShmRingBuffer is now in ringbuffer.hpp (already included at top)
 
 // Shared memory configuration for Binance market data
 // Uses BSDSocketTransport + WolfSSL (not XDP) for development

@@ -7,7 +7,7 @@
 //
 // Build: USE_HFTSHM=1 USE_WOLFSSL=1 make test-hftshm
 //
-#include "../../src/core/hftshm_ringbuffer.hpp"
+#include "../../src/ringbuffer.hpp"
 #include <cassert>
 #include <cstring>
 #include <cstdio>

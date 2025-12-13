@@ -1,7 +1,7 @@
 // test/unittest/test_ringbuffer.cpp
 // Unit tests for optimized ring buffer implementation
 
-#include "core/ringbuffer.hpp"
+#include "../../src/ringbuffer.hpp"
 #include <cassert>
 #include <cstring>
 #include <iostream>

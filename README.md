@@ -1,21 +1,24 @@
 # High-Performance WebSocket Client Library
 
-A policy-based C++17 WebSocket client library optimized for low-latency, high-frequency trading environments.
+A policy-based C++20 WebSocket client library optimized for low-latency, high-frequency trading environments.
 
 ## Key Features
 
-- **Policy-Based Design**: Compile-time selection of SSL, event loop, and buffer implementations
+- **Policy-Based Design**: Compile-time selection of SSL, transport, event loop, and buffer policies
 - **Zero-Copy Architecture**: Ring buffer with virtual memory mirroring for efficient data handling
+- **Shared Memory IPC**: SPSC ring buffer for inter-process communication (hft-shm compatible)
 - **Hardware Timestamping**: NIC-level packet timestamps for precise latency measurement
-- **Multi-Platform**: Linux (epoll, io_uring) and macOS (kqueue)
+- **XDP/AF_XDP Transport**: Kernel bypass with userspace TCP/IP stack for ultra-low latency
+- **Multi-Platform**: Linux (epoll, io_uring, XDP) and macOS (kqueue)
 - **SSL Flexibility**: OpenSSL, LibreSSL, or WolfSSL support
-- **Production-Ready**: Comprehensive bug fixes and unit test coverage
+- **WebSocket Fragment Support**: Full RFC 6455 fragmented message reassembly (HftShm mode)
 
 ## Performance
 
 - Sub-microsecond event notification latency
-- Zero-copy message processing
+- Zero-copy message processing via circular buffers
 - Optional kernel TLS offload (kTLS)
+- XDP zero-copy kernel bypass mode
 - CPU core pinning support for consistent performance
 
 ## Quick Start
@@ -43,6 +46,12 @@ make
 # Linux: epoll + OpenSSL
 USE_IOURING=0 make
 
+# Linux: XDP kernel bypass + OpenSSL
+USE_XDP=1 USE_OPENSSL=1 make
+
+# Linux: HftShm shared memory + WolfSSL
+USE_HFTSHM=1 USE_WOLFSSL=1 make
+
 # Linux: select + OpenSSL (maximum compatibility)
 USE_OPENSSL=1 USE_SELECT=1 make
 
@@ -53,13 +62,14 @@ make
 ## Requirements
 
 **Linux:**
-- GCC 7+ or Clang 6+ with C++17 support
+- GCC 10+ or Clang 10+ with C++20 support
 - libssl-dev (OpenSSL) or libwolfssl-dev
 - liburing-dev (optional, for io_uring)
-- Linux kernel 4.17+ (for kTLS support)
+- Linux kernel 5.4+ (for XDP zero-copy, kTLS)
+- libbpf-dev, libxdp-dev (optional, for XDP transport)
 
 **macOS:**
-- Xcode with C++17 support
+- Xcode 12+ with C++20 support
 - LibreSSL (via Homebrew: `brew install libressl`)
 
 ## Examples
@@ -82,33 +92,121 @@ client.run([](const uint8_t* data, size_t len, const timing_record_t& timing) {
 
 ## Architecture
 
+### Source Structure
+```
+src/
+├── websocket.hpp          # Main WebSocketClient template
+├── ws_policies.hpp        # Policy type definitions
+├── ws_configs.hpp         # Pre-configured client types
+├── ringbuffer.hpp         # Unified buffer implementations (8 sections)
+├── core/
+│   ├── http.hpp           # WebSocket frame parsing/building
+│   └── timing.hpp         # RDTSC/hardware timestamp utilities
+├── policy/
+│   ├── ssl.hpp            # OpenSSL/LibreSSL/WolfSSL policies
+│   ├── event.hpp          # Epoll/IoUring/Kqueue/Select policies
+│   ├── transport.hpp      # BSD socket transport
+│   └── userspace_transport_bio.hpp  # OpenSSL BIO for XDP
+├── transport/
+│   └── bsd_socket.hpp     # BSD socket wrapper
+├── xdp/                   # AF_XDP kernel bypass
+│   ├── xdp_transport.hpp  # XDP transport policy
+│   ├── xdp_frame.hpp      # Zero-copy frame handling
+│   └── bpf/               # eBPF filter programs
+└── stack/                 # Userspace TCP/IP (for XDP)
+    ├── userspace_stack.hpp
+    ├── tcp/               # TCP state machine, retransmit
+    ├── ip/                # IP layer, checksum
+    └── mac/               # Ethernet, ARP
+```
+
 ### Policy-Based Design
 - **SSL Policy**: OpenSSLPolicy, LibreSSLPolicy, WolfSSLPolicy
+- **Transport Policy**: BSDSocketTransport, XDPUserspaceTransport
 - **Event Policy**: EpollPolicy, IoUringPolicy, KqueuePolicy, SelectPolicy
-- **Buffer Policy**: RingBuffer (configurable size: 64KB - 16MB)
+- **Buffer Policy**: RingBuffer, ShmRingBuffer, HftShmRingBuffer
+
+### Buffer Types (unified in ringbuffer.hpp)
+- **RingBuffer<Capacity>**: Private memory with virtual mirroring (default)
+- **ShmRingBuffer**: Runtime path-based shared memory
+- **HftShmRingBuffer**: Compile-time segment name (C++20, hft-shm compatible)
+
+All buffer types use the same batch format: `[ShmBatchHeader][ssl_data][ShmFrameDesc[]]`
 
 ### Timing Instrumentation
 Six-stage latency measurement:
-1. Hardware NIC RX timestamp
+1. Hardware NIC RX timestamp (SO_TIMESTAMPING or XDP metadata)
 2. Event loop wake (RDTSC)
 3. SSL_read start
 4. SSL_read end
 5. Frame parsing complete
 6. User callback entry
 
+## Shared Memory IPC
+
+For inter-process communication, use `ShmWebSocketClient` with a separate `RXRingBufferConsumer`:
+
+### Producer Process (WebSocket → Shared Memory)
+```cpp
+#include "ws_configs.hpp"
+
+// Create shared memory files (one-time setup)
+ShmRxBuffer::create("/dev/shm/hft/binance.rx", 2*1024*1024);
+
+// Producer writes to shared memory (callback disabled)
+ShmWebSocketClient client("/dev/shm/hft/binance.rx");
+client.connect("stream.binance.com", 443, "/stream");
+client.run(nullptr);  // Data flows to shm only
+```
+
+### Consumer Process (Shared Memory → Application)
+```cpp
+#include "rx_ringbuffer_consumer.hpp"
+
+RXRingBufferConsumer consumer;
+consumer.init("/dev/shm/hft/binance.rx");
+
+consumer.set_on_messages([](const BatchInfo& batch, const MessageInfo* msgs, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        const char* payload = reinterpret_cast<const char*>(msgs[i].payload);
+        process(payload, msgs[i].len);
+    }
+});
+
+consumer.run();  // Busy-poll for lowest latency
+```
+
+### hft-shm Integration
+For use with [hft-shm](https://github.com/hft-shm):
+```bash
+# Initialize shared memory segments
+hft-shm init --config ~/hft.toml
+
+# Run producer/consumer test
+./build/binance_txrx -m ws_client     # Terminal 1: WebSocket → shm
+./build/binance_txrx -m rx_consumer   # Terminal 2: shm → stdout
+```
+
 ## Testing
 
 ```bash
 # Unit tests
-make test-ringbuffer    # Ring buffer tests
-make test-event         # Event policy tests
-make test-bug-fixes     # Bug fix verification
+make test-ringbuffer       # Ring buffer tests
+make test-shm-ringbuffer   # Shared memory ring buffer tests
+make test-event            # Event policy tests
+make test-bug-fixes        # Bug fix verification
 
 # Integration tests
-make test-binance       # Binance WebSocket test
+make test-binance          # Binance WebSocket test
+
+# Shared memory IPC tests (requires hft-shm)
+hft-shm init --config ~/hft.toml
+make test-binance-shm      # Build binance_txrx
+./build/binance_txrx -m ws_client     # Producer mode (default)
+./build/binance_txrx -m rx_consumer   # Consumer mode
 
 # Benchmarks
-make benchmark-binance  # Latency benchmark
+make benchmark-binance     # Latency benchmark
 ```
 
 ## Documentation
@@ -132,6 +230,16 @@ See LICENSE file for details.
 
 ## Status
 
-**Production Ready** - 12 critical bugs fixed, 29/29 unit tests passing, comprehensive test coverage.
+**Production Ready** - Unified ringbuffer architecture, shared memory IPC, XDP kernel bypass support.
 
-Open issues: 5 low-severity code quality improvements (see `doc/known_issues.md`)
+- Unified `ringbuffer.hpp` with 8 sections (RingBuffer, ShmRingBuffer, HftShmRingBuffer)
+- WebSocket fragment reassembly support (HftShm mode)
+- XDP/AF_XDP transport with userspace TCP/IP stack
+- Shared memory IPC with hft-shm compatibility
+- C++20 required (for HftShmRingBuffer compile-time segment names)
+
+Recent fixes:
+- Frame misalignment fix in `try_read_on_timeout()` leftover handling
+- Leftover state reset on disconnect for clean reconnection
+
+Open issues: See `doc/known_issues.md`

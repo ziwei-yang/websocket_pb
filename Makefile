@@ -135,6 +135,7 @@ TEST_EVENT_SRC := $(TEST_DIR)/test_event.cpp
 TEST_BUG_FIXES_SRC := $(TEST_DIR)/test_bug_fixes.cpp
 TEST_NEW_BUG_FIXES_SRC := $(TEST_DIR)/test_new_bug_fixes.cpp
 TEST_HFTSHM_SRC := $(TEST_DIR)/test_hftshm_ringbuffer.cpp
+TEST_SHM_RINGBUFFER_SRC := $(TEST_DIR)/test_shm_ringbuffer.cpp
 
 # XDP test source files
 TEST_XDP_TRANSPORT_SRC := $(TEST_DIR)/test_xdp_transport.cpp
@@ -163,6 +164,7 @@ TEST_EVENT_BIN := $(BUILD_DIR)/test_event
 TEST_BUG_FIXES_BIN := $(BUILD_DIR)/test_bug_fixes
 TEST_NEW_BUG_FIXES_BIN := $(BUILD_DIR)/test_new_bug_fixes
 TEST_HFTSHM_BIN := $(BUILD_DIR)/test_hftshm_ringbuffer
+TEST_SHM_RINGBUFFER_BIN := $(BUILD_DIR)/test_shm_ringbuffer
 TEST_BINANCE_BIN := $(BUILD_DIR)/test_binance_integration
 BENCHMARK_BINANCE_BIN := $(BUILD_DIR)/benchmark_binance
 
@@ -179,7 +181,7 @@ TEST_IP_OPTIMIZATIONS_BIN := $(BUILD_DIR)/test_ip_optimizations
 TEST_STACK_CHECKSUM_BIN := $(BUILD_DIR)/test_stack_checksum
 TEST_TCP_STATE_BIN := $(BUILD_DIR)/test_tcp_state
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-hftshm bpf check-ktls release debug epoll
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-hftshm bpf check-ktls release debug epoll
 
 all: $(EXAMPLE_BIN)
 
@@ -214,6 +216,17 @@ run: $(EXAMPLE_BIN)
 test-ringbuffer: $(TEST_RINGBUFFER_BIN)
 	@echo "🧪 Running ringbuffer unit tests..."
 	./$(TEST_RINGBUFFER_BIN)
+
+# Build shm-ringbuffer tests
+$(TEST_SHM_RINGBUFFER_BIN): $(TEST_SHM_RINGBUFFER_SRC) src/ringbuffer.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling shm-ringbuffer unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run shm-ringbuffer tests
+test-shm-ringbuffer: $(TEST_SHM_RINGBUFFER_BIN)
+	@echo "🧪 Running shm-ringbuffer unit tests..."
+	./$(TEST_SHM_RINGBUFFER_BIN)
 
 # Run event policy tests
 test-event: $(TEST_EVENT_BIN)
@@ -389,7 +402,7 @@ test-tcp-state: $(TEST_TCP_STATE_BIN)
 # ============================================================================
 
 # Build HftShm ringbuffer tests
-$(TEST_HFTSHM_BIN): $(TEST_HFTSHM_SRC) src/core/hftshm_ringbuffer.hpp | $(BUILD_DIR)
+$(TEST_HFTSHM_BIN): $(TEST_HFTSHM_SRC) src/ringbuffer.hpp | $(BUILD_DIR)
 	@echo "🔨 Compiling HftShm ringbuffer unit tests..."
 	$(CXX) -std=c++20 -O3 -march=native -Wall -Wextra -I./src -DUSE_HFTSHM -o $@ $<
 	@echo "✅ Test build complete: $@"
@@ -407,25 +420,28 @@ test-hftshm: $(TEST_HFTSHM_BIN)
 	HFT_SHM_CONFIG="$(HFT_SHM_CONFIG)" ./$(TEST_HFTSHM_BIN)
 
 # ============================================================================
-# HftShm Binance TX/RX Integration Test
+# Binance TX/RX Integration Test (Shared Memory)
 # ============================================================================
 # Single executable - spawns consumer thread, main thread runs producer
-#   - Producer: WebSocketClient writes to RX shm
-#   - Consumer: Reads from RX shm every 1 second
+#   - Producer: ShmWebSocketClient writes to RX shm (runtime path)
+#   - Consumer: RXRingBufferConsumer reads from RX shm
+#
+# Prerequisites: hft-shm init --config ~/hft.toml (creates shared memory files)
 
 BINANCE_TXRX_SRC := test/integration/binance_txrx.cpp
 BINANCE_TXRX_BIN := $(BUILD_DIR)/binance_txrx
 
-# Build Binance TX/RX test
-$(BINANCE_TXRX_BIN): $(BINANCE_TXRX_SRC) $(HEADERS) src/core/hftshm_ringbuffer.hpp | $(BUILD_DIR)
+# Build Binance TX/RX test (C++17, no USE_HFTSHM required)
+$(BINANCE_TXRX_BIN): $(BINANCE_TXRX_SRC) $(HEADERS) src/ringbuffer.hpp | $(BUILD_DIR)
 	@echo "Building Binance TX/RX integration test..."
-	$(CXX) -std=c++20 $(CXXFLAGS) -DUSE_HFTSHM -o $@ $< $(LDFLAGS)
+	$(CXX) $(CXX_STD) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 
 # Build-only target
 test-binance-shm: $(BINANCE_TXRX_BIN)
 	@echo "Built: $(BINANCE_TXRX_BIN)"
 	@echo ""
-	@echo "Usage: HFT_SHM_CONFIG=test/shmem.toml ./build/binance_txrx"
+	@echo "Usage: ./build/binance_txrx"
+	@echo "Prerequisites: hft-shm init --config ~/hft.toml"
 
 # ============================================================================
 # Unified Test Target - Run All Unit Tests
@@ -521,6 +537,7 @@ help:
 	@echo "Unit Tests:"
 	@echo "  make test               - Run ALL unit tests"
 	@echo "  make test-ringbuffer    - Test ring buffer implementation"
+	@echo "  make test-shm-ringbuffer - Test shared memory ring buffer"
 	@echo "  make test-event         - Test event policies (epoll/kqueue/select)"
 	@echo "  make test-bug-fixes     - Verify bug fixes #1-10"
 	@echo "  make test-new-bug-fixes - Verify bug fixes #11-20"

@@ -411,6 +411,15 @@ struct OpenSSLPolicy {
     }
 
     /**
+     * Check bytes available in SSL read buffer
+     * @return Number of bytes buffered in SSL (not yet returned to app)
+     */
+    size_t pending() const {
+        if (!ssl_) return 0;
+        return static_cast<size_t>(SSL_pending(ssl_));
+    }
+
+    /**
      * Check if kernel TLS is enabled
      *
      * @return true if kTLS is active, false otherwise
@@ -797,6 +806,15 @@ struct LibreSSLPolicy {
     }
 
     /**
+     * Check bytes available in SSL read buffer
+     * @return Number of bytes buffered in SSL (not yet returned to app)
+     */
+    size_t pending() const {
+        if (!ssl_) return 0;
+        return static_cast<size_t>(SSL_pending(ssl_));
+    }
+
+    /**
      * Check if kernel TLS is enabled
      *
      * @return false (LibreSSL doesn't support kTLS)
@@ -1154,6 +1172,15 @@ struct WolfSSLPolicy {
             errno = EIO;  // Fatal error
             return -1;
         }
+    }
+
+    /**
+     * Check bytes available in SSL read buffer
+     * @return Number of bytes buffered in SSL (not yet returned to app)
+     */
+    size_t pending() const {
+        if (!ssl_) return 0;
+        return static_cast<size_t>(wolfSSL_pending(ssl_));
     }
 
     /**
