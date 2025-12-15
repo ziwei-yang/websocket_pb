@@ -196,53 +196,7 @@ using AsymmetricBuffers = WebSocketClient<
 // Portable configuration (works on all platforms)
 using PortableWebSocket = DefaultWebSocket;
 
-// ============================================================================
-// Configuration 7: DPDK WebSocket (Ultra-Low Latency)
-// ============================================================================
-// Best for: Ultra-low latency HFT with dedicated NICs and CPU cores
-//
-// Policy composition:
-//   - TransportPolicy: DPDKTransport (userspace TCP stack)
-//   - SSLPolicy: DPDKSSLPolicy (OpenSSL with custom BIO)
-//   - EventPolicy: DPDKEventPolicy (polling-based, no syscalls)
-//   - RxBufferPolicy: RingBuffer<32MB> (HFT market data)
-//   - TxBufferPolicy: RingBuffer<2MB> (HFT orders)
-//
-// Requirements:
-//   - DPDK installed (dpdk, dpdk-dev packages)
-//   - NIC bound to DPDK (dpdk-devbind.py)
-//   - Huge pages configured (2MB pages)
-//   - Dedicated CPU core for polling
-//
-// Performance characteristics:
-//   - Sub-50 μs latency (NIC→callback)
-//   - Zero syscalls (pure userspace)
-//   - 100% CPU on polling core
-//   - Hardware timestamping support
-//   - No kernel bypass overhead
-//
-// Build:
-//   USE_DPDK=1 make clean all
-//
-// NOTE: This is an advanced configuration requiring DPDK setup.
-//       See doc/DPDK_SETUP.md for installation instructions.
-
-#ifdef USE_DPDK
-#include "dpdk/ssl/dpdk_ssl_policy.hpp"
-#include "dpdk/dpdk_event.hpp"
-
-// Note: DPDK WebSocket integration is work-in-progress
-// Full integration requires Phase 4 (HTTP/WebSocket framing) completion
-// For now, this serves as a template for future DPDK configs
-//
-// using DPDKWebSocket = WebSocketClient<
-//     websocket::dpdk::ssl::DPDKSSLPolicy,
-//     DPDKEventPolicy,
-//     RingBuffer<32 * 1024 * 1024>,  // 32MB RX (market data)
-//     RingBuffer<2 * 1024 * 1024>    // 2MB TX (orders)
-// >;
-
-#endif // USE_DPDK
+// NOTE: DPDK configuration removed - not implemented
 
 // ============================================================================
 // XDP Zero-Copy Configuration (AF_XDP + Userspace TCP)
@@ -381,56 +335,8 @@ using PrivateWebSocketClient = WebSocketClient<
 
 #endif // __linux__
 
-// ============================================================================
-// Configuration: hft-shm Shared Memory Buffers (Legacy - USE_HFTSHM)
-// ============================================================================
-// Enable with: USE_HFTSHM=1 USE_WOLFSSL=1 make
-//
-// Uses hft-shm managed shared memory for RX/TX buffers, enabling:
-//   - RX: WebSocketClient writes to shm, external consumers read market data
-//   - TX: External producers write commands to shm, WebSocketClient sends
-//
-// Policy composition:
-//   - SSLPolicy: WolfSSLPolicy (optimized TLS)
-//   - TransportPolicy: BSDSocketTransport<EpollPolicy> (not XDP during dev)
-//   - RxBufferPolicy: HftShmRxBuffer (producer role, writes to shm)
-//   - TxBufferPolicy: HftShmTxBuffer (consumer role, reads from shm)
-//
-// Requirements:
-//   - hft-shm CLI installed and in PATH
-//   - Segments created: hft-shm init --config conf/test.toml
-//   - Segment type must be "ringbuffer"
-//
-// Build:
-//   USE_HFTSHM=1 USE_WOLFSSL=1 make
-
-#ifdef USE_HFTSHM
-// HftShmRingBuffer is now in ringbuffer.hpp (already included at top)
-
-// Shared memory configuration for Binance market data
-// Uses BSDSocketTransport + WolfSSL (not XDP) for development
-using BinanceShmClient = WebSocketClient<
-    WolfSSLPolicy,                                          // WolfSSL for TLS
-    websocket::transport::BSDSocketTransport<EpollPolicy>,  // BSD sockets (not XDP)
-    HftShmRxBuffer<"zwy.mktdata.binance.raw.rx">,           // RX = Producer
-    HftShmTxBuffer<"zwy.mktdata.binance.raw.tx">            // TX = Consumer
->;
-
-// Mixed: RX to shared memory, TX private
-// Useful when you only need to publish market data to other processes
-using BinanceRxShmClient = WebSocketClient<
-    WolfSSLPolicy,
-    websocket::transport::BSDSocketTransport<EpollPolicy>,
-    HftShmRxBuffer<"zwy.mktdata.binance.raw.rx">,
-    RingBuffer<2 * 1024 * 1024>                             // 2MB private TX
->;
-
-// Test configuration (uses test.* segments)
-using TestShmClient = WebSocketClient<
-    WolfSSLPolicy,
-    websocket::transport::BSDSocketTransport<EpollPolicy>,
-    HftShmRxBuffer<"test.mktdata.binance.raw.rx">,
-    HftShmTxBuffer<"test.mktdata.binance.raw.tx">
->;
-
-#endif // USE_HFTSHM
+// NOTE: Compile-time segment mode (USE_HFTSHM) removed.
+// Use ShmWebSocketClient with runtime path instead:
+//   ShmWebSocketClient client("/dev/shm/hft/segment_name");
+//   client.connect(...);
+//   client.run(nullptr);  // on_messages callback disabled

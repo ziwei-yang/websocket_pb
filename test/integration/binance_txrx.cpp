@@ -10,6 +10,13 @@
 //
 // Run both in separate terminals for true IPC testing.
 
+// Debug printing - enable with -DDEBUG
+#ifdef DEBUG
+#define DEBUG_PRINT(...) printf(__VA_ARGS__)
+#else
+#define DEBUG_PRINT(...) ((void)0)
+#endif
+
 #include "../../src/ws_configs.hpp"
 #include "../../src/ringbuffer.hpp"
 #include "../../src/rx_ringbuffer_consumer.hpp"
@@ -51,28 +58,43 @@ int run_consumer() {
     consumer.set_on_messages([&](const BatchInfo& batch, const MessageInfo* msgs, size_t n) {
         total_batches++;
 
+#ifdef DEBUG
         // Print batch header with sizes: Batch[N] Frames X [HDR Y][Data Z][TAIL W]
-        printf("Batch[%d] Frames %u [HDR %zu][Data %zu][TAIL %zu]\n",
+        DEBUG_PRINT("Batch[%d] Frames %u [HDR %zu][Data %zu][TAIL %zu]\n",
                total_batches, batch.frame_count,
                batch.hdr_size, batch.data_size, batch.tail_size);
+#else
+        (void)batch;
+        (void)msgs;
+#endif
 
         for (size_t i = 0; i < n; i++) {
-            const char* payload = reinterpret_cast<const char*>(msgs[i].payload);
+            total_messages++;
+
+#ifdef DEBUG
+            const uint8_t* payload = msgs[i].payload;
             uint32_t len = msgs[i].len;
             uint8_t opcode = msgs[i].opcode;
 
-            total_messages++;
-
-            // Print payload (truncated for readability)
+            // Print payload (truncated for readability) - use safe bounds
             if (len > 80) {
-                printf("    [%d] op=%d len=%u: %.60s .... %.20s\n",
-                       total_messages, opcode, len,
-                       payload, payload + len - 20);
+                // Safe print: copy to temp buffer to avoid overflows
+                char start[61] = {0}, end[21] = {0};
+                memcpy(start, payload, 60);
+                memcpy(end, payload + len - 20, 20);
+                DEBUG_PRINT("    [%d] op=%d len=%u: %s .... %s\n",
+                       total_messages, opcode, len, start, end);
+            } else if (len > 0) {
+                char tmp[256] = {0};
+                size_t copy_len = (len < 255) ? len : 255;
+                memcpy(tmp, payload, copy_len);
+                DEBUG_PRINT("    [%d] op=%d len=%u: %s\n",
+                       total_messages, opcode, len, tmp);
             } else {
-                printf("    [%d] op=%d len=%u: %.*s\n",
-                       total_messages, opcode, len,
-                       (int)len, payload);
+                DEBUG_PRINT("    [%d] op=%d len=%u: (empty)\n",
+                       total_messages, opcode, len);
             }
+#endif
         }
     });
 
@@ -112,6 +134,9 @@ int run_producer() {
     // Use ShmWebSocketClient with runtime path
     ShmWebSocketClient client(RX_SHM_PATH);
 
+    // Enable debug traffic recording for debugging stuck issues
+    client.enable_debug_traffic("debug_traffic.dat");
+
     // Set stop flag for graceful Ctrl+C handling
     client.set_stop_flag(&running);
 
@@ -121,10 +146,10 @@ int run_producer() {
         count = 1;
     });
 
-    // Set on_close handler
+    // Set on_close handler - return true to auto-reconnect
     client.set_on_close([]() -> bool {
-        printf("[Producer] Connection closed, will reconnect...\n");
-        return false;  // Don't reconnect
+        printf("[Producer] Connection closed by server, reconnecting...\n");
+        return false;  // Auto-reconnect
     });
 
     printf("[Producer] Connecting to Binance...\n");

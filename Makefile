@@ -2,8 +2,13 @@
 # Supports: Linux (epoll, io_uring) and macOS (kqueue)
 
 CXX := g++
-CXXFLAGS := -std=c++17 -O3 -march=native -Wall -Wextra -I./src
+CXXFLAGS := -std=c++17 -O3 -march=native -Wall -Wextra -I./src -I../01_shared_headers
 LDFLAGS :=
+
+# Debug mode - enables verbose debug prints
+ifdef DEBUG
+    CXXFLAGS += -DDEBUG
+endif
 
 # Build directory
 BUILD_DIR := ./build
@@ -442,6 +447,40 @@ test-binance-shm: $(BINANCE_TXRX_BIN)
 	@echo ""
 	@echo "Usage: ./build/binance_txrx"
 	@echo "Prerequisites: hft-shm init --config ~/hft.toml"
+
+# ============================================================================
+# Traffic Simulator - Replay debug_traffic.dat through frame parser
+# ============================================================================
+TRAFFIC_SIM_SRC := test/traffic_simulator.cpp
+TRAFFIC_SIM_BIN := $(BUILD_DIR)/traffic_simulator
+
+$(TRAFFIC_SIM_BIN): $(TRAFFIC_SIM_SRC) | $(BUILD_DIR)
+	@echo "Building traffic simulator..."
+	$(CXX) $(CXXFLAGS) -I./src -I../01_shared_headers -o $@ $<
+	@echo "Built: $@"
+
+test-traffic-sim: $(TRAFFIC_SIM_BIN)
+	@echo ""
+	@echo "Usage: ./build/traffic_simulator [debug_traffic.dat]"
+	@echo "Replays recorded SSL traffic through frame parser to detect issues"
+
+# ============================================================================
+# WebSocket Simulator - Replay debug_traffic.dat through ACTUAL process_frames()
+# Uses compile-time SIMULATOR_MODE for zero runtime overhead in production
+# ============================================================================
+
+SIMULATOR_SRC := test/test_simulator.cpp
+SIMULATOR_BIN := $(BUILD_DIR)/test_simulator
+
+$(SIMULATOR_BIN): $(SIMULATOR_SRC) src/websocket.hpp src/ringbuffer.hpp src/core/http.hpp | $(BUILD_DIR)
+	@echo "Building WebSocket simulator (SIMULATOR_MODE)..."
+	$(CXX) $(CXXFLAGS) -DSIMULATOR_MODE -I./src -I../01_shared_headers -o $@ $<
+	@echo "Built: $@"
+
+test-simulator: $(SIMULATOR_BIN)
+	@echo ""
+	@echo "Usage: ./build/test_simulator [debug_traffic.dat]"
+	@echo "Replays SSL traffic through ACTUAL process_frames() code"
 
 # ============================================================================
 # Unified Test Target - Run All Unit Tests

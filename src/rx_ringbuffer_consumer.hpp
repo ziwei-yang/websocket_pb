@@ -1,19 +1,35 @@
 // rx_ringbuffer_consumer.hpp
 // Standalone consumer for reading batches from shared memory ring buffer
-// Uses ShmRingBuffer to attach to .hdr/.dat files created by WebSocketClient
+// Compatible with HftShmRingBuffer (hft-shm format) created by WebSocketClient
 //
 // Usage:
 //   RXRingBufferConsumer consumer;
-//   consumer.init("/path/to/shm");  // Opens /path/to/shm.hdr and .dat
+//   consumer.init("/dev/shm/hft/test.mktdata.binance.raw.rx");
 //   consumer.set_on_messages([](const BatchInfo& batch, const MessageInfo* msgs, size_t n) { ... });
 //   consumer.run();  // Blocking busy-poll
 //
 #pragma once
 
+// Debug printing - enable with -DDEBUG
+#ifdef DEBUG
+#define DEBUG_PRINT(...) printf(__VA_ARGS__)
+#define DEBUG_FPRINTF(...) fprintf(__VA_ARGS__)
+#else
+#define DEBUG_PRINT(...) ((void)0)
+#define DEBUG_FPRINTF(...) ((void)0)
+#endif
+
 #include "ringbuffer.hpp"
 #include "core/timing.hpp"
 #include <functional>
 #include <cstring>
+#include <atomic>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdexcept>
+#include <string>
 
 // Batch metadata passed to callback
 struct BatchInfo {
@@ -21,7 +37,7 @@ struct BatchInfo {
     size_t data_size;     // Padded SSL data size
     size_t tail_size;     // Overflow descriptors size
     size_t total_size;    // Total batch size
-    uint8_t frame_count;  // Number of frames in batch
+    uint16_t frame_count; // Number of frames in batch (up to 65535)
 };
 
 class RXRingBufferConsumer {
@@ -34,9 +50,18 @@ public:
     RXRingBufferConsumer() = default;
 
     ~RXRingBufferConsumer() {
+        cleanup();
         if (message_batch_) {
             delete[] message_batch_;
             message_batch_ = nullptr;
+        }
+        if (overflow_copy_) {
+            delete[] overflow_copy_;
+            overflow_copy_ = nullptr;
+        }
+        if (payload_copy_) {
+            delete[] payload_copy_;
+            payload_copy_ = nullptr;
         }
     }
 
@@ -44,10 +69,93 @@ public:
     RXRingBufferConsumer(const RXRingBufferConsumer&) = delete;
     RXRingBufferConsumer& operator=(const RXRingBufferConsumer&) = delete;
 
-    // Initialize by opening shared memory files
-    // path: base path, opens {path}.hdr and {path}.dat
+    // Initialize by opening shared memory files (hft-shm format)
+    // path: base path without extension, opens {path}.hdr and {path}.dat
     void init(const char* path) {
-        rx_buffer_.init(path);
+        std::string hdr_path = std::string(path) + ".hdr";
+        std::string dat_path = std::string(path) + ".dat";
+
+        // Open and mmap header
+        header_fd_ = open(hdr_path.c_str(), O_RDWR);
+        if (header_fd_ < 0) {
+            throw std::runtime_error("Failed to open header: " + hdr_path);
+        }
+
+        struct stat st;
+        if (fstat(header_fd_, &st) < 0) {
+            close(header_fd_);
+            header_fd_ = -1;
+            throw std::runtime_error("Failed to stat header");
+        }
+        header_size_ = st.st_size;
+
+        header_ = mmap(nullptr, header_size_, PROT_READ | PROT_WRITE, MAP_SHARED, header_fd_, 0);
+        if (header_ == MAP_FAILED) {
+            close(header_fd_);
+            header_fd_ = -1;
+            header_ = nullptr;
+            throw std::runtime_error("Failed to mmap header");
+        }
+
+        // Validate hft-shm metadata
+        auto* meta = static_cast<hftshm::metadata*>(header_);
+        if (meta->magic != hftshm::METADATA_MAGIC) {
+            cleanup();
+            throw std::runtime_error("Invalid hft-shm magic in header");
+        }
+
+        index_mask_ = meta->index_mask;
+        buffer_capacity_ = meta->buffer_size;
+
+        // Open and mmap data
+        data_fd_ = open(dat_path.c_str(), O_RDWR);
+        if (data_fd_ < 0) {
+            cleanup();
+            throw std::runtime_error("Failed to open data: " + dat_path);
+        }
+
+        data_ = mmap(nullptr, buffer_capacity_, PROT_READ | PROT_WRITE, MAP_SHARED, data_fd_, 0);
+        if (data_ == MAP_FAILED) {
+            cleanup();
+            throw std::runtime_error("Failed to mmap data segment");
+        }
+
+        buffer_ = static_cast<uint8_t*>(data_);
+
+        // Set up sequence pointers (hft-shm layout)
+        auto* producer = reinterpret_cast<hftshm::producer_section*>(
+            static_cast<uint8_t*>(header_) + meta->producer_offset);
+        auto* consumer = reinterpret_cast<hftshm::consumer_section*>(
+            static_cast<uint8_t*>(header_) + meta->consumer_0_offset);
+
+        write_seq_ = &producer->published;
+        read_seq_ = &consumer->sequence;
+        dirty_flag_ = &consumer->dirty;
+
+        // Check if we need to resync (stale consumer position from previous run)
+        // Resync if: readable < 0, readable > half buffer, or data looks invalid
+        int64_t w = write_seq_->load(std::memory_order_acquire);
+        int64_t r = read_seq_->load(std::memory_order_relaxed);
+        int64_t readable_bytes = w - r;
+        bool need_resync = (readable_bytes < 0 || readable_bytes > static_cast<int64_t>(buffer_capacity_ / 2));
+
+        // Also check if data at read_pos looks like valid batch header
+        if (!need_resync && readable_bytes >= static_cast<int64_t>(sizeof(ShmBatchHeader))) {
+            size_t read_pos = static_cast<size_t>(r) & index_mask_;
+            const auto* hdr = reinterpret_cast<const ShmBatchHeader*>(buffer_ + read_pos);
+            // Check for reasonable values (ssl_data typically < 64KB, frame_count < 1000)
+            if (hdr->ssl_data_len_in_CLS > 1024 || hdr->frame_count > 1000 ||
+                hdr->ssl_data_len_in_CLS == 0 || hdr->frame_count == 0) {
+                need_resync = true;
+            }
+        }
+
+        if (need_resync) {
+            DEBUG_FPRINTF(stderr, "[INFO] Consumer resync: invalid/stale position, jumping to write_pos\n");
+            read_seq_->store(w, std::memory_order_release);
+        }
+
+        // Allocate message batch
         if (!message_batch_) {
             message_batch_ = new MessageInfo[256];
             message_batch_capacity_ = 256;
@@ -55,7 +163,6 @@ public:
     }
 
     // Set message callback (REQUIRED)
-    // Signature: void(const BatchInfo& batch, const MessageInfo* msgs, size_t count)
     void set_on_messages(MessageCallback cb) { on_messages_ = std::move(cb); }
 
     // Set connection closed callback (optional)
@@ -65,14 +172,33 @@ public:
     void set_on_connect(ConnectCallback cb) { on_connect_ = std::move(cb); }
 
     // Non-blocking: process all available batches, return message count
+    // Limits processing per call to min(buffer_capacity/2, 1MB) to prevent infinite loops
     size_t poll() {
         if (!on_messages_) return 0;
 
+        // Check if producer marked us dirty (data was overwritten)
+        if (dirty_flag_ && dirty_flag_->load(std::memory_order_acquire)) {
+            DEBUG_FPRINTF(stderr, "[WARN] Consumer marked dirty - producer overwrote data. "
+                    "Resetting to write_pos (data loss)\n");
+            // Reset read position to current write position
+            int64_t w = write_seq_->load(std::memory_order_acquire);
+            read_seq_->store(w, std::memory_order_release);
+            dirty_flag_->store(false, std::memory_order_release);
+            return 0;  // No data this call, next call will start fresh
+        }
+
         size_t total = 0;
-        while (rx_buffer_.readable() >= sizeof(ShmBatchHeader)) {
-            size_t n = process_one_batch();
+        size_t bytes_processed = 0;
+        size_t max_bytes = (buffer_capacity_ / 2 < 1024 * 1024)
+                         ? buffer_capacity_ / 2
+                         : 1024 * 1024;
+
+        while (readable() >= sizeof(ShmBatchHeader) && bytes_processed < max_bytes) {
+            size_t batch_size = 0;
+            size_t n = process_one_batch(&batch_size);
             if (n == 0) break;
             total += n;
+            bytes_processed += batch_size;
         }
         return total;
     }
@@ -93,106 +219,174 @@ public:
     bool is_running() const { return running_; }
 
     // Buffer statistics
-    size_t readable() const { return rx_buffer_.readable(); }
-    size_t capacity() const { return rx_buffer_.buffer_capacity(); }
-    size_t current_read_pos() const { return rx_buffer_.current_read_pos(); }
-    size_t current_write_pos() const { return rx_buffer_.current_write_pos(); }
+    size_t readable() const {
+        int64_t w = write_seq_->load(std::memory_order_acquire);
+        int64_t r = read_seq_->load(std::memory_order_relaxed);
+        return static_cast<size_t>(w - r);
+    }
+
+    size_t capacity() const { return buffer_capacity_; }
+
+    size_t current_read_pos() const {
+        return static_cast<size_t>(read_seq_->load(std::memory_order_relaxed));
+    }
+
+    size_t current_write_pos() const {
+        return static_cast<size_t>(write_seq_->load(std::memory_order_relaxed));
+    }
 
 private:
+    void cleanup() {
+        if (data_ && data_ != MAP_FAILED) {
+            munmap(data_, buffer_capacity_);
+            data_ = nullptr;
+        }
+        if (data_fd_ >= 0) {
+            close(data_fd_);
+            data_fd_ = -1;
+        }
+        if (header_ && header_ != MAP_FAILED) {
+            munmap(header_, header_size_);
+            header_ = nullptr;
+        }
+        if (header_fd_ >= 0) {
+            close(header_fd_);
+            header_fd_ = -1;
+        }
+    }
+
+    void commit_read(size_t len) {
+        if (len == 0) return;
+        int64_t r = read_seq_->load(std::memory_order_relaxed);
+        read_seq_->store(r + static_cast<int64_t>(len), std::memory_order_release);
+    }
+
     // Decode one batch (ShmBatchHeader + frames)
     // Returns number of frames processed, 0 if incomplete or invalid
-    size_t process_one_batch() {
-        const uint8_t* buffer = rx_buffer_.buffer_base();
-        size_t capacity = rx_buffer_.buffer_capacity();
-        size_t read_pos = rx_buffer_.current_read_pos();
-        size_t available = rx_buffer_.readable();
+    // Optionally returns batch_size through out parameter
+    size_t process_one_batch(size_t* out_batch_size = nullptr) {
+        size_t capacity = buffer_capacity_;
+        int64_t r = read_seq_->load(std::memory_order_relaxed);
+        size_t read_pos = static_cast<size_t>(r) & index_mask_;
+        size_t available = readable();
 
         if (available < sizeof(ShmBatchHeader)) {
-            return 0;  // Not enough data for header
+            return 0;
         }
 
-        // Read header from circular buffer
-        ShmBatchHeader hdr;
-        circular_read(buffer, capacity, read_pos,
-                      reinterpret_cast<uint8_t*>(&hdr), sizeof(hdr));
+        // Check if header wraps around buffer boundary
+        const ShmBatchHeader* hdr;
+        ShmBatchHeader hdr_copy;
+        if (read_pos + sizeof(ShmBatchHeader) <= capacity) {
+            // No wrap - direct pointer (common case)
+            hdr = reinterpret_cast<const ShmBatchHeader*>(buffer_ + read_pos);
+        } else {
+            // Header wraps - must copy (rare)
+            circular_read(buffer_, capacity, read_pos,
+                          reinterpret_cast<uint8_t*>(&hdr_copy), sizeof(ShmBatchHeader));
+            hdr = &hdr_copy;
+        }
 
         // Validate header
-        if (hdr.ssl_data_len_in_CLS == 0 || hdr.frame_count == 0) {
-            // Empty or invalid batch - skip header
-            rx_buffer_.commit_read(sizeof(ShmBatchHeader));
+        if (hdr->ssl_data_len_in_CLS == 0 || hdr->frame_count == 0) {
+            commit_read(sizeof(ShmBatchHeader));
             return 0;
         }
 
         // Sanity checks
-        if (hdr.ssl_data_len_in_CLS > 16384) {  // >1MB, likely corrupt
-            rx_buffer_.commit_read(sizeof(ShmBatchHeader));
+        if (hdr->ssl_data_len_in_CLS > 16384) {  // >1MB, likely corrupt
+            commit_read(sizeof(ShmBatchHeader));
             return 0;
         }
 
         // Calculate batch size
-        size_t padded_ssl_len = cls_to_bytes(hdr.ssl_data_len_in_CLS);
-        size_t overflow_size = overflow_descs_size(hdr.frame_count);
+        size_t padded_ssl_len = cls_to_bytes(hdr->ssl_data_len_in_CLS);
+        size_t overflow_size = overflow_descs_size(hdr->frame_count);
         size_t batch_size = sizeof(ShmBatchHeader) + padded_ssl_len + overflow_size;
 
-        // Sanity check batch size
-        if (batch_size > capacity) {
-            rx_buffer_.commit_read(sizeof(ShmBatchHeader));
+        if (batch_size > capacity || available < batch_size) {
+            if (batch_size > capacity) commit_read(sizeof(ShmBatchHeader));
             return 0;
         }
 
-        if (available < batch_size) {
-            return 0;  // Incomplete batch - wait for more data
-        }
+        // Direct pointer to embedded descriptors (inside header, no copy)
+        const ShmFrameDesc* embedded_descs = hdr->embedded;
 
-        // Read frame descriptors
-        ShmFrameDesc descs[255];
-        uint8_t embedded_count = std::min(hdr.frame_count, static_cast<uint8_t>(EMBEDDED_FRAMES));
-        std::memcpy(descs, hdr.embedded, embedded_count * sizeof(ShmFrameDesc));
+        // Overflow descriptors: direct pointer if no wrap, copy only if wrapping
+        uint16_t overflow_count = overflow_frame_count(hdr->frame_count);
+        const ShmFrameDesc* overflow_descs = nullptr;
 
-        uint8_t overflow_count = overflow_frame_count(hdr.frame_count);
         if (overflow_count > 0) {
-            size_t overflow_pos = (read_pos + sizeof(ShmBatchHeader) + padded_ssl_len) % capacity;
-            circular_read(buffer, capacity, overflow_pos,
-                          reinterpret_cast<uint8_t*>(descs + EMBEDDED_FRAMES),
-                          overflow_count * sizeof(ShmFrameDesc));
+            size_t overflow_pos = (read_pos + sizeof(ShmBatchHeader) + padded_ssl_len) & index_mask_;
+            size_t overflow_bytes = overflow_count * sizeof(ShmFrameDesc);
+
+            if (overflow_pos + overflow_bytes <= capacity) {
+                // No wrap - direct pointer (common case)
+                overflow_descs = reinterpret_cast<const ShmFrameDesc*>(buffer_ + overflow_pos);
+            } else {
+                // Wraps around buffer boundary - must copy (rare)
+                ensure_overflow_capacity(overflow_count);
+                circular_read(buffer_, capacity, overflow_pos,
+                              reinterpret_cast<uint8_t*>(overflow_copy_), overflow_bytes);
+                overflow_descs = overflow_copy_;
+            }
         }
 
-        // Build message batch
-        size_t ssl_data_pos = (read_pos + sizeof(ShmBatchHeader)) % capacity;
-        ensure_batch_capacity(hdr.frame_count);
+        // Build message batch - direct access to descriptors
+        size_t ssl_data_pos = (read_pos + sizeof(ShmBatchHeader)) & index_mask_;
+        ensure_batch_capacity(hdr->frame_count);
+        size_t payload_copy_offset = 0;
 
-        for (uint8_t i = 0; i < hdr.frame_count; i++) {
+        for (uint16_t i = 0; i < hdr->frame_count; i++) {
+            const ShmFrameDesc* desc = (i < EMBEDDED_FRAMES)
+                ? &embedded_descs[i]
+                : &overflow_descs[i - EMBEDDED_FRAMES];
+
             // Bounds check
-            if (descs[i].payload_start + descs[i].payload_len > padded_ssl_len) {
-                // Invalid frame bounds - skip entire batch
-                rx_buffer_.commit_read(batch_size);
+            if (desc->payload_start + desc->payload_len > padded_ssl_len) {
+                commit_read(batch_size);
                 return 0;
             }
 
-            size_t payload_pos = (ssl_data_pos + descs[i].payload_start) % capacity;
-            message_batch_[i] = {
-                buffer + payload_pos,  // Zero-copy pointer
-                descs[i].payload_len,
-                0,  // parse_cycle not needed in consumer
-                descs[i].opcode
-            };
+            size_t payload_pos = (ssl_data_pos + desc->payload_start) & index_mask_;
+
+            // Check if payload wraps around buffer boundary
+            if (payload_pos + desc->payload_len <= capacity) {
+                // No wrap - direct pointer (common case, zero-copy)
+                message_batch_[i] = {
+                    buffer_ + payload_pos,
+                    desc->payload_len,
+                    0,
+                    desc->opcode
+                };
+            } else {
+                // Payload wraps - must copy to contiguous buffer (rare)
+                ensure_payload_capacity(payload_copy_offset + desc->payload_len);
+                circular_read(buffer_, capacity, payload_pos,
+                              payload_copy_ + payload_copy_offset, desc->payload_len);
+                message_batch_[i] = {
+                    payload_copy_ + payload_copy_offset,
+                    desc->payload_len,
+                    0,
+                    desc->opcode
+                };
+                payload_copy_offset += desc->payload_len;
+            }
         }
 
         // Build batch info
         BatchInfo batch_info = {
-            sizeof(ShmBatchHeader),  // hdr_size
-            padded_ssl_len,          // data_size
-            overflow_size,           // tail_size
-            batch_size,              // total_size
-            hdr.frame_count          // frame_count
+            sizeof(ShmBatchHeader),
+            padded_ssl_len,
+            overflow_size,
+            batch_size,
+            hdr->frame_count
         };
 
-        // Invoke callback with batch info
-        on_messages_(batch_info, message_batch_, hdr.frame_count);
-
-        // Commit read
-        rx_buffer_.commit_read(batch_size);
-        return hdr.frame_count;
+        on_messages_(batch_info, message_batch_, hdr->frame_count);
+        commit_read(batch_size);
+        if (out_batch_size) *out_batch_size = batch_size;
+        return hdr->frame_count;
     }
 
     void ensure_batch_capacity(size_t needed) {
@@ -203,11 +397,47 @@ private:
         }
     }
 
-    ShmRingBuffer<ShmBufferRole::Consumer> rx_buffer_;
+    void ensure_overflow_capacity(size_t needed) {
+        if (needed > overflow_copy_capacity_) {
+            delete[] overflow_copy_;
+            overflow_copy_capacity_ = needed * 2;
+            overflow_copy_ = new ShmFrameDesc[overflow_copy_capacity_];
+        }
+    }
+
+    void ensure_payload_capacity(size_t needed) {
+        if (needed > payload_copy_capacity_) {
+            delete[] payload_copy_;
+            size_t new_cap = needed * 2;
+            payload_copy_capacity_ = (new_cap < 65536) ? 65536 : new_cap;
+            payload_copy_ = new uint8_t[payload_copy_capacity_];
+        }
+    }
+
+    // hft-shm mmap state
+    int header_fd_ = -1;
+    int data_fd_ = -1;
+    void* header_ = nullptr;
+    void* data_ = nullptr;
+    size_t header_size_ = 0;
+    size_t buffer_capacity_ = 0;
+    uint32_t index_mask_ = 0;
+    uint8_t* buffer_ = nullptr;
+    std::atomic<int64_t>* write_seq_ = nullptr;
+    std::atomic<int64_t>* read_seq_ = nullptr;
+    std::atomic<bool>* dirty_flag_ = nullptr;
+
+    // Callbacks
     MessageCallback on_messages_;
     CloseCallback on_close_;
     ConnectCallback on_connect_;
+
+    // Batch processing state
     MessageInfo* message_batch_ = nullptr;
     size_t message_batch_capacity_ = 0;
+    ShmFrameDesc* overflow_copy_ = nullptr;
+    size_t overflow_copy_capacity_ = 0;
+    uint8_t* payload_copy_ = nullptr;
+    size_t payload_copy_capacity_ = 0;
     volatile bool running_ = false;
 };
