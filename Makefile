@@ -2,7 +2,7 @@
 # Supports: Linux (epoll, io_uring) and macOS (kqueue)
 
 CXX := g++
-CXXFLAGS := -std=c++17 -O3 -march=native -Wall -Wextra -I./src -I../01_shared_headers
+CXXFLAGS := -std=c++20 -O3 -march=native -Wall -Wextra -I./src -I../01_shared_headers
 LDFLAGS :=
 
 # Debug mode - enables verbose debug prints
@@ -465,22 +465,22 @@ test-traffic-sim: $(TRAFFIC_SIM_BIN)
 	@echo "Replays recorded SSL traffic through frame parser to detect issues"
 
 # ============================================================================
-# WebSocket Simulator - Replay debug_traffic.dat through ACTUAL process_frames()
-# Uses compile-time SIMULATOR_MODE for zero runtime overhead in production
+# WebSocket Simulator - Replay debug_traffic.dat through real frame parser
+# Uses SimulatorReplayClient (SimulatorTransport + NoSSLPolicy)
 # ============================================================================
 
 SIMULATOR_SRC := test/test_simulator.cpp
 SIMULATOR_BIN := $(BUILD_DIR)/test_simulator
 
-$(SIMULATOR_BIN): $(SIMULATOR_SRC) src/websocket.hpp src/ringbuffer.hpp src/core/http.hpp | $(BUILD_DIR)
-	@echo "Building WebSocket simulator (SIMULATOR_MODE)..."
-	$(CXX) $(CXXFLAGS) -DSIMULATOR_MODE -I./src -I../01_shared_headers -o $@ $<
+$(SIMULATOR_BIN): $(SIMULATOR_SRC) src/ws_configs.hpp src/websocket.hpp src/ringbuffer.hpp src/policy/simulator_transport.hpp | $(BUILD_DIR)
+	@echo "Building WebSocket simulator..."
+	$(CXX) $(CXXFLAGS) -I./src -I../01_shared_headers -o $@ $<
 	@echo "Built: $@"
 
 test-simulator: $(SIMULATOR_BIN)
 	@echo ""
 	@echo "Usage: ./build/test_simulator [debug_traffic.dat]"
-	@echo "Replays SSL traffic through ACTUAL process_frames() code"
+	@echo "Replays recorded traffic through WebSocket frame parser"
 
 # ============================================================================
 # Unified Test Target - Run All Unit Tests
@@ -538,7 +538,7 @@ release: all
 	@echo "✅ Release build complete"
 
 # Build with debug symbols
-debug: CXXFLAGS := -std=c++17 -g -O0 -Wall -Wextra -I./src
+debug: CXXFLAGS := -std=c++20 -g -O0 -Wall -Wextra -I./src
 debug: all
 	@echo "🐛 Debug build complete"
 

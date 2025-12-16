@@ -348,10 +348,113 @@ struct BSDSocketTransport {
         return EventPolicy::name();
     }
 
+    // =========================================================================
+    // Debug Traffic Recording (controlled by websocket::debug_enabled)
+    // =========================================================================
+
+    /**
+     * Enable recording of decrypted traffic to file
+     * Called from WebSocketClient when debug_enabled is true
+     */
+    void enable_recording(const char* path) {
+        if constexpr (websocket::debug_enabled) {
+            if (recording_fp_) fclose(recording_fp_);
+            recording_fp_ = fopen(path, "wb");
+        } else {
+            (void)path;
+        }
+    }
+
+    /**
+     * Disable traffic recording
+     */
+    void disable_recording() {
+        if constexpr (websocket::debug_enabled) {
+            if (recording_fp_) {
+                fclose(recording_fp_);
+                recording_fp_ = nullptr;
+            }
+        }
+    }
+
+    /**
+     * Write RX traffic record: 32-byte header + decrypted SSL data
+     * Header: "SSLR" magic, timestamp_ns, ssl_bytes, accumulated_before
+     *
+     * @param buffer     Circular buffer base pointer
+     * @param pos        Write position in circular buffer
+     * @param n          Bytes written
+     * @param capacity   Buffer capacity (for wrap handling)
+     * @param data_written  Total accumulated bytes (for accum_before calculation)
+     */
+    void write_record(uint8_t* buffer, size_t pos, ssize_t n, size_t capacity, size_t data_written) {
+        if constexpr (websocket::debug_enabled) {
+            if (!recording_fp_ || n <= 0) return;
+
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t ts_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+
+            // Build 32-byte header
+            uint8_t header[32] = {0};
+            memcpy(header, "SSLR", 4);                                    // 0-3: magic (RX)
+            memcpy(header + 4, &ts_ns, 8);                                // 4-11: timestamp_ns
+            uint32_t bytes = static_cast<uint32_t>(n);
+            memcpy(header + 12, &bytes, 4);                               // 12-15: ssl_read_bytes
+            // data_written already includes this read, so subtract to get "accum before"
+            uint32_t accum_before = static_cast<uint32_t>(data_written - static_cast<size_t>(n));
+            memcpy(header + 16, &accum_before, 4);                        // 16-19: accumulated_before
+            // 20-31: reserved
+
+            fwrite(header, 1, 32, recording_fp_);
+
+            // Write SSL data (handle circular buffer wrap)
+            size_t to_end = capacity - pos;
+            if (static_cast<size_t>(n) <= to_end) {
+                fwrite(buffer + pos, 1, n, recording_fp_);
+            } else {
+                fwrite(buffer + pos, 1, to_end, recording_fp_);
+                fwrite(buffer, 1, n - to_end, recording_fp_);
+            }
+            fflush(recording_fp_);
+        } else {
+            (void)buffer; (void)pos; (void)n; (void)capacity; (void)data_written;
+        }
+    }
+
+    /**
+     * Write TX traffic record: 32-byte header + data sent
+     * Header: "SSLT" magic, timestamp_ns, bytes_sent
+     */
+    void write_tx_record(const uint8_t* data, size_t len) {
+        if constexpr (websocket::debug_enabled) {
+            if (!recording_fp_ || len == 0) return;
+
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t ts_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+
+            // Build 32-byte header
+            uint8_t header[32] = {0};
+            memcpy(header, "SSLT", 4);                                    // 0-3: magic (TX)
+            memcpy(header + 4, &ts_ns, 8);                                // 4-11: timestamp_ns
+            uint32_t bytes = static_cast<uint32_t>(len);
+            memcpy(header + 12, &bytes, 4);                               // 12-15: bytes sent
+            // 16-31: reserved
+
+            fwrite(header, 1, 32, recording_fp_);
+            fwrite(data, 1, len, recording_fp_);
+            fflush(recording_fp_);
+        } else {
+            (void)data; (void)len;
+        }
+    }
+
 private:
     int fd_;
     bool connected_;
     EventPolicy event_;
+    FILE* recording_fp_ = nullptr;  // Debug traffic recording (optimized away when !debug_enabled)
 };
 
 } // namespace transport
@@ -406,14 +509,16 @@ struct XDPUserspaceTransport {
     XDPUserspaceTransport& operator=(const XDPUserspaceTransport&) = delete;
 
     /**
-     * Initialize XDP transport with userspace stack
+     * Initialize XDP transport with DNS resolution and BPF filter setup
      *
-     * @param interface Network interface name (e.g., "eth0", "enp108s0")
-     * @param bpf_path Path to BPF object file
+     * @param interface  Network interface name (e.g., "enp108s0")
+     * @param bpf_path   Path to BPF object file
+     * @param domain     Exchange domain to filter (e.g., "stream.binance.com")
+     * @param port       Exchange port to filter (e.g., 443)
      */
-    void init(const char* interface = "eth0",
-              const char* bpf_path = "src/xdp/bpf/exchange_filter.bpf.o") {
-        // Configure XDP
+    void init(const char* interface, const char* bpf_path,
+              const char* domain, uint16_t port) {
+        // 1. Configure and initialize XDP
         websocket::xdp::XDPConfig config;
         config.interface = interface;
         config.queue_id = 0;
@@ -424,7 +529,7 @@ struct XDPUserspaceTransport {
 
         xdp_.init(config, bpf_path);
 
-        // Get local interface configuration
+        // 2. Get local interface configuration
         uint8_t local_mac[6];
         uint32_t local_ip, gateway_ip, netmask;
 
@@ -451,12 +556,51 @@ struct XDPUserspaceTransport {
         // Set up zero-copy receive buffer callback
         recv_buffer_.set_release_callback(frame_release_callback, this);
 
-        printf("[XDP-Userspace] Initialized on %s\n", interface);
+        // 3. DNS resolution for exchange domain
+        auto ips = resolve_hostname(domain);
+        if (ips.empty()) {
+            throw std::runtime_error(std::string("Failed to resolve domain: ") + domain);
+        }
+
+        // 4. Configure BPF filter for all resolved IPs and port
+        for (const auto& ip : ips) {
+            add_exchange_ip(ip.c_str());
+        }
+        add_exchange_port(port);
+
+        printf("[XDP-Userspace] Initialized on %s for %s:%u (%zu IPs)\n",
+               interface, domain, port, ips.size());
         printf("  Local IP:  %s\n", local_ip_str);
         printf("  Gateway:   %s\n", gateway_ip_str);
         printf("  MAC:       %02x:%02x:%02x:%02x:%02x:%02x\n",
                local_mac[0], local_mac[1], local_mac[2],
                local_mac[3], local_mac[4], local_mac[5]);
+    }
+
+    // Helper: resolve hostname to list of IP addresses
+    static std::vector<std::string> resolve_hostname(const char* hostname) {
+        std::vector<std::string> ips;
+        struct addrinfo hints = {};
+        struct addrinfo* result = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        int ret = getaddrinfo(hostname, nullptr, &hints, &result);
+        if (ret != 0 || !result) {
+            if (result) freeaddrinfo(result);
+            return ips;
+        }
+
+        for (struct addrinfo* p = result; p != nullptr; p = p->ai_next) {
+            if (p->ai_family == AF_INET) {
+                auto* addr = reinterpret_cast<struct sockaddr_in*>(p->ai_addr);
+                char ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
+                ips.push_back(ip_str);
+            }
+        }
+        freeaddrinfo(result);
+        return ips;
     }
 
     /**

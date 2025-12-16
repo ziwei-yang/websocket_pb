@@ -84,6 +84,14 @@ struct IsPowerOfTwo {
     static constexpr bool value = (N != 0) && ((N & (N - 1)) == 0);
 };
 
+// Compile-time capacity traits for Private mode optimization
+// Avoids runtime member loads when capacity is known at compile-time
+template<size_t Cap>
+struct CapacityTraits {
+    static constexpr size_t SIZE = Cap;
+    static constexpr uint32_t INDEX_MASK = static_cast<uint32_t>(Cap - 1);
+};
+
 // ============================================================================
 // Section 2: Circular buffer helpers
 // ============================================================================
@@ -93,35 +101,37 @@ struct IsPowerOfTwo {
 static constexpr size_t MAX_CIRCULAR_ACCESS_SIZE = 786432;
 
 // Write len bytes to circular buffer starting at logical position
-inline void circular_write(uint8_t* buffer, size_t capacity, size_t pos,
-                           const uint8_t* src, size_t len) {
+// C++20: constexpr via std::copy (replaces non-constexpr memcpy)
+constexpr void circular_write(uint8_t* buffer, size_t capacity, size_t pos,
+                              const uint8_t* src, size_t len) {
     assert(len <= MAX_CIRCULAR_ACCESS_SIZE &&
            "circular_write is for small metadata only; use direct access for payloads");
     pos = pos % capacity;  // Normalize position
     size_t first = std::min(len, capacity - pos);
-    std::memcpy(buffer + pos, src, first);
+    std::copy(src, src + first, buffer + pos);
     if (len > first) {
-        std::memcpy(buffer, src + first, len - first);
+        std::copy(src + first, src + len, buffer);
     }
 }
 
 // Read len bytes from circular buffer starting at logical position
-inline void circular_read(const uint8_t* buffer, size_t capacity, size_t pos,
-                          uint8_t* dest, size_t len) {
+// C++20: constexpr via std::copy (replaces non-constexpr memcpy)
+constexpr void circular_read(const uint8_t* buffer, size_t capacity, size_t pos,
+                             uint8_t* dest, size_t len) {
     assert(len <= MAX_CIRCULAR_ACCESS_SIZE &&
            "circular_read is for small metadata only; use direct access for payloads");
     pos = pos % capacity;  // Normalize position
     size_t first = std::min(len, capacity - pos);
-    std::memcpy(dest, buffer + pos, first);
+    std::copy(buffer + pos, buffer + pos + first, dest);
     if (len > first) {
-        std::memcpy(dest + first, buffer, len - first);
+        std::copy(buffer, buffer + (len - first), dest + first);
     }
 }
 
 // Copy len bytes within circular buffer from src_pos to dst_pos
 // Processes chunk-by-chunk where both src and dst are contiguous
-// memmove handles overlap within each chunk safely
-inline void circular_copy(uint8_t* buffer, size_t capacity, size_t src_pos, size_t dst_pos, size_t len) {
+// C++20: constexpr via std::copy/std::copy_backward for overlap safety
+constexpr void circular_copy(uint8_t* buffer, size_t capacity, size_t src_pos, size_t dst_pos, size_t len) {
     if (len == 0) return;
     src_pos %= capacity;
     dst_pos %= capacity;
@@ -131,7 +141,14 @@ inline void circular_copy(uint8_t* buffer, size_t capacity, size_t src_pos, size
         size_t dst_chunk = std::min(len, capacity - dst_pos);
         size_t chunk = std::min(src_chunk, dst_chunk);
 
-        std::memmove(buffer + dst_pos, buffer + src_pos, chunk);
+        // Handle overlap: use copy_backward if dst overlaps src from behind
+        uint8_t* src_ptr = buffer + src_pos;
+        uint8_t* dst_ptr = buffer + dst_pos;
+        if (dst_ptr > src_ptr && dst_ptr < src_ptr + chunk) {
+            std::copy_backward(src_ptr, src_ptr + chunk, dst_ptr + chunk);
+        } else {
+            std::copy(src_ptr, src_ptr + chunk, dst_ptr);
+        }
 
         src_pos = (src_pos + chunk) % capacity;
         dst_pos = (dst_pos + chunk) % capacity;
@@ -140,31 +157,56 @@ inline void circular_copy(uint8_t* buffer, size_t capacity, size_t src_pos, size
 }
 
 // Get pointer with wrap: returns buffer + (pos % capacity)
-inline uint8_t* circular_ptr(uint8_t* buffer, size_t capacity, size_t pos) {
+constexpr uint8_t* circular_ptr(uint8_t* buffer, size_t capacity, size_t pos) {
     return buffer + (pos % capacity);
 }
 
-inline const uint8_t* circular_ptr(const uint8_t* buffer, size_t capacity, size_t pos) {
+constexpr const uint8_t* circular_ptr(const uint8_t* buffer, size_t capacity, size_t pos) {
     return buffer + (pos % capacity);
+}
+
+// Compile-time verification that circular_* functions are truly constexpr (C++20)
+namespace detail {
+    consteval bool test_circular_constexpr() {
+        uint8_t buf[16] = {};
+        uint8_t src[4] = {1, 2, 3, 4};
+        uint8_t dst[4] = {};
+        circular_write(buf, 16, 14, src, 4);  // Wrap-around write
+        circular_read(buf, 16, 14, dst, 4);   // Wrap-around read
+        return dst[0] == 1 && dst[1] == 2 && dst[2] == 3 && dst[3] == 4;
+    }
+    static_assert(test_circular_constexpr(), "circular_* functions must be constexpr");
 }
 
 // ============================================================================
 // Section 3: Shared memory batch types (from shm_types.hpp)
 // ============================================================================
 
-// Frame descriptor (9 bytes packed)
-#pragma pack(push, 1)
+// Frame descriptor (8 bytes - exact cache line fit)
+// Opcode moved to ShmBatchHeader (batch-wide, all frames in batch have same opcode)
 struct ShmFrameDesc {
     uint32_t payload_start;   // Offset from ssl_data start to payload
     uint32_t payload_len;     // Payload length
-    uint8_t  opcode;          // WebSocket opcode
 };
-#pragma pack(pop)
-static_assert(sizeof(ShmFrameDesc) == 9);
+static_assert(sizeof(ShmFrameDesc) == 8, "ShmFrameDesc must be 8 bytes");
+static_assert(CACHE_LINE_SIZE % sizeof(ShmFrameDesc) == 0, "ShmFrameDesc must fit exactly in cache line");
+
+// Descriptors per cache line and bit-shift constants for fast addressing
+constexpr size_t DESCS_PER_CLS = CACHE_LINE_SIZE / sizeof(ShmFrameDesc);  // 64/8 = 8
+constexpr size_t DESCS_PER_CLS_SHIFT = 3;   // 8 = 2^3, for >> division
+constexpr size_t DESCS_PER_CLS_MASK = DESCS_PER_CLS - 1;  // 0x7, for & modulo
+constexpr size_t CLS_SHIFT = 6;             // 64 = 2^6, for << multiplication
+
+static_assert(DESCS_PER_CLS == (1 << DESCS_PER_CLS_SHIFT), "DESCS_PER_CLS_SHIFT mismatch");
+static_assert(CACHE_LINE_SIZE == (1 << CLS_SHIFT), "CLS_SHIFT mismatch");
 
 // Number of frame descriptors that fit in header's reserved space
-// 64-byte CLS: (64-3)/9 = 6 frames, 128-byte CLS: (128-3)/9 = 13 frames
-constexpr size_t EMBEDDED_FRAMES = (CACHE_LINE_SIZE - 3) / sizeof(ShmFrameDesc);
+// Header has: ssl_data_len_in_CLS(2) + frame_count(2) + opcode(1) + padding(3) = 8 bytes
+// 64-byte CLS: (64-8)/8 = 7 frames, 128-byte CLS: (128-8)/8 = 15 frames
+constexpr size_t EMBEDDED_FRAMES = (CACHE_LINE_SIZE - 8) / sizeof(ShmFrameDesc);
+static_assert(EMBEDDED_FRAMES > 0, "CACHE_LINE_SIZE too small for embedded frames");
+static_assert(EMBEDDED_FRAMES * sizeof(ShmFrameDesc) <= CACHE_LINE_SIZE - 8,
+              "Embedded frames exceed batch header capacity");
 
 // Batch format for RX buffer entries:
 // Case 1 (≤EMBEDDED_FRAMES): [ShmBatchHeader with embedded descs: CLS][raw_ssl_data padded: N*CLS]
@@ -173,27 +215,28 @@ constexpr size_t EMBEDDED_FRAMES = (CACHE_LINE_SIZE - 3) / sizeof(ShmFrameDesc);
 struct alignas(CACHE_LINE_SIZE) ShmBatchHeader {
     uint16_t ssl_data_len_in_CLS;  // SSL data length in cache line units
     uint16_t frame_count;          // Total number of WebSocket frames (up to 65535)
-    ShmFrameDesc embedded[EMBEDDED_FRAMES];  // First 6 (or 13) frames embedded here
-    uint8_t  padding[CACHE_LINE_SIZE - 4 - EMBEDDED_FRAMES * sizeof(ShmFrameDesc)];
+    uint8_t  opcode;               // WebSocket opcode (batch-wide, same for all frames)
+    uint8_t  padding[3];           // Align to 8 bytes
+    ShmFrameDesc embedded[EMBEDDED_FRAMES];  // First 7 (or 15) frames embedded here
 };
-static_assert(sizeof(ShmBatchHeader) == CACHE_LINE_SIZE);
+static_assert(sizeof(ShmBatchHeader) == CACHE_LINE_SIZE, "ShmBatchHeader must be exactly one cache line");
 
-// Helper functions
-inline uint16_t bytes_to_cls(size_t bytes) {
+// Helper functions (constexpr for compile-time evaluation when args are constant)
+constexpr uint16_t bytes_to_cls(size_t bytes) {
     return static_cast<uint16_t>((bytes + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE);
 }
 
-inline size_t cls_to_bytes(uint16_t cls) {
+constexpr size_t cls_to_bytes(uint16_t cls) {
     return static_cast<size_t>(cls) * CACHE_LINE_SIZE;
 }
 
 // Number of overflow frames (frames beyond what fits in header)
-inline uint16_t overflow_frame_count(uint16_t frame_count) {
-    return (frame_count > EMBEDDED_FRAMES) ? (frame_count - EMBEDDED_FRAMES) : 0;
+constexpr uint16_t overflow_frame_count(uint16_t frame_count) {
+    return (frame_count > EMBEDDED_FRAMES) ? (frame_count - static_cast<uint16_t>(EMBEDDED_FRAMES)) : 0;
 }
 
 // Size of overflow descriptor region (cache-line padded), 0 if all fit in header
-inline size_t overflow_descs_size(uint16_t frame_count) {
+constexpr size_t overflow_descs_size(uint16_t frame_count) {
     uint16_t overflow = overflow_frame_count(frame_count);
     if (overflow == 0) return 0;
     size_t raw = overflow * sizeof(ShmFrameDesc);
@@ -201,7 +244,7 @@ inline size_t overflow_descs_size(uint16_t frame_count) {
 }
 
 // Total batch size
-inline size_t batch_total_size(uint16_t ssl_cls, uint16_t frame_count) {
+constexpr size_t batch_total_size(uint16_t ssl_cls, uint16_t frame_count) {
     return sizeof(ShmBatchHeader) + cls_to_bytes(ssl_cls) + overflow_descs_size(frame_count);
 }
 
@@ -257,7 +300,7 @@ struct SplitRegion {
     uint8_t* ptr2;
     size_t   len2;
 
-    size_t total() const { return len1 + len2; }
+    constexpr size_t total() const { return len1 + len2; }
 };
 
 // ============================================================================
@@ -278,6 +321,16 @@ struct HftShmRingBuffer {
     static constexpr bool is_private = (Mode == HftShmAllocMode::Private);
     static constexpr bool uses_runtime_path = (Mode == HftShmAllocMode::SharedRuntimePath);
     static constexpr bool is_rx = (Role == HftShmBufferRole::Producer);
+
+    // Compile-time validation
+    static_assert(!(is_private && uses_runtime_path),
+                  "Cannot be both private and use runtime path");
+    static_assert(Mode == HftShmAllocMode::Private || Mode == HftShmAllocMode::SharedRuntimePath,
+                  "Invalid HftShmAllocMode");
+    static_assert(Mode != HftShmAllocMode::Private || Capacity > 0,
+                  "Private mode requires non-zero Capacity template parameter");
+    static_assert(Mode != HftShmAllocMode::Private || IsPowerOfTwo<Capacity>::value,
+                  "Private mode Capacity must be power of 2");
 
     HftShmRingBuffer() = default;
     ~HftShmRingBuffer() { cleanup(); }
@@ -508,7 +561,12 @@ struct HftShmRingBuffer {
     inline size_t writable() const {
         int64_t w = write_seq_->load(std::memory_order_relaxed);
         int64_t r = read_seq_->load(std::memory_order_acquire);
-        return static_cast<size_t>(index_mask_ + 1) - static_cast<size_t>(w - r);
+        if constexpr (Mode == HftShmAllocMode::Private) {
+            // Compile-time constant for Private mode
+            return CapacityTraits<Capacity>::SIZE - static_cast<size_t>(w - r);
+        } else {
+            return static_cast<size_t>(index_mask_ + 1) - static_cast<size_t>(w - r);
+        }
     }
 
     SplitRegion next_write_regions(size_t* total_available = nullptr) {
@@ -621,15 +679,41 @@ struct HftShmRingBuffer {
     const uint8_t* buffer() const { return buffer_; }
     uint8_t* buffer_base() { return buffer_; }
     const uint8_t* buffer_base() const { return buffer_; }
-    size_t capacity() const { return data_size_; }
-    size_t buffer_capacity() const { return index_mask_ + 1; }
-    uint32_t index_mask() const { return index_mask_; }
+    size_t capacity() const {
+        if constexpr (Mode == HftShmAllocMode::Private) {
+            return Capacity;  // Compile-time constant
+        } else {
+            return data_size_;
+        }
+    }
+    size_t buffer_capacity() const {
+        if constexpr (Mode == HftShmAllocMode::Private) {
+            return Capacity;  // Compile-time constant
+        } else {
+            return index_mask_ + 1;
+        }
+    }
+    uint32_t index_mask() const {
+        if constexpr (Mode == HftShmAllocMode::Private) {
+            return CapacityTraits<Capacity>::INDEX_MASK;  // Compile-time constant
+        } else {
+            return index_mask_;
+        }
+    }
 
     size_t current_write_pos() const {
-        return static_cast<size_t>(write_seq_->load(std::memory_order_relaxed)) & index_mask_;
+        if constexpr (Mode == HftShmAllocMode::Private) {
+            return static_cast<size_t>(write_seq_->load(std::memory_order_relaxed)) & CapacityTraits<Capacity>::INDEX_MASK;
+        } else {
+            return static_cast<size_t>(write_seq_->load(std::memory_order_relaxed)) & index_mask_;
+        }
     }
     size_t current_read_pos() const {
-        return static_cast<size_t>(read_seq_->load(std::memory_order_relaxed)) & index_mask_;
+        if constexpr (Mode == HftShmAllocMode::Private) {
+            return static_cast<size_t>(read_seq_->load(std::memory_order_relaxed)) & CapacityTraits<Capacity>::INDEX_MASK;
+        } else {
+            return static_cast<size_t>(read_seq_->load(std::memory_order_relaxed)) & index_mask_;
+        }
     }
     size_t write_pos() const {
         return static_cast<size_t>(write_seq_->load(std::memory_order_acquire));
@@ -736,15 +820,18 @@ private:
 #endif
     }
 
-    void* header_ = nullptr;
-    void* data_ = nullptr;
-    uint8_t* buffer_ = nullptr;
+    // HOT members - frequently accessed in read/write paths (same cache line)
+    alignas(64) uint8_t* buffer_ = nullptr;
     std::atomic<int64_t>* write_seq_ = nullptr;
     std::atomic<int64_t>* read_seq_ = nullptr;
     std::atomic<bool>* dirty_flag_ = nullptr;
-    size_t header_size_ = 0;
-    size_t data_size_ = 0;
     uint32_t index_mask_ = 0;
+    size_t data_size_ = 0;
+
+    // COLD members - accessed only during init/cleanup (separate cache line)
+    alignas(64) void* header_ = nullptr;
+    void* data_ = nullptr;
+    size_t header_size_ = 0;
     int header_fd_ = -1;
     int data_fd_ = -1;
     bool is_private_ = false;
@@ -780,3 +867,55 @@ using RingBuffer16MB = PrivateRingBuffer<1u << 24>;
 // Legacy template alias for backward compatibility
 template<size_t Capacity>
 using RingBuffer = PrivateRingBuffer<Capacity>;
+
+// ============================================================================
+// Section 8: NullBuffer - No-op buffer policy (TX disabled at compile-time)
+// ============================================================================
+
+/**
+ * NullBuffer - A no-op buffer policy that discards all writes and returns empty reads.
+ *
+ * Use as TxBufferPolicy to disable TX outbox at compile-time:
+ *   using ShmWebSocketClientRxOnly = WebSocketClient<
+ *       SSLPolicy, TransportPolicy, ShmRxBuffer, NullBuffer
+ *   >;
+ *
+ * When used:
+ * - write_ptr() returns nullptr (no buffer)
+ * - writable() returns 0 (cannot write)
+ * - readable() returns 0 (nothing to read)
+ * - All commit operations are no-ops
+ * - drain_tx_buffer() becomes compile-time eliminated
+ *
+ * Benefits:
+ * - Zero memory allocation for TX buffer
+ * - Zero runtime overhead (all operations are constexpr no-ops)
+ * - Compiler eliminates TX codepaths via `if constexpr`
+ */
+struct NullBuffer {
+    // Policy traits - detected by WebSocketClient
+    static constexpr bool is_hftshm = false;
+    static constexpr bool is_private = true;
+    static constexpr bool is_null_buffer = true;  // Used for tx_outbox_supported detection
+
+    // No-op initialization
+    constexpr void init([[maybe_unused]] const char* path = nullptr) {}
+    constexpr void init_private() {}
+    constexpr void init_external([[maybe_unused]] void* buffer, [[maybe_unused]] size_t size) {}
+
+    // Write operations - discard all data
+    constexpr size_t writable() const { return 0; }
+    constexpr uint8_t* write_ptr() { return nullptr; }
+    constexpr void commit_write([[maybe_unused]] size_t len) {}
+
+    // Read operations - always empty
+    constexpr size_t readable() const { return 0; }
+    constexpr const uint8_t* next_read_region(size_t* len) const {
+        if (len) *len = 0;
+        return nullptr;
+    }
+    constexpr void commit_read([[maybe_unused]] size_t len) {}
+
+    // Capacity - zero
+    constexpr size_t buffer_capacity() const { return 0; }
+};

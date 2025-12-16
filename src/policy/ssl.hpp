@@ -1287,6 +1287,84 @@ using WolfSSLPolicy = websocket::ssl::WolfSSLPolicy;
 #endif
 
 // ============================================================================
+// NoSSLPolicy - Pass-through (no encryption)
+// ============================================================================
+// For use with SimulatorTransport where data is already decrypted in recordings
+namespace websocket { namespace ssl {
+
+/**
+ * NoSSLPolicy - Pass-through policy for unencrypted transports
+ *
+ * Used with SimulatorTransport where data is already decrypted.
+ * All reads/writes are passed directly to the transport layer.
+ */
+struct NoSSLPolicy {
+    NoSSLPolicy() = default;
+    ~NoSSLPolicy() = default;
+
+    // Prevent copying
+    NoSSLPolicy(const NoSSLPolicy&) = delete;
+    NoSSLPolicy& operator=(const NoSSLPolicy&) = delete;
+
+    // Allow moving
+    NoSSLPolicy(NoSSLPolicy&&) noexcept = default;
+    NoSSLPolicy& operator=(NoSSLPolicy&&) noexcept = default;
+
+    void init() {
+        // No SSL context needed
+    }
+
+    // BSD socket handshake (no-op for NoSSL)
+    void handshake(int fd) {
+        (void)fd;
+        // No handshake needed
+    }
+
+    // Userspace transport handshake - store transport pointer
+    template<typename TransportPolicy>
+    void handshake_userspace_transport(TransportPolicy* transport) {
+        transport_ = static_cast<void*>(transport);
+        recv_fn_ = [](void* tp, void* buf, size_t len) -> ssize_t {
+            return static_cast<TransportPolicy*>(tp)->recv(buf, len);
+        };
+        send_fn_ = [](void* tp, const void* buf, size_t len) -> ssize_t {
+            return static_cast<TransportPolicy*>(tp)->send(buf, len);
+        };
+    }
+
+    ssize_t read(void* buf, size_t len) {
+        if (!transport_ || !recv_fn_) {
+            errno = ENOTCONN;
+            return -1;
+        }
+        return recv_fn_(transport_, buf, len);
+    }
+
+    ssize_t write(const void* buf, size_t len) {
+        if (!transport_ || !send_fn_) {
+            errno = ENOTCONN;
+            return -1;
+        }
+        return send_fn_(transport_, buf, len);
+    }
+
+    bool ktls_enabled() const { return false; }
+    int get_fd() const { return -1; }
+    int pending() const { return 0; }  // No SSL buffering
+    void shutdown() { transport_ = nullptr; }
+    void cleanup() { transport_ = nullptr; }
+
+private:
+    void* transport_ = nullptr;
+    ssize_t (*recv_fn_)(void*, void*, size_t) = nullptr;
+    ssize_t (*send_fn_)(void*, const void*, size_t) = nullptr;
+};
+
+}}  // namespace websocket::ssl
+
+using NoSSLPolicy = websocket::ssl::NoSSLPolicy;
+
+// ============================================================================
 // SSL Policy Concepts (C++20)
 // ============================================================================
 

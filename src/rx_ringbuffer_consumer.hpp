@@ -12,8 +12,8 @@
 
 // Debug printing - enable with -DDEBUG
 #ifdef DEBUG
-#define DEBUG_PRINT(...) printf(__VA_ARGS__)
-#define DEBUG_FPRINTF(...) fprintf(__VA_ARGS__)
+#define DEBUG_PRINT(...) do { printf(__VA_ARGS__); fflush(stdout); } while(0)
+#define DEBUG_FPRINTF(...) do { fprintf(__VA_ARGS__); fflush(stderr); } while(0)
 #else
 #define DEBUG_PRINT(...) ((void)0)
 #define DEBUG_FPRINTF(...) ((void)0)
@@ -54,10 +54,6 @@ public:
         if (message_batch_) {
             delete[] message_batch_;
             message_batch_ = nullptr;
-        }
-        if (overflow_copy_) {
-            delete[] overflow_copy_;
-            overflow_copy_ = nullptr;
         }
         if (payload_copy_) {
             delete[] payload_copy_;
@@ -159,6 +155,12 @@ public:
         if (!message_batch_) {
             message_batch_ = new MessageInfo[256];
             message_batch_capacity_ = 256;
+        }
+
+        // Pre-allocate payload copy buffer (max possible = buffer capacity)
+        // Eliminates dynamic allocation in hot path
+        if (!payload_copy_) {
+            payload_copy_ = new uint8_t[buffer_capacity_];
         }
     }
 
@@ -274,18 +276,9 @@ private:
             return 0;
         }
 
-        // Check if header wraps around buffer boundary
-        const ShmBatchHeader* hdr;
-        ShmBatchHeader hdr_copy;
-        if (read_pos + sizeof(ShmBatchHeader) <= capacity) {
-            // No wrap - direct pointer (common case)
-            hdr = reinterpret_cast<const ShmBatchHeader*>(buffer_ + read_pos);
-        } else {
-            // Header wraps - must copy (rare)
-            circular_read(buffer_, capacity, read_pos,
-                          reinterpret_cast<uint8_t*>(&hdr_copy), sizeof(ShmBatchHeader));
-            hdr = &hdr_copy;
-        }
+        // Header is always CLS-aligned (producer writes at CLS boundaries)
+        // sizeof(ShmBatchHeader) = 1 CLS, so header never wraps within itself
+        const ShmBatchHeader* hdr = reinterpret_cast<const ShmBatchHeader*>(buffer_ + read_pos);
 
         // Validate header
         if (hdr->ssl_data_len_in_CLS == 0 || hdr->frame_count == 0) {
@@ -309,38 +302,28 @@ private:
             return 0;
         }
 
-        // Direct pointer to embedded descriptors (inside header, no copy)
-        const ShmFrameDesc* embedded_descs = hdr->embedded;
-
-        // Overflow descriptors: direct pointer if no wrap, copy only if wrapping
-        uint16_t overflow_count = overflow_frame_count(hdr->frame_count);
-        const ShmFrameDesc* overflow_descs = nullptr;
-
-        if (overflow_count > 0) {
-            size_t overflow_pos = (read_pos + sizeof(ShmBatchHeader) + padded_ssl_len) & index_mask_;
-            size_t overflow_bytes = overflow_count * sizeof(ShmFrameDesc);
-
-            if (overflow_pos + overflow_bytes <= capacity) {
-                // No wrap - direct pointer (common case)
-                overflow_descs = reinterpret_cast<const ShmFrameDesc*>(buffer_ + overflow_pos);
-            } else {
-                // Wraps around buffer boundary - must copy (rare)
-                ensure_overflow_capacity(overflow_count);
-                circular_read(buffer_, capacity, overflow_pos,
-                              reinterpret_cast<uint8_t*>(overflow_copy_), overflow_bytes);
-                overflow_descs = overflow_copy_;
-            }
-        }
-
         // Build message batch - direct access to descriptors
+        // Opcode is batch-wide (from header), same for all frames in batch
         size_t ssl_data_pos = (read_pos + sizeof(ShmBatchHeader)) & index_mask_;
+        size_t overflow_pos = (read_pos + sizeof(ShmBatchHeader) + padded_ssl_len) & index_mask_;
+        uint8_t batch_opcode = hdr->opcode;  // Single opcode for all frames
         ensure_batch_capacity(hdr->frame_count);
         size_t payload_copy_offset = 0;
 
         for (uint16_t i = 0; i < hdr->frame_count; i++) {
-            const ShmFrameDesc* desc = (i < EMBEDDED_FRAMES)
-                ? &embedded_descs[i]
-                : &overflow_descs[i - EMBEDDED_FRAMES];
+            const ShmFrameDesc* desc;
+            if (i < EMBEDDED_FRAMES) {
+                // Embedded descriptors: direct pointer into header
+                desc = &hdr->embedded[i];
+            } else {
+                // Overflow: use CLS-by-CLS addressing (each CLS holds 8 descriptors)
+                // No copy needed - just locate the correct CLS and index within
+                uint16_t overflow_idx = i - static_cast<uint16_t>(EMBEDDED_FRAMES);
+                size_t cls_idx = overflow_idx >> DESCS_PER_CLS_SHIFT;  // / 8
+                size_t cls_pos = (overflow_pos + (cls_idx << CLS_SHIFT)) & index_mask_;  // * 64, wrap
+                const ShmFrameDesc* cls_ptr = reinterpret_cast<const ShmFrameDesc*>(buffer_ + cls_pos);
+                desc = &cls_ptr[overflow_idx & DESCS_PER_CLS_MASK];  // % 8
+            }
 
             // Bounds check
             if (desc->payload_start + desc->payload_len > padded_ssl_len) {
@@ -357,18 +340,18 @@ private:
                     buffer_ + payload_pos,
                     desc->payload_len,
                     0,
-                    desc->opcode
+                    batch_opcode  // Same for all frames in batch
                 };
             } else {
                 // Payload wraps - must copy to contiguous buffer (rare)
-                ensure_payload_capacity(payload_copy_offset + desc->payload_len);
+                // payload_copy_ pre-allocated to buffer_capacity_ in init()
                 circular_read(buffer_, capacity, payload_pos,
                               payload_copy_ + payload_copy_offset, desc->payload_len);
                 message_batch_[i] = {
                     payload_copy_ + payload_copy_offset,
                     desc->payload_len,
                     0,
-                    desc->opcode
+                    batch_opcode  // Same for all frames in batch
                 };
                 payload_copy_offset += desc->payload_len;
             }
@@ -397,23 +380,6 @@ private:
         }
     }
 
-    void ensure_overflow_capacity(size_t needed) {
-        if (needed > overflow_copy_capacity_) {
-            delete[] overflow_copy_;
-            overflow_copy_capacity_ = needed * 2;
-            overflow_copy_ = new ShmFrameDesc[overflow_copy_capacity_];
-        }
-    }
-
-    void ensure_payload_capacity(size_t needed) {
-        if (needed > payload_copy_capacity_) {
-            delete[] payload_copy_;
-            size_t new_cap = needed * 2;
-            payload_copy_capacity_ = (new_cap < 65536) ? 65536 : new_cap;
-            payload_copy_ = new uint8_t[payload_copy_capacity_];
-        }
-    }
-
     // hft-shm mmap state
     int header_fd_ = -1;
     int data_fd_ = -1;
@@ -435,9 +401,6 @@ private:
     // Batch processing state
     MessageInfo* message_batch_ = nullptr;
     size_t message_batch_capacity_ = 0;
-    ShmFrameDesc* overflow_copy_ = nullptr;
-    size_t overflow_copy_capacity_ = 0;
-    uint8_t* payload_copy_ = nullptr;
-    size_t payload_copy_capacity_ = 0;
+    uint8_t* payload_copy_ = nullptr;  // Pre-allocated to buffer_capacity_ in init()
     volatile bool running_ = false;
 };

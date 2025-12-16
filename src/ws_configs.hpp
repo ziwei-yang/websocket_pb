@@ -317,6 +317,7 @@ static_assert(FdBasedTransportConcept<DefaultTransportPolicy>,
 
 // WebSocket client with shared memory RX (runtime path)
 // Constructor takes shmem path, on_messages callback is DISABLED
+// Debug traffic: enabled when compiled with -DDEBUG
 using ShmWebSocketClient = WebSocketClient<
     DefaultSSLPolicy,
     DefaultTransportPolicy,
@@ -324,13 +325,47 @@ using ShmWebSocketClient = WebSocketClient<
     RingBuffer<2 * 1024 * 1024>     // 2MB private TX
 >;
 
+// RX-only client - TX outbox completely disabled at compile-time (NullBuffer)
+// Use when no TX functionality needed (receive-only mode)
+// Subscription messages handled internally via set_on_connect callback
+using ShmWebSocketClientRxOnly = WebSocketClient<
+    DefaultSSLPolicy,
+    DefaultTransportPolicy,
+    ShmRxBuffer,                    // Runtime shm RX (path via constructor)
+    NullBuffer                      // TX disabled at compile-time
+>;
+
 // Default private buffer client (2MB RX/TX)
 // on_messages callback is ENABLED - use for direct message processing
+// Debug traffic: enabled when compiled with -DDEBUG
 using PrivateWebSocketClient = WebSocketClient<
     DefaultSSLPolicy,
     DefaultTransportPolicy,
     RingBuffer<2 * 1024 * 1024>,    // 2MB private RX
     RingBuffer<2 * 1024 * 1024>     // 2MB private TX
+>;
+
+// ============================================================================
+// Simulator Replay Client (for testing with recorded traffic)
+// ============================================================================
+// Replays traffic from debug_traffic.dat files recorded with enable_debug_traffic()
+//
+// Usage:
+//   SimulatorReplayClient client;
+//   client.transport().open_file("debug_traffic.dat");
+//   client.set_message_callback([](const MessageInfo* msgs, size_t n, const timing_record_t&) {
+//       // Process replayed messages
+//       return true;
+//   });
+//   client.connect("", 0, "");  // Dummy connect (no real connection)
+//   client.run(nullptr);  // Process all recorded traffic
+//
+// Note: Uses NoSSLPolicy since recorded data is already decrypted
+using SimulatorReplayClient = WebSocketClient<
+    NoSSLPolicy,                          // Data already decrypted in recording
+    websocket::transport::SimulatorTransport,
+    RingBuffer<4 * 1024 * 1024>,          // 4MB private RX buffer
+    NullBuffer                             // No TX needed (replay mode)
 >;
 
 #endif // __linux__

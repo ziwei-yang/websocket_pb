@@ -12,7 +12,7 @@
 
 // Debug printing - enable with -DDEBUG
 #ifdef DEBUG
-#define DEBUG_PRINT(...) printf(__VA_ARGS__)
+#define DEBUG_PRINT(...) do { printf(__VA_ARGS__); fflush(stdout); } while(0)
 #else
 #define DEBUG_PRINT(...) ((void)0)
 #endif
@@ -131,10 +131,11 @@ int run_producer() {
     printf("[Producer] Starting WebSocket client...\n");
     printf("[Producer] Path: %s\n\n", RX_SHM_PATH);
 
-    // Use ShmWebSocketClient with runtime path
-    ShmWebSocketClient client(RX_SHM_PATH);
+    // Use RX-only client - no TX outbox needed (subscription handled internally)
+    // Debug traffic: compile with -DDEBUG for debug_traffic_*.dat recording
+    ShmWebSocketClientRxOnly client(RX_SHM_PATH);
 
-    // Enable debug traffic recording for debugging stuck issues
+    // Enable debug traffic recording (only functional in DEBUG builds)
     client.enable_debug_traffic("debug_traffic.dat");
 
     // Set stop flag for graceful Ctrl+C handling
