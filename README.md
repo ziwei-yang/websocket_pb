@@ -108,14 +108,12 @@ src/
 │   ├── event.hpp              # Epoll/IoUring/Kqueue/Select policies
 │   ├── transport.hpp          # BSD socket transport
 │   ├── simulator_transport.hpp    # Traffic replay transport
-│   ├── userspace_transport_bio.hpp # OpenSSL BIO for XDP
-│   └── xdp_event_policy.hpp   # XDP-specific event policy
+│   └── userspace_transport_bio.hpp # OpenSSL BIO for XDP
 ├── transport/
 │   └── bsd_socket.hpp         # BSD socket wrapper
 ├── xdp/                       # AF_XDP kernel bypass
 │   ├── xdp_transport.hpp      # XDP transport policy
 │   ├── xdp_frame.hpp          # Zero-copy frame handling
-│   ├── xdp_event.hpp          # XDP epoll-based event loop
 │   └── bpf_loader.hpp         # eBPF program loader
 └── stack/                     # Userspace TCP/IP (for XDP)
     ├── userspace_stack.hpp
@@ -157,7 +155,6 @@ The library uses compile-time policy composition for maximum flexibility and zer
 | `IoUringPolicy` | Linux 5.1+ | Async I/O, reduced syscalls |
 | `KqueuePolicy` | macOS/BSD | Edge-cleared, similar to epoll |
 | `SelectPolicy` | All | Maximum compatibility fallback |
-| `XDPEventPolicy` | Linux | XDP-specific epoll wrapper |
 
 #### Buffer Policies (`ringbuffer.hpp`)
 | Policy | Description | on_messages callback |
