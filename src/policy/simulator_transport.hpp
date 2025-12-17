@@ -26,6 +26,13 @@
 #include <cstring>
 #include <type_traits>
 
+// Debug printing - enable with -DDEBUG
+#ifdef DEBUG
+#define DEBUG_PRINT(...) do { printf(__VA_ARGS__); fflush(stdout); } while(0)
+#else
+#define DEBUG_PRINT(...) ((void)0)
+#endif
+
 namespace websocket {
 namespace transport {
 
@@ -214,10 +221,20 @@ struct SimulatorTransport {
      *
      * In simulator, returns immediately if more data in file.
      * Returns 0 (timeout) if no more data.
+     *
+     * IMPORTANT: Sets connected_ = false when no file or EOF to ensure
+     * event loop exits even if is_replay_mode detection fails.
      */
     int wait() {
-        if (!fp_ || feof(fp_)) {
-            return 0;  // No more data
+        if (!fp_) {
+            DEBUG_PRINT("[SimulatorTransport::wait] fp_ is nullptr - call open_file() first!\n");
+            connected_ = false;  // Force disconnection to exit event loop
+            return 0;  // File not opened
+        }
+        if (feof(fp_)) {
+            DEBUG_PRINT("[SimulatorTransport::wait] EOF reached after %lu RX records\n", rx_count_);
+            connected_ = false;  // Force disconnection to exit event loop
+            return 0;  // End of file
         }
         return 1;  // Data available
     }
@@ -233,6 +250,10 @@ struct SimulatorTransport {
 
     int get_ready_fd() const {
         return get_fd();  // Always returns -1
+    }
+
+    bool is_error() const {
+        return !fp_;  // Error if file not opened
     }
 
     void* get_transport_ptr() {

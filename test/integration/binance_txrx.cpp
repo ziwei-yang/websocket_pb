@@ -147,10 +147,10 @@ int run_producer() {
         count = 1;
     });
 
-    // Set on_close handler - return true to auto-reconnect
+    // Set on_close handler - return false to NOT reconnect (for testing timeout detection)
     client.set_on_close([]() -> bool {
-        printf("[Producer] Connection closed by server, reconnecting...\n");
-        return false;  // Auto-reconnect
+        printf("[Producer] Connection closed, NOT reconnecting\n");
+        return false;  // Do NOT reconnect - let the program exit
     });
 
     printf("[Producer] Connecting to Binance...\n");

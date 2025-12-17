@@ -277,6 +277,14 @@ struct BSDSocketTransport {
         return event_.get_ready_fd();
     }
 
+    /**
+     * Check if last wait() detected socket error (EPOLLHUP/EPOLLERR)
+     * Call after wait() returns > 0 to detect peer disconnect
+     */
+    bool is_error() const {
+        return event_.has_error();
+    }
+
     // =========================================================================
     // SSL integration (TransportPolicy interface)
     // =========================================================================

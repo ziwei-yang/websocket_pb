@@ -92,44 +92,80 @@ client.run([](const uint8_t* data, size_t len, const timing_record_t& timing) {
 
 ## Architecture
 
-### Source Structure
+### Source Structure (~7,400 lines of code)
 ```
 src/
-├── websocket.hpp          # Main WebSocketClient template
-├── ws_policies.hpp        # Policy type definitions
-├── ws_configs.hpp         # Pre-configured client types
-├── ringbuffer.hpp         # Unified buffer implementations (8 sections)
+├── websocket.hpp              # Main WebSocketClient template
+├── ws_policies.hpp            # Policy type definitions & C++20 concepts
+├── ws_configs.hpp             # Pre-configured client types
+├── ringbuffer.hpp             # Unified buffer implementations
+├── rx_ringbuffer_consumer.hpp # Standalone shared memory consumer
 ├── core/
-│   ├── http.hpp           # WebSocket frame parsing/building
-│   └── timing.hpp         # RDTSC/hardware timestamp utilities
+│   ├── http.hpp               # WebSocket frame parsing/building
+│   └── timing.hpp             # RDTSC/hardware timestamp utilities
 ├── policy/
-│   ├── ssl.hpp            # OpenSSL/LibreSSL/WolfSSL policies
-│   ├── event.hpp          # Epoll/IoUring/Kqueue/Select policies
-│   ├── transport.hpp      # BSD socket transport
-│   └── userspace_transport_bio.hpp  # OpenSSL BIO for XDP
+│   ├── ssl.hpp                # OpenSSL/LibreSSL/WolfSSL policies
+│   ├── event.hpp              # Epoll/IoUring/Kqueue/Select policies
+│   ├── transport.hpp          # BSD socket transport
+│   ├── simulator_transport.hpp    # Traffic replay transport
+│   ├── userspace_transport_bio.hpp # OpenSSL BIO for XDP
+│   └── xdp_event_policy.hpp   # XDP-specific event policy
 ├── transport/
-│   └── bsd_socket.hpp     # BSD socket wrapper
-├── xdp/                   # AF_XDP kernel bypass
-│   ├── xdp_transport.hpp  # XDP transport policy
-│   ├── xdp_frame.hpp      # Zero-copy frame handling
-│   └── bpf/               # eBPF filter programs
-└── stack/                 # Userspace TCP/IP (for XDP)
+│   └── bsd_socket.hpp         # BSD socket wrapper
+├── xdp/                       # AF_XDP kernel bypass
+│   ├── xdp_transport.hpp      # XDP transport policy
+│   ├── xdp_frame.hpp          # Zero-copy frame handling
+│   ├── xdp_event.hpp          # XDP epoll-based event loop
+│   └── bpf_loader.hpp         # eBPF program loader
+└── stack/                     # Userspace TCP/IP (for XDP)
     ├── userspace_stack.hpp
-    ├── tcp/               # TCP state machine, retransmit
-    ├── ip/                # IP layer, checksum
-    └── mac/               # Ethernet, ARP
+    ├── tcp/                   # TCP state machine, retransmit
+    │   ├── tcp_state.hpp
+    │   ├── tcp_packet.hpp
+    │   └── tcp_retransmit.hpp
+    ├── ip/                    # IP layer, checksum
+    │   ├── ip_layer.hpp
+    │   └── checksum.hpp
+    └── mac/                   # Ethernet, ARP
+        ├── ethernet.hpp
+        └── arp.hpp
 ```
 
 ### Policy-Based Design
-- **SSL Policy**: OpenSSLPolicy, LibreSSLPolicy, WolfSSLPolicy
-- **Transport Policy**: BSDSocketTransport, XDPUserspaceTransport
-- **Event Policy**: EpollPolicy, IoUringPolicy, KqueuePolicy, SelectPolicy
-- **Buffer Policy**: RingBuffer, ShmRingBuffer, HftShmRingBuffer
 
-### Buffer Types (unified in ringbuffer.hpp)
-- **RingBuffer<Capacity>**: Private memory with virtual mirroring (default)
-- **ShmRingBuffer**: Runtime path-based shared memory
-- **HftShmRingBuffer**: Compile-time segment name (C++20, hft-shm compatible)
+The library uses compile-time policy composition for maximum flexibility and zero runtime overhead.
+
+#### SSL Policies (`policy/ssl.hpp`)
+| Policy | Description | kTLS Support |
+|--------|-------------|--------------|
+| `OpenSSLPolicy` | Industry standard, widely deployed | Yes (Linux 4.17+) |
+| `LibreSSLPolicy` | macOS/BSD default, OpenSSL-compatible | No |
+| `WolfSSLPolicy` | Lightweight, optimized for embedded | No |
+| `NoSSLPolicy` | No encryption (for simulator/testing) | N/A |
+
+#### Transport Policies (`policy/transport.hpp`)
+| Policy | Description | Use Case |
+|--------|-------------|----------|
+| `BSDSocketTransport<EventPolicy>` | Kernel TCP/IP stack | Standard deployments |
+| `XDPUserspaceTransport` | AF_XDP zero-copy + userspace TCP/IP | Ultra-low latency HFT |
+| `SimulatorTransport` | Replay recorded traffic from file | Testing, benchmarking |
+
+#### Event Policies (`policy/event.hpp`)
+| Policy | Platform | Description |
+|--------|----------|-------------|
+| `EpollPolicy` | Linux | Edge-triggered, O(1), sub-μs latency |
+| `IoUringPolicy` | Linux 5.1+ | Async I/O, reduced syscalls |
+| `KqueuePolicy` | macOS/BSD | Edge-cleared, similar to epoll |
+| `SelectPolicy` | All | Maximum compatibility fallback |
+| `XDPEventPolicy` | Linux | XDP-specific epoll wrapper |
+
+#### Buffer Policies (`ringbuffer.hpp`)
+| Policy | Description | on_messages callback |
+|--------|-------------|---------------------|
+| `RingBuffer<Capacity>` | Private memory with virtual mirroring | Enabled |
+| `ShmRxBuffer` | Runtime path-based shared memory (producer) | Disabled |
+| `ShmTxBuffer` | Runtime path-based shared memory (consumer) | Disabled |
+| `NullBuffer` | No-op buffer (disable TX) | N/A |
 
 All buffer types use the same batch format: `[ShmBatchHeader][ssl_data][ShmFrameDesc[]]`
 
@@ -187,6 +223,41 @@ hft-shm init --config ~/hft.toml
 ./build/binance_txrx -m rx_consumer   # Terminal 2: shm → stdout
 ```
 
+## Traffic Recording & Replay
+
+The library supports recording live traffic and replaying it for testing/benchmarking.
+
+### Recording Traffic (DEBUG builds)
+```cpp
+#include "ws_configs.hpp"
+
+PrivateWebSocketClient client;
+client.enable_debug_traffic("debug_traffic.dat");  // Start recording
+client.connect("stream.binance.com", 443, "/ws/btcusdt@trade");
+client.run([](auto* msgs, size_t n, auto& timing) { /* ... */ });
+// Traffic saved to debug_traffic.dat
+```
+
+### Replaying Traffic
+```cpp
+#include "ws_configs.hpp"
+
+SimulatorReplayClient client;
+client.transport().open_file("debug_traffic.dat");
+client.set_message_callback([](const MessageInfo* msgs, size_t n, const timing_record_t&) {
+    for (size_t i = 0; i < n; i++) {
+        process(msgs[i].payload, msgs[i].len);
+    }
+    return true;
+});
+client.connect("", 0, "");  // Dummy connect (no real connection)
+client.run(nullptr);        // Process all recorded traffic
+```
+
+Traffic file format (32-byte header + payload per record):
+- `SSLR` magic: RX record (received data)
+- `SSLT` magic: TX record (sent data, skipped during replay)
+
 ## Testing
 
 ```bash
@@ -230,16 +301,19 @@ See LICENSE file for details.
 
 ## Status
 
-**Production Ready** - Unified ringbuffer architecture, shared memory IPC, XDP kernel bypass support.
+**Production Ready** - Policy-based architecture with ~7,400 lines of code.
 
-- Unified `ringbuffer.hpp` with 8 sections (RingBuffer, ShmRingBuffer, HftShmRingBuffer)
-- WebSocket fragment reassembly support (HftShm mode)
-- XDP/AF_XDP transport with userspace TCP/IP stack
+Features:
+- Unified `ringbuffer.hpp` with private and shared memory modes
+- WebSocket fragment reassembly support
+- XDP/AF_XDP transport with userspace TCP/IP stack (kernel bypass)
 - Shared memory IPC with hft-shm compatibility
-- C++20 required (for HftShmRingBuffer compile-time segment names)
+- SimulatorTransport for traffic recording and replay
+- C++20 required
 
-Recent fixes:
+Recent changes:
+- Added SimulatorTransport policy for traffic replay testing
+- Unified RingBuffer and ShmRingBuffer into dual-mode support
 - Frame misalignment fix in `try_read_on_timeout()` leftover handling
-- Leftover state reset on disconnect for clean reconnection
 
 Open issues: See `doc/known_issues.md`

@@ -425,17 +425,40 @@ public:
                         connected_ = false;
                         break;
                     }
+                    // Check if transport disconnected (SimulatorTransport sets this on EOF/error)
+                    if (!transport_.is_connected()) {
+                        DEBUG_PRINT("[WS] Transport disconnected, exiting event loop\n");
+                        connected_ = false;
+                        break;
+                    }
+                    // Track consecutive timeouts - detect dead connection
+                    consecutive_timeouts_++;
+                    if (consecutive_timeouts_ >= NO_DATA_TIMEOUT_COUNT) {
+                        DEBUG_PRINT("[WS] No data for %d consecutive timeouts (%d seconds), disconnecting\n",
+                                   consecutive_timeouts_, consecutive_timeouts_);
+                        connected_ = false;
+                        break;
+                    }
                     // Timeout - just handle TX (SSL buffer draining now in recv_into_buffer)
                     send_subscribe_messages();
                     drain_tx_buffer();
                     continue;
                 }
+                // Reset timeout counter on successful wait
+                consecutive_timeouts_ = 0;
 
                 // For BSD sockets: verify ready fd and drain HW timestamps (compile-time dispatch)
                 if constexpr (is_fd_based) {
                     int fd = transport_.get_fd();
                     int ready_fd = transport_.get_ready_fd();
                     if (ready_fd != fd) continue;
+
+                    // Check for socket errors (EPOLLHUP/EPOLLERR) - connection died
+                    if (transport_.is_error()) {
+                        DEBUG_PRINT("[WS] Socket error detected (EPOLLHUP/EPOLLERR), disconnecting\n");
+                        connected_ = false;
+                        break;
+                    }
 
                     // Stage 1: Drain hardware RX timestamps from NIC/kernel queue
                     // Only applicable for BSD sockets (XDP has no kernel timestamps)
@@ -1524,6 +1547,10 @@ private:
     uint64_t last_data_frame_ns_ = 0; // Timestamp of last data frame (for flow monitoring)
     uint32_t ping_without_data_count_ = 0; // Count consecutive PINGs without data frames
 #endif
+
+    // Dead connection detection - disconnect after N consecutive timeouts (1 sec each)
+    static constexpr int NO_DATA_TIMEOUT_COUNT = 60;  // 60 seconds without data
+    int consecutive_timeouts_ = 0;
 
     // Subscription messages - populated by on_connect callback, sent automatically
     char subscribe_messages_[128][512];       // Max 128 messages, 512 bytes each
