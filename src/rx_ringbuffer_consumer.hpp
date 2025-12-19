@@ -5,7 +5,7 @@
 // Usage:
 //   RXRingBufferConsumer consumer;
 //   consumer.init("/dev/shm/hft/test.mktdata.binance.raw.rx");
-//   consumer.set_on_messages([](const BatchInfo& batch, const MessageInfo* msgs, size_t n) { ... });
+//   consumer.set_on_messages([](const ShmBatchHeader* hdr, const ShmMessageInfo* msgs) { ... });
 //   consumer.run();  // Blocking busy-poll
 //
 #pragma once
@@ -20,7 +20,6 @@
 #endif
 
 #include "ringbuffer.hpp"
-#include "core/timing.hpp"
 #include <functional>
 #include <cstring>
 #include <atomic>
@@ -31,19 +30,23 @@
 #include <stdexcept>
 #include <string>
 
-// Batch metadata passed to callback
-struct BatchInfo {
-    size_t hdr_size;      // sizeof(ShmBatchHeader)
-    size_t data_size;     // Padded SSL data size
-    size_t tail_size;     // Overflow descriptors size
-    size_t total_size;    // Total batch size
-    uint16_t frame_count; // Number of frames in batch (up to 65535)
+// Simplified message info for RXRingBufferConsumer
+// Contains offset and length relative to SSL data start
+// Consumer must resolve pointer using: ssl_data_ptr + offset
+struct ShmMessageInfo {
+    int32_t offset;  // Offset from SSL data start to payload
+    int32_t len;     // Payload length in bytes
 };
+static_assert(sizeof(ShmMessageInfo) == 8, "ShmMessageInfo must be 8 bytes");
 
 class RXRingBufferConsumer {
 public:
+    // Assembly buffer size for wrapped payloads (2MB fixed)
+    static constexpr size_t ASSEMBLY_BUFFER_SIZE = 2 * 1024 * 1024;
+
     // Callback types
-    using MessageCallback = std::function<void(const BatchInfo&, const MessageInfo*, size_t)>;
+    // New simplified signature: header contains status, frame_count, cpucycle; no separate size_t n
+    using MessageCallback = std::function<void(const ShmBatchHeader*, const ShmMessageInfo*)>;
     using CloseCallback = std::function<void()>;      // Optional
     using ConnectCallback = std::function<void()>;    // Optional
 
@@ -55,9 +58,9 @@ public:
             delete[] message_batch_;
             message_batch_ = nullptr;
         }
-        if (payload_copy_) {
-            delete[] payload_copy_;
-            payload_copy_ = nullptr;
+        if (assembly_buffer_) {
+            delete[] assembly_buffer_;
+            assembly_buffer_ = nullptr;
         }
     }
 
@@ -151,16 +154,16 @@ public:
             read_seq_->store(w, std::memory_order_release);
         }
 
-        // Allocate message batch
+        // Allocate message batch (ShmMessageInfo: 8 bytes each)
         if (!message_batch_) {
-            message_batch_ = new MessageInfo[256];
+            message_batch_ = new ShmMessageInfo[256];
             message_batch_capacity_ = 256;
         }
 
-        // Pre-allocate payload copy buffer (max possible = buffer capacity)
-        // Eliminates dynamic allocation in hot path
-        if (!payload_copy_) {
-            payload_copy_ = new uint8_t[buffer_capacity_];
+        // Pre-allocate assembly buffer for wrapped payloads (fixed 2MB)
+        // Used when a payload spans the buffer wrap-around point
+        if (!assembly_buffer_) {
+            assembly_buffer_ = new uint8_t[ASSEMBLY_BUFFER_SIZE];
         }
     }
 
@@ -280,7 +283,17 @@ private:
         // sizeof(ShmBatchHeader) = 1 CLS, so header never wraps within itself
         const ShmBatchHeader* hdr = reinterpret_cast<const ShmBatchHeader*>(buffer_ + read_pos);
 
-        // Validate header
+        // Handle status-only batch (connection events)
+        // frame_count=0 and ssl_data_len_in_CLS=0 indicates a status-only message
+        if (hdr->is_status_only()) {
+            // Invoke callback with empty message array for status events
+            on_messages_(hdr, nullptr);
+            commit_read(sizeof(ShmBatchHeader));
+            if (out_batch_size) *out_batch_size = sizeof(ShmBatchHeader);
+            return 0;  // No frames, but batch was processed
+        }
+
+        // Validate header for data batches
         if (hdr->ssl_data_len_in_CLS == 0 || hdr->frame_count == 0) {
             commit_read(sizeof(ShmBatchHeader));
             return 0;
@@ -302,23 +315,20 @@ private:
             return 0;
         }
 
-        // Build message batch - direct access to descriptors
-        // Opcode is batch-wide (from header), same for all frames in batch
+        // Build message batch with offsets (ShmMessageInfo)
         size_t ssl_data_pos = (read_pos + sizeof(ShmBatchHeader)) & index_mask_;
         size_t overflow_pos = (read_pos + sizeof(ShmBatchHeader) + padded_ssl_len) & index_mask_;
-        uint8_t batch_opcode = hdr->opcode;  // Single opcode for all frames
         ensure_batch_capacity(hdr->frame_count);
-        size_t payload_copy_offset = 0;
+        size_t assembly_offset = 0;  // Track position in assembly buffer for wrapped payloads
 
         for (uint16_t i = 0; i < hdr->frame_count; i++) {
             const ShmFrameDesc* desc;
-            if (i < EMBEDDED_FRAMES) {
+            if (i < EMBEDDED_FRAME_NUM) {
                 // Embedded descriptors: direct pointer into header
                 desc = &hdr->embedded[i];
             } else {
                 // Overflow: use CLS-by-CLS addressing (each CLS holds 8 descriptors)
-                // No copy needed - just locate the correct CLS and index within
-                uint16_t overflow_idx = i - static_cast<uint16_t>(EMBEDDED_FRAMES);
+                uint16_t overflow_idx = i - static_cast<uint16_t>(EMBEDDED_FRAME_NUM);
                 size_t cls_idx = overflow_idx >> DESCS_PER_CLS_SHIFT;  // / 8
                 size_t cls_pos = (overflow_pos + (cls_idx << CLS_SHIFT)) & index_mask_;  // * 64, wrap
                 const ShmFrameDesc* cls_ptr = reinterpret_cast<const ShmFrameDesc*>(buffer_ + cls_pos);
@@ -335,38 +345,36 @@ private:
 
             // Check if payload wraps around buffer boundary
             if (payload_pos + desc->payload_len <= capacity) {
-                // No wrap - direct pointer (common case, zero-copy)
+                // No wrap - store offset directly (common case)
                 message_batch_[i] = {
-                    buffer_ + payload_pos,
-                    desc->payload_len,
-                    0,
-                    batch_opcode  // Same for all frames in batch
+                    static_cast<int32_t>(desc->payload_start),
+                    static_cast<int32_t>(desc->payload_len)
                 };
             } else {
-                // Payload wraps - must copy to contiguous buffer (rare)
-                // payload_copy_ pre-allocated to buffer_capacity_ in init()
+                // Payload wraps - copy to assembly buffer for contiguous access
+                // Store negative offset to indicate assembly buffer location
                 circular_read(buffer_, capacity, payload_pos,
-                              payload_copy_ + payload_copy_offset, desc->payload_len);
+                              assembly_buffer_ + assembly_offset, desc->payload_len);
+                // Use negative offset to signal "in assembly buffer"
+                // Consumer can detect this and use get_assembly_buffer() + (-offset - 1)
                 message_batch_[i] = {
-                    payload_copy_ + payload_copy_offset,
-                    desc->payload_len,
-                    0,
-                    batch_opcode  // Same for all frames in batch
+                    -static_cast<int32_t>(assembly_offset) - 1,  // Negative = assembly buffer
+                    static_cast<int32_t>(desc->payload_len)
                 };
-                payload_copy_offset += desc->payload_len;
+                assembly_offset += desc->payload_len;
             }
         }
 
-        // Build batch info
-        BatchInfo batch_info = {
-            sizeof(ShmBatchHeader),
-            padded_ssl_len,
-            overflow_size,
-            batch_size,
-            hdr->frame_count
-        };
+        // Set ssl_data_ptr for callback (valid only during callback)
+        size_t ssl_data_start = (read_pos + sizeof(ShmBatchHeader)) & index_mask_;
+        current_ssl_data_ptr_ = buffer_ + ssl_data_start;
 
-        on_messages_(batch_info, message_batch_, hdr->frame_count);
+        // Invoke callback with new signature: (header, messages)
+        // frame_count available from hdr->frame_count
+        on_messages_(hdr, message_batch_);
+
+        // Clear ssl_data_ptr after callback
+        current_ssl_data_ptr_ = nullptr;
         commit_read(batch_size);
         if (out_batch_size) *out_batch_size = batch_size;
         return hdr->frame_count;
@@ -376,7 +384,7 @@ private:
         if (needed > message_batch_capacity_) {
             delete[] message_batch_;
             message_batch_capacity_ = needed * 2;
-            message_batch_ = new MessageInfo[message_batch_capacity_];
+            message_batch_ = new ShmMessageInfo[message_batch_capacity_];
         }
     }
 
@@ -399,8 +407,32 @@ private:
     ConnectCallback on_connect_;
 
     // Batch processing state
-    MessageInfo* message_batch_ = nullptr;
+    ShmMessageInfo* message_batch_ = nullptr;
     size_t message_batch_capacity_ = 0;
-    uint8_t* payload_copy_ = nullptr;  // Pre-allocated to buffer_capacity_ in init()
+    uint8_t* assembly_buffer_ = nullptr;  // Pre-allocated 2MB for wrapped payloads
     volatile bool running_ = false;
+
+public:
+    // Get pointer to SSL data region (valid only during callback)
+    // Use this to resolve offsets: ssl_data_ptr() + msg.offset
+    const uint8_t* ssl_data_ptr() const { return current_ssl_data_ptr_; }
+
+    // Get assembly buffer for wrapped payloads
+    // When msg.offset < 0: payload is at assembly_buffer + (-offset - 1)
+    const uint8_t* get_assembly_buffer() const { return assembly_buffer_; }
+
+    // Helper to resolve payload pointer from ShmMessageInfo
+    // If offset >= 0: pointer is ssl_data_ptr() + offset
+    // If offset < 0: pointer is assembly_buffer + (-offset - 1)
+    const uint8_t* resolve_payload(const ShmMessageInfo& msg) const {
+        if (msg.offset >= 0) {
+            return current_ssl_data_ptr_ + msg.offset;
+        } else {
+            return assembly_buffer_ + static_cast<size_t>(-msg.offset - 1);
+        }
+    }
+
+private:
+    // Current SSL data pointer (valid only during callback)
+    const uint8_t* current_ssl_data_ptr_ = nullptr;
 };

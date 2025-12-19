@@ -207,7 +207,8 @@ struct WebSocketClient {
     using RxBufferPolicy = RxBufferPolicy_;
     using TxBufferPolicy = TxBufferPolicy_;
 
-    // Compile-time detection for TX buffer (RX unified - no branching needed)
+    // Compile-time detection for buffer types
+    static constexpr bool uses_hftshm_rx = RxBufferPolicy_::is_hftshm;
     static constexpr bool uses_hftshm_tx = TxBufferPolicy_::is_hftshm;
 
     // Detect NullBuffer policy (TX disabled at compile-time)
@@ -386,6 +387,10 @@ struct WebSocketClient {
         if (on_connect_) {
             on_connect_(subscribe_messages_, num_subscribe_messages_);
         }
+
+        // Write connection status to RX buffer (for external consumers)
+        // Status: connected (bit0=0), reconnect enabled if on_close is set (bit1)
+        write_status_batch(/*disconnected=*/false, /*reconnect_enabled=*/static_cast<bool>(on_close_));
     }
 
 public:
@@ -500,6 +505,9 @@ public:
             DEBUG_PRINT("[DEBUG] Reconnect disabled in debug mode - analyze debug_traffic.dat\n");
             break;
 #endif
+            // Write disconnect status to RX buffer before potential reconnect
+            write_status_batch(/*disconnected=*/true, /*reconnect_enabled=*/static_cast<bool>(on_close_));
+
             if (on_close_ && on_close_() && (!stop_flag_ || *stop_flag_)) {
                 DEBUG_PRINT("[WS] Reconnecting...\n");
                 // Clean up old connection before reconnecting
@@ -532,7 +540,20 @@ public:
             persistent_frame_count_ = 0;
             deferred_pending_ = false;
             pending_pong_count_ = 0;
-            DEBUG_PRINT("[WS] Disconnected\n");
+#ifdef DEBUG
+            if (connect_time_ns_ > 0) {
+                struct timespec ts_now;
+                clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                uint64_t now_ns = ts_now.tv_sec * 1000000000ULL + ts_now.tv_nsec;
+                uint64_t duration_ns = now_ns - connect_time_ns_;
+                uint64_t duration_sec = duration_ns / 1000000000ULL;
+                uint64_t minutes = duration_sec / 60;
+                uint64_t seconds = duration_sec % 60;
+                DEBUG_PRINT("[WS] Disconnected after %lum %lus\n", minutes, seconds);
+            } else {
+                DEBUG_PRINT("[WS] Disconnected\n");
+            }
+#endif
         }
     }
 
@@ -947,12 +968,12 @@ private:
                             }
 
                             // Write descriptor directly to shm (embedded or overflow)
-                            if (frame_count < EMBEDDED_FRAMES) {
+                            if (frame_count < EMBEDDED_FRAME_NUM) {
                                 embedded[frame_count].payload_start = payload_start;
                                 embedded[frame_count].payload_len = payload_len;
                             } else {
                                 // Overflow region: use bit shifts for fast addressing
-                                size_t overflow_idx = frame_count - EMBEDDED_FRAMES;
+                                size_t overflow_idx = frame_count - EMBEDDED_FRAME_NUM;
                                 if (using_deferred_frame_descs_) {
                                     // Writing to deferred buffer (during deferred state)
                                     deferred_frame_descs_[overflow_idx] = {payload_start, payload_len};
@@ -1004,12 +1025,12 @@ private:
                 }
 
                 // Write descriptor directly to shm (embedded or overflow)
-                if (frame_count < EMBEDDED_FRAMES) {
+                if (frame_count < EMBEDDED_FRAME_NUM) {
                     embedded[frame_count].payload_start = payload_start;
                     embedded[frame_count].payload_len = payload_len;
                 } else {
                     // Overflow region: use bit shifts for fast addressing
-                    size_t overflow_idx = frame_count - EMBEDDED_FRAMES;
+                    size_t overflow_idx = frame_count - EMBEDDED_FRAME_NUM;
                     if (using_deferred_frame_descs_) {
                         // Writing to deferred buffer (during deferred state)
                         deferred_frame_descs_[overflow_idx] = {payload_start, payload_len};
@@ -1161,7 +1182,10 @@ private:
             // Embedded descriptors already written during parsing phase
             hdr->ssl_data_len_in_CLS = ssl_cls;
             hdr->frame_count = frame_count;
-            hdr->opcode = batch_opcode;
+            // Set status byte: connected (bit0=0), reconnect ON (bit1=1 if enabled), text/binary (bit2)
+            hdr->status = (batch_opcode == 0x01 ? SHM_STATUS_TEXT_OPCODE : 0);
+            // TODO: Add reconnect status bit when reconnect feature is detected
+            hdr->cpucycle = rdtscp();  // TSC when batch is ready to commit
 
             // Handle overflow descriptors
             uint16_t overflow_count = overflow_frame_count(frame_count);
@@ -1257,8 +1281,8 @@ private:
 
             // Copy overflow descriptors from shm to deferred buffer (if not already using it)
             // Embedded descriptors stay in shm header - no copy needed
-            if (frame_count > EMBEDDED_FRAMES && !using_deferred_frame_descs_) {
-                uint16_t overflow_count = frame_count - static_cast<uint16_t>(EMBEDDED_FRAMES);
+            if (frame_count > EMBEDDED_FRAME_NUM && !using_deferred_frame_descs_) {
+                uint16_t overflow_count = frame_count - static_cast<uint16_t>(EMBEDDED_FRAME_NUM);
                 size_t padded_ssl_len = cls_to_bytes(bytes_to_cls(ssl_data_len));
                 size_t overflow_pos = (ssl_data_pos + padded_ssl_len) % capacity;
                 circular_read(buffer, capacity, overflow_pos,
@@ -1273,6 +1297,16 @@ private:
                 persistent_accum_len_ = accum_payload_len;
             }
             // data_written_ stays intact - next SSL_read will append
+
+            // Send pending PONGs even when deferring - don't wait for commit
+            // This fixes "Pong timeout" disconnections when PING arrives mid-batch
+            if (pending_pong_count_ > 0) {
+                for (uint8_t i = 0; i < pending_pong_count_; i++) {
+                    send_pong(pending_pong_payloads_[i], pending_pong_lens_[i]);
+                }
+                DEBUG_PRINT("[BATCH-DEFER] Sent %u PONGs before deferring\n", pending_pong_count_);
+                pending_pong_count_ = 0;
+            }
         } else if (all_consumed && frame_count == 0) {
             // Control frames only (e.g., PING) - no data to commit, but all consumed
             // Reset state and send any queued PONGs now
@@ -1490,6 +1524,37 @@ private:
         // No-op when NullBuffer - compile-time eliminated
     }
 
+    // Write a status-only batch to RX buffer (for connection events)
+    // Status-only: frame_count=0, ssl_data_len_in_CLS=0, just status byte
+    // Called on connect (status=0 for connected) and disconnect (status=1 for disconnected)
+    void write_status_batch(bool disconnected, bool reconnect_enabled) {
+        // Only write to RX buffer if it's an hftshm buffer (shared memory)
+        if constexpr (uses_hftshm_rx) {
+            size_t capacity = rx_buffer_.buffer_capacity();
+            size_t writable = rx_buffer_.writable();
+
+            // Need exactly one cache line for status-only header
+            if (writable < sizeof(ShmBatchHeader)) {
+                return;  // No space, skip status update
+            }
+
+            // Get write position and construct header
+            uint8_t* buffer = rx_buffer_.buffer();
+            size_t write_pos = rx_buffer_.current_write_pos();
+            ShmBatchHeader* hdr = reinterpret_cast<ShmBatchHeader*>(buffer + (write_pos % capacity));
+
+            // Set status fields
+            hdr->ssl_data_len_in_CLS = 0;  // No data
+            hdr->frame_count = 0;          // No frames (indicates status-only)
+            hdr->status = (disconnected ? SHM_STATUS_DISCONNECTED : 0) |
+                          (reconnect_enabled ? SHM_STATUS_RECONNECT_ON : 0);
+            hdr->cpucycle = rdtscp();
+
+            // Commit the status-only batch
+            rx_buffer_.commit_write(sizeof(ShmBatchHeader));
+        }
+    }
+
     // Note: Debug traffic recording moved to transport layer (transport_.write_record())
 
     SSLPolicy_ ssl_;
@@ -1522,7 +1587,7 @@ private:
 
     // Deferred commit: overflow frame descriptors from partial batch
     // MAX_FRAMES defined at class level (65535, from ShmBatchHeader::frame_count type)
-    // Only used when frame_count > EMBEDDED_FRAMES AND batch is deferred
+    // Only used when frame_count > EMBEDDED_FRAME_NUM AND batch is deferred
     ShmFrameDesc deferred_frame_descs_[MAX_FRAMES];  // ~512KB always allocated
     bool using_deferred_frame_descs_ = false;  // True when overflow is in deferred buffer
     uint16_t persistent_frame_count_ = 0;

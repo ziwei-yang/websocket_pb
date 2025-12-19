@@ -55,26 +55,37 @@ int run_consumer() {
     int total_messages = 0;
 
     // Set message callback - invoked for each batch of frames
-    consumer.set_on_messages([&](const BatchInfo& batch, const MessageInfo* msgs, size_t n) {
+    // New API: (ShmBatchHeader*, ShmMessageInfo*) - frame_count from header
+    consumer.set_on_messages([&](const ShmBatchHeader* hdr, const ShmMessageInfo* msgs) {
+        // Handle status-only batches (connection events)
+        if (hdr->is_status_only()) {
+            if (hdr->is_connected()) {
+                printf("[Consumer] Connection established (reconnect=%d)\n",
+                       hdr->is_reconnect_enabled());
+            } else {
+                printf("[Consumer] Disconnected\n");
+            }
+            return;
+        }
+
         total_batches++;
 
 #ifdef DEBUG
-        // Print batch header with sizes: Batch[N] Frames X [HDR Y][Data Z][TAIL W]
-        DEBUG_PRINT("Batch[%d] Frames %u [HDR %zu][Data %zu][TAIL %zu]\n",
-               total_batches, batch.frame_count,
-               batch.hdr_size, batch.data_size, batch.tail_size);
+        // Print batch header info
+        DEBUG_PRINT("Batch[%d] Frames %u text=%d cpucycle=%lu\n",
+               total_batches, hdr->frame_count, hdr->is_text(), hdr->cpucycle);
 #else
-        (void)batch;
         (void)msgs;
 #endif
 
-        for (size_t i = 0; i < n; i++) {
+        for (uint16_t i = 0; i < hdr->frame_count; i++) {
             total_messages++;
 
 #ifdef DEBUG
-            const uint8_t* payload = msgs[i].payload;
-            uint32_t len = msgs[i].len;
-            uint8_t opcode = msgs[i].opcode;
+            // Resolve payload pointer from offset
+            const uint8_t* payload = consumer.resolve_payload(msgs[i]);
+            int32_t len = msgs[i].len;
+            uint8_t opcode = hdr->is_text() ? 0x01 : 0x02;
 
             // Print payload (truncated for readability) - use safe bounds
             if (len > 80) {
@@ -82,16 +93,16 @@ int run_consumer() {
                 char start[61] = {0}, end[21] = {0};
                 memcpy(start, payload, 60);
                 memcpy(end, payload + len - 20, 20);
-                DEBUG_PRINT("    [%d] op=%d len=%u: %s .... %s\n",
+                DEBUG_PRINT("    [%d] op=%d len=%d: %s .... %s\n",
                        total_messages, opcode, len, start, end);
             } else if (len > 0) {
                 char tmp[256] = {0};
-                size_t copy_len = (len < 255) ? len : 255;
+                size_t copy_len = (static_cast<size_t>(len) < 255) ? static_cast<size_t>(len) : 255;
                 memcpy(tmp, payload, copy_len);
-                DEBUG_PRINT("    [%d] op=%d len=%u: %s\n",
+                DEBUG_PRINT("    [%d] op=%d len=%d: %s\n",
                        total_messages, opcode, len, tmp);
             } else {
-                DEBUG_PRINT("    [%d] op=%d len=%u: (empty)\n",
+                DEBUG_PRINT("    [%d] op=%d len=%d: (empty)\n",
                        total_messages, opcode, len);
             }
 #endif
@@ -125,7 +136,7 @@ int run_consumer() {
 // ============================================================================
 
 // Subscription message for Binance streams
-static const char* g_subscribe = R"({"method":"SUBSCRIBE","params":["btcusdt@aggTrade","btcusdt@depth@100ms","btcusdt@depth@250ms","btcusdt@depth"],"id":1})";
+static const char* g_subscribe = R"({"method":"SUBSCRIBE","params":["btcusdt@aggTrade"],"id":1})";
 
 int run_producer() {
     printf("[Producer] Starting WebSocket client...\n");

@@ -200,24 +200,39 @@ constexpr size_t CLS_SHIFT = 6;             // 64 = 2^6, for << multiplication
 static_assert(DESCS_PER_CLS == (1 << DESCS_PER_CLS_SHIFT), "DESCS_PER_CLS_SHIFT mismatch");
 static_assert(CACHE_LINE_SIZE == (1 << CLS_SHIFT), "CLS_SHIFT mismatch");
 
+// ShmBatchHeader status bits (replaces opcode field)
+constexpr uint8_t SHM_STATUS_DISCONNECTED = 0x01;  // bit 0: 1=disconnected, 0=connected
+constexpr uint8_t SHM_STATUS_RECONNECT_ON = 0x02;  // bit 1: 1=reconnect enabled, 0=disabled
+constexpr uint8_t SHM_STATUS_TEXT_OPCODE  = 0x04;  // bit 2: 1=text (opcode 1), 0=binary (opcode 2)
+
 // Number of frame descriptors that fit in header's reserved space
-// Header has: ssl_data_len_in_CLS(2) + frame_count(2) + opcode(1) + padding(3) = 8 bytes
-// 64-byte CLS: (64-8)/8 = 7 frames, 128-byte CLS: (128-8)/8 = 15 frames
-constexpr size_t EMBEDDED_FRAMES = (CACHE_LINE_SIZE - 8) / sizeof(ShmFrameDesc);
-static_assert(EMBEDDED_FRAMES > 0, "CACHE_LINE_SIZE too small for embedded frames");
-static_assert(EMBEDDED_FRAMES * sizeof(ShmFrameDesc) <= CACHE_LINE_SIZE - 8,
+// Header has: ssl_data_len_in_CLS(2) + frame_count(2) + status(1) + padding(3) + cpucycle(8) = 16 bytes
+// 64-byte CLS: (64-16)/8 = 6 frames, 128-byte CLS: (128-16)/8 = 14 frames
+constexpr size_t EMBEDDED_FRAME_NUM = (CACHE_LINE_SIZE - 16) / sizeof(ShmFrameDesc);
+static_assert(EMBEDDED_FRAME_NUM > 0, "CACHE_LINE_SIZE too small for embedded frames");
+static_assert(EMBEDDED_FRAME_NUM * sizeof(ShmFrameDesc) <= CACHE_LINE_SIZE - 16,
               "Embedded frames exceed batch header capacity");
 
 // Batch format for RX buffer entries:
-// Case 1 (≤EMBEDDED_FRAMES): [ShmBatchHeader with embedded descs: CLS][raw_ssl_data padded: N*CLS]
-// Case 2 (>EMBEDDED_FRAMES): [Header: CLS][ssl_data: N*CLS][overflow descs: M*CLS]
+// Case 1 (≤EMBEDDED_FRAME_NUM): [ShmBatchHeader with embedded descs: CLS][raw_ssl_data padded: N*CLS]
+// Case 2 (>EMBEDDED_FRAME_NUM): [Header: CLS][ssl_data: N*CLS][overflow descs: M*CLS]
 
 struct alignas(CACHE_LINE_SIZE) ShmBatchHeader {
     uint16_t ssl_data_len_in_CLS;  // SSL data length in cache line units
     uint16_t frame_count;          // Total number of WebSocket frames (up to 65535)
-    uint8_t  opcode;               // WebSocket opcode (batch-wide, same for all frames)
+    uint8_t  status;               // Status byte (replaces opcode):
+                                   //   bit 0: 0=connected, 1=disconnected
+                                   //   bit 1: 0=reconnect OFF, 1=reconnect ON
+                                   //   bit 2: 0=binary (opcode 2), 1=text (opcode 1)
     uint8_t  padding[3];           // Align to 8 bytes
-    ShmFrameDesc embedded[EMBEDDED_FRAMES];  // First 7 (or 15) frames embedded here
+    uint64_t cpucycle;             // TSC when last frame parsed, batch ready to commit
+    ShmFrameDesc embedded[EMBEDDED_FRAME_NUM];  // First 6 (or 14) frames embedded here
+
+    // Helper methods for status interpretation
+    bool is_connected() const { return !(status & SHM_STATUS_DISCONNECTED); }
+    bool is_reconnect_enabled() const { return status & SHM_STATUS_RECONNECT_ON; }
+    bool is_text() const { return status & SHM_STATUS_TEXT_OPCODE; }
+    bool is_status_only() const { return frame_count == 0 && ssl_data_len_in_CLS == 0; }
 };
 static_assert(sizeof(ShmBatchHeader) == CACHE_LINE_SIZE, "ShmBatchHeader must be exactly one cache line");
 
@@ -232,7 +247,7 @@ constexpr size_t cls_to_bytes(uint16_t cls) {
 
 // Number of overflow frames (frames beyond what fits in header)
 constexpr uint16_t overflow_frame_count(uint16_t frame_count) {
-    return (frame_count > EMBEDDED_FRAMES) ? (frame_count - static_cast<uint16_t>(EMBEDDED_FRAMES)) : 0;
+    return (frame_count > EMBEDDED_FRAME_NUM) ? (frame_count - static_cast<uint16_t>(EMBEDDED_FRAME_NUM)) : 0;
 }
 
 // Size of overflow descriptor region (cache-line padded), 0 if all fit in header
