@@ -884,6 +884,55 @@ struct LibreSSLPolicy {
 #ifdef SSL_POLICY_WOLFSSL
 
 /**
+ * WolfSSLUserspaceIO - Native I/O callbacks for userspace transports
+ *
+ * WolfSSL's native I/O callback mechanism (no BIO/OPENSSL_EXTRA required).
+ * Template parameter: TransportPolicy with send/recv interface.
+ */
+template<typename TransportPolicy>
+struct WolfSSLUserspaceIO {
+    /**
+     * Receive callback - called by WolfSSL when it needs to read data
+     */
+    static int recv_cb(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
+        (void)ssl;
+        auto* transport = static_cast<TransportPolicy*>(ctx);
+        if (!transport) return WOLFSSL_CBIO_ERR_GENERAL;
+
+        ssize_t result = transport->recv(buf, sz);
+        if (result > 0) {
+            return static_cast<int>(result);
+        } else if (result == 0) {
+            return WOLFSSL_CBIO_ERR_CONN_CLOSE;
+        } else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return WOLFSSL_CBIO_ERR_WANT_READ;
+            }
+            return WOLFSSL_CBIO_ERR_GENERAL;
+        }
+    }
+
+    /**
+     * Send callback - called by WolfSSL when it needs to write data
+     */
+    static int send_cb(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
+        (void)ssl;
+        auto* transport = static_cast<TransportPolicy*>(ctx);
+        if (!transport) return WOLFSSL_CBIO_ERR_GENERAL;
+
+        ssize_t result = transport->send(buf, sz);
+        if (result > 0) {
+            return static_cast<int>(result);
+        } else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return WOLFSSL_CBIO_ERR_WANT_WRITE;
+            }
+            return WOLFSSL_CBIO_ERR_GENERAL;
+        }
+    }
+};
+
+/**
  * WolfSSLPolicy - WolfSSL implementation
  *
  * Features:
@@ -972,10 +1021,7 @@ struct WolfSSLPolicy {
         }
 
         if (!ssl_) {
-            unsigned long err = wolfSSL_ERR_get_error();
-            char err_buf[256];
-            wolfSSL_ERR_error_string(err, err_buf);
-            throw std::runtime_error(std::string("wolfSSL_new() failed: ") + err_buf);
+            throw std::runtime_error("wolfSSL_new() failed");
         }
 
         // Associate socket with SSL object
@@ -1014,6 +1060,11 @@ struct WolfSSLPolicy {
             init();
         }
 
+        // Register native I/O callbacks BEFORE creating SSL object
+        // This avoids the need for OPENSSL_EXTRA/BIO compatibility layer
+        wolfSSL_CTX_SetIORecv(ctx_, WolfSSLUserspaceIO<TransportPolicy>::recv_cb);
+        wolfSSL_CTX_SetIOSend(ctx_, WolfSSLUserspaceIO<TransportPolicy>::send_cb);
+
         ssl_ = wolfSSL_new(ctx_);
         if (!ssl_) {
             // ctx_ might be stale after reconnect, try reinitializing
@@ -1022,31 +1073,19 @@ struct WolfSSLPolicy {
                 ctx_ = nullptr;
             }
             init();
+            // Re-register callbacks on new context
+            wolfSSL_CTX_SetIORecv(ctx_, WolfSSLUserspaceIO<TransportPolicy>::recv_cb);
+            wolfSSL_CTX_SetIOSend(ctx_, WolfSSLUserspaceIO<TransportPolicy>::send_cb);
             ssl_ = wolfSSL_new(ctx_);
         }
 
         if (!ssl_) {
-            unsigned long err = wolfSSL_ERR_get_error();
-            char err_buf[256];
-            wolfSSL_ERR_error_string(err, err_buf);
-            throw std::runtime_error(std::string("wolfSSL_new() failed: ") + err_buf);
+            throw std::runtime_error("wolfSSL_new() failed");
         }
 
-        // Create custom BIO for userspace transport
-        bio_method_ = websocket::policy::UserspaceTransportBIO<TransportPolicy>::create_bio_method();
-        if (!bio_method_) {
-            wolfSSL_free(ssl_);
-            throw std::runtime_error("Failed to create userspace transport BIO method");
-        }
-
-        WOLFSSL_BIO* bio = websocket::policy::UserspaceTransportBIO<TransportPolicy>::create_bio(bio_method_, transport);
-        if (!bio) {
-            wolfSSL_free(ssl_);
-            throw std::runtime_error("Failed to create userspace transport BIO");
-        }
-
-        // Associate BIO with SSL object
-        wolfSSL_set_bio(ssl_, bio, bio);
+        // Set transport as the I/O context for this SSL session
+        wolfSSL_SetIOReadCtx(ssl_, transport);
+        wolfSSL_SetIOWriteCtx(ssl_, transport);
 
         // Perform TLS handshake (non-blocking, polling-based)
         int max_retries = 1000;
@@ -1238,7 +1277,6 @@ struct WolfSSLPolicy {
 
     WOLFSSL_CTX* ctx_;
     WOLFSSL* ssl_;
-    WOLFSSL_BIO_METHOD* bio_method_ = nullptr;  // For userspace transport
 };
 
 #endif // SSL_POLICY_WOLFSSL

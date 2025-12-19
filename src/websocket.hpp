@@ -78,11 +78,14 @@
 namespace websocket {
 
 // Compile-time debug flag - use if constexpr (debug_enabled) instead of #ifdef DEBUG
+#ifndef WEBSOCKET_DEBUG_ENABLED_DEFINED
+#define WEBSOCKET_DEBUG_ENABLED_DEFINED
 constexpr bool debug_enabled =
 #ifdef DEBUG
     true;
 #else
     false;
+#endif
 #endif
 
 } // namespace websocket
@@ -581,6 +584,9 @@ private:
     // Loops with SSL_pending() to drain any buffered TLS data
     // Deferred commit mode: accumulates data across SSL_reads until no partial frame
     bool recv_into_buffer() {
+        // Compile-time constant for transport type dispatch
+        constexpr bool is_fd_based = websocket::traits::is_fd_based_transport_v<TransportPolicy_>;
+
         // Stage 3: Record timestamp before SSL_read/recv
         timing_.recv_start_cycle = rdtsc();
 
@@ -588,6 +594,13 @@ private:
 
         // Loop to drain all available data (SSL buffer + socket)
         while (true) {
+            // XDP mode: Poll transport to process pending XDP RX frames
+            // This is critical - XDP frames sit in the ring until poll() is called
+            // The integration test calls transport.poll() before every ssl.read()
+            if constexpr (!is_fd_based) {
+                transport_.poll();
+            }
+
             // Get circular buffer info
             uint8_t* buffer = rx_buffer_.buffer_base();
             size_t capacity = rx_buffer_.buffer_capacity();

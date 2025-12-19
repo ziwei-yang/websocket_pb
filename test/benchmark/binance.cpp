@@ -13,8 +13,8 @@
 //
 // Usage:
 //   BSD sockets:  ./build/benchmark_binance [warmup_count] [benchmark_count]
-//   XDP mode:     sudo ./build/benchmark_binance <interface> [bpf_obj] [warmup_count] [benchmark_count]
-//                 sudo ./build/benchmark_binance enp108s0 100 300
+//   XDP mode:     sudo ./build/benchmark_binance <interface> [warmup_count] [benchmark_count]
+//                 sudo ./build/benchmark_binance enp40s0 50 150
 
 #include "../../src/ws_configs.hpp"
 #include "../../src/core/timing.hpp"
@@ -483,7 +483,7 @@ int main(int argc, char* argv[]) {
 
 #ifdef USE_XDP
         // XDP mode: Initialize transport before connect (resolves DNS internally)
-        client.init_xdp(interface, bpf_obj, "stream.binance.com", 443);
+        client.transport().init(interface, bpf_obj, "stream.binance.com", 443);
         printf("\n");
 #endif
 

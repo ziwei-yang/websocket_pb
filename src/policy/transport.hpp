@@ -61,6 +61,18 @@
 #endif
 
 namespace websocket {
+
+// Compile-time debug flag (for standalone transport.hpp compilation)
+#ifndef WEBSOCKET_DEBUG_ENABLED_DEFINED
+#define WEBSOCKET_DEBUG_ENABLED_DEFINED
+constexpr bool debug_enabled =
+#ifdef DEBUG
+    true;
+#else
+    false;
+#endif
+#endif
+
 namespace transport {
 
 /**
@@ -517,9 +529,60 @@ struct XDPUserspaceTransport {
     XDPUserspaceTransport& operator=(const XDPUserspaceTransport&) = delete;
 
     /**
+     * Initialize XDP transport without DNS resolution (caller manages BPF filter)
+     *
+     * @param interface  Network interface name (e.g., "enp41s0")
+     * @param bpf_path   Path to BPF object file
+     */
+    void init(const char* interface, const char* bpf_path, bool zero_copy = true) {
+        // 1. Configure and initialize XDP
+        // Uses compile-time defaults from xdp_transport.hpp (XDP_INTERFACE, XDP_MTU, XDP_HEADROOM)
+        websocket::xdp::XDPConfig config;
+        config.interface = interface;
+        // config.frame_size uses XDP_FRAME_SIZE by default (calculated from XDP_MTU)
+        config.zero_copy = zero_copy;
+
+        xdp_.init(config, bpf_path);
+
+        // 2. Get local interface configuration
+        uint8_t local_mac[6];
+        uint32_t local_ip, gateway_ip, netmask;
+
+        if (!get_interface_config(interface, local_mac, &local_ip, &gateway_ip, &netmask)) {
+            throw std::runtime_error("Failed to get interface configuration");
+        }
+
+        // Initialize stack (pure packet ops only)
+        char local_ip_str[16], gateway_ip_str[16], netmask_str[16];
+        ip_to_string(local_ip, local_ip_str);
+        ip_to_string(gateway_ip, gateway_ip_str);
+        ip_to_string(netmask, netmask_str);
+
+        stack_.init(local_ip_str, gateway_ip_str, netmask_str, local_mac);
+
+        // Initialize TCP params
+        tcp_params_.local_ip = local_ip;
+
+        // Set local IP in BPF filter
+        if (xdp_.is_bpf_enabled()) {
+            xdp_.set_local_ip(local_ip_str);
+        }
+
+        // Set up zero-copy receive buffer callback
+        recv_buffer_.set_release_callback(frame_release_callback, this);
+
+        printf("[XDP-Userspace] Initialized on %s\n", interface);
+        printf("  Local IP:  %s\n", local_ip_str);
+        printf("  Gateway:   %s\n", gateway_ip_str);
+        printf("  MAC:       %02x:%02x:%02x:%02x:%02x:%02x\n",
+               local_mac[0], local_mac[1], local_mac[2],
+               local_mac[3], local_mac[4], local_mac[5]);
+    }
+
+    /**
      * Initialize XDP transport with DNS resolution and BPF filter setup
      *
-     * @param interface  Network interface name (e.g., "enp108s0")
+     * @param interface  Network interface name (e.g., "enp41s0")
      * @param bpf_path   Path to BPF object file
      * @param domain     Exchange domain to filter (e.g., "stream.binance.com")
      * @param port       Exchange port to filter (e.g., 443)
@@ -527,13 +590,10 @@ struct XDPUserspaceTransport {
     void init(const char* interface, const char* bpf_path,
               const char* domain, uint16_t port) {
         // 1. Configure and initialize XDP
+        // Uses compile-time defaults from xdp_transport.hpp (XDP_INTERFACE, XDP_MTU, XDP_HEADROOM)
         websocket::xdp::XDPConfig config;
         config.interface = interface;
-        config.queue_id = 0;
-        config.frame_size = 4096;
-        config.num_frames = 4096;
-        config.zero_copy = true;
-        config.batch_size = 64;
+        // config.frame_size uses XDP_FRAME_SIZE by default (calculated from XDP_MTU)
 
         xdp_.init(config, bpf_path);
 
@@ -849,15 +909,18 @@ struct XDPUserspaceTransport {
 
     /**
      * Set timeout for wait operations
-     * @param timeout_us Timeout in microseconds (0 = busy poll)
+     * @param timeout_ms Timeout in milliseconds (0 = busy poll)
      *
      * For XDP, this controls the busy-poll loop duration.
      * 0 = infinite busy-poll (lowest latency, highest CPU)
+     * Uses milliseconds to match BSD socket transport API.
      *
      * TSC calibration is done here (one-time) rather than in wait() hot path.
      */
-    void set_wait_timeout(int timeout_us) {
-        poll_interval_us_ = timeout_us;
+    void set_wait_timeout(int timeout_ms) {
+        // Convert milliseconds to microseconds for internal use
+        // This matches the BSD socket API which uses milliseconds
+        poll_interval_us_ = timeout_ms * 1000;
 
         // One-time TSC frequency calibration (done at setup, not in hot path)
         if (tsc_freq_hz_ == 0) {
