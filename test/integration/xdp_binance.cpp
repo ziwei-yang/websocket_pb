@@ -102,7 +102,8 @@ int main(int argc, char** argv) {
 
     // Parse command line args
     // Usage: ./test_xdp_binance_integration [interface]
-    const char* interface = "enp108s0";
+    // Interface set via compile-time XDP_INTERFACE (required, see xdp_transport.hpp)
+    const char* interface = XDP_INTERFACE;
 
     for (int i = 1; i < argc; i++) {
         // Silently ignore deprecated --napi-timer and --user-poll flags

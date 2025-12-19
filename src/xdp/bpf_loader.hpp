@@ -151,7 +151,6 @@ struct BPFLoader {
         // First, try to query if there's an existing program
         // We'll use REPLACE flag to atomically replace it
         __u32 existing_prog_id = 0;
-        __u32 existing_flags = 0;
 
         // Query existing XDP program
         int query_ret = bpf_xdp_query_id(ifindex_, 0, &existing_prog_id);

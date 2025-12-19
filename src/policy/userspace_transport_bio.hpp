@@ -22,20 +22,11 @@
 
 // SSL library headers
 #if defined(WOLFSSL_USER_SETTINGS) || defined(HAVE_WOLFSSL)
-    // WolfSSL with OpenSSL compatibility layer
+    // WolfSSL - use native I/O callbacks instead of BIO
+    // BIO requires OPENSSL_EXTRA which may not be available
     #define SSL_USING_WOLFSSL 1
     #include <wolfssl/options.h>
     #include <wolfssl/ssl.h>
-    #include <wolfssl/openssl/bio.h>
-    #include <wolfssl/openssl/ssl.h>
-    #include <wolfssl/openssl/err.h>
-
-    // WolfSSL doesn't have these OpenSSL constants, define custom values
-    #ifndef BIO_TYPE_SOURCE_SINK
-        #define BIO_TYPE_SOURCE_SINK 0x0400
-    #endif
-    // WolfSSL uses static BIO type assignment (no BIO_get_new_index)
-    #define CUSTOM_BIO_TYPE (BIO_TYPE_SOURCE_SINK | 100)
 #else
     // OpenSSL or LibreSSL - full BIO support
     #include <openssl/bio.h>
@@ -45,6 +36,21 @@
 
 namespace websocket {
 namespace policy {
+
+#ifdef SSL_USING_WOLFSSL
+/**
+ * UserspaceTransportBIO - Stub for WolfSSL (uses native I/O callbacks instead)
+ *
+ * WolfSSL uses native I/O callbacks via wolfSSL_CTX_SetIORecv/Send
+ * instead of the BIO abstraction. See WolfSSLUserspaceIO in ssl.hpp.
+ */
+template<typename TransportPolicy>
+struct UserspaceTransportBIO {
+    static void* create_bio_method() { return nullptr; }
+    static void* create_bio(void*, TransportPolicy*) { return nullptr; }
+};
+
+#else  // OpenSSL/LibreSSL
 
 /**
  * UserspaceTransportBIO - Generic BIO for userspace transport policies
@@ -62,19 +68,11 @@ struct UserspaceTransportBIO {
      * @return BIO_METHOD pointer, or nullptr on failure
      */
     static BIO_METHOD* create_bio_method() {
-#ifdef SSL_USING_WOLFSSL
-        // WolfSSL: Use static custom type (no BIO_get_new_index)
-        BIO_METHOD* bio_method = BIO_meth_new(
-            CUSTOM_BIO_TYPE,
-            "userspace_transport_bio"
-        );
-#else
         // OpenSSL/LibreSSL: Dynamic type allocation
         BIO_METHOD* bio_method = BIO_meth_new(
             BIO_TYPE_SOURCE_SINK | BIO_get_new_index(),
             "userspace_transport_bio"
         );
-#endif
         if (!bio_method) {
             return nullptr;
         }
@@ -260,6 +258,8 @@ private:
         return 1;
     }
 };
+
+#endif // SSL_USING_WOLFSSL
 
 } // namespace policy
 } // namespace websocket

@@ -69,13 +69,48 @@ namespace xdp {
 
 #ifdef USE_XDP
 
+// ============================================================================
+// Compile-time XDP Configuration
+// ============================================================================
+// Override these via Makefile: -DXDP_INTERFACE='"enp40s0"'
+// MTU and HEADROOM are auto-detected from interface if not specified.
+//
+// XDP_INTERFACE: Network interface for XDP (REQUIRED)
+// XDP_HEADROOM:  Bytes reserved before packet data in UMEM frame (auto: 0 for most drivers, 256 for mlx5)
+// XDP_MTU:       Maximum transmission unit (auto-detected from interface)
+// ============================================================================
+
+#ifndef XDP_INTERFACE
+#error "XDP_INTERFACE must be defined. Use: make USE_XDP=1 XDP_INTERFACE=<interface>"
+#endif
+
+#ifndef XDP_HEADROOM
+#define XDP_HEADROOM 0
+#endif
+
+#ifndef XDP_MTU
+#define XDP_MTU 3502
+#endif
+
+// Calculate frame size: MTU + Ethernet(14) + IP(20) + TCP(60 max) + margin, round up to power of 2
+// For MTU=3502: 3502 + 14 + 20 + 60 + 500 = 4096
+constexpr uint32_t xdp_calculate_frame_size(uint32_t mtu) {
+    uint32_t min_size = mtu + 14 + 20 + 60 + 500;  // Headers + margin
+    // Round up to next power of 2
+    uint32_t v = min_size - 1;
+    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+    return v + 1;
+}
+
+constexpr uint32_t XDP_FRAME_SIZE = xdp_calculate_frame_size(XDP_MTU);
+
 /**
  * XDP Transport Configuration
  */
 struct XDPConfig {
     const char* interface;      // Network interface (e.g., "eth0")
     uint32_t queue_id;          // RX/TX queue ID (usually 0)
-    uint32_t frame_size;        // UMEM frame size (default: 2048)
+    uint32_t frame_size;        // UMEM frame size (default: calculated from XDP_MTU)
     uint32_t num_frames;        // Number of UMEM frames (default: 4096)
     bool zero_copy;             // Enable zero-copy mode (requires driver support)
     uint32_t batch_size;        // Batch size for TX/RX (default: 64)
@@ -90,9 +125,9 @@ struct XDPConfig {
     uint32_t rx_trickle_interval_us;  // Interval between trickle packets in microseconds (default: 2000 = 500 Hz)
 
     XDPConfig()
-        : interface("eth0")
+        : interface(XDP_INTERFACE)
         , queue_id(0)
-        , frame_size(XSK_UMEM__DEFAULT_FRAME_SIZE)  // 2048
+        , frame_size(XDP_FRAME_SIZE)  // Calculated from XDP_MTU (4096 for MTU=3502)
         , num_frames(4096)
         , zero_copy(true)   // Enable zero-copy by default for HFT (igc driver supports it)
         , batch_size(64)
@@ -125,9 +160,8 @@ struct XDPConfig {
  *   xdp.release_rx_frame(rx);
  */
 struct XDPTransport {
-    // Use 256 bytes headroom - maximum supported by igc driver for XDP_ZEROCOPY mode
-    // Note: Higher values (e.g., 512) cause EOPNOTSUPP when using zero-copy
-    static constexpr uint32_t XDP_HEADROOM = 256;
+    // Headroom: configurable via -DXDP_HEADROOM=N (0 for ENA driver)
+    static constexpr uint32_t HEADROOM = XDP_HEADROOM;
 
     XDPTransport()
         : xsk_(nullptr)
@@ -217,7 +251,7 @@ struct XDPTransport {
         umem_cfg.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
         umem_cfg.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
         umem_cfg.frame_size = config_.frame_size;
-        umem_cfg.frame_headroom = XDP_HEADROOM;  // Use 256 bytes, not 0
+        umem_cfg.frame_headroom = HEADROOM;  // Configurable via -DXDP_HEADROOM=N
         umem_cfg.flags = 0;
 
         // Create UMEM
@@ -332,9 +366,9 @@ struct XDPTransport {
 
         // Initialize reusable frame structs (no FramePool needed)
         rx_frame_.clear();
-        rx_frame_.capacity = config_.frame_size - XDP_HEADROOM;
+        rx_frame_.capacity = config_.frame_size - HEADROOM;
         tx_frame_.clear();
-        tx_frame_.capacity = config_.frame_size - XDP_HEADROOM;
+        tx_frame_.capacity = config_.frame_size - HEADROOM;
 
         // Mark as "connected" for userspace stack usage (no TCP socket needed)
         connected_ = true;
@@ -435,7 +469,7 @@ struct XDPTransport {
         // Read hardware timestamp from metadata area (8 bytes before packet data)
         uint64_t* ts_ptr = (uint64_t*)((uint8_t*)umem_area_ + rx_desc->addr - 8);
         rx_frame_.hw_timestamp_ns = *ts_ptr;
-        rx_frame_.capacity = config_.frame_size - XDP_HEADROOM;
+        rx_frame_.capacity = config_.frame_size - HEADROOM;
         rx_frame_.offset = 0;
         rx_frame_.owned = true;
 
@@ -533,9 +567,9 @@ struct XDPTransport {
 
         // Setup tx_frame_ directly (no FramePool lookup needed)
         tx_frame_.addr = frame_addr;
-        tx_frame_.data = (uint8_t*)umem_area_ + frame_addr + XDP_HEADROOM;
+        tx_frame_.data = (uint8_t*)umem_area_ + frame_addr + HEADROOM;
         tx_frame_.len = 0;
-        tx_frame_.capacity = config_.frame_size - XDP_HEADROOM;
+        tx_frame_.capacity = config_.frame_size - HEADROOM;
         tx_frame_.offset = 0;
         tx_frame_.owned = true;
 
@@ -1091,14 +1125,14 @@ private:
         }
 
         // Add completed frames back to free list
-        // NOTE: The completion addr includes XDP_HEADROOM offset,
+        // NOTE: The completion addr includes HEADROOM offset,
         // so we need to subtract it to get the base frame address
         // IMPORTANT: Insert at the FRONT of the free list to avoid immediately
         // reusing just-completed frames (gives DMA time to fully release)
         for (uint32_t i = 0; i < nb_completed; i++) {
             uint64_t desc_addr = *xsk_ring_cons__comp_addr(&comp_ring_, idx_cq++);
             // Convert descriptor addr back to frame base address
-            uint64_t frame_addr = desc_addr - XDP_HEADROOM;
+            uint64_t frame_addr = desc_addr - HEADROOM;
             free_frames_.insert(free_frames_.begin(), frame_addr);
         }
 

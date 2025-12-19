@@ -77,6 +77,11 @@ ifeq ($(UNAME_S),Linux)
     # Transport Layer Selection
     # Note: These are mutually exclusive - only one can be active at a time
 
+    # Auto-enable USE_XDP if XDP_INTERFACE is provided
+    ifdef XDP_INTERFACE
+        USE_XDP := 1
+    endif
+
     # XDP Support (Linux only)
     ifdef USE_XDP
         ifdef USE_SOCKET
@@ -89,6 +94,44 @@ ifeq ($(UNAME_S),Linux)
             CXXFLAGS += -DUSE_XDP $(shell pkg-config --cflags libbpf libxdp)
             LDFLAGS += $(shell pkg-config --libs libbpf libxdp) -lbpf -lxdp
             TRANSPORT_INFO := XDP (AF_XDP)
+            # XDP Compile-time configuration
+            # XDP_INTERFACE is required; MTU and HEADROOM are auto-detected
+            # Example: make XDP_INTERFACE=enp40s0 build/benchmark_binance
+            ifndef XDP_INTERFACE
+                $(error XDP_INTERFACE is required. Usage: make XDP_INTERFACE=<interface>)
+            endif
+            ifdef XDP_INTERFACE
+                CXXFLAGS += -DXDP_INTERFACE='"$(XDP_INTERFACE)"'
+                $(info XDP Interface: $(XDP_INTERFACE))
+                # Auto-detect MTU from interface if not specified
+                ifndef XDP_MTU
+                    XDP_MTU := $(shell cat /sys/class/net/$(XDP_INTERFACE)/mtu 2>/dev/null || echo 1500)
+                    $(info XDP MTU: $(XDP_MTU) (auto-detected))
+                endif
+                # Auto-detect headroom based on driver if not specified
+                # Driver-specific defaults: mlx5=256 (XDP metadata), others=0
+                ifndef XDP_HEADROOM
+                    XDP_DRIVER := $(shell basename $$(readlink /sys/class/net/$(XDP_INTERFACE)/device/driver 2>/dev/null) 2>/dev/null)
+                    ifeq ($(XDP_DRIVER),mlx5_core)
+                        XDP_HEADROOM := 256
+                    else
+                        XDP_HEADROOM := 0
+                    endif
+                    $(info XDP Headroom: $(XDP_HEADROOM) (auto-detected, driver=$(XDP_DRIVER)))
+                endif
+            endif
+            ifdef XDP_HEADROOM
+                CXXFLAGS += -DXDP_HEADROOM=$(XDP_HEADROOM)
+                ifndef XDP_INTERFACE
+                    $(info XDP Headroom: $(XDP_HEADROOM))
+                endif
+            endif
+            ifdef XDP_MTU
+                CXXFLAGS += -DXDP_MTU=$(XDP_MTU)
+                ifndef XDP_INTERFACE
+                    $(info XDP MTU: $(XDP_MTU))
+                endif
+            endif
             $(info Building with XDP support enabled)
         else
             $(error XDP requested but dependencies not found. Install libbpf-dev and libxdp-dev)
