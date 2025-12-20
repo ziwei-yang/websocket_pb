@@ -467,8 +467,13 @@ struct XDPTransport {
         rx_frame_.len = rx_desc->len;
 
         // Read hardware timestamp from metadata area (8 bytes before packet data)
-        uint64_t* ts_ptr = (uint64_t*)((uint8_t*)umem_area_ + rx_desc->addr - 8);
-        rx_frame_.hw_timestamp_ns = *ts_ptr;
+        // Only valid when HEADROOM >= 8 (space for bpf_xdp_adjust_meta to store timestamp)
+        if constexpr (HEADROOM >= 8) {
+            uint64_t* ts_ptr = (uint64_t*)((uint8_t*)umem_area_ + rx_desc->addr - 8);
+            rx_frame_.hw_timestamp_ns = *ts_ptr;
+        } else {
+            rx_frame_.hw_timestamp_ns = 0;  // No metadata space available
+        }
         rx_frame_.capacity = config_.frame_size - HEADROOM;
         rx_frame_.offset = 0;
         rx_frame_.owned = true;

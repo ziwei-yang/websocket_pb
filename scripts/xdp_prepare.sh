@@ -325,11 +325,14 @@ start_clock_sync() {
         return 0
     fi
 
-    # Start the clock sync daemon
-    if "$sync_script" start "$phc_device" 2>/dev/null; then
+    # Start the clock sync daemon (requires root for phc2sys)
+    local sync_output
+    if sync_output=$("$sync_script" start "$phc_device" 2>&1); then
         print_status "Clock sync daemon started (CPU → $phc_device)"
     else
+        # Show actual error instead of hiding it
         print_warning "Failed to start clock sync daemon"
+        echo "       $sync_output" | head -3
     fi
 }
 

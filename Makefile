@@ -109,10 +109,10 @@ ifeq ($(UNAME_S),Linux)
                     $(info XDP MTU: $(XDP_MTU) (auto-detected))
                 endif
                 # Auto-detect headroom based on driver if not specified
-                # Driver-specific defaults: mlx5=256 (XDP metadata), others=0
+                # Driver-specific defaults: mlx5/igc/i40e/ice/ixgbe=256 (XDP metadata), others=0
                 ifndef XDP_HEADROOM
                     XDP_DRIVER := $(shell basename $$(readlink /sys/class/net/$(XDP_INTERFACE)/device/driver 2>/dev/null) 2>/dev/null)
-                    ifeq ($(XDP_DRIVER),mlx5_core)
+                    ifneq (,$(filter $(XDP_DRIVER),mlx5_core igc i40e ice ixgbe))
                         XDP_HEADROOM := 256
                     else
                         XDP_HEADROOM := 0
@@ -321,7 +321,10 @@ $(BENCHMARK_BINANCE_BIN): $(BENCHMARK_BINANCE_SRC) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "✅ Benchmark build complete: $@"
 
-# Run Binance benchmark
+# Build Binance benchmark only (no auto-run, for sudo usage)
+build-benchmark-binance: $(BENCHMARK_BINANCE_BIN)
+
+# Run Binance benchmark (builds and runs - requires sudo for XDP)
 benchmark-binance: $(BENCHMARK_BINANCE_BIN)
 	@echo "📊 Running Binance WebSocket latency benchmark..."
 	@echo "📡 Warmup: 100 messages, Benchmark: 300 messages"
