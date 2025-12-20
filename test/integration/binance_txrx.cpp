@@ -136,7 +136,7 @@ int run_consumer() {
 // ============================================================================
 
 // Subscription message for Binance streams
-static const char* g_subscribe = R"({"method":"SUBSCRIBE","params":["btcusdt@aggTrade"],"id":1})";
+static const char* g_subscribe = R"({"method":"SUBSCRIBE","params":["btcusdt@aggTrade","btcusdt@depth@100ms","btcusdt@depth@250ms","btcusdt@depth"],"id":1})";
 
 int run_producer() {
     printf("[Producer] Starting WebSocket client...\n");
