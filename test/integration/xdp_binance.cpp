@@ -47,6 +47,13 @@ using namespace websocket::transport;
 using namespace websocket::ssl;
 using namespace websocket::http;
 
+// SSL policy type alias - selects correct policy based on compile flags
+#if defined(HAVE_WOLFSSL)
+using SSLPolicyType = WolfSSLPolicy;
+#else
+using SSLPolicyType = OpenSSLPolicy;
+#endif
+
 // Test configuration
 constexpr const char* BINANCE_HOST = "stream.binance.com";
 constexpr uint16_t BINANCE_PORT = 443;
@@ -169,7 +176,7 @@ int main(int argc, char** argv) {
         printf("🔒 Phase 3: SSL/TLS Handshake\n");
         printf("─────────────────────────────────────────────────────────────────\n");
 
-        OpenSSLPolicy ssl;
+        SSLPolicyType ssl;
         ssl.init();
 
         printf("  Performing TLS handshake over userspace TCP...\n");
