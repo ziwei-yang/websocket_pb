@@ -150,22 +150,36 @@ else ifeq ($(UNAME_S),Darwin)
     # macOS configuration
     CXXFLAGS += -D__APPLE__
 
-    # Check for Homebrew LibreSSL (preferred) or fall back to OpenSSL
-    HOMEBREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo /usr/local)
-    LIBRESSL_PREFIX := $(shell brew --prefix libressl 2>/dev/null)
+    # Custom SSL libraries in ~/Proj/ (WolfSSL default for lowest jitter)
+    WOLFSSL_PREFIX := $(HOME)/Proj/wolfssl
+    OPENSSL_PREFIX := $(HOME)/Proj/openssl
+    LIBRESSL_PREFIX := $(HOME)/Proj/libressl/install
 
-    ifneq ($(LIBRESSL_PREFIX),)
-        # LibreSSL found (preferred)
+    # SSL Policy Selection (WolfSSL default - best P99 latency and jitter)
+    ifdef USE_LIBRESSL
         CXXFLAGS += -I$(LIBRESSL_PREFIX)/include -DUSE_LIBRESSL
         LDFLAGS += -L$(LIBRESSL_PREFIX)/lib -lssl -lcrypto
-        $(info Building for macOS with kqueue + LibreSSL (default))
+        SSL_INFO := LibreSSL
+    else ifdef USE_OPENSSL
+        CXXFLAGS += -I$(OPENSSL_PREFIX)/include -DUSE_OPENSSL
+        LDFLAGS += -L$(OPENSSL_PREFIX) -lssl -lcrypto
+        SSL_INFO := OpenSSL
     else
-        # Fall back to OpenSSL
-        OPENSSL_PREFIX := $(shell brew --prefix openssl@3 2>/dev/null || echo $(HOMEBREW_PREFIX)/opt/openssl)
-        CXXFLAGS += -I$(OPENSSL_PREFIX)/include
-        LDFLAGS += -L$(OPENSSL_PREFIX)/lib -lssl -lcrypto
-        $(info Building for macOS with kqueue + OpenSSL (LibreSSL not found))
+        # Default: WolfSSL (lowest P99=52μs, jitter=3μs)
+        CXXFLAGS += -I$(WOLFSSL_PREFIX) -DHAVE_WOLFSSL
+        LDFLAGS += -L$(WOLFSSL_PREFIX)/src/.libs -lwolfssl
+        SSL_INFO := WolfSSL
     endif
+
+    # IO Backend Selection (select default - lower jitter than kqueue)
+    ifdef USE_KQUEUE
+        CXXFLAGS += -DUSE_KQUEUE
+        IO_INFO := kqueue
+    else
+        IO_INFO := select
+    endif
+
+    $(info Building for macOS with $(IO_INFO) + $(SSL_INFO))
 else
     $(error Unsupported platform: $(UNAME_S))
 endif

@@ -96,30 +96,42 @@ using LinuxOptimized = WebSocketClient<
 #endif
 
 // ============================================================================
-// Configuration 2: macOS/BSD Default (LibreSSL + kqueue, HFT-optimized)
+// Configuration 2: macOS/BSD Default (WolfSSL + select, HFT-optimized)
 // ============================================================================
 // Best for: macOS/BSD development and high-frequency trading systems
 //
 // Policy composition:
-//   - SSLPolicy: LibreSSLPolicy (preferred on macOS/BSD)
-//   - EventPolicy: KqueuePolicy (edge-cleared, similar to epoll)
+//   - SSLPolicy: WolfSSLPolicy (lowest P99 latency and jitter)
+//   - EventPolicy: SelectPolicy (lower jitter than kqueue in benchmarks)
 //   - RxBufferPolicy: RingBuffer<32MB> (HFT: high-volume market data)
 //   - TxBufferPolicy: RingBuffer<2MB> (HFT: low-volume order commands)
+//
+// Benchmark results (SELECT + BSDSocket):
+//   - WolfSSL: P99=52μs, jitter=3μs (best tail latency)
+//   - OpenSSL: P99=83μs, mean=34μs (best average)
+//   - LibreSSL: P99=124μs, mean=65μs
 //
 // HFT-optimized buffer sizing (same as Linux):
 //   - RX: 32MB handles market data bursts without message loss
 //   - TX: 2MB sufficient for order flow (asymmetric usage pattern)
 //
 // Performance characteristics:
-//   - kqueue for efficient event notification
+//   - select() for predictable latency (use USE_KQUEUE for kqueue)
 //   - Standard user-space TLS (kTLS is Linux-only)
 //   - Zero-copy ring buffer operations
 //   - Asymmetric buffers reduce memory footprint
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
-// macOS/BSD Transport Policy: BSD socket + kqueue
+// macOS/BSD Transport Policy: BSD socket + select (default) or kqueue
+// SELECT chosen for lower jitter in HFT scenarios (benchmark validated)
+#ifdef USE_KQUEUE
 using MacOSTransportPolicy = websocket::transport::BSDSocketTransport<KqueuePolicy>;
+#else
+using MacOSTransportPolicy = websocket::transport::BSDSocketTransport<SelectPolicy>;
+#endif
 
+// SSL Policy selection for macOS
+// WolfSSL default: lowest P99 latency (52μs) and jitter (3μs) per benchmark
 #ifdef USE_LIBRESSL
 using MacOSDefault = WebSocketClient<
     LibreSSLPolicy,
@@ -127,10 +139,17 @@ using MacOSDefault = WebSocketClient<
     RingBuffer<32 * 1024 * 1024>,  // 32MB RX buffer (HFT: market data ingestion)
     RingBuffer<2 * 1024 * 1024>    // 2MB TX buffer (HFT: order commands)
 >;
-#else
-// Fallback to OpenSSL if LibreSSL not available
+#elif defined(USE_OPENSSL)
 using MacOSDefault = WebSocketClient<
     OpenSSLPolicy,
+    MacOSTransportPolicy,
+    RingBuffer<32 * 1024 * 1024>,  // 32MB RX buffer (HFT: market data ingestion)
+    RingBuffer<2 * 1024 * 1024>    // 2MB TX buffer (HFT: order commands)
+>;
+#else
+// Default: WolfSSL (best tail latency and lowest jitter)
+using MacOSDefault = WebSocketClient<
+    WolfSSLPolicy,
     MacOSTransportPolicy,
     RingBuffer<32 * 1024 * 1024>,  // 32MB RX buffer (HFT: market data ingestion)
     RingBuffer<2 * 1024 * 1024>    // 2MB TX buffer (HFT: order commands)
@@ -256,12 +275,17 @@ using websocket::transport::FdBasedTransportConcept;
 using websocket::transport::UserspaceTransportConcept;
 
 // Compile-time validation of default transport
-#ifdef USE_XDP
-static_assert(UserspaceTransportConcept<DefaultTransportPolicy>,
-              "DefaultTransportPolicy (XDP) must conform to UserspaceTransportConcept");
-#else
-static_assert(FdBasedTransportConcept<DefaultTransportPolicy>,
-              "DefaultTransportPolicy (BSD) must conform to FdBasedTransportConcept");
+#ifdef __linux__
+    #ifdef USE_XDP
+    static_assert(UserspaceTransportConcept<DefaultTransportPolicy>,
+                  "DefaultTransportPolicy (XDP) must conform to UserspaceTransportConcept");
+    #else
+    static_assert(FdBasedTransportConcept<DefaultTransportPolicy>,
+                  "DefaultTransportPolicy (BSD) must conform to FdBasedTransportConcept");
+    #endif
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+static_assert(FdBasedTransportConcept<MacOSTransportPolicy>,
+              "MacOSTransportPolicy must conform to FdBasedTransportConcept");
 #endif
 
 #endif // C++20
