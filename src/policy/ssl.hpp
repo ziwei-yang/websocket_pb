@@ -200,8 +200,8 @@ struct OpenSSLPolicy {
             throw std::runtime_error(std::string("SSL_connect() failed: ") + err_buf);
         }
 
-        #ifdef __linux__
-        // Check if kTLS was successfully activated
+        #if defined(__linux__) && !defined(USE_LIBRESSL) && !defined(HAVE_WOLFSSL)
+        // Check if kTLS was successfully activated (OpenSSL only)
         BIO* wbio = SSL_get_wbio(ssl_);
         BIO* rbio = SSL_get_rbio(ssl_);
 

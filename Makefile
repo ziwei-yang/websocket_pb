@@ -28,21 +28,37 @@ ifeq ($(UNAME_S),Linux)
 
     # Check for available libraries
     HAS_IOURING := $(shell echo "int main(){}" | gcc -x c - -luring -o /dev/null 2>/dev/null && echo 1 || echo 0)
-    HAS_WOLFSSL := $(shell echo "int main(){}" | gcc -x c - -lwolfssl -o /dev/null 2>/dev/null && echo 1 || echo 0)
 
-    # SSL Policy Selection
+    # ============================================================================
+    # Custom SSL Library Paths (~/Proj/)
+    # ============================================================================
+    CUSTOM_LIBRESSL_DIR := $(HOME)/Proj/libressl/install
+    CUSTOM_OPENSSL_DIR := $(HOME)/Proj/openssl/install
+    CUSTOM_WOLFSSL_DIR := $(HOME)/Proj/wolfssl/install
+
+    # SSL Policy Selection - Always use custom libraries from ~/Proj/
     ifdef USE_WOLFSSL
-        CXXFLAGS += -DHAVE_WOLFSSL
-        LDFLAGS += -lwolfssl
-        SSL_INFO := WolfSSL
+        ifeq ($(wildcard $(CUSTOM_WOLFSSL_DIR)/include/wolfssl),)
+            $(error WolfSSL not found at $(CUSTOM_WOLFSSL_DIR). Please build and install WolfSSL to ~/Proj/wolfssl/install/)
+        endif
+        CXXFLAGS += -DHAVE_WOLFSSL -I$(CUSTOM_WOLFSSL_DIR)/include
+        LDFLAGS += -L$(CUSTOM_WOLFSSL_DIR)/lib -Wl,-rpath,$(CUSTOM_WOLFSSL_DIR)/lib -lwolfssl
+        SSL_INFO := WolfSSL ($(CUSTOM_WOLFSSL_DIR))
     else ifdef USE_OPENSSL
-        LDFLAGS += -lssl -lcrypto
-        SSL_INFO := OpenSSL
+        ifeq ($(wildcard $(CUSTOM_OPENSSL_DIR)/include/openssl),)
+            $(error OpenSSL not found at $(CUSTOM_OPENSSL_DIR). Please build and install OpenSSL to ~/Proj/openssl/install/)
+        endif
+        CXXFLAGS += -I$(CUSTOM_OPENSSL_DIR)/include
+        LDFLAGS += -L$(CUSTOM_OPENSSL_DIR)/lib64 -Wl,-rpath,$(CUSTOM_OPENSSL_DIR)/lib64 -lssl -lcrypto
+        SSL_INFO := OpenSSL ($(CUSTOM_OPENSSL_DIR))
     else
         # Default: LibreSSL
-        CXXFLAGS += -DUSE_LIBRESSL
-        LDFLAGS += -lssl -lcrypto
-        SSL_INFO := LibreSSL
+        ifeq ($(wildcard $(CUSTOM_LIBRESSL_DIR)/include/openssl),)
+            $(error LibreSSL not found at $(CUSTOM_LIBRESSL_DIR). Please build and install LibreSSL to ~/Proj/libressl/install/)
+        endif
+        CXXFLAGS += -DUSE_LIBRESSL -I$(CUSTOM_LIBRESSL_DIR)/include
+        LDFLAGS += -L$(CUSTOM_LIBRESSL_DIR)/lib -Wl,-rpath,$(CUSTOM_LIBRESSL_DIR)/lib -lssl -lcrypto
+        SSL_INFO := LibreSSL ($(CUSTOM_LIBRESSL_DIR))
     endif
 
     # kTLS Support (Linux only, OpenSSL only)
