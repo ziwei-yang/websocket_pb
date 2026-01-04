@@ -1,11 +1,11 @@
 // src/stack/tcp/tcp_retransmit.hpp
-// TCP Retransmit Queue and Zero-Copy Receive Buffer (Internal)
+// Zero-Copy TCP Retransmit Queue and Zero-Copy Receive Buffer (Internal)
 //
 // INTERNAL: These classes are used by transport policy, not by stack.
 // Transport policy owns TCP state, including retransmit queue and receive buffer.
 //
 // Provides:
-//   - RetransmitQueue: Tracks unacknowledged segments for retransmission
+//   - ZeroCopyRetransmitQueue: Zero-copy retransmit tracking via UMEM frame references
 //   - ZeroCopyReceiveBuffer: Zero-copy buffer holding UMEM frame pointers
 //
 // Note: Simplified for HFT (low packet loss, in-order delivery expected)
@@ -13,104 +13,99 @@
 #pragma once
 
 #include "tcp_state.hpp"
+#include "../../core/timing.hpp"  // rdtsc()
 #include <deque>
 #include <vector>
 #include <cstring>
-#include <chrono>
 
 namespace userspace_stack {
 
-// Retransmission segment
-struct RetransmitSegment {
-    uint32_t seq;                // Sequence number
-    uint8_t flags;               // TCP flags
-    uint8_t data[USERSPACE_TCP_MSS];       // Segment data
-    uint16_t len;                // Data length
-    uint64_t send_time_us;       // Send time (microseconds)
-    uint8_t retransmit_count;    // Number of retransmissions
+// ============================================================================
+// Zero-Copy Retransmit Queue
+// ============================================================================
+//
+// Instead of copying segment data, stores references to UMEM TX frames.
+// Benefits:
+//   - No memcpy on add_ref() - just stores frame index
+//   - Fast retransmit - re-submit same frame, no rebuild/re-encrypt
+//   - Uses TSC for timing (~20 cycles vs ~50-100 cycles for chrono)
+//   - 24 bytes per segment vs 1488 bytes (62x reduction)
+//
+// Assumes:
+//   - UMEM has sufficient frames (HFT scenario)
+//   - TX completion always before ACK (NIC DMA ~μs, network RTT ~ms)
+
+// Zero-copy segment reference (replaces RetransmitSegment)
+struct RetransmitSegmentRef {
+    uint32_t seq;              // TCP sequence number
+    uint32_t frame_idx;        // UMEM frame index
+    uint16_t frame_len;        // Total frame length for retransmit
+    uint8_t  retransmit_count;
+    uint8_t  flags;            // TCP flags (for SYN/FIN seq adjustment)
+    uint64_t send_cycle;       // TSC cycle at send time
 };
+// Size: 24 bytes vs 1488 bytes (62x reduction)
 
-struct RetransmitQueue {
-    RetransmitQueue() = default;
+// Zero-copy retransmit queue
+struct ZeroCopyRetransmitQueue {
+    ZeroCopyRetransmitQueue() = default;
 
-    // Add segment to queue
-    bool add_segment(uint32_t seq, uint8_t flags, const uint8_t* data, uint16_t len) {
+    // Initialize with TSC frequency (call once before use)
+    void init(uint64_t tsc_freq_hz, uint32_t rto_ms) {
+        tsc_freq_hz_ = tsc_freq_hz;
+        rto_cycles_ = (static_cast<uint64_t>(rto_ms) * tsc_freq_hz) / 1000;
+    }
+
+    // Add segment reference (no data copy)
+    bool add_ref(uint32_t seq, uint8_t flags, uint32_t frame_idx, uint16_t frame_len) {
         if (queue_.size() >= max_queue_size_) {
-            return false;  // Queue full
+            return false;
         }
 
-        if (len > USERSPACE_TCP_MSS) {
-            return false;  // Invalid length
-        }
-
-        RetransmitSegment seg;
-        seg.seq = seq;
-        seg.flags = flags;
-        seg.len = len;
-        seg.send_time_us = get_time_us();
-        seg.retransmit_count = 0;
-
-        if (data && len > 0) {
-            std::memcpy(seg.data, data, len);
-        }
-
-        queue_.push_back(seg);
+        queue_.push_back({seq, frame_idx, frame_len, 0, flags, rdtsc()});
         return true;
     }
 
-    // Remove acknowledged segments (up to ack_seq)
-    // Returns number of segments removed
-    size_t remove_acked(uint32_t ack_seq) {
-        size_t removed = 0;
+    // Remove acknowledged segments, return frame indices for release
+    std::vector<uint32_t> remove_acked(uint32_t ack_seq) {
+        std::vector<uint32_t> released;
 
         while (!queue_.empty()) {
-            const auto& seg = queue_.front();
-
-            // Calculate segment end sequence
-            uint32_t seg_end = seg.seq + seg.len;
-            if (seg.flags & TCP_FLAG_SYN || seg.flags & TCP_FLAG_FIN) {
-                seg_end++;  // SYN and FIN consume one sequence number
+            const auto& ref = queue_.front();
+            uint32_t seg_end = ref.seq + ref.frame_len;
+            if (ref.flags & TCP_FLAG_SYN || ref.flags & TCP_FLAG_FIN) {
+                seg_end++;
             }
 
-            // Check if segment is fully acknowledged
             if (seq_le(seg_end, ack_seq)) {
+                released.push_back(ref.frame_idx);
                 queue_.pop_front();
-                removed++;
             } else {
-                break;  // Remaining segments not yet acknowledged
+                break;
             }
         }
-
-        return removed;
+        return released;
     }
 
-    // Get segments that need retransmission
-    // rto_ms: Retransmission timeout in milliseconds
-    // Returns segments to retransmit
-    std::vector<RetransmitSegment*> get_retransmit_segments(uint32_t rto_ms) {
-        std::vector<RetransmitSegment*> segments;
-        uint64_t now = get_time_us();
-        uint64_t rto_us = static_cast<uint64_t>(rto_ms) * 1000;
+    // Get segments needing retransmission
+    std::vector<RetransmitSegmentRef*> get_retransmit_refs() {
+        std::vector<RetransmitSegmentRef*> refs;
+        uint64_t now = rdtsc();
 
-        for (auto& seg : queue_) {
-            // Check if segment timed out
-            if (now - seg.send_time_us >= rto_us) {
-                if (seg.retransmit_count < max_retransmits_) {
-                    segments.push_back(&seg);
-                }
-                // If max retransmits reached, connection is dead (handled elsewhere)
+        for (auto& ref : queue_) {
+            if (now - ref.send_cycle >= rto_cycles_ && ref.retransmit_count < max_retransmits_) {
+                refs.push_back(&ref);
             }
         }
-
-        return segments;
+        return refs;
     }
 
-    // Update send time for retransmitted segment
+    // Mark segment as retransmitted
     void mark_retransmitted(uint32_t seq) {
-        for (auto& seg : queue_) {
-            if (seg.seq == seq) {
-                seg.send_time_us = get_time_us();
-                seg.retransmit_count++;
+        for (auto& ref : queue_) {
+            if (ref.seq == seq) {
+                ref.send_cycle = rdtsc();
+                ref.retransmit_count++;
                 break;
             }
         }
@@ -118,48 +113,28 @@ struct RetransmitQueue {
 
     // Check if any segment has exceeded max retransmits
     bool has_failed_segment() const {
-        for (const auto& seg : queue_) {
-            if (seg.retransmit_count >= max_retransmits_) {
+        for (const auto& ref : queue_) {
+            if (ref.retransmit_count >= max_retransmits_) {
                 return true;
             }
         }
         return false;
     }
 
-    // Get queue size
-    size_t size() const {
-        return queue_.size();
-    }
+    size_t size() const { return queue_.size(); }
+    bool empty() const { return queue_.empty(); }
+    void clear() { queue_.clear(); }
 
-    // Check if queue is empty
-    bool empty() const {
-        return queue_.empty();
-    }
-
-    // Clear queue
-    void clear() {
-        queue_.clear();
-    }
-
-    // Get oldest unacknowledged sequence number
     uint32_t get_oldest_seq() const {
-        if (queue_.empty()) {
-            return 0;
-        }
-        return queue_.front().seq;
+        return queue_.empty() ? 0 : queue_.front().seq;
     }
 
 private:
-    // Get current time in microseconds
-    static uint64_t get_time_us() {
-        auto now = std::chrono::steady_clock::now();
-        return std::chrono::duration_cast<std::chrono::microseconds>(
-            now.time_since_epoch()).count();
-    }
-
-    std::deque<RetransmitSegment> queue_;
-    size_t max_queue_size_ = 256;  // Maximum queue size
-    uint8_t max_retransmits_ = 5;  // Maximum retransmissions before giving up
+    std::deque<RetransmitSegmentRef> queue_;
+    uint64_t tsc_freq_hz_ = 0;
+    uint64_t rto_cycles_ = 0;
+    size_t max_queue_size_ = 256;
+    uint8_t max_retransmits_ = 5;
 };
 
 // ============================================================================

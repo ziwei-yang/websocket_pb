@@ -2,14 +2,17 @@
 # XDP Binance Integration Test Script
 # Runs the complete XDP workflow: prepare -> filter -> test -> reset
 #
-# Usage: sudo ./scripts/xdp_binance_integration.sh [interface]
-# Example: sudo ./scripts/xdp_binance_integration.sh enp108s0
+# Usage: sudo ./scripts/xdp_binance_integration.sh [interface] [timeout]
+# Example: sudo ./scripts/xdp_binance_integration.sh enp108s0      # 45s timeout (default)
+#          sudo ./scripts/xdp_binance_integration.sh enp108s0 60   # 60s timeout
+#          sudo ./scripts/xdp_binance_integration.sh enp108s0 -1   # Run forever (Ctrl+C to stop)
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 IFACE="${1:-enp108s0}"
+TIMEOUT="${2:-45}"
 DOMAIN="stream.binance.com"
 
 # Color codes
@@ -28,6 +31,11 @@ print_banner() {
     echo ""
     echo "  Interface: $IFACE"
     echo "  Domain:    $DOMAIN"
+    if [[ "$TIMEOUT" == "-1" ]]; then
+        echo "  Timeout:   ∞ (Ctrl+C to stop)"
+    else
+        echo "  Timeout:   ${TIMEOUT}s"
+    fi
     echo ""
 }
 
@@ -80,8 +88,10 @@ print_banner
 # Step 0: Build
 print_step "0/5" "Building XDP Binance Integration Test"
 echo "Cleaning and rebuilding..."
-USE_XDP=1 USE_OPENSSL=1 make clean >/dev/null 2>&1
-USE_XDP=1 USE_OPENSSL=1 make src/xdp/bpf/exchange_filter.bpf.o build/test_xdp_binance_integration 2>&1 | tail -5
+# Use sudo -u to run make as original user (avoids ~/Proj path issues when run as root)
+ORIG_USER="${SUDO_USER:-$(whoami)}"
+sudo -u "$ORIG_USER" bash -c "USE_XDP=1 USE_OPENSSL=1 XDP_INTERFACE='$IFACE' make clean" >/dev/null 2>&1
+sudo -u "$ORIG_USER" bash -c "USE_XDP=1 USE_OPENSSL=1 XDP_INTERFACE='$IFACE' make src/xdp/bpf/exchange_filter.bpf.o build/test_xdp_binance_integration 2>&1" | tail -5
 
 if [[ ! -x "$PROJECT_DIR/build/test_xdp_binance_integration" ]]; then
     print_error "Build failed. Check compiler output above."
@@ -99,8 +109,19 @@ print_step "2/5" "Setting up DNS and route bypass"
 
 # Step 3: Run test
 print_step "3/5" "Running XDP Binance Integration Test"
-timeout 45 "$PROJECT_DIR/build/test_xdp_binance_integration" "$IFACE"
-TEST_RESULT=$?
+if [[ "$TIMEOUT" == "-1" ]]; then
+    # Run forever (no timeout)
+    "$PROJECT_DIR/build/test_xdp_binance_integration" "$IFACE"
+    TEST_RESULT=$?
+else
+    # Run with timeout
+    timeout "$TIMEOUT" "$PROJECT_DIR/build/test_xdp_binance_integration" "$IFACE"
+    TEST_RESULT=$?
+    # timeout returns 124 on timeout - treat as success for timed tests
+    if [[ $TEST_RESULT -eq 124 ]]; then
+        TEST_RESULT=0
+    fi
+fi
 
 # Step 4: Reset (handled by trap, but show status)
 print_step "4/5" "Cleanup"

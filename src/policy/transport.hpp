@@ -719,11 +719,31 @@ struct XDPUserspaceTransport {
         tcp_params_.snd_wnd = userspace_stack::TCP_MAX_WINDOW;
         tcp_params_.rcv_wnd = userspace_stack::TCP_MAX_WINDOW;
 
-        send_syn();
+        // Initialize retransmit queue with TSC frequency
+        if (tsc_freq_hz_ == 0) {
+            tsc_freq_hz_ = calibrate_tsc_freq();
+        }
+        retransmit_queue_.init(tsc_freq_hz_, timers_.rto);
+
+        // Send SYN using zero-copy TX
+        uint32_t syn_frame_idx = xdp_.alloc_tx_frame_idx();
+        if (syn_frame_idx == UINT32_MAX) {
+            throw std::runtime_error("Failed to allocate TX frame for SYN");
+        }
+
+        uint64_t syn_frame_addr = xdp_.frame_idx_to_addr(syn_frame_idx);
+        uint8_t* syn_buffer = xdp_.get_frame_ptr(syn_frame_addr);
+        size_t syn_len = stack_.build_syn(syn_buffer, xdp_.frame_capacity(), tcp_params_);
+        if (syn_len == 0) {
+            throw std::runtime_error("Failed to build SYN packet");
+        }
+
+        xdp_.send_raw_frame(syn_frame_addr, syn_len);
         state_ = userspace_stack::TCPState::SYN_SENT;
 
-        // Add SYN to retransmit queue
-        retransmit_queue_.add_segment(tcp_params_.snd_nxt, userspace_stack::TCP_FLAG_SYN, nullptr, 0);
+        // Add SYN to zero-copy retransmit queue
+        retransmit_queue_.add_ref(tcp_params_.snd_nxt, userspace_stack::TCP_FLAG_SYN,
+                                  syn_frame_idx, static_cast<uint16_t>(syn_len));
         tcp_params_.snd_nxt++;  // SYN consumes one sequence number
 
         // Wait for SYN-ACK with timeout
@@ -761,7 +781,10 @@ struct XDPUserspaceTransport {
     }
 
     /**
-     * Send data via userspace TCP
+     * Send data via userspace TCP (zero-copy path)
+     *
+     * Uses sequential TX frame allocation for zero-copy retransmit.
+     * Frames are released based on TCP ACK, not TX completion.
      */
     ssize_t send(const void* buf, size_t len) {
         if (!connected_ || state_ != userspace_stack::TCPState::ESTABLISHED) {
@@ -782,11 +805,35 @@ struct XDPUserspaceTransport {
             size_t remaining = len - sent;
             size_t chunk_size = std::min(remaining, static_cast<size_t>(tcp_params_.snd_mss));
 
-            send_data(data + sent, chunk_size);
+            // Allocate TX frame from sequential pool
+            uint32_t frame_idx = xdp_.alloc_tx_frame_idx();
+            if (frame_idx == UINT32_MAX) {
+                // TX pool exhausted
+                if (sent > 0) break;  // Return what we've sent so far
+                errno = ENOBUFS;
+                return -1;
+            }
 
-            retransmit_queue_.add_segment(tcp_params_.snd_nxt,
-                                          userspace_stack::TCP_FLAG_ACK | userspace_stack::TCP_FLAG_PSH,
-                                          data + sent, static_cast<uint16_t>(chunk_size));
+            uint64_t frame_addr = xdp_.frame_idx_to_addr(frame_idx);
+            uint8_t* frame_data = xdp_.get_frame_ptr(frame_addr);
+
+            // Build TCP packet directly in UMEM frame
+            size_t frame_len = stack_.build_data(frame_data, xdp_.frame_capacity(),
+                                                  tcp_params_, data + sent, chunk_size);
+            if (frame_len == 0) {
+                // Build failed - can't send
+                if (sent > 0) break;
+                errno = EINVAL;
+                return -1;
+            }
+
+            // Submit frame to TX ring
+            xdp_.send_raw_frame(frame_addr, frame_len);
+
+            // Add to zero-copy retransmit queue (no data copy)
+            retransmit_queue_.add_ref(tcp_params_.snd_nxt,
+                                      userspace_stack::TCP_FLAG_ACK | userspace_stack::TCP_FLAG_PSH,
+                                      frame_idx, static_cast<uint16_t>(frame_len));
 
             tcp_params_.snd_nxt += chunk_size;
             sent += chunk_size;
@@ -857,12 +904,21 @@ struct XDPUserspaceTransport {
         }
 
         if (state_ == userspace_stack::TCPState::ESTABLISHED) {
-            send_fin();
-            retransmit_queue_.add_segment(tcp_params_.snd_nxt,
-                                          userspace_stack::TCP_FLAG_FIN | userspace_stack::TCP_FLAG_ACK,
-                                          nullptr, 0);
-            tcp_params_.snd_nxt++;
-            state_ = userspace_stack::TCPState::FIN_WAIT_1;
+            // Send FIN using zero-copy TX
+            uint32_t fin_frame_idx = xdp_.alloc_tx_frame_idx();
+            if (fin_frame_idx != UINT32_MAX) {
+                uint64_t fin_frame_addr = xdp_.frame_idx_to_addr(fin_frame_idx);
+                uint8_t* fin_buffer = xdp_.get_frame_ptr(fin_frame_addr);
+                size_t fin_len = stack_.build_fin(fin_buffer, xdp_.frame_capacity(), tcp_params_);
+                if (fin_len > 0) {
+                    xdp_.send_raw_frame(fin_frame_addr, fin_len);
+                    retransmit_queue_.add_ref(tcp_params_.snd_nxt,
+                                              userspace_stack::TCP_FLAG_FIN | userspace_stack::TCP_FLAG_ACK,
+                                              fin_frame_idx, static_cast<uint16_t>(fin_len));
+                    tcp_params_.snd_nxt++;
+                    state_ = userspace_stack::TCPState::FIN_WAIT_1;
+                }
+            }
 
             // Wait briefly for FIN-ACK
             auto start = std::chrono::steady_clock::now();
@@ -874,6 +930,7 @@ struct XDPUserspaceTransport {
 
                 poll_rx_and_process();
                 check_retransmit();
+                xdp_.try_release_tx_frames();
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
         }
@@ -901,6 +958,9 @@ struct XDPUserspaceTransport {
 
         poll_rx_and_process();
         check_retransmit();
+
+        // Release contiguous acked TX frames
+        xdp_.try_release_tx_frames();
     }
 
     // =========================================================================
@@ -1080,49 +1140,15 @@ private:
     // PACKET SENDING (uses stack's pure packet building)
     // =========================================================================
 
-    void send_syn() {
-        auto [buffer, capacity] = alloc_tx_buffer();
-        if (!buffer) {
-            throw std::runtime_error("Failed to allocate TX buffer for SYN");
-        }
-
-        size_t len = stack_.build_syn(buffer, capacity, tcp_params_);
-        if (len == 0) {
-            throw std::runtime_error("Failed to build SYN packet");
-        }
-
-        send_tx_buffer(len);
-    }
-
+    /**
+     * Send pure ACK (no retransmit tracking needed)
+     * Uses old alloc_tx_buffer() path - ACKs don't need zero-copy retransmit
+     */
     void send_ack() {
         auto [buffer, capacity] = alloc_tx_buffer();
         if (!buffer) return;
 
         size_t len = stack_.build_ack(buffer, capacity, tcp_params_);
-        if (len > 0) {
-            send_tx_buffer(len);
-        }
-    }
-
-    void send_data(const uint8_t* data, size_t data_len) {
-        auto [buffer, capacity] = alloc_tx_buffer();
-        if (!buffer) {
-            throw std::runtime_error("Failed to allocate TX buffer for data");
-        }
-
-        size_t len = stack_.build_data(buffer, capacity, tcp_params_, data, data_len);
-        if (len == 0) {
-            throw std::runtime_error("Failed to build data packet");
-        }
-
-        send_tx_buffer(len);
-    }
-
-    void send_fin() {
-        auto [buffer, capacity] = alloc_tx_buffer();
-        if (!buffer) return;
-
-        size_t len = stack_.build_fin(buffer, capacity, tcp_params_);
         if (len > 0) {
             send_tx_buffer(len);
         }
@@ -1196,10 +1222,15 @@ private:
                     break;
                 }
 
-                // Process ACKs (update snd_una, remove from retransmit queue)
+                // Process ACKs (update snd_una, mark frames as acked)
                 if (parsed.flags & userspace_stack::TCP_FLAG_ACK) {
                     if (userspace_stack::seq_gt(parsed.ack, tcp_params_.snd_una)) {
-                        retransmit_queue_.remove_acked(parsed.ack);
+                        // Get frame indices that are now acked
+                        auto released = retransmit_queue_.remove_acked(parsed.ack);
+                        // Mark frames as acked (will be released by try_release_tx_frames())
+                        for (uint32_t frame_idx : released) {
+                            xdp_.mark_frame_acked(frame_idx);
+                        }
                         tcp_params_.snd_una = parsed.ack;
                     }
                 }
@@ -1219,27 +1250,19 @@ private:
     }
 
     // =========================================================================
-    // RETRANSMIT HANDLING
+    // RETRANSMIT HANDLING (zero-copy: re-submit existing UMEM frames)
     // =========================================================================
 
     void check_retransmit() {
-        auto segments = retransmit_queue_.get_retransmit_segments(timers_.rto);
+        auto refs = retransmit_queue_.get_retransmit_refs();
 
-        for (auto* seg : segments) {
-            // Retransmit the segment
-            auto [buffer, capacity] = alloc_tx_buffer();
-            if (!buffer) continue;
-
-            // Build packet with original seq number
-            userspace_stack::TCPParams retx_params = tcp_params_;
-            retx_params.snd_nxt = seg->seq;
-
-            size_t len = stack_.build_tcp(buffer, capacity, retx_params, seg->flags,
-                                          seg->data, seg->len);
-            if (len > 0) {
-                send_tx_buffer(len);
-                retransmit_queue_.mark_retransmitted(seg->seq);
+        for (auto* ref : refs) {
+            // Retransmit existing frame (no rebuild, no re-encryption)
+            ssize_t sent = xdp_.retransmit_frame(ref->frame_idx, ref->frame_len);
+            if (sent > 0) {
+                retransmit_queue_.mark_retransmitted(ref->seq);
             }
+            // If TX ring full, retry next poll iteration
         }
 
         // Check for failed segments
@@ -1322,7 +1345,7 @@ private:
     userspace_stack::TCPState state_;
     userspace_stack::TCPParams tcp_params_;
     userspace_stack::TCPTimers timers_;
-    userspace_stack::RetransmitQueue retransmit_queue_;
+    userspace_stack::ZeroCopyRetransmitQueue retransmit_queue_;  // Zero-copy: holds UMEM frame refs
     userspace_stack::ZeroCopyReceiveBuffer recv_buffer_;  // Zero-copy: holds UMEM frame refs
 
     // Connection state
