@@ -52,6 +52,7 @@
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <thread>
@@ -112,7 +113,7 @@ struct XDPConfig {
     const char* interface;      // Network interface (e.g., "eth0")
     uint32_t queue_id;          // RX/TX queue ID (usually 0)
     uint32_t frame_size;        // UMEM frame size (default: calculated from XDP_MTU)
-    uint32_t num_frames;        // Number of UMEM frames (default: 4096)
+    uint32_t num_frames;        // Number of UMEM frames (default: 65536)
     bool zero_copy;             // Enable zero-copy mode (requires driver support)
     uint32_t batch_size;        // Batch size for TX/RX (default: 64)
 
@@ -129,7 +130,7 @@ struct XDPConfig {
         : interface(XDP_INTERFACE)
         , queue_id(0)
         , frame_size(XDP_FRAME_SIZE)  // Calculated from XDP_MTU (4096 for MTU=3502)
-        , num_frames(4096)
+        , num_frames(65536)           // 16x larger for high throughput
         , zero_copy(true)   // Enable zero-copy by default for HFT (igc driver supports it)
         , batch_size(64)
         , busy_poll_usec(1000)           // 1000us busy-poll duration (testing)
@@ -176,16 +177,17 @@ struct XDPTransport {
     static constexpr uint32_t HEADROOM = XDP_HEADROOM;
 
     // Frame pool configuration (separate RX and TX pools)
-    // Total frames split 50/50 between RX and TX
+    // Total frames split 50/50 between RX and TX (16x larger: 65536 total)
     static constexpr uint32_t RX_POOL_START = 0;
-    static constexpr uint32_t DEFAULT_RX_POOL_SIZE = 2048;  // Frames 0-2047 for RX
-    static constexpr uint32_t DEFAULT_TX_POOL_SIZE = 2048;  // Frames 2048-4095 for TX
+    static constexpr uint32_t DEFAULT_RX_POOL_SIZE = 32768;  // Frames 0-32767 for RX
+    static constexpr uint32_t DEFAULT_TX_POOL_SIZE = 32768;  // Frames 32768-65535 for TX
 
     XDPTransport()
         : xsk_(nullptr)
         , umem_(nullptr)
         , umem_area_(nullptr)
         , umem_size_(0)
+        , umem_fd_(-1)
         , connected_(false)
         , ifindex_(0)
         , next_free_frame_(0)
@@ -251,29 +253,54 @@ struct XDPTransport {
         }
 
         // Allocate UMEM (User Memory for packet buffers)
+        // CRITICAL: Use MAP_SHARED so child processes can see kernel writes after fork()
+        // With MAP_PRIVATE, copy-on-write semantics prevent children from seeing XDP RX data
         umem_size_ = config_.num_frames * config_.frame_size;
+
+        // Create shared memory file for UMEM
+        char umem_path[256];
+        snprintf(umem_path, sizeof(umem_path), "/dev/shm/xdp_umem_%d_%s",
+                 getpid(), config_.interface);
+        umem_fd_ = open(umem_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (umem_fd_ < 0) {
+            throw std::runtime_error(std::string("Failed to create UMEM file: ") + strerror(errno));
+        }
+        // Mark for deletion on close (will be cleaned up when all processes exit)
+        unlink(umem_path);
+
+        // Resize the file
+        if (ftruncate(umem_fd_, umem_size_) < 0) {
+            ::close(umem_fd_);
+            throw std::runtime_error(std::string("Failed to resize UMEM file: ") + strerror(errno));
+        }
+
+        // Try with huge pages first (MAP_SHARED + MAP_HUGETLB)
         umem_area_ = mmap(nullptr, umem_size_,
                           PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
-                          -1, 0);
+                          MAP_SHARED | MAP_HUGETLB,
+                          umem_fd_, 0);
 
         if (umem_area_ == MAP_FAILED) {
             // Fallback to regular pages if huge pages fail
             umem_area_ = mmap(nullptr, umem_size_,
                               PROT_READ | PROT_WRITE,
-                              MAP_PRIVATE | MAP_ANONYMOUS,
-                              -1, 0);
+                              MAP_SHARED,
+                              umem_fd_, 0);
         }
 
         if (umem_area_ == MAP_FAILED) {
-            throw std::runtime_error("Failed to allocate UMEM");
+            ::close(umem_fd_);
+            throw std::runtime_error(std::string("Failed to mmap UMEM: ") + strerror(errno));
         }
+
+        printf("[XDP] UMEM allocated: %zu bytes (MAP_SHARED) at %p\n", umem_size_, umem_area_);
 
         // Configure UMEM
         struct xsk_umem_config umem_cfg;
         memset(&umem_cfg, 0, sizeof(umem_cfg));
-        umem_cfg.fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
-        umem_cfg.comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
+        // Use larger ring sizes to match increased UMEM (32768 RX frames)
+        umem_cfg.fill_size = rx_pool_size_;  // FILL ring holds all RX frames
+        umem_cfg.comp_size = tx_pool_size_;  // COMP ring holds all TX frames
         umem_cfg.frame_size = config_.frame_size;
         umem_cfg.frame_headroom = HEADROOM;  // Configurable via -DXDP_HEADROOM=N
         umem_cfg.flags = 0;
@@ -289,8 +316,9 @@ struct XDPTransport {
         // Configure XDP socket
         struct xsk_socket_config xsk_cfg;
         memset(&xsk_cfg, 0, sizeof(xsk_cfg));
-        xsk_cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
-        xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+        // Use larger ring sizes to match increased UMEM
+        xsk_cfg.rx_size = rx_pool_size_;  // RX ring size matches RX pool
+        xsk_cfg.tx_size = tx_pool_size_;  // TX ring size matches TX pool
 
         // If BPF filtering enabled, bind to the existing XDP program
         // Otherwise, let libxsk attach its default XDP program
@@ -395,7 +423,7 @@ struct XDPTransport {
         }
 
         xsk_ring_prod__submit(&fill_ring_, frames_to_populate);
-        printf("[XDP] ✅ FILL ring populated with %u RX frames\n", frames_to_populate);
+        printf("[XDP] FILL ring populated with %u RX frames\n", frames_to_populate);
 
         // RX pool uses free_frames_ for recycling (populated as frames are released)
         // TX pool uses sequential allocation (tx_alloc_pos_/tx_free_pos_)
@@ -678,10 +706,26 @@ struct XDPTransport {
         // Submit the TX descriptor
         xsk_ring_prod__submit(&tx_ring_, 1);
 
+        // Kick TX if kernel needs wakeup (required with XDP_USE_NEED_WAKEUP)
+        kick_tx();
+
         // Mark frame as no longer owned by application
         frame->owned = false;
 
         return len;
+    }
+
+    /**
+     * Kick TX ring to notify kernel of pending transmissions
+     *
+     * With XDP_USE_NEED_WAKEUP, the kernel may be sleeping and needs
+     * explicit notification via sendto() to process TX ring.
+     */
+    void kick_tx() {
+        if (xsk_ring_prod__needs_wakeup(&tx_ring_)) {
+            int xdp_fd = xsk_socket__fd(xsk_);
+            ::sendto(xdp_fd, NULL, 0, MSG_DONTWAIT, NULL, 0);
+        }
     }
 
     // ========================================================================
@@ -821,6 +865,10 @@ struct XDPTransport {
         tx_desc->options = 0;
 
         xsk_ring_prod__submit(&tx_ring_, 1);
+
+        // Kick TX if kernel needs wakeup (required with XDP_USE_NEED_WAKEUP)
+        kick_tx();
+
         return len;
     }
 
@@ -883,6 +931,24 @@ struct XDPTransport {
     static const char* name() {
         return "XDP (AF_XDP)";
     }
+
+    // ========================================================================
+    // XSK State Accessors (for pipeline process inheritance)
+    // ========================================================================
+    // These allow child processes to inherit the XSK socket/UMEM after fork
+
+    struct xsk_socket* get_xsk() { return xsk_; }
+    struct xsk_umem* get_umem() { return umem_; }
+    void* get_umem_area() { return umem_area_; }
+    size_t get_umem_size() const { return umem_size_; }
+    struct xsk_ring_prod* get_fill_ring() { return &fill_ring_; }
+    struct xsk_ring_cons* get_comp_ring() { return &comp_ring_; }
+    struct xsk_ring_cons* get_rx_ring() { return &rx_ring_; }
+    struct xsk_ring_prod* get_tx_ring() { return &tx_ring_; }
+    uint32_t get_frame_size() const { return config_.frame_size; }
+    BPFLoader* get_bpf_loader() { return bpf_loader_; }
+
+    // ========================================================================
 
     /**
      * Enable BPF packet filtering
@@ -1057,6 +1123,11 @@ private:
         if (umem_area_) {
             munmap(umem_area_, umem_size_);
             umem_area_ = nullptr;
+        }
+
+        if (umem_fd_ >= 0) {
+            ::close(umem_fd_);
+            umem_fd_ = -1;
         }
 
         if (!free_frames_.empty()) {
@@ -1365,6 +1436,7 @@ private:
     struct xsk_umem* umem_;                 // UMEM handle for shared packet buffer memory
     void* umem_area_;                       // Pointer to mmap'd UMEM memory region
     size_t umem_size_;                      // Total UMEM size (num_frames × frame_size)
+    int umem_fd_;                           // File descriptor for UMEM shared memory
 
     // Ring Buffers (zero-copy I/O between userspace and kernel)
     struct xsk_ring_prod fill_ring_;       // Producer: UMEM frames available for RX (app → kernel)

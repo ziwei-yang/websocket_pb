@@ -40,11 +40,12 @@ struct RetransmitSegmentRef {
     uint32_t seq;              // TCP sequence number
     uint32_t frame_idx;        // UMEM frame index
     uint16_t frame_len;        // Total frame length for retransmit
+    uint16_t payload_len;      // TCP payload length for ACK tracking (seq + payload_len = seg_end)
     uint8_t  retransmit_count;
     uint8_t  flags;            // TCP flags (for SYN/FIN seq adjustment)
     uint64_t send_cycle;       // TSC cycle at send time
 };
-// Size: 24 bytes vs 1488 bytes (62x reduction)
+// Size: 26 bytes (was 24, +2 for payload_len)
 
 // Zero-copy retransmit queue
 struct ZeroCopyRetransmitQueue {
@@ -57,12 +58,14 @@ struct ZeroCopyRetransmitQueue {
     }
 
     // Add segment reference (no data copy)
-    bool add_ref(uint32_t seq, uint8_t flags, uint32_t frame_idx, uint16_t frame_len) {
+    // frame_len = total Ethernet frame length for retransmit
+    // payload_len = TCP payload length for ACK tracking
+    bool add_ref(uint32_t seq, uint8_t flags, uint32_t frame_idx, uint16_t frame_len, uint16_t payload_len) {
         if (queue_.size() >= max_queue_size_) {
             return false;
         }
 
-        queue_.push_back({seq, frame_idx, frame_len, 0, flags, rdtsc()});
+        queue_.push_back({seq, frame_idx, frame_len, payload_len, 0, flags, rdtsc()});
         return true;
     }
 
@@ -72,7 +75,8 @@ struct ZeroCopyRetransmitQueue {
 
         while (!queue_.empty()) {
             const auto& ref = queue_.front();
-            uint32_t seg_end = ref.seq + ref.frame_len;
+            // Use payload_len for ACK tracking, not frame_len
+            uint32_t seg_end = ref.seq + ref.payload_len;
             if (ref.flags & TCP_FLAG_SYN || ref.flags & TCP_FLAG_FIN) {
                 seg_end++;
             }

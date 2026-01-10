@@ -100,6 +100,37 @@ static __always_inline void inc_stat(__u32 index) {
     }
 }
 
+// Helper to extract NIC hardware timestamp into XDP metadata area
+// Returns 0 on success (redirect should proceed), -1 on failure (pass to kernel)
+static __always_inline int extract_hw_timestamp(struct xdp_md *ctx) {
+    int ret = bpf_xdp_adjust_meta(ctx, -(int)sizeof(struct xdp_user_metadata));
+    if (ret != 0) {
+        // adjust_meta failed - likely no headroom
+        return -1;
+    }
+
+    void *data = (void *)(long)ctx->data;
+    void *data_meta = (void *)(long)ctx->data_meta;
+    struct xdp_user_metadata *meta = data_meta;
+
+    // Verify metadata fits before data
+    if ((void *)(meta + 1) > data) {
+        return -1;
+    }
+
+    __u64 timestamp = 0;
+    ret = bpf_xdp_metadata_rx_timestamp(ctx, &timestamp);
+    if (ret == 0 && timestamp != 0) {
+        meta->rx_timestamp_ns = timestamp;
+        inc_stat(STAT_TIMESTAMP_OK);
+    } else {
+        meta->rx_timestamp_ns = 0;
+        inc_stat(STAT_TIMESTAMP_FAIL);
+    }
+
+    return 0;
+}
+
 // Packet parsing context
 struct parse_ctx {
     void *data;
@@ -246,6 +277,39 @@ int exchange_packet_filter(struct xdp_md *ctx) {
 
     // Check if TCP (we only filter TCP traffic)
     if (pctx.ip->protocol != IPPROTO_TCP) {
+        // Redirect trickle packets (UDP to 127.0.0.1) to XSK to preserve FILL ring frames
+        // Trickle packets are self-addressed L2 packets used for NAPI polling workaround
+        // We redirect instead of drop so frames are properly returned to FILL ring
+        if (pctx.ip->protocol == IPPROTO_UDP &&
+            pctx.ip->saddr == bpf_htonl(0x7f000001) &&  // 127.0.0.1
+            pctx.ip->daddr == bpf_htonl(0x7f000001)) {
+            inc_stat(STAT_NON_TCP_PACKETS);
+            // Redirect to XSK - frame will be properly refilled when processed
+            return bpf_redirect_map(&xsks_map, 0, 0);
+        }
+
+        // Redirect ICMP Echo Reply from exchange IPs (for ping-based testing)
+        if (pctx.ip->protocol == IPPROTO_ICMP) {
+            // Check if from exchange IP and destined to us
+            __u32 key = 0;
+            __u32 *our_ip = bpf_map_lookup_elem(&local_ip, &key);
+            bpf_printk("ICMP: src=%x dst=%x our=%x", pctx.ip_src, pctx.ip_dst, our_ip ? *our_ip : 0);
+            if (our_ip && pctx.ip_dst == *our_ip) {
+                __u8 *src_ip_val = bpf_map_lookup_elem(&exchange_ips, &pctx.ip_src);
+                bpf_printk("ICMP check: src_ip_val=%p", src_ip_val);
+                if (src_ip_val && *src_ip_val != 0) {
+                    inc_stat(STAT_EXCHANGE_PACKETS);  // Count as exchange packet
+
+                    // Extract HW timestamp into metadata area
+                    extract_hw_timestamp(ctx);
+
+                    bpf_printk("ICMP REDIRECT from exchange IP");
+                    // Redirect ICMP from exchange to XSK
+                    return bpf_redirect_map(&xsks_map, 0, 0);
+                }
+            }
+        }
+
         inc_stat(STAT_NON_TCP_PACKETS);
         return XDP_PASS;  // Pass non-TCP (UDP, ICMP, etc.) to kernel
     }
@@ -265,24 +329,7 @@ int exchange_packet_filter(struct xdp_md *ctx) {
         inc_stat(STAT_EXCHANGE_PACKETS);
 
         // Extract NIC hardware RX timestamp into metadata area
-        // See: kernel commit 714070c4cb7a (kernel 6.3+)
-        ret = bpf_xdp_adjust_meta(ctx, -(int)sizeof(struct xdp_user_metadata));
-        if (ret == 0) {
-            void *data = (void *)(long)ctx->data;
-            void *data_meta = (void *)(long)ctx->data_meta;
-            struct xdp_user_metadata *meta = data_meta;
-            if ((void *)(meta + 1) <= data) {
-                __u64 timestamp = 0;
-                ret = bpf_xdp_metadata_rx_timestamp(ctx, &timestamp);
-                if (ret == 0 && timestamp != 0) {
-                    meta->rx_timestamp_ns = timestamp;
-                    inc_stat(STAT_TIMESTAMP_OK);
-                } else {
-                    meta->rx_timestamp_ns = 0;
-                    inc_stat(STAT_TIMESTAMP_FAIL);
-                }
-            }
-        }
+        extract_hw_timestamp(ctx);
 
         // Redirect to AF_XDP socket on queue 0
         __u32 queue_id = 0;

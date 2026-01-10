@@ -259,7 +259,7 @@ TEST_IP_OPTIMIZATIONS_BIN := $(BUILD_DIR)/test_ip_optimizations
 TEST_STACK_CHECKSUM_BIN := $(BUILD_DIR)/test_stack_checksum
 TEST_TCP_STATE_BIN := $(BUILD_DIR)/test_tcp_state
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-hftshm bpf check-ktls release debug epoll
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll
 
 all: $(EXAMPLE_BIN)
 
@@ -479,6 +479,61 @@ test-tcp-state: $(TEST_TCP_STATE_BIN)
 	./$(TEST_TCP_STATE_BIN)
 
 # ============================================================================
+# Pipeline Integration Tests (Multi-Process AF_XDP WebSocket)
+# ============================================================================
+
+# Pipeline source and binary
+PIPELINE_BINANCE_SRC := $(INTEGRATION_DIR)/binance_pipeline.cpp
+PIPELINE_BINANCE_BIN := $(BUILD_DIR)/binance_pipeline
+
+# Build pipeline Binance integration test
+$(PIPELINE_BINANCE_BIN): $(PIPELINE_BINANCE_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling Pipeline Binance integration test..."
+ifdef USE_XDP
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Pipeline build complete: $@"
+else
+	@echo "❌ Error: Pipeline requires USE_XDP=1"
+	@exit 1
+endif
+
+# Build-only target for pipeline
+build-pipeline-binance: $(PIPELINE_BINANCE_BIN)
+
+# Run pipeline Binance test (with full XDP preparation)
+test-pipeline-binance: $(PIPELINE_BINANCE_BIN)
+	@echo "🧪 Running Pipeline integration test via script..."
+	sudo ./scripts/xdp_pipeline_integration.sh $(XDP_INTERFACE) 45
+
+# ============================================================================
+# XDP Poll Segregated Test (Wire Loopback)
+# ============================================================================
+
+PIPELINE_XDP_POLL_SRC := test/pipeline/00_xdp_poll.cpp
+PIPELINE_XDP_POLL_BIN := $(BUILD_DIR)/test_pipeline_xdp_poll
+
+# Build XDP Poll test
+$(PIPELINE_XDP_POLL_BIN): $(PIPELINE_XDP_POLL_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling XDP Poll segregated test..."
+ifdef USE_XDP
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ XDP Poll test build complete: $@"
+else
+	@echo "❌ Error: XDP Poll test requires USE_XDP=1"
+	@exit 1
+endif
+
+# Build-only target for XDP Poll test
+build-test-pipeline-xdp-poll: $(PIPELINE_XDP_POLL_BIN)
+
+# Run XDP Poll segregated test (requires sudo access and wire loopback)
+# Uses scripts/test_pipeline_xdp_poll.sh for safe setup/teardown
+# NOTE: Script uses sudo internally, do not invoke with sudo
+test-pipeline-xdp-poll: $(PIPELINE_XDP_POLL_BIN) bpf
+	@echo "🧪 Running XDP Poll segregated test via script..."
+	./scripts/test_pipeline_xdp_poll.sh $(XDP_INTERFACE)
+
+# ============================================================================
 # HftShm RingBuffer Tests (requires hft-shm CLI)
 # ============================================================================
 
@@ -669,6 +724,8 @@ help:
 	@echo "Integration Tests:"
 	@echo "  make test-binance       - BSD socket test with Binance (20 msgs)"
 	@echo "  make test-xdp-binance   - XDP zero-copy test with Binance (requires sudo)"
+	@echo "  make test-pipeline-binance - Multi-process pipeline test (requires sudo)"
+	@echo "  make test-pipeline-xdp-poll - XDP Poll segregated test (wire loopback, sudo)"
 	@echo ""
 	@echo "Benchmark:"
 	@echo "  make benchmark-binance  - Latency benchmark (100 warmup, 300 samples)"

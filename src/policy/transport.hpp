@@ -740,23 +740,38 @@ struct XDPUserspaceTransport {
 
         xdp_.send_raw_frame(syn_frame_addr, syn_len);
         state_ = userspace_stack::TCPState::SYN_SENT;
+        fprintf(stderr, "[XDP-Userspace] SYN sent (seq=%u, frame_idx=%u, len=%zu)\n",
+                tcp_params_.snd_nxt - 1, syn_frame_idx, syn_len);
 
-        // Add SYN to zero-copy retransmit queue
+        // Add SYN to zero-copy retransmit queue (SYN has 0 payload, consumes 1 seq)
         retransmit_queue_.add_ref(tcp_params_.snd_nxt, userspace_stack::TCP_FLAG_SYN,
-                                  syn_frame_idx, static_cast<uint16_t>(syn_len));
+                                  syn_frame_idx, static_cast<uint16_t>(syn_len), 0);
         tcp_params_.snd_nxt++;  // SYN consumes one sequence number
 
         // Wait for SYN-ACK with timeout
         auto start = std::chrono::steady_clock::now();
         constexpr uint32_t timeout_ms = 5000;
 
+        // Debug: Print BPF stats during handshake
+        static int handshake_debug_count = 0;
+
         while (state_ == userspace_stack::TCPState::SYN_SENT) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
 
             if (elapsed_ms >= timeout_ms) {
+                // Print BPF stats before timeout
+                fprintf(stderr, "[XDP-Userspace] Connection timeout - BPF stats:\n");
+                xdp_.print_bpf_stats();
                 state_ = userspace_stack::TCPState::CLOSED;
                 throw std::runtime_error("Connection timeout");
+            }
+
+            // Debug: Print BPF stats every second during handshake
+            if (handshake_debug_count < 5 && (elapsed_ms / 1000) > handshake_debug_count) {
+                fprintf(stderr, "[XDP-Userspace] Handshake %lds - BPF stats:\n", elapsed_ms / 1000);
+                xdp_.print_bpf_stats();
+                handshake_debug_count++;
             }
 
             // Trigger NAPI via poll_wait() for TX completions + RX processing
@@ -831,9 +846,11 @@ struct XDPUserspaceTransport {
             xdp_.send_raw_frame(frame_addr, frame_len);
 
             // Add to zero-copy retransmit queue (no data copy)
+            // frame_len = Ethernet frame size, chunk_size = TCP payload size
             retransmit_queue_.add_ref(tcp_params_.snd_nxt,
                                       userspace_stack::TCP_FLAG_ACK | userspace_stack::TCP_FLAG_PSH,
-                                      frame_idx, static_cast<uint16_t>(frame_len));
+                                      frame_idx, static_cast<uint16_t>(frame_len),
+                                      static_cast<uint16_t>(chunk_size));
 
             tcp_params_.snd_nxt += chunk_size;
             sent += chunk_size;
@@ -912,9 +929,10 @@ struct XDPUserspaceTransport {
                 size_t fin_len = stack_.build_fin(fin_buffer, xdp_.frame_capacity(), tcp_params_);
                 if (fin_len > 0) {
                     xdp_.send_raw_frame(fin_frame_addr, fin_len);
+                    // FIN has 0 payload, consumes 1 seq (like SYN)
                     retransmit_queue_.add_ref(tcp_params_.snd_nxt,
                                               userspace_stack::TCP_FLAG_FIN | userspace_stack::TCP_FLAG_ACK,
-                                              fin_frame_idx, static_cast<uint16_t>(fin_len));
+                                              fin_frame_idx, static_cast<uint16_t>(fin_len), 0);
                     tcp_params_.snd_nxt++;
                     state_ = userspace_stack::TCPState::FIN_WAIT_1;
                 }
@@ -1135,6 +1153,29 @@ struct XDPUserspaceTransport {
         consumed_recv_latest_timestamp_ns_ = 0;
     }
 
+    // =========================================================================
+    // XSK State Accessors (for pipeline process inheritance)
+    // =========================================================================
+    // These allow child processes to inherit the XSK socket/UMEM after fork
+
+    struct xsk_socket* get_xsk() { return xdp_.get_xsk(); }
+    struct xsk_umem* get_umem() { return xdp_.get_umem(); }
+    void* get_umem_area() { return xdp_.get_umem_area(); }
+    size_t get_umem_size() const { return xdp_.get_umem_size(); }
+    struct xsk_ring_prod* get_fill_ring() { return xdp_.get_fill_ring(); }
+    struct xsk_ring_cons* get_comp_ring() { return xdp_.get_comp_ring(); }
+    struct xsk_ring_cons* get_rx_ring() { return xdp_.get_rx_ring(); }
+    struct xsk_ring_prod* get_tx_ring() { return xdp_.get_tx_ring(); }
+    uint32_t get_frame_size() const { return xdp_.get_frame_size(); }
+    websocket::xdp::BPFLoader* get_bpf_loader() { return xdp_.get_bpf_loader(); }
+
+    // TCP parameters accessor (for populating shared memory after handshake)
+    const userspace_stack::TCPParams& tcp_params() const { return tcp_params_; }
+
+    // MAC address accessors (for populating shared memory after handshake)
+    const uint8_t* get_local_mac() const { return stack_.get_local_mac(); }
+    const uint8_t* get_gateway_mac() const { return stack_.get_gateway_mac(); }
+
 private:
     // =========================================================================
     // PACKET SENDING (uses stack's pure packet building)
@@ -1161,6 +1202,16 @@ private:
     void poll_rx_and_process() {
         // Process ALL available packets in the RX ring
         websocket::xdp::XDPFrame* frame = xdp_.peek_rx_frame();
+
+        // Debug: track poll calls during handshake
+        static int poll_debug_count = 0;
+        if (poll_debug_count < 50 && state_ == userspace_stack::TCPState::SYN_SENT) {
+            if (frame) {
+                fprintf(stderr, "[XDP-Userspace] RX frame during SYN_SENT: len=%u hw_ts=%lu\n",
+                        frame->len, frame->hw_timestamp_ns);
+            }
+            poll_debug_count++;
+        }
 
         while (frame) {
             // Capture hardware timestamp from XDP metadata
@@ -1202,11 +1253,11 @@ private:
                         uint64_t frame_timestamp = frame->hw_timestamp_ns;
                         uint64_t umem_addr = xdp_.release_rx_frame(frame, true);
                         if (umem_addr != 0) {
-                            // WARNING: push_frame() return value not checked.
-                            // If recv_buffer_ is full (256 frames), data is silently dropped.
-                            // Since rcv_nxt advances and ACK is sent regardless, sender won't
-                            // retransmit. DATA PERMANENTLY LOST if consumer is too slow.
-                            recv_buffer_.push_frame(result.data, result.data_len, umem_addr, frame_timestamp);
+                            bool push_ok = recv_buffer_.push_frame(result.data, result.data_len, umem_addr, frame_timestamp);
+                            if (!push_ok) {
+                                // Frame was deferred-released but can't be pushed - must refill immediately
+                                xdp_.refill_frame(umem_addr);
+                            }
                             frame = nullptr;
                         }
                         tcp_params_.rcv_nxt += result.data_len;
