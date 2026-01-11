@@ -55,149 +55,201 @@ In fork-first architecture, XDP Poll creates its own XSK socket fresh after fork
 This avoids XSK socket inheritance issues that caused `rx=0` packets.
 
 ```cpp
-template<typename RawInboxProd, typename RawOutboxCons,
-         typename AckOutboxCons, typename PongOutboxCons>
-class XDPPollProcess {
-    // XDP socket and rings (created fresh in init_fresh())
-    int xsk_fd_;
-    struct xsk_socket* xsk_ = nullptr;
-    struct xsk_umem* umem_obj_ = nullptr;
-    struct xsk_ring_prod tx_ring_;
-    struct xsk_ring_cons rx_ring_;
-    struct xsk_ring_cons comp_ring_;
-    struct xsk_ring_prod fill_ring_;
-
-    // UMEM (shared memory, mapped from parent)
-    uint8_t* umem_;
-    size_t umem_size_;
-
-    // BPF loader (owned by XDP Poll in fork-first architecture)
-    std::unique_ptr<websocket::xdp::BPFLoader> bpf_loader_;
-
-    // Shared state (includes TCP state and TX frame allocation)
-    // See pipeline_data.hpp for WebsocketStateShm definition
-    WebsocketStateShm* tcp_state_;  // Note: TCPStateShm is alias for WebsocketStateShm
-
-    // Ring buffer producers/consumers (IPC rings from parent)
-    RawInboxProd* raw_inbox_prod_;
-    RawOutboxCons* raw_outbox_consumer_;
-    AckOutboxCons* ack_outbox_consumer_;
-    PongOutboxCons* pong_outbox_consumer_;
-
-    // Note: TxFrameState is now merged into WebsocketStateShm.tx_frame
-    // Access via: tcp_state_->tx_frame.ack_release_pos, etc.
-
-    // Trickle packet (pre-built static frame, allocated OUTSIDE RX/TX pools)
-    // Address calculation uses compile-time FRAME_SIZE constant
-    uint64_t trickle_frame_addr_;  // = TOTAL_UMEM_FRAMES * FRAME_SIZE
-
-    // RX frame tracking
-    int64_t last_released_ = 0;
-
-    // Config
-    struct Config {
-        const char* interface;
-        uint32_t queue_id = 0;
-        uint32_t frame_size = FRAME_SIZE;  // Must equal compile-time FRAME_SIZE
-        bool zero_copy = true;
-    };
+template<typename RingProducer,
+         typename OutboxConsumer,
+         bool TrickleEnabled = true,
+         uint32_t FrameHeadroom = 256,
+         uint32_t FrameSize = 2048>
+struct XDPPollProcess {
+    // Compile-time constants from template args
+    static constexpr bool kTrickleEnabled = TrickleEnabled;
+    static constexpr uint32_t kFrameHeadroom = FrameHeadroom;
+    static constexpr uint32_t kFrameSize = FrameSize;
+    static constexpr uint32_t kQueueId = 0;  // Always queue 0
 
 public:
     // ========================================================================
-    // init_fresh() - Creates XSK socket from scratch (fork-first architecture)
+    // Constructor - Takes interface name only
+    // ========================================================================
+    explicit XDPPollProcess(const char* interface) : interface_(interface) {}
+
+    // ========================================================================
+    // init() - Creates XSK socket from scratch (fork-first architecture)
     // Called in XDP Poll child process after fork
     // ========================================================================
-    bool init_fresh(void* umem_area, size_t umem_size, const Config& config,
-                    const char* bpf_path,
-                    RawInboxProd* raw_inbox_prod,
-                    RawOutboxCons* raw_outbox_cons,
-                    AckOutboxCons* ack_outbox_cons,
-                    PongOutboxCons* pong_outbox_cons,
-                    WebsocketStateShm* tcp_state);
+    bool init(void* umem_area, size_t umem_size,
+              const char* bpf_path,
+              RingProducer* raw_inbox_prod,
+              OutboxConsumer* raw_outbox_cons,
+              OutboxConsumer* ack_outbox_cons,
+              OutboxConsumer* pong_outbox_cons,
+              ConnStateShm* conn_state);
 
     void run();
     void cleanup();
 
+    // Accessors
+    websocket::xdp::BPFLoader* get_bpf_loader();
+    struct xsk_socket* get_xsk_socket();
+    int get_xsk_fd() const;
+    uint32_t fill_ring_producer() const;
+    uint32_t fill_ring_consumer() const;
+    int64_t last_released_seq() const;
+    uint64_t last_rx_timestamp() const;
+    uint64_t rx_packets() const;
+    uint64_t tx_completions() const;
+
 private:
-    bool load_and_attach_bpf(const char* bpf_path);
-    void refill_rx_frame(uint64_t addr);
-    void return_frame_to_pool(uint32_t frame_idx);
-    void send_trickle_packet();
-    void advance_tx_release_positions();
-    void advance_msg_release_pos();
-    void advance_pong_release_pos();
+    // Main loop helper methods
+    bool submit_tx_batch();
+    bool process_rx();
+    void process_completions();
+    void reclaim_rx_frames();
+    void send_trickle();
+
+    // Initialization helpers
+    bool get_interface_mac();
+    void create_trickle_socket();
+    void build_trickle_packet();
+
+    // XDP state
+    struct xsk_socket* xsk_ = nullptr;
+    struct xsk_umem* umem_ = nullptr;
+    struct xsk_ring_prod fill_ring_;
+    struct xsk_ring_cons comp_ring_;
+    struct xsk_ring_cons rx_ring_;
+    struct xsk_ring_prod tx_ring_;
+    int xsk_fd_ = -1;
+
+    // BPF loader (owns BPF program lifecycle)
+    std::unique_ptr<websocket::xdp::BPFLoader> bpf_loader_;
+
+    // Configuration
+    void* umem_area_ = nullptr;
+    size_t umem_size_ = 0;
+    const char* interface_ = nullptr;
+    unsigned int ifindex_ = 0;
+
+    // Ring pointers (IPC rings from parent)
+    RingProducer* raw_inbox_prod_ = nullptr;
+    OutboxConsumer* raw_outbox_cons_ = nullptr;
+    OutboxConsumer* ack_outbox_cons_ = nullptr;
+    OutboxConsumer* pong_outbox_cons_ = nullptr;
+    ConnStateShm* conn_state_ = nullptr;
+
+    // Trickle state (AF_PACKET socket for igc driver workaround)
+    int trickle_fd_ = -1;
+    uint8_t local_mac_[6];
+    uint8_t trickle_packet_[64];
+    size_t trickle_packet_len_ = 0;
+
+    // Stats
+    uint64_t rx_packets_ = 0;
+    uint64_t tx_completions_ = 0;
+
+    // RX frame tracking (via consumer sequence)
+    int64_t last_released_seq_ = -1;
+    uint64_t last_rx_timestamp_ns_ = 0;
 };
 ```
 
 ---
 
-## init_fresh() Implementation (Fork-First)
+## init() Implementation (Fork-First)
 
 Creates XSK socket from scratch in child process. This is the fork-first approach:
 no socket inheritance from parent, avoiding rx=0 issues.
 
 ```cpp
-template<typename ...>
-bool XDPPollProcess<...>::init_fresh(void* umem_area, size_t umem_size,
-                                      const Config& config, const char* bpf_path,
-                                      RawInboxProd* raw_inbox_prod, ...) {
-    umem_ = static_cast<uint8_t*>(umem_area);
+template<typename RingProducer, typename OutboxConsumer,
+         bool TrickleEnabled, uint32_t FrameHeadroom, uint32_t FrameSize>
+bool XDPPollProcess<...>::init(void* umem_area, size_t umem_size,
+                               const char* bpf_path,
+                               RingProducer* raw_inbox_prod, ...) {
+    umem_area_ = umem_area;
     umem_size_ = umem_size;
 
     // Store IPC ring pointers (created by parent before fork)
-    raw_inbox_producer_ = raw_inbox_prod;
-    raw_outbox_consumer_ = raw_outbox_cons;
-    ack_outbox_consumer_ = ack_outbox_cons;
-    pong_outbox_consumer_ = pong_outbox_cons;
-    tcp_state_ = tcp_state;
+    raw_inbox_prod_ = raw_inbox_prod;
+    raw_outbox_cons_ = raw_outbox_cons;
+    ack_outbox_cons_ = ack_outbox_cons;
+    pong_outbox_cons_ = pong_outbox_cons;
+    conn_state_ = conn_state;
 
     // 1. Create UMEM from shared memory area
+    // Uses compile-time kFrameSize and kFrameHeadroom
     struct xsk_umem_config umem_cfg = {
-        .fill_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
-        .comp_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
-        .frame_size = config.frame_size,
-        .frame_headroom = XDP_PACKET_HEADROOM,
+        .fill_size = RX_FRAMES,       // Must match RX pool size
+        .comp_size = TX_POOL_SIZE,    // Must match TX pool size
+        .frame_size = kFrameSize,     // Compile-time template param
+        .frame_headroom = kFrameHeadroom,
         .flags = 0
     };
-    int ret = xsk_umem__create(&umem_obj_, umem_, umem_size_,
+    int ret = xsk_umem__create(&umem_, umem_area_, umem_size_,
                                 &fill_ring_, &comp_ring_, &umem_cfg);
     if (ret) return false;
 
-    // 2. Load and attach BPF program
-    if (!load_and_attach_bpf(bpf_path)) return false;
+    // Initialize cached pointers for fill ring (producer ring)
+    fill_ring_.cached_prod = *fill_ring_.producer;
+    fill_ring_.cached_cons = *fill_ring_.consumer + fill_ring_.size;
 
-    // 3. Create XSK socket (no program load - BPF already attached)
+    // Initialize cached pointers for completion ring (consumer ring)
+    // These are NOT initialized by xsk_umem__create, causing garbage reads
+    comp_ring_.cached_cons = *comp_ring_.consumer;
+    comp_ring_.cached_prod = *comp_ring_.producer;
+
+    // 2. Load and attach BPF program
+    if (bpf_path) {
+        bpf_loader_ = std::make_unique<websocket::xdp::BPFLoader>();
+        bpf_loader_->load(interface_, bpf_path);
+        bpf_loader_->attach();
+    }
+
+    // 3. Create XSK socket - always zero-copy mode
+    // queue_id is always 0 (kQueueId), zero_copy is always true
     struct xsk_socket_config xsk_cfg = {
         .rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
         .tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
-        .xdp_flags = config.zero_copy ? XDP_FLAGS_DRV_MODE : 0,
-        .bind_flags = config.zero_copy ? XDP_ZEROCOPY : XDP_COPY,
+        .xdp_flags = 0,
+        .bind_flags = XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP,  // Always zero-copy
         .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD
     };
-    ret = xsk_socket__create(&xsk_, config.interface, config.queue_id,
-                              umem_obj_, &rx_ring_, &tx_ring_, &xsk_cfg);
+    ret = xsk_socket__create(&xsk_, interface_, kQueueId,
+                              umem_, &rx_ring_, &tx_ring_, &xsk_cfg);
     if (ret) return false;
     xsk_fd_ = xsk_socket__fd(xsk_);
+
+    // Initialize RX ring cached values (consumer ring)
+    rx_ring_.cached_cons = *rx_ring_.consumer;
+    rx_ring_.cached_prod = *rx_ring_.producer;
 
     // 4. Register XSK in BPF xsks_map
     bpf_loader_->register_xsk_socket(xsk_);
 
+    // 4.5. Enable SO_BUSY_POLL for lower latency
+    int busy_poll = 1;
+    setsockopt(xsk_fd_, SOL_SOCKET, SO_PREFER_BUSY_POLL, &busy_poll, sizeof(busy_poll));
+    int budget = 32;
+    setsockopt(xsk_fd_, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &budget, sizeof(budget));
+    int usec = 50;  // 50us busy poll interval
+    setsockopt(xsk_fd_, SOL_SOCKET, SO_BUSY_POLL, &usec, sizeof(usec));
+
     // 5. Populate fill_ring with RX frames
     uint32_t idx;
     if (xsk_ring_prod__reserve(&fill_ring_, RX_FRAMES, &idx) == RX_FRAMES) {
-        for (size_t i = 0; i < RX_FRAMES; i++) {
-            *xsk_ring_prod__fill_addr(&fill_ring_, idx + i) = i * config.frame_size;
+        for (uint32_t i = 0; i < RX_FRAMES; i++) {
+            *xsk_ring_prod__fill_addr(&fill_ring_, idx++) = i * kFrameSize;
         }
         xsk_ring_prod__submit(&fill_ring_, RX_FRAMES);
     }
 
-    // 6. Build trickle packet at reserved UMEM address
-    // Use compile-time FRAME_SIZE constant (config.frame_size must equal FRAME_SIZE)
-    trickle_frame_addr_ = TOTAL_UMEM_FRAMES * FRAME_SIZE;
-    build_trickle_packet();
+    // 6. Build trickle packet and create AF_PACKET socket
+    if constexpr (kTrickleEnabled) {
+        create_trickle_socket();
+    }
 
     // 7. Signal XDP ready (XSK socket created, BPF attached)
-    tcp_state_->set_handshake_xdp_ready();
+    conn_state_->set_handshake_xdp_ready();
     printf("[XDP-POLL] XSK socket created, signaling xdp_ready\n");
 
     return true;
@@ -214,171 +266,231 @@ void XDPPollProcess::run() {
     constexpr uint32_t RX_BATCH = 32;
     uint8_t trickle_counter = 0;
 
-    // Fork-first: use is_running() helper with ProcessId enum
-    while (tcp_state_->is_running(PROC_XDP_POLL)) {
+    // Direct flag access for main loop (explicit memory ordering)
+    while (conn_state_->running[PROC_XDP_POLL].flag.load(std::memory_order_acquire)) {
         bool data_moved = false;
-        uint32_t tx_batch_count = 0;
-        uint32_t tx_batch_idx;
 
-        // Reserve TX ring space for batch
-        xsk_ring_prod__reserve(&tx_ring_, TX_BATCH_SIZE, &tx_batch_idx);
+        // 1. Collect and submit TX packets
+        data_moved |= submit_tx_batch();
 
-        // Reusable lambda for collecting TX frames from any outbox
-        auto collect_tx_frames = [&](UMEMFrameDescriptor& desc, int64_t seq) -> bool {
-            if (tx_batch_count >= TX_BATCH_SIZE) return false;
-            auto* tx_desc = xsk_ring_prod__tx_desc(&tx_ring_, tx_batch_idx + tx_batch_count);
-            tx_desc->addr = desc.umem_addr;
-            tx_desc->len = desc.frame_len;
-            ++tx_batch_count;
-            data_moved = true;
-            return true;
-        };
+        // 2. RX: rx_ring → RAW_INBOX - uses try_claim + publish
+        data_moved |= process_rx();
 
-        // 1-3. Collect from all TX outboxes using shared lambda
-        raw_outbox_consumer_.process_manually(collect_tx_frames);
-        ack_outbox_consumer_.process_manually(collect_tx_frames);
-        pong_outbox_consumer_.process_manually(collect_tx_frames);
-
-        // 4. Submit TX batch + kick + commit consumers
-        // CRITICAL: Only commit after successful TX submission
-        if (tx_batch_count > 0) {
-            xsk_ring_prod__submit(&tx_ring_, tx_batch_count);
-            sendto(xsk_fd_, NULL, 0, MSG_DONTWAIT, NULL, 0);
-            // Now safe to commit consumers (frames are in flight to NIC)
-            raw_outbox_consumer_.commit_manually();
-            ack_outbox_consumer_.commit_manually();
-            pong_outbox_consumer_.commit_manually();
+        // 3. (always) Inline trickle for igc driver TX completion stall
+        if ((++trickle_counter & 0x07) == 0) {
+            send_trickle();  // 43-byte self-addressed UDP to trigger NAPI
         }
 
-        // 5. RX: rx_ring → RAW_INBOX - uses try_claim + publish
-        //    NO separate build_descriptor() - inline for minimal overhead
-        //    Capture NIC timestamp + XDP Poll cycle for latency tracking
-        //    CRITICAL: RAW_INBOX full is a fatal error - Transport is too slow
-        uint32_t idx;
-        uint32_t nb_pkts = xsk_ring_cons__peek(&rx_ring_, RX_BATCH, &idx);
-        for (uint32_t i = 0; i < nb_pkts; i++) {
-            const auto* rx_desc = xsk_ring_cons__rx_desc(&rx_ring_, idx + i);
-            int64_t slot = raw_inbox_producer_.try_claim();
-            if (slot < 0) {
-                // FATAL: RAW_INBOX full - Transport process is not keeping up
-                // This is a critical error that indicates system overload
-                // Crash immediately to prevent silent data loss
-                std::abort();  // Or: raise(SIGABRT);
-            }
-
-            auto& desc = raw_inbox_producer_[slot];
-            desc.umem_addr = rx_desc->addr;
-            desc.frame_len = rx_desc->len;
-            desc.frame_type = FRAME_TYPE_RX;
-            desc.consumed = 0;  // Will be set to 1 by Transport after SSL_read
-
-            // Fetch NIC HW timestamp from BPF metadata (8 bytes before packet)
-            desc.nic_timestamp_ns = *(uint64_t*)(umem_ + rx_desc->addr - 8);
-
-            // Capture XDP Poll timestamp (using rdtscp() from core/timing.hpp)
-            desc.nic_frame_poll_cycle = rdtscp();
-
-            raw_inbox_producer_.publish(slot);
+        // 4. (idle) comp_ring → reclaim TX UMEM by address range
+        if (!data_moved) {
+            process_completions();
         }
-        if (nb_pkts > 0) {
-            xsk_ring_cons__release(&rx_ring_, nb_pkts);
-            data_moved = true;
+
+        // 5. (idle) Release ACKed PONG/MSG frames
+        if (!data_moved) {
+            release_acked_tx_frames();
         }
 
         // 6. (idle) Reclaim consumed RX UMEM → fill_ring
-        //    NOTE: Read Transport's consumer sequence via producer's consumer_sequence() method
-        //    This is the implementation pattern from src/pipeline/xdp_poll_process.hpp
         if (!data_moved) {
-            int64_t consumer_pos = raw_inbox_prod_->consumer_sequence();
+            reclaim_rx_frames();
+        }
+    }
+}
+```
 
-            // Release frames that Transport has consumed
-            // SAFETY: Only release up to consumer_pos (what Transport has processed)
-            // last_released_ tracks how many frames XDP Poll has returned to fill_ring
-            //
-            // Invariant: last_released_ <= consumer_pos <= producer_pos
-            //   - last_released_: XDP Poll's release cursor (how many we've recycled)
-            //   - consumer_pos: Transport's consumption cursor (how many it has processed)
-            //   - producer_pos: XDP Poll's publish cursor (how many we've received)
-            //
-            // We can safely release frames in range [last_released_, consumer_pos)
-            // because Transport has finished reading them.
-            while (last_released_ < consumer_pos) {
-                // Read descriptor from RAW_INBOX ring buffer at last_released_ position
-                auto& desc = raw_inbox_prod_->ring_buffer()[last_released_ & (RAW_INBOX_SIZE - 1)];
-                refill_rx_frame(desc.umem_addr);
-                ++last_released_;
-            }
+### submit_tx_batch()
+
+Collects frames from all TX outboxes, submits to NIC, then commits consumers:
+
+```cpp
+bool XDPPollProcess::submit_tx_batch() {
+    uint32_t tx_idx = 0;
+    uint32_t tx_count = 0;
+    uint32_t available = 0;
+
+    // First check if any outbox has data before reserving TX slots
+    bool has_raw = raw_outbox_cons_ && raw_outbox_cons_->has_data();
+    bool has_ack = ack_outbox_cons_ && ack_outbox_cons_->has_data();
+    bool has_pong = pong_outbox_cons_ && pong_outbox_cons_->has_data();
+
+    if (!has_raw && !has_ack && !has_pong) {
+        return false;  // Nothing to send
+    }
+
+    // Reserve TX ring slots - must always get full batch
+    available = xsk_ring_prod__reserve(&tx_ring_, TX_BATCH_SIZE, &tx_idx);
+    if (available < TX_BATCH_SIZE) {
+        fprintf(stderr, "[XDP-TX] FATAL: TX ring reserve failed: got %u, need %u\n",
+                available, TX_BATCH_SIZE);
+        fprintf(stderr, "[XDP-TX] prod=%u cons=%u cached_prod=%u cached_cons=%u\n",
+                *tx_ring_.producer, *tx_ring_.consumer,
+                tx_ring_.cached_prod, tx_ring_.cached_cons);
+        abort();
+    }
+
+    // Reusable lambda for collecting TX frames from any outbox
+    auto collect_tx_frames = [&](UMEMFrameDescriptor& desc, int64_t seq) -> bool {
+        (void)seq;
+        if (tx_count >= available) return false;
+
+        struct xdp_desc* tx_desc = xsk_ring_prod__tx_desc(&tx_ring_, tx_idx++);
+        tx_desc->addr = desc.umem_addr;
+        tx_desc->len = desc.frame_len;
+        tx_desc->options = 0;
+        tx_count++;
+        return true;
+    };
+
+    // Collect from all TX outboxes using shared lambda
+    if (has_raw && tx_count < available) {
+        raw_outbox_cons_->process_manually(collect_tx_frames);
+    }
+    if (has_ack && tx_count < available) {
+        ack_outbox_cons_->process_manually(collect_tx_frames);
+    }
+    if (has_pong && tx_count < available) {
+        pong_outbox_cons_->process_manually(collect_tx_frames);
+    }
+
+    // Submit whatever we collected
+    xsk_ring_prod__submit(&tx_ring_, tx_count);
+
+    // Cancel reservation for unused slots
+    if (tx_count < available) {
+        tx_ring_.cached_prod -= (available - tx_count);
+    }
+
+    if (tx_count > 0) {
+        // Conditional kick: only wake kernel if driver needs it
+        if (xsk_ring_prod__needs_wakeup(&tx_ring_)) {
+            sendto(xsk_fd_, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
         }
 
-        // 7. (idle) comp_ring → reclaim TX UMEM by address range
-        //    CRITICAL SAFETY: comp_ring means NIC sent frame, but TCP ACK may not be received yet
-        //    For MSG frames (retransmittable), MUST verify frame is ACKed before releasing
-        //    For ACK/PONG frames (control, no retransmit), can release immediately
-        if (!data_moved) {
-            uint32_t n = xsk_ring_cons__peek(&comp_ring_, COMP_BATCH, &idx);
-            for (uint32_t i = 0; i < n; i++) {
-                uint64_t addr = *xsk_ring_cons__comp_addr(&comp_ring_, idx + i);
+        // Commit consumers ONLY after successful TX submission
+        if (has_raw) raw_outbox_cons_->commit_manually();
+        if (has_ack) ack_outbox_cons_->commit_manually();
+        if (has_pong) pong_outbox_cons_->commit_manually();
 
-                // FRAME INDEX DERIVATION: addr→frame_idx
-                // =====================================
-                // comp_ring returns UMEM addresses (byte offsets into UMEM buffer).
-                // To identify which pool a frame belongs to, we derive frame_idx:
-                //   frame_idx = addr / FRAME_SIZE
-                //
-                // UMEM layout: [RX frames][ACK frames][PONG frames][MSG frames][Trickle]
-                // So frame_idx directly maps to pool:
-                //   [0, RX_FRAMES)           → RX pool (error if in comp_ring)
-                //   [RX_FRAMES, RX+ACK)      → ACK pool
-                //   [RX+ACK, RX+ACK+PONG)    → PONG pool
-                //   [RX+ACK+PONG, ...)       → MSG pool
-                //
-                // Compare with Transport's position→frame_idx:
-                //   frame_idx = BASE + (alloc_pos % POOL_SIZE)
-                // where BASE is the starting frame index for that pool.
-                uint32_t frame_idx = addr / FRAME_SIZE;
+        return true;  // Data moved
+    } else {
+        tx_ring_.cached_prod -= available;
+        return false;
+    }
+}
+```
 
-                // Skip trickle frame (reserved, not part of any pool)
-                if (addr == trickle_frame_addr_) {
-                    continue;
-                }
+### process_rx()
 
-                // Derive pool from address range
-                if (frame_idx < RX_FRAMES) {
-                    // RX frame - should never appear in comp_ring (RX only)
-                    // This indicates a bug - abort
-                    std::abort();
-                } else if (frame_idx < RX_FRAMES + ACK_FRAMES) {
-                    // ACK frame - control frame, no retransmit needed, release immediately
-                    return_frame_to_pool(frame_idx);
-                } else if (frame_idx < RX_FRAMES + ACK_FRAMES + PONG_FRAMES) {
-                    // PONG frame - must wait for TCP ACK before release (like MSG)
-                    //
-                    // COMP_RING FLOW FOR PONG/MSG FRAMES:
-                    // 1. comp_ring: NIC signals frame was SENT (DMA complete)
-                    // 2. But we can't release yet - need TCP ACK for retransmit support
-                    // 3. Transport marks pong_acked[] when TCP ACK covers this segment
-                    // 4. advance_tx_release_positions() (step 8) advances position counters
-                    //
-                    // We don't track comp_ring completion explicitly - the acked[] flag
-                    // subsumes it (can only be ACKed if it was sent)
-                } else {
-                    // MSG frame - same flow as PONG (see above)
-                    // Transport marks msg_acked[] when TCP ACK covers this segment
-                }
-            }
-            xsk_ring_cons__release(&comp_ring_, n);
+Receives frames from rx_ring, publishes to RAW_INBOX with timestamps:
+
+```cpp
+bool XDPPollProcess::process_rx() {
+    uint32_t rx_idx;
+    uint32_t nb_pkts = xsk_ring_cons__peek(&rx_ring_, RX_BATCH, &rx_idx);
+
+    if (nb_pkts == 0) return false;
+
+    uint64_t poll_cycle = rdtscp();
+
+    for (uint32_t i = 0; i < nb_pkts; i++) {
+        const struct xdp_desc* rx_desc = xsk_ring_cons__rx_desc(&rx_ring_, rx_idx++);
+
+        // Claim slot in RAW_INBOX
+        int64_t slot = raw_inbox_prod_->try_claim();
+        if (slot < 0) {
+            // FATAL: RAW_INBOX full - Transport process is not keeping up
+            abort();
         }
 
-        // 8. (idle) Release ACKed TX frames sequentially
-        //    Transport marks frames as ACKed, XDP Poll releases them
-        if (!data_moved) {
-            advance_tx_release_positions();
-        }
+        // Write directly to claimed slot
+        auto& desc = (*raw_inbox_prod_)[slot];
+        desc.umem_addr = rx_desc->addr;
+        desc.frame_len = rx_desc->len;
+        desc.nic_frame_poll_cycle = poll_cycle;
+        desc.frame_type = FRAME_TYPE_RX;
+        desc.consumed = 0;
 
-        // 9. (always) Inline RX trickle for igc driver TX completion stall
-        if ((++trickle_counter & 0x07) == 0) {
-            send_trickle_packet();  // 43-byte self-addressed UDP to trigger NAPI
+        // Read NIC timestamp from metadata (8 bytes before packet data)
+        uint64_t* ts_ptr = reinterpret_cast<uint64_t*>(
+            static_cast<uint8_t*>(umem_area_) + rx_desc->addr - 8);
+        desc.nic_timestamp_ns = *ts_ptr;
+        last_rx_timestamp_ns_ = desc.nic_timestamp_ns;  // Track for testing
+
+        raw_inbox_prod_->publish(slot);
+    }
+
+    xsk_ring_cons__release(&rx_ring_, nb_pkts);
+    rx_packets_ += nb_pkts;
+    return true;  // Data moved
+}
+```
+
+### process_completions()
+
+Processes TX completion ring during idle time:
+
+```cpp
+void XDPPollProcess::process_completions() {
+    uint32_t comp_idx;
+    uint32_t nb_completed = xsk_ring_cons__peek(&comp_ring_, COMP_BATCH, &comp_idx);
+
+    if (nb_completed == 0) return;
+
+    for (uint32_t i = 0; i < nb_completed; i++) {
+        uint64_t addr = *xsk_ring_cons__comp_addr(&comp_ring_, comp_idx++);
+        uint32_t frame_idx = addr_to_frame_idx(addr, kFrameSize);
+
+        // Determine pool and handle accordingly
+        if (frame_idx < RX_POOL_END) {
+            // RX frame in comp_ring - should NEVER happen
+            abort();
+        } else if (frame_idx < ACK_POOL_END) {
+            // ACK frame - release now (no retransmit needed)
+            conn_state_->tx_frame.ack_release_pos.fetch_add(1, std::memory_order_release);
+        } else if (frame_idx < PONG_POOL_END) {
+            // PONG frame - release after TCP ACK (handled by Transport)
+        } else {
+            // MSG frame - release after TCP ACK (handled by Transport)
         }
+    }
+
+    xsk_ring_cons__release(&comp_ring_, nb_completed);
+    tx_completions_ += nb_completed;
+}
+```
+
+### reclaim_rx_frames()
+
+Reclaims consumed RX frames to fill_ring during idle time:
+
+```cpp
+void XDPPollProcess::reclaim_rx_frames() {
+    // Read Transport's consumer sequence
+    int64_t consumer_pos = raw_inbox_prod_->consumer_sequence();
+
+    // Nothing to reclaim if consumer hasn't advanced
+    if (consumer_pos <= last_released_seq_) return;
+
+    int64_t to_reclaim = consumer_pos - last_released_seq_;
+    if (to_reclaim <= 0) return;
+
+    // Reserve fill ring slots
+    uint32_t fill_idx;
+    uint32_t available = xsk_ring_prod__reserve(&fill_ring_, (uint32_t)to_reclaim, &fill_idx);
+    if (available == 0) return;
+
+    // Reclaim frames from RAW_INBOX ring buffer
+    uint32_t reclaimed = 0;
+    for (int64_t pos = last_released_seq_ + 1; pos <= consumer_pos && reclaimed < available; pos++) {
+        const auto& desc = (*raw_inbox_prod_)[pos];
+        *xsk_ring_prod__fill_addr(&fill_ring_, fill_idx++) = desc.umem_addr & ~(uint64_t)(kFrameSize - 1);
+        reclaimed++;
+    }
+
+    if (reclaimed > 0) {
+        xsk_ring_prod__submit(&fill_ring_, reclaimed);
+        last_released_seq_ += reclaimed;
     }
 }
 ```
@@ -409,12 +521,13 @@ See [pipeline_architecture.md Section 3.5.1](pipeline_architecture.md#351-txfram
 - PONG frames (data, ACK-based release - PONGs consume TCP sequence space and need retransmit)
 - MSG frames (data, ACK-based release - application data needs retransmit)
 
-**XDP Poll Process** (advances release positions during idle):
+**XDP Poll Process** (advances release positions in `process_completions()`):
 ```cpp
-// In idle section - advance release positions for MSG/PONG frames
-// See advance_tx_release_positions() helper function
+// In idle section - process completion ring and release TX frames
+// ACK frames: immediate release (ack_release_pos.fetch_add(1))
+// PONG/MSG frames: XDP Poll advances release_pos when release_pos < acked_pos
 if (!data_moved) {
-    advance_tx_release_positions();
+    process_completions();
 }
 ```
 
@@ -492,163 +605,58 @@ if (ret == 0) {
 
 ## Helper Functions
 
-### refill_rx_frame()
-```cpp
-void XDPPollProcess::refill_rx_frame(uint64_t addr) {
-    uint32_t idx;
-    if (xsk_ring_prod__reserve(&fill_ring_, 1, &idx) == 1) {
-        *xsk_ring_prod__fill_addr(&fill_ring_, idx) = addr;
-        xsk_ring_prod__submit(&fill_ring_, 1);
-    }
-}
-```
-
-### return_frame_to_pool()
-```cpp
-void XDPPollProcess::return_frame_to_pool(uint32_t frame_idx) {
-    // Derive pool from frame index based on UMEM partitioning
-    // NOTE: No separate allocator classes - simple position-based allocation
-    //       Transport picks frames by incrementing position (abort on full)
-    //       XDP Poll releases by advancing release position
-    //
-    // DESIGN DECISION: Sequential release for ACK frames (tolerate potential race)
-    // ============================================================================
-    // ACK frames are released via position increment (fetch_add) which assumes sequential
-    // release order. In practice, comp_ring returns frames in submission order, so this
-    // works correctly.
-    //
-    // POTENTIAL RACE: If comp_ring returns frames out-of-order (e.g., frame 5 before frame 4),
-    // calling fetch_add(1) for frame 5 would advance release_pos past unreleased frame 4.
-    // This could cause Transport to think more frames are available than actually free.
-    //
-    // WHY WE TOLERATE THIS:
-    // 1. comp_ring out-of-order is extremely rare (NIC DMA completion is typically FIFO)
-    // 2. With large UMEM (4096+ frames), the "skipped" slot is just temporarily unavailable
-    // 3. The slot becomes available on the next allocation wrap-around
-    // 4. For HFT, we can size the buffer large enough that this never causes exhaustion
-    // 5. The simplicity of position-based allocation (no free-list, no locks, no bitmap)
-    //    outweighs the theoretical edge case
-    //
-    // MITIGATION: Size ACK_FRAMES generously (default 1/8 of total = 512 frames).
-    // At 1M ACKs/sec with rare out-of-order, we'd need hundreds of consecutive
-    // out-of-order completions to exhaust the pool - practically impossible.
-    //
-    // DEBUG ASSERTION: In debug builds, verify FIFO ordering assumption
-    // If comp_ring returns out-of-order, abort with diagnostic info
-#ifdef PIPELINE_DEBUG
-    static thread_local uint64_t last_ack_addr = 0;
-    if (last_ack_addr != 0 && addr < last_ack_addr) {
-        fprintf(stderr, "[FATAL] comp_ring out-of-order: addr=%lu < last_ack_addr=%lu\n",
-                addr, last_ack_addr);
-        std::abort();
-    }
-    last_ack_addr = addr;
-#endif
-    //
-    if (frame_idx < RX_FRAMES) {
-        // RX frame - refill to fill_ring (should never happen via comp_ring)
-        refill_rx_frame(frame_idx * FRAME_SIZE);
-    } else if (frame_idx < RX_FRAMES + ACK_FRAMES) {
-        // ACK frame - advance ACK pool release position (no retransmit, immediate release)
-        // NOTE: Sequential release by design - see comment above
-        tx_state_->ack_release_pos.fetch_add(1, std::memory_order_release);
-    } else if (frame_idx < RX_FRAMES + ACK_FRAMES + PONG_FRAMES) {
-        // PONG frame - should NOT be released here (uses sequential ACK-based release)
-        // This branch should never execute - PONG positions advanced via advance_pong_release_pos()
-        std::abort();  // Bug: PONG frame in immediate comp_ring reclaim path
-    } else {
-        // MSG frame - should NOT be released here (uses sequential ACK-based release)
-        // This branch should never execute - MSG positions advanced via advance_msg_release_pos()
-        std::abort();  // Bug: MSG frame in immediate comp_ring reclaim path
-    }
-}
-```
-
-### send_trickle_packet()
+### send_trickle()
 
 **Purpose**: The igc driver (Intel I225/I226) may stall TX completions in RX-only workloads.
 Sending a minimal UDP packet triggers NAPI poll, which processes pending TX completions.
 
-**Frame Details**: Pre-built 43-byte static frame stored in reserved UMEM region (NOT part of RX/TX pools):
+**Implementation**: Uses a separate AF_PACKET raw socket (not XDP tx_ring) for simplicity:
+- Avoids UMEM frame allocation complexity
+- Works regardless of XDP socket state
+- Trickle packets bypass XDP entirely (sent via kernel stack)
+
+**Frame Details**: Pre-built 43-byte self-addressed UDP packet stored in process memory:
 - Ethernet header (14 bytes): src=local_mac, dst=local_mac, type=0x0800 (IPv4)
 - IP header (20 bytes): src=127.0.0.1, dst=127.0.0.1, TTL=1, protocol=UDP
 - UDP header (8 bytes): src_port=65534, dst_port=65534, len=9, checksum=0
 - Payload (1 byte): 0x00
 
 ```cpp
-void XDPPollProcess::send_trickle_packet() {
-    // Pre-built 43-byte self-addressed UDP packet (in 64-byte aligned frame)
-    // Stored at trickle_frame_addr_ (reserved UMEM region, excluded from pool reclaim)
-    // This triggers NAPI processing on igc driver to complete TX
-    // Packet is dropped by stack but forces TX completion interrupt
-
-    uint32_t idx;
-    if (xsk_ring_prod__reserve(&tx_ring_, 1, &idx) == 1) {
-        auto* desc = xsk_ring_prod__tx_desc(&tx_ring_, idx);
-        desc->addr = trickle_frame_addr_;  // Pre-built trickle packet
-        desc->len = 43;                     // Actual packet size (not padded size)
-        xsk_ring_prod__submit(&tx_ring_, 1);
-        sendto(xsk_fd_, NULL, 0, MSG_DONTWAIT, NULL, 0);
-    }
+void XDPPollProcess::send_trickle() {
+    if constexpr (!kTrickleEnabled) return;
+    if (trickle_fd_ < 0) return;
+    // Send via AF_PACKET socket (separate from XDP tx_ring)
+    ::send(trickle_fd_, trickle_packet_, trickle_packet_len_, MSG_DONTWAIT);
 }
 ```
 
-**UMEM Layout for Trickle Frame**:
-```
-UMEM_BUFFER:
-├── RX Frames      [0, RX_FRAMES * FRAME_SIZE)
-├── ACK TX Frames  [ACK_START, ACK_END)
-├── PONG TX Frames [PONG_START, PONG_END)
-├── MSG TX Frames  [MSG_START, MSG_END)
-└── Trickle Frame  [TRICKLE_ADDR, TRICKLE_ADDR + 64)  ← Reserved, not part of any pool
-```
+**Initialization**:
+1. Create AF_PACKET raw socket bound to interface
+2. Build trickle packet once during setup, store in `trickle_packet_[64]` buffer
 
-**Initialization**: Build trickle packet once during setup, store at reserved address.
+**Note**: MSG and PONG frame release is handled by Transport Process when it receives TCP ACKs. XDP Poll only releases ACK frames immediately via `ack_release_pos.fetch_add()`.
 
-### advance_tx_release_positions()
+### cleanup()
+
+Cleans up XDP resources:
+
 ```cpp
-// Advance TX frame release positions based on Transport's ACK progress.
-//
-// NOTE ON NAMING: This function advances position counters, not "releases frames to a pool".
-// The position-based allocation scheme works as follows:
-//   - Transport allocates frames at `alloc_pos % POOL_SIZE`, then increments alloc_pos
-//   - Transport sets `acked_pos` when TCP ACK confirms delivery
-//   - XDP Poll advances `release_pos` up to `acked_pos`
-//   - Transport can allocate if `alloc_pos - release_pos < POOL_SIZE`
-//
-// So "release" here means "mark position as reusable" not "return to free pool".
-//
-void XDPPollProcess::advance_tx_release_positions() {
-    // Advance MSG frame release position
-    advance_msg_release_pos();
-
-    // Advance PONG frame release position
-    advance_pong_release_pos();
-}
-
-void XDPPollProcess::advance_msg_release_pos() {
-    // Uses position-based tracking: advance release_pos up to acked_pos
-    uint64_t release_pos = tx_state_->msg_release_pos.load(std::memory_order_relaxed);
-    uint64_t acked_pos = tx_state_->msg_acked_pos.load(std::memory_order_acquire);
-
-    // Advance release position to match acked position
-    // This marks those positions as available for Transport to reuse
-    while (release_pos < acked_pos) {
-        release_pos++;
-        tx_state_->msg_release_pos.store(release_pos, std::memory_order_release);
+void XDPPollProcess::cleanup() {
+    if (trickle_fd_ >= 0) {
+        ::close(trickle_fd_);
+        trickle_fd_ = -1;
     }
-}
-
-void XDPPollProcess::advance_pong_release_pos() {
-    // Uses position-based tracking: advance release_pos up to acked_pos
-    uint64_t release_pos = tx_state_->pong_release_pos.load(std::memory_order_relaxed);
-    uint64_t acked_pos = tx_state_->pong_acked_pos.load(std::memory_order_acquire);
-
-    // Advance release position to match acked position
-    // This marks those positions as available for Transport to reuse
-    while (release_pos < acked_pos) {
-        release_pos++;
-        tx_state_->pong_release_pos.store(release_pos, std::memory_order_release);
+    if (xsk_) {
+        xsk_socket__delete(xsk_);
+        xsk_ = nullptr;
+    }
+    if (umem_) {
+        xsk_umem__delete(umem_);
+        umem_ = nullptr;
+    }
+    if (bpf_loader_) {
+        bpf_loader_->detach();
+        bpf_loader_.reset();
     }
 }
 ```
@@ -671,7 +679,7 @@ void XDPPollProcess::advance_pong_release_pos() {
 | Condition | Action |
 |-----------|--------|
 | RAW_INBOX full | `std::abort()` - Transport is not keeping up |
-| TX ring reserve fails | Skip TX batch, retry next iteration |
+| TX ring reserve fails | `std::abort()` - TX ring full indicates NIC not draining (misconfiguration) |
 | comp_ring empty | Normal - no TX completions pending |
 
 ---
@@ -846,7 +854,7 @@ if (parsed.flags & TCP_FLAG_SYN && parsed.flags & TCP_FLAG_ACK) {
 }
 ```
 
-**TCPParams structure** (from `src/stack/tcp/tcp_state.hpp`):
+**TCPParams structure** (from `src/stack/tcp/conn_state.hpp`):
 ```cpp
 struct TCPParams {
     uint32_t snd_una = 0;    // Send unacknowledged

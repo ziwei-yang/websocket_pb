@@ -208,6 +208,15 @@ detach_xdp() {
     sudo ip link set "$IFACE" xdp off 2>/dev/null || true
     sudo ip link set "$IFACE" xdpdrv off 2>/dev/null || true
 
+    # Clean up any pinned BPF programs from previous test runs
+    # These are created by bpftool when loading device-bound XDP programs
+    for pin_dir in /sys/fs/bpf/selftest_* /sys/fs/bpf/xdp_test_*; do
+        if [[ -d "$pin_dir" ]]; then
+            echo "Cleaning up pinned BPF: $pin_dir"
+            sudo rm -rf "$pin_dir" 2>/dev/null || true
+        fi
+    done
+
     # Verify cleanup
     local xdp_info=$(ip link show "$IFACE" | grep -o "xdp[^ ]*" || true)
 

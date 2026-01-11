@@ -4,11 +4,6 @@
 // C++20, policy-based design, single-thread HFT focus
 #pragma once
 
-// Set to 1 to enable verbose IPC ring buffer debug logging
-#ifndef DEBUG_IPC
-#define DEBUG_IPC 0
-#endif
-
 #include <cstdint>
 #include <cstddef>
 #include <atomic>
@@ -248,11 +243,11 @@ struct alignas(CACHE_LINE_SIZE) PaddedRunning {
 };
 
 // ============================================================================
-// WebsocketStateShm - Shared pipeline state (renamed from TCPStateShm)
+// ConnStateShm - Shared pipeline state (renamed from ConnStateShm)
 // Includes per-process running flags, target URL, TCP state, and TX frame state
 // ============================================================================
 
-struct alignas(CACHE_LINE_SIZE) WebsocketStateShm {
+struct alignas(CACHE_LINE_SIZE) ConnStateShm {
     // ========================================================================
     // Cache Lines 0-3: Per-process running flags (padded to avoid false sharing)
     // ========================================================================
@@ -299,7 +294,7 @@ struct alignas(CACHE_LINE_SIZE) WebsocketStateShm {
     uint32_t rcv_nxt;                         // Next expected receive sequence
     uint32_t peer_recv_window;                // Peer advertised window
     uint8_t  window_scale;                    // Window scale factor
-    uint8_t  tcp_state;                       // TCP_ESTABLISHED, etc.
+    uint8_t  tcp_conn_state;                   // TCP_ESTABLISHED, etc.
     uint8_t  _pad_tcp1[2];
 
     // Addressing (set during handshake, read-only after)
@@ -325,20 +320,21 @@ struct alignas(CACHE_LINE_SIZE) WebsocketStateShm {
     // ========================================================================
     alignas(CACHE_LINE_SIZE) struct {
         // ACK pool (Transport allocates, XDP Poll releases)
-        std::atomic<uint32_t> ack_alloc_pos;
-        std::atomic<uint32_t> ack_release_pos;
+        std::atomic<uint64_t> ack_alloc_pos;
+        std::atomic<uint64_t> ack_release_pos;
 
         // PONG pool (Transport allocates, XDP Poll releases after ACK)
-        std::atomic<uint32_t> pong_alloc_pos;
-        std::atomic<uint32_t> pong_release_pos;
-        std::atomic<uint32_t> pong_acked_pos;
+        std::atomic<uint64_t> pong_alloc_pos;
+        std::atomic<uint64_t> pong_release_pos;
+        std::atomic<uint64_t> pong_acked_pos;
 
         // MSG pool (Transport allocates, XDP Poll releases after ACK)
-        std::atomic<uint32_t> msg_alloc_pos;
-        std::atomic<uint32_t> msg_release_pos;
-        std::atomic<uint32_t> msg_acked_pos;
+        std::atomic<uint64_t> msg_alloc_pos;
+        std::atomic<uint64_t> msg_release_pos;
+        std::atomic<uint64_t> msg_acked_pos;
 
-        char _pad[CACHE_LINE_SIZE - 36];  // Pad to cache line (36 = 9 × 4 bytes)
+        // Pad to 2 cache lines (9 × 8 = 72 bytes, need 128)
+        char _pad[2 * CACHE_LINE_SIZE - 72];
     } tx_frame;
 
     // ========================================================================
@@ -405,28 +401,17 @@ struct alignas(CACHE_LINE_SIZE) WebsocketStateShm {
     // Wait for handshake stage with timeout (returns false on timeout)
     bool wait_for_handshake_xdp_ready(uint64_t timeout_us = 10000000) const {
         auto start = std::chrono::steady_clock::now();
-        [[maybe_unused]] uint64_t iter = 0;
         while (!is_handshake_xdp_ready()) {
             if (!is_running(PROC_XDP_POLL)) {
-#if DEBUG_IPC
-                fprintf(stderr, "[WAIT] XDP Poll not running, aborting wait after %lu iters\n", iter);
-#endif
                 return false;
             }
             auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - start).count();
             if (static_cast<uint64_t>(elapsed) > timeout_us) {
-#if DEBUG_IPC
-                fprintf(stderr, "[WAIT] Timeout waiting for XDP ready after %lu us\n", elapsed);
-#endif
                 return false;
             }
-            iter++;
             __builtin_ia32_pause();
         }
-#if DEBUG_IPC
-        fprintf(stderr, "[WAIT] XDP Poll ready after %lu iters\n", iter);
-#endif
         return true;
     }
 
@@ -476,7 +461,7 @@ struct alignas(CACHE_LINE_SIZE) WebsocketStateShm {
         rcv_nxt = 0;
         peer_recv_window = 65535;
         window_scale = 0;
-        tcp_state = 0;
+        tcp_conn_state = 0;
         local_ip = 0;
         remote_ip = 0;
         local_port = 0;
@@ -500,8 +485,6 @@ struct alignas(CACHE_LINE_SIZE) WebsocketStateShm {
     }
 };
 
-// Type alias for backwards compatibility
-using TCPStateShm = WebsocketStateShm;
 
 // TCP states
 inline constexpr uint8_t TCP_CLOSED      = 0;
@@ -603,12 +586,6 @@ struct IPCRingProducer {
         // Compute element-based sizes (metadata stores bytes, we need element count)
         element_count_ = region_.buffer_size() / sizeof(T);
         element_mask_ = element_count_ - 1;
-#if DEBUG_IPC
-        fprintf(stderr, "[PROD-INIT] region=%p cursor@%p published@%p elements=%zu mask=%zu sizeof(T)=%zu\n",
-                (void*)&region_, (void*)region_.producer_cursor(),
-                (void*)region_.producer_published(), element_count_, element_mask_, sizeof(T));
-        fflush(stderr);
-#endif
     }
 
     // Non-copyable but movable
@@ -645,13 +622,6 @@ struct IPCRingProducer {
         int64_t next_seq = old_cursor + 1;  // The slot we just claimed
         int64_t cons = consumer_seq->load(std::memory_order_acquire);
 
-#if DEBUG_IPC
-        // Debug: Print claims (per producer)
-        fprintf(stderr, "[PROD-CLAIM] this=%p old_cursor=%ld next_seq=%ld cons=%ld published@%p\n",
-                (void*)this, old_cursor, next_seq, cons, (void*)region_.producer_published());
-        fflush(stderr);
-#endif
-
         // Check if buffer full (producer wrapped around to consumer)
         if (next_seq - cons >= static_cast<int64_t>(element_count_)) {
             cursor->fetch_sub(1, std::memory_order_relaxed);  // Rollback
@@ -674,29 +644,12 @@ struct IPCRingProducer {
         // Wait for in-order publishing (ensures no gaps in published sequence)
         int64_t expected = seq - 1;
 
-#if DEBUG_IPC
-        // Debug: Print first few publishes (per producer)
-        int64_t current_pub = published->load(std::memory_order_acquire);
-        fprintf(stderr, "[PROD-PUB] this=%p seq=%ld expected=%ld current_pub=%ld published@%p\n",
-                (void*)this, seq, expected, current_pub, (void*)published);
-        fflush(stderr);
-#endif
-
         while (published->load(std::memory_order_acquire) != expected) {
             __builtin_ia32_pause();
         }
 
         // Publish
         published->store(seq, std::memory_order_release);
-
-#if DEBUG_IPC
-        // Verify publish worked
-        {
-            int64_t after = published->load(std::memory_order_acquire);
-            fprintf(stderr, "[PROD-PUB] this=%p after store: published=%ld (expected %ld)\n", (void*)this, after, seq);
-            fflush(stderr);
-        }
-#endif
     }
 
     // ========================================================================
@@ -712,12 +665,6 @@ struct IPCRingProducer {
         int64_t old_cursor = cursor->fetch_add(1, std::memory_order_relaxed);
         int64_t seq = old_cursor + 1;  // The slot we just claimed
         int64_t cons = consumer_seq->load(std::memory_order_acquire);
-
-#if DEBUG_IPC
-        fprintf(stderr, "[TRY-PUB] this=%p old_cursor=%ld seq=%ld cons=%ld published@%p\n",
-                (void*)this, old_cursor, seq, cons, (void*)published);
-        fflush(stderr);
-#endif
 
         // Check if buffer full (producer wrapped around to consumer)
         if (seq - cons >= static_cast<int64_t>(element_count_)) {
@@ -755,19 +702,11 @@ struct IPCRingConsumer {
     size_t element_mask_;          // element_count - 1 (for element indexing)
     int64_t sequence_ = -1;        // Last committed sequence
     int64_t last_processed_ = -1;  // Last processed sequence (for deferred commit)
-    int64_t last_seen_avail_ = -1; // For debug: track avail changes
-    uint64_t consume_call_count_ = 0; // For debug: count try_consume calls
 
     explicit IPCRingConsumer(disruptor::ipc::shared_region& r) : region_(r) {
         // Compute element-based sizes (metadata stores bytes, we need element count)
         element_count_ = region_.buffer_size() / sizeof(T);
         element_mask_ = element_count_ - 1;
-#if DEBUG_IPC
-        fprintf(stderr, "[CONS-INIT] region=%p cursor@%p published@%p elements=%zu mask=%zu sizeof(T)=%zu this=%p\n",
-                (void*)&region_, (void*)region_.producer_cursor(),
-                (void*)region_.producer_published(), element_count_, element_mask_, sizeof(T), (void*)this);
-        fflush(stderr);
-#endif
     }
 
     // Non-copyable but movable
@@ -793,26 +732,6 @@ struct IPCRingConsumer {
     bool try_consume(T& item, bool* end_of_batch = nullptr) {
         auto* published = region_.producer_published();
         int64_t avail = published->load(std::memory_order_acquire);
-
-#if DEBUG_IPC
-        // Debug: Print consume attempts - per-instance tracking
-        if (avail != last_seen_avail_) {
-            fprintf(stderr, "[CONS-TRY] seq=%ld avail_changed: %ld->%ld (published@%p) elements=%zu this=%p\n",
-                    sequence_, last_seen_avail_, avail, (void*)published, element_count_, (void*)this);
-            fflush(stderr);
-            last_seen_avail_ = avail;
-        }
-
-        // Also log periodically (per-instance)
-        consume_call_count_++;
-        if (consume_call_count_ % 1000000 == 0) {
-            // Direct memory read for debug
-            int64_t raw_value = *reinterpret_cast<volatile int64_t*>(published);
-            fprintf(stderr, "[CONS-POLL] calls=%lu seq=%ld avail=%ld raw=%ld published@%p this=%p\n",
-                    consume_call_count_, sequence_, avail, raw_value, (void*)published, (void*)this);
-            fflush(stderr);
-        }
-#endif
 
         if (sequence_ >= avail) {
             return false;  // Nothing available
@@ -854,8 +773,13 @@ struct IPCRingConsumer {
             return 0;  // No events available
         }
 
-        // Limit to max_events
-        int64_t end = std::min(avail, next + static_cast<int64_t>(max_events) - 1);
+        // Limit to max_events (handle SIZE_MAX overflow by capping at avail)
+        int64_t end;
+        if (max_events >= static_cast<size_t>(INT64_MAX)) {
+            end = avail;  // No limit effectively
+        } else {
+            end = std::min(avail, next + static_cast<int64_t>(max_events) - 1);
+        }
 
         T* data = region_.data<T>();
         size_t count = 0;
@@ -864,15 +788,27 @@ struct IPCRingConsumer {
             T& event = data[seq & element_mask_];
             bool is_end = (seq == end);
 
-            // Support both bool and void return types
+            // Support multiple handler signatures:
+            // 1. (T&, int64_t, bool) -> bool  (3-param with stop control)
+            // 2. (T&, int64_t) -> bool        (2-param with stop control)
+            // 3. (T&, int64_t, bool) -> void  (3-param, no stop)
+            // 4. (T&, int64_t) -> void        (2-param, no stop)
             if constexpr (std::is_invocable_r_v<bool, F, T&, int64_t, bool>) {
                 if (!handler(event, seq, is_end)) {
                     ++count;
                     last_processed_ = seq;
                     return count;  // Handler requested stop
                 }
-            } else {
+            } else if constexpr (std::is_invocable_r_v<bool, F, T&, int64_t>) {
+                if (!handler(event, seq)) {
+                    ++count;
+                    last_processed_ = seq;
+                    return count;  // Handler requested stop
+                }
+            } else if constexpr (std::is_invocable_v<F, T&, int64_t, bool>) {
                 handler(event, seq, is_end);
+            } else {
+                handler(event, seq);
             }
             ++count;
         }
