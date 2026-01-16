@@ -175,6 +175,92 @@ struct TCPPacket {
     }
 
     /**
+     * Build ETH/IP/TCP headers in-place, assuming payload is already at data_offset.
+     * ZERO-COPY: Does NOT copy or touch payload data.
+     *
+     * Use this when payload is already written to the frame at offset 54 (ETH+IP+TCP).
+     * This function only builds the headers in front of the existing payload.
+     *
+     * @param buffer      Destination buffer (UMEM frame)
+     * @param capacity    Buffer capacity
+     * @param params      TCP parameters (IPs, ports, seq/ack numbers)
+     * @param flags       TCP flags (ACK, PSH, etc.)
+     * @param payload_len Length of payload already at data_offset (for checksums)
+     * @param local_mac   Local MAC address
+     * @param gateway_mac Gateway MAC address
+     * @param ip_id       IP identification field
+     * @return Total frame length (headers + payload), 0 on error
+     */
+    static size_t build_headers(
+        uint8_t* buffer,
+        size_t capacity,
+        const TCPParams& params,
+        uint8_t flags,
+        size_t payload_len,
+        const uint8_t* local_mac,
+        const uint8_t* gateway_mac,
+        uint16_t ip_id
+    ) {
+        if (!buffer || !local_mac || !gateway_mac) {
+            return 0;
+        }
+
+        // TCP header is always 20 bytes (no options for data packets)
+        constexpr size_t tcp_header_len = TCP_HEADER_MIN_LEN;
+        constexpr size_t data_offset = ETH_HEADER_LEN + IP_HEADER_LEN + tcp_header_len;
+
+        size_t total_len = data_offset + payload_len;
+        if (total_len > capacity) {
+            return 0;
+        }
+
+        // Offsets
+        constexpr size_t eth_offset = 0;
+        constexpr size_t ip_offset = ETH_HEADER_LEN;
+        constexpr size_t tcp_offset = ETH_HEADER_LEN + IP_HEADER_LEN;
+
+        // === Build TCP header ===
+        TCPHeader* tcp = reinterpret_cast<TCPHeader*>(buffer + tcp_offset);
+        tcp->source = htons(params.local_port);
+        tcp->dest = htons(params.remote_port);
+        tcp->seq = htonl(params.snd_nxt);
+        tcp->ack_seq = (flags & TCP_FLAG_ACK) ? htonl(params.rcv_nxt) : 0;
+        tcp->doff_reserved = 0x50;  // 5 << 4 (20 bytes header, no options)
+        tcp->flags = flags;
+        tcp->window = htons(static_cast<uint16_t>(params.rcv_wnd));
+        tcp->check = 0;
+        tcp->urg_ptr = 0;
+
+        // Calculate TCP checksum (payload is already in place at data_offset)
+        const uint8_t* tcp_data = (payload_len > 0) ? (buffer + data_offset) : nullptr;
+        tcp->check = htons(tcp_checksum(params.local_ip, params.remote_ip,
+                                        tcp, tcp_header_len, tcp_data, payload_len));
+
+        // === Build IP header ===
+        IPv4Header* ip_hdr = reinterpret_cast<IPv4Header*>(buffer + ip_offset);
+        size_t ip_payload_len = tcp_header_len + payload_len;
+        ip_hdr->version_ihl = 0x45;
+        ip_hdr->tos = 0;
+        ip_hdr->tot_len = htons(static_cast<uint16_t>(IP_HEADER_LEN + ip_payload_len));
+        ip_hdr->id = htons(ip_id);
+        ip_hdr->frag_off = htons(0x4000);  // Don't fragment
+        ip_hdr->ttl = IP_DEFAULT_TTL;
+        ip_hdr->protocol = IP_PROTO_TCP;
+        ip_hdr->check = 0;
+        ip_hdr->saddr = htonl(params.local_ip);
+        ip_hdr->daddr = htonl(params.remote_ip);
+        ip_hdr->check = htons(ip_checksum(ip_hdr));
+
+        // === Build Ethernet header ===
+        EthernetHeader* eth = reinterpret_cast<EthernetHeader*>(buffer + eth_offset);
+        std::memcpy(eth->dst_mac, gateway_mac, ETH_ADDR_LEN);
+        std::memcpy(eth->src_mac, local_mac, ETH_ADDR_LEN);
+        eth->ethertype = htons(ETH_TYPE_IP);
+
+        return total_len;
+    }
+
+    /**
      * Parse a raw Ethernet frame containing TCP
      *
      * @param frame Raw Ethernet frame data

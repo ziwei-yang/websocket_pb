@@ -536,6 +536,14 @@ map_test_source() {
             TEST_BIN="build/test_pipeline_xdp_poll_tcp"
             MAKE_TARGET="build-test-pipeline-xdp-poll-tcp"
             ;;
+        01_xdp_poll_ping)
+            TEST_BIN="build/test_pipeline_xdp_poll_ping"
+            MAKE_TARGET="build-test-pipeline-xdp-poll-ping"
+            ;;
+        10_transport_tcp)
+            TEST_BIN="build/test_pipeline_transport_tcp"
+            MAKE_TARGET="build-test-pipeline-transport-tcp"
+            ;;
         *)
             # Generic pattern: NN_name.cpp -> test_pipeline_name
             local name="${base#*_}"  # Remove NN_ prefix
@@ -549,25 +557,20 @@ map_test_source() {
     log_info "Make target: $MAKE_TARGET"
 }
 
-# Build test if needed
+# Build test (always rebuild to ensure latest code)
 build_test() {
     cd "$PROJECT_DIR"
-
-    if [[ -f "$TEST_BIN" ]]; then
-        log_ok "Test binary exists: $TEST_BIN"
-        return 0
-    fi
 
     log_info "Building test: $MAKE_TARGET"
 
     # Build BPF first if needed
     if [[ ! -f "$BPF_OBJ" ]]; then
         log_info "Building BPF program first..."
-        make bpf USE_XDP=1 || die "Failed to build BPF program"
+        make bpf USE_XDP=1 XDP_INTERFACE="$INTERFACE" || die "Failed to build BPF program"
     fi
 
     # Build test binary (as normal user, no sudo)
-    make "$MAKE_TARGET" USE_XDP=1 || die "Failed to build test: $MAKE_TARGET"
+    make "$MAKE_TARGET" USE_XDP=1 XDP_INTERFACE="$INTERFACE" || die "Failed to build test: $MAKE_TARGET"
 
     log_ok "Test binary built: $TEST_BIN"
 }
@@ -814,6 +817,13 @@ main() {
 
     # Setup phase
     echo "--- Setup ---"
+
+    # Build BPF first (as user, before sudo prepare)
+    if [[ ! -f "$BPF_OBJ" ]]; then
+        log_info "Building BPF program..."
+        make bpf USE_XDP=1 XDP_INTERFACE="$INTERFACE" || die "Failed to build BPF program"
+    fi
+
     run_xdp_prepare
     run_clock_sync
     setup_echo_route
@@ -843,8 +853,23 @@ main() {
     echo "--- Running Test (timeout: ${TIMEOUT}s) ---"
     echo ""
 
+    # Determine target IP based on test type
+    # Ping tests use gateway, TCP tests use echo server
+    if [[ "$TEST_SOURCE" == *"ping"* ]]; then
+        # Ensure gateway is fetched for ping tests
+        if [[ -z "$GATEWAY_IP" ]]; then
+            get_gateway || die "Cannot determine gateway for ping test"
+        fi
+        TARGET_IP="$GATEWAY_IP"
+        TARGET_PORT=""
+        log_info "Ping test detected - using gateway: $TARGET_IP"
+    else
+        TARGET_IP="$ECHO_SERVER_IP"
+        TARGET_PORT="$ECHO_SERVER_PORT"
+    fi
+
     # Run test binary as normal user (with capabilities)
-    "./$TEST_BIN" "$INTERFACE" "$BPF_OBJ" "$ECHO_SERVER_IP" "$ECHO_SERVER_PORT" "${TEST_ARGS[@]}" &
+    "./$TEST_BIN" "$INTERFACE" "$BPF_OBJ" "$TARGET_IP" "$TARGET_PORT" "${TEST_ARGS[@]}" &
     TEST_PID=$!
 
     log_info "Test started (PID: $TEST_PID)"

@@ -26,7 +26,7 @@ Multi-process pipeline architecture for ultra-low-latency WebSocket using AF_XDP
 - **comp_ring FIFO Assumption**: The design assumes XDP comp_ring returns frames in submission order (FIFO). This is the typical behavior of NIC DMA completion.
   - **If violated for ACK frames**: `ack_release_pos` advances past an unreleased frame, creating a "leaked" slot. The slot becomes reusable after counter wrap-around (~2^64 allocations). Practically harmless but wastes one frame slot.
   - **If violated for MSG/PONG frames**: No immediate impact - these use ACK-based release via `acked_pos`, not comp_ring order. However, debug assertions will abort to signal the unexpected NIC behavior.
-  - **Detection**: In debug builds (`PIPELINE_DEBUG`), assertions verify ordering and abort with diagnostics. If encountered in production, it indicates a NIC driver bug - contact driver vendor.
+  - **Detection**: In debug builds (`DEBUG`), assertions verify ordering and abort with diagnostics. If encountered in production, it indicates a NIC driver bug - contact driver vendor.
   - **Tested NICs**: igc (Intel I225), Mellanox ConnectX - all return completions in FIFO order.
 - **Mandatory Processes**: XDP Poll, Transport, and WebSocket are **mandatory**. AppClient is **optional** (can be omitted if user handles WS frames directly in WebSocket callbacks).
   - If WebSocket is slow, MSG_METADATA_INBOX fills up → Transport aborts on `try_claim()` failure
@@ -118,7 +118,7 @@ constexpr size_t MSG_OUTBOX_SIZE = 8192;
 ┌─────────────────┼─────────────────────────────────────────┼─────────────────────────────┐
 │                 ▼                                         │                             │
 │  ┌────────────────────────────────────────────────────────────────────────────────┬───┐│
-│  │          UMEM_BUFFER (TOTAL_UMEM_FRAMES × FRAME_SIZE + TRICKLE_FRAME_SIZE)    │TRK││
+│  │          UMEM_BUFFER (TOTAL_UMEM_FRAMES × FRAME_SIZE)    │TRK││
 │  ├────────────────────┬───────────────┬───────────────┬──────────────────────────┼───┤│
 │  │  RX (0..N/2-1)     │ ACK TX        │ PONG TX       │ MSG TX                   │64B││
 │  │  1/2 of pool       │ 1/8 of pool   │ 1/8 of pool   │ 1/4 of pool              │   ││
@@ -134,14 +134,12 @@ constexpr size_t MSG_OUTBOX_SIZE = 8192;
 │  API: process_manually<Lambda> for consumers (commit after TX submit)                   │
 │       sequencer.try_claim() + ring_buffer[seq] + sequencer.publish(seq) for producers  │
 │  Loop:                                                                                  │
-│    1. Batch collect: process_manually on RAW_OUTBOX + ACK_OUTBOX + PONG_OUTBOX         │
-│    2. Submit + kick: xsk_ring_prod__submit() + sendto()                                │
-│    3. Commit consumers ONLY if tx_batch_count > 0 (after submit)                       │
-│    4. rx_ring → RAW_INBOX via try_claim() + publish() (sets consumed=0)                │
-│    5. Track data_moved = (tx_count > 0 || rx_count > 0) for idle optimization (N7)     │
-│    6. (idle: !data_moved) check RAW_INBOX consumer seq → release to fill_ring          │
-│    7. (idle: !data_moved) comp_ring → derive pool from addr → reclaim TX UMEM          │
-│    8. (always) Inline trickle every 8 iterations via XDP tx_ring (N1)                  │
+│    1. submit_tx_batch(): process_manually on outboxes → submit → commit after submit   │
+│    2. process_rx(): rx_ring → RAW_INBOX via try_claim() + publish()                    │
+│    3. (always) send_trickle() every 8 iterations via AF_PACKET socket                  │
+│    4. (idle: !data_moved) process_completions(): comp_ring → derive pool → handle      │
+│    5. (idle: !data_moved) release_acked_tx_frames(): advance PONG/MSG release_pos      │
+│    6. (idle: !data_moved) reclaim_rx_frames(): consumer seq → fill_ring                │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
                   │ RAW_INBOX              ▲ RAW_OUTBOX, ACK_OUTBOX, PONG_OUTBOX
                   ▼                        │
@@ -161,7 +159,7 @@ constexpr size_t MSG_OUTBOX_SIZE = 8192;
 │       - Out-of-order → send immediate dup ACK for fast retransmit (N4)                 │
 │       - Write to MSG_INBOX with wrap-flag if linear space < TLS record size           │
 │    3. Adaptive ACK: Send when pkts >= 8 OR timeout >= 100us                            │
-│    4. PONG: process_manually on PONGS → SSL_write() → PONG_OUTBOX via try_claim()      │
+│    4. PONG: process_manually on PONGS → SSL_write() → PONG_OUTBOX via try_claim_batch()│
 └─────────────────────────────────────────────────────────────────────────────────────────┘
                   │ MSG_METADATA_INBOX + MSG_INBOX    ▲ MSG_OUTBOX, PONGS
                   ▼                                   │
@@ -347,20 +345,21 @@ struct alignas(64) WSFrameInfo {
     uint8_t  reserved : 6;               // [13.2-7]
     uint8_t  padding[2];                 // [14:15]
 
-    // First packet timestamps (32 bytes) - Gap N6: renamed to first_byte_ts/last_byte_ts
+    // First packet timestamps (24 bytes)
     uint64_t first_byte_ts;              // [16:23] NIC timestamp when first byte arrived
     uint64_t first_nic_frame_poll_cycle; // [24:31] First packet XDP Poll rdtscp
-    uint64_t first_raw_frame_poll_cycle; // [32:39] First packet Transport rdtscp
 
     // Latest packet timestamps (32 bytes)
-    uint64_t last_byte_ts;               // [40:47] NIC timestamp when frame completed
-    uint64_t latest_nic_frame_poll_cycle;// [48:55] Latest packet XDP Poll rdtscp
-    uint64_t latest_raw_frame_poll_cycle;// [56:63] Latest packet Transport rdtscp
+    uint64_t last_byte_ts;               // [32:39] NIC timestamp when frame completed
+    uint64_t latest_nic_frame_poll_cycle;// [40:47] Latest packet XDP Poll rdtscp
+    uint64_t latest_raw_frame_poll_cycle;// [48:55] Latest packet Transport rdtscp
+
+    // SSL/WS timing (16 bytes)
+    uint64_t ssl_read_cycle;             // [56:63] Transport SSL_read rdtscp
 
     // --- Cache line 2 ---
-    uint64_t ssl_read_cycle;             // [64:71] Transport SSL_read rdtscp
-    uint64_t ws_parse_cycle;             // [72:79] WebSocket parse rdtscp
-    uint8_t  padding2[48];               // [80:127] Padding to 128 bytes
+    uint64_t ws_parse_cycle;             // [64:71] WebSocket parse rdtscp
+    uint8_t  padding2[56];               // [72:127] Padding to 128 bytes
 };
 static_assert(sizeof(WSFrameInfo) == 128);  // 2 cache-lines
 ```
@@ -494,9 +493,9 @@ struct MsgInbox {
 // If wrap_flag is removed, the pipeline still works correctly.
 ```
 
-### 3.5.1 TxFrameState (merged into WebsocketStateShm)
+### 3.5.1 TxFrameState (merged into ConnStateShm)
 
-**Note**: The `TxFrameState` struct has been **merged into `WebsocketStateShm.tx_frame`** in the implementation (`src/pipeline/pipeline_data.hpp`). This document shows the conceptual structure for reference.
+**Note**: The `TxFrameState` struct has been **merged into `ConnStateShm.tx_frame`** in the implementation (`src/pipeline/pipeline_data.hpp`). This document shows the conceptual structure for reference.
 
 **Purpose**: Shared state between Transport (allocator) and XDP Poll (releaser) for position-based TX frame allocation with ACK-based release.
 
@@ -504,34 +503,34 @@ struct MsgInbox {
 
 **Access Pattern**:
 ```cpp
-// Access via WebsocketStateShm (TCPStateShm is alias)
-tcp_state_->tx_frame.ack_alloc_pos.load(...)
-tcp_state_->tx_frame.msg_release_pos.fetch_add(1, ...)
+// Access via ConnStateShm
+conn_state_->tx_frame.ack_alloc_pos.load(...)
+conn_state_->tx_frame.msg_release_pos.fetch_add(1, ...)
 ```
 
 **Conceptual Structure**:
 ```cpp
-// Part of WebsocketStateShm - see pipeline_data.hpp for full definition
+// Part of ConnStateShm - see pipeline_data.hpp for full definition
 alignas(CACHE_LINE_SIZE) struct {
     // ACK pool (position-based, immediate release after comp_ring - no retransmit needed)
-    std::atomic<uint32_t> ack_alloc_pos;       // Transport increments
-    std::atomic<uint32_t> ack_release_pos;     // XDP Poll increments
+    std::atomic<uint64_t> ack_alloc_pos;       // Transport increments
+    std::atomic<uint64_t> ack_release_pos;     // XDP Poll increments
 
     // PONG pool (position-based with ACK-based release)
-    std::atomic<uint32_t> pong_alloc_pos;      // Transport increments
-    std::atomic<uint32_t> pong_release_pos;    // XDP Poll increments (after ACK)
-    std::atomic<uint32_t> pong_acked_pos;      // Transport sets when TCP ACK received
+    std::atomic<uint64_t> pong_alloc_pos;      // Transport increments
+    std::atomic<uint64_t> pong_release_pos;    // XDP Poll increments (after ACK)
+    std::atomic<uint64_t> pong_acked_pos;      // Transport sets when TCP ACK received
 
     // MSG pool (position-based with ACK-based release)
-    std::atomic<uint32_t> msg_alloc_pos;       // Transport increments
-    std::atomic<uint32_t> msg_release_pos;     // XDP Poll increments (after ACK)
-    std::atomic<uint32_t> msg_acked_pos;       // Transport sets when TCP ACK received
+    std::atomic<uint64_t> msg_alloc_pos;       // Transport increments
+    std::atomic<uint64_t> msg_release_pos;     // XDP Poll increments (after ACK)
+    std::atomic<uint64_t> msg_acked_pos;       // Transport sets when TCP ACK received
 } tx_frame;
 
-// NOTE: Implementation uses uint32_t (not uint64_t) for position counters.
-// At 1M allocs/sec, uint32_t overflows in ~70 min. The position values
-// are used for relative comparisons (alloc - release), so wrap-around
-// is handled correctly as long as the difference doesn't exceed 2^31.
+// NOTE: Implementation uses uint64_t for position counters.
+// This eliminates wrap-around concerns entirely (~584 years at 1M allocs/sec).
+// The slight memory overhead (8 bytes vs 4 bytes per counter) is negligible
+// compared to the safety benefit of never dealing with wrap-around logic.
 ```
 
 **Initialization Values** (set during handshake, before fork):
@@ -581,19 +580,22 @@ For each pool (ACK, PONG, MSG):
 // Metadata for each SSL_read message - written to MSG_METADATA_INBOX
 struct alignas(64) MsgMetadata {
     // First packet timestamps (oldest in SSL_read batch)
-    uint64_t first_nic_timestamp_ns;      // [0:7]   NIC HW timestamp of first packet
-    uint64_t first_nic_frame_poll_cycle;  // [8:15]  XDP Poll rdtscp of first packet
-    uint64_t first_raw_frame_poll_cycle;  // [16:23] Transport rdtscp of first packet
+    uint64_t first_nic_timestamp_ns;       // [0:7]   NIC HW timestamp of first packet
+    uint64_t first_nic_frame_poll_cycle;   // [8:15]  XDP Poll rdtscp of first packet
 
     // Latest packet timestamps (newest in SSL_read batch)
-    uint64_t latest_nic_timestamp_ns;     // [24:31] NIC HW timestamp of latest packet
-    uint64_t latest_nic_frame_poll_cycle; // [32:39] XDP Poll rdtscp of latest packet
-    uint64_t latest_raw_frame_poll_cycle; // [40:47] Transport rdtscp of latest packet
-    uint64_t ssl_read_cycle;              // [48:55] Transport rdtscp after SSL_read()
+    uint64_t latest_nic_timestamp_ns;      // [16:23] NIC HW timestamp of latest packet
+    uint64_t latest_nic_frame_poll_cycle;  // [24:31] XDP Poll rdtscp of latest packet
+    uint64_t latest_raw_frame_poll_cycle;  // [32:39] Transport rdtscp of latest packet
+
+    // SSL timing
+    uint64_t ssl_read_cycle;               // [40:47] Transport rdtscp after SSL_read()
 
     // Message location in MSG_INBOX
-    uint32_t msg_inbox_offset;            // [56:59] Start offset in MSG_INBOX
-    uint32_t decrypted_len;               // [60:63] Decrypted message length
+    uint32_t msg_inbox_offset;             // [48:51] Start offset in MSG_INBOX
+    uint32_t decrypted_len;                // [52:55] Decrypted message length
+
+    uint8_t _pad[8];                       // [56:63] Padding to 64 bytes
 };
 static_assert(sizeof(MsgMetadata) == 64);  // Cache-line aligned
 ```
@@ -616,7 +618,7 @@ static_assert(sizeof(MsgMetadata) == 64);  // Cache-line aligned
 | RAW_INBOX | XDP Poll → Transport | UMEMFrameDescriptor (32B) | 32768 | try_claim() + publish() | process_manually |
 | RAW_OUTBOX | Transport → XDP Poll | UMEMFrameDescriptor (32B) | 32768 | try_claim() + publish() | process_manually |
 | ACK_OUTBOX | Transport → XDP Poll | UMEMFrameDescriptor (32B) | 8192 | try_claim() + publish() | process_manually |
-| PONG_OUTBOX | Transport → XDP Poll | UMEMFrameDescriptor (32B) | 1024 | try_claim() + publish() | process_manually |
+| PONG_OUTBOX | Transport → XDP Poll | UMEMFrameDescriptor (32B) | 1024 | try_claim_batch() + publish_batch() | process_manually |
 | **MSG_METADATA_INBOX** | **Transport → WebSocket** | **MsgMetadata (64B)** | **65536** | **try_claim() + publish()** | **event_processor.run** |
 | WS_FRAME_INFO_RING | WebSocket → AppClient | WSFrameInfo (128B) | 65536 | try_claim() + publish() | event_processor.run |
 | PONGS | WebSocket → Transport | PongFrameAligned (128B) | 1024 | try_claim() + publish() | process_manually |
@@ -637,7 +639,7 @@ All ring buffers use acquire-release semantics:
 
 This ensures the consumer sees all data written by the producer before the sequence number was published.
 
-### Position Counter Pattern (WebsocketStateShm.tx_frame)
+### Position Counter Pattern (ConnStateShm.tx_frame)
 
 The position-based frame allocation uses:
 - **Writer** (e.g., Transport increments `alloc_pos`): `fetch_add(1, release)`
@@ -647,10 +649,10 @@ The position-based frame allocation uses:
 // Transport (writer): allocates frame, then publishes
 frame = allocate_at(alloc_pos);
 build_packet(frame);
-tcp_state_->tx_frame.msg_alloc_pos.fetch_add(1, memory_order_release);  // Release: data visible
+conn_state_->tx_frame.msg_alloc_pos.fetch_add(1, memory_order_release);  // Release: data visible
 
 // XDP Poll (reader): reads acked position
-uint32_t acked = tcp_state_->tx_frame.msg_acked_pos.load(memory_order_acquire);  // Acquire
+uint32_t acked = conn_state_->tx_frame.msg_acked_pos.load(memory_order_acquire);  // Acquire
 // Now safe to assume frames up to acked-1 are ACKed
 ```
 
@@ -662,10 +664,10 @@ Single-writer flags use:
 
 ```cpp
 // Writer (parent process)
-tcp_state_->running.store(false, memory_order_release);
+conn_state_->running.store(false, memory_order_release);
 
 // Reader (child process)
-if (!tcp_state_->running.load(memory_order_acquire)) {
+if (!conn_state_->running.load(memory_order_acquire)) {
     // Safe to see all writes before running was set false
     shutdown();
 }
@@ -694,21 +696,20 @@ Use `relaxed` only for reads where the value is advisory and doesn't guard other
 ## 5. UMEM Partitioning
 
 ```
-UMEM_BUFFER (TOTAL_UMEM_FRAMES × FRAME_SIZE + TRICKLE_FRAME_SIZE)
+UMEM_BUFFER (TOTAL_UMEM_FRAMES × FRAME_SIZE)
 ├── RX Frames      [0, N/2)                   1/2 (50%)  - incoming packets
 ├── ACK TX Frames  [N/2, N/2 + N/8)           1/8 (12.5%) - TCP ACKs
 ├── PONG TX Frames [N/2 + N/8, N/2 + N/4)     1/8 (12.5%) - encrypted WS PONGs
-├── MSG TX Frames  [N/2 + N/4, N)             1/4 (25%)  - WS messages
-└── Trickle Frame  [N × FRAME_SIZE]           Static     - igc driver workaround (outside pools)
+└── MSG TX Frames  [N/2 + N/4, N)             1/4 (25%)  - WS messages
 ```
 
-**Trickle Frame**: Pre-built 43-byte UDP packet allocated at the very end of UMEM, outside all pools. Used by XDP Poll to trigger igc driver NAPI polling for TX completion stall workaround. Not tracked in fill_ring or any pool allocation.
+**Trickle Frame**: Pre-built 43-byte UDP packet stored in process memory (not UMEM). Used by XDP Poll to trigger igc driver NAPI polling for TX completion stall workaround. Sent via separate AF_PACKET socket.
 
-**Trickle TX Path (Gap N1)**: Trickle is sent via XDP tx_ring (unified TX path), NOT via separate raw socket:
-- Trickle packet built in UMEM at `TRICKLE_FRAME_INDEX × FRAME_SIZE` during init
-- Submitted via `xsk_ring_prod__reserve()` → `xsk_ring_prod__submit()` like all other TX
-- Unified TX path reduces code complexity and syscall overhead
-- Trickle frame appears in comp_ring but is never released (static, reused indefinitely)
+**Trickle TX Path**: Trickle is sent via separate AF_PACKET raw socket (not XDP tx_ring):
+- Trickle packet built in process memory during init (43-byte self-addressed UDP)
+- Sent via `::send(trickle_fd_, ...)` on AF_PACKET socket bound to interface
+- Simpler implementation, avoids UMEM frame allocation complexity
+- Trickle packets bypass XDP entirely, triggering kernel NAPI for TX completion
 
 Pool derivation from comp_ring (TX frames only):
 ```
@@ -863,7 +864,7 @@ The XDP BPF program must store the NIC hardware timestamp in metadata space befo
 The pipeline uses a **fork-first architecture** where all processes are forked BEFORE any network activity. This eliminates XSK socket inheritance issues.
 
 ```
-1. Create shared memory regions (UMEM, all ring buffers, tcp_state)
+1. Create shared memory regions (UMEM, all ring buffers, conn_state)
    - shm_open() + mmap() for each shared memory file
    - Initialize ring buffer producer/consumer indices to 0
 
@@ -877,7 +878,7 @@ The pipeline uses a **fork-first architecture** where all processes are forked B
    - Transport child reads these to perform handshake
 
 4. Calibrate TSC frequency (once in parent)
-   - Stored in tcp_state_shm->tsc_freq_hz
+   - Stored in conn_state_shm->tsc_freq_hz
    - All child processes use this value (avoids recalibration)
 
 5. Fork ALL processes BEFORE any network activity
@@ -942,7 +943,7 @@ The pipeline uses a **fork-first architecture** where all processes are forked B
 ├── msg_outbox             # MSG_OUTBOX ring (.hdr/.dat, 2KB events)
 ├── pongs                  # PONGS ring (.hdr/.dat, 128B aligned)
 ├── ws_frame_info          # WS_FRAME_INFO ring (.hdr/.dat, 128B with timestamps)
-├── tcp_state.dat          # TCP state (single file)
+├── conn_state.dat          # TCP state (single file)
 └── tx_frame_state.dat     # TX frame state (single file)
 ```
 
@@ -1073,7 +1074,7 @@ sudo ./build/binance_pipeline --interface enp108s0 --benchmark --duration 60
 |-----------|-------------|---------------------|
 | **Stack Entry** | `src/stack/userspace_stack.hpp` | `UserspaceStack::build_syn()`, `build_ack()`, `build_data()`, `build_fin()`, `build_fin_ack()`, `build_probe()`, `parse_tcp()`, `update_ack_and_checksum()` |
 | **TCP Packet** | `src/stack/tcp/tcp_packet.hpp` | `TCPPacket::build()` - builds ETH+IP+TCP+payload frame<br>`TCPPacket::parse()` - returns `TCPParseResult` with zero-copy payload pointer |
-| **TCP State** | `src/stack/tcp/tcp_state.hpp` | `TCPState` enum, `TCPParams`, `TCPParseResult`, `TCPProcessResult`<br>`TCP_FLAG_*` constants, `seq_lt/gt/le/ge()` helpers |
+| **TCP State** | `src/stack/tcp/conn_state.hpp` | `TCPState` enum, `TCPParams`, `TCPParseResult`, `TCPProcessResult`<br>`TCP_FLAG_*` constants, `seq_lt/gt/le/ge()` helpers |
 | **Retransmit** | `src/stack/tcp/tcp_retransmit.hpp` | `ZeroCopyRetransmitQueue::add_ref()`, `remove_acked()`, `get_retransmit_refs()`<br>`RetransmitSegmentRef` (40 bytes - stores alloc_pos, frame_idx, seq range, not data) |
 | **Receive Buffer** | `src/stack/tcp/tcp_retransmit.hpp` | `ZeroCopyReceiveBuffer::push_frame()`, `read()`, `get_last_read_stats()` |
 | **IP Layer** | `src/stack/ip/ip_layer.hpp` | `IPLayer::build_packet()`, `parse_packet()`<br>`ip_to_string()`, `string_to_ip()` |
@@ -1114,8 +1115,11 @@ All XDP components are **production-tested** and should be reused directly witho
 
 | Component | Source File | Key Functions/Types |
 |-----------|-------------|---------------------|
-| **SSL Policies** | `src/policy/ssl.hpp` | `OpenSSLPolicy`, `LibreSSLPolicy`, `WolfSSLPolicy`<br>`handshake_userspace_transport()`, `read()`, `write()` |
-| **Userspace BIO** | `src/policy/userspace_transport_bio.hpp` | `UserspaceTransportBIO<T>::create_bio_method()`, `create_bio()` |
+| **SSL Policies** | `src/policy/ssl.hpp` | `OpenSSLPolicy`, `LibreSSLPolicy`, `WolfSSLPolicy`, `NoSSLPolicy`<br>Zero-copy RX: `append_encrypted_view()` (ring buffer of UMEM pointers), `clear_encrypted_view()` (reconnect only)<br>Zero-copy TX: `set_encrypted_output()`, `encrypted_output_len()`, `clear_encrypted_output()`<br>I/O: `read()`, `write()`, `init_zero_copy_bio()` |
+
+**Note**: Transport Process does NOT use `userspace_transport_bio.hpp`. Instead, it uses a zero-copy view/output buffer model:
+- **RX**: UMEM frame pointers are appended via `append_encrypted_view()` → SSL reads from scattered views
+- **TX**: Output buffer is set via `set_encrypted_output()` → SSL writes directly to UMEM frames
 
 ### 11.5 Timing (`src/core/timing.hpp`)
 
@@ -1319,6 +1323,7 @@ On connection loss: signal processes to stop, wait for exit, cleanup, exponentia
 - [ ] **Latency breakdown calculation helper**: Add `calculate_latency(WSFrameInfo, app_recv_cycle, tsc_freq_hz)` helper that returns per-stage breakdown (NIC→XDP, XDP→Transport, SSL decrypt, WS parse, WS→App).
 - [ ] **Ring buffer high-water mark metrics**: Add optional tracking of `max_fill_level` and `full_abort_count` per ring buffer for capacity planning.
 - [ ] **Connection timeout monitoring**: Add optional dead connection detection (no RX packets for configurable timeout, e.g., 120s) to trigger reconnection.
+- [ ] **Gateway/netmask configuration**: Transport currently assumes gateway is `.1` of local subnet and netmask is `/24`. Should read gateway IP and netmask from `ConnStateShm` or config, populated by parent process (e.g., from system routing table or user config).
 
 ### Design Decisions: Implemented (Gap Analysis)
 
@@ -1332,8 +1337,9 @@ The following features were identified in gap analysis and implemented:
 | **WSFrameInfo timestamp field naming (N6)** | WebSocket | Renamed `first_nic_timestamp_ns` → `first_byte_ts`, `latest_nic_timestamp_ns` → `last_byte_ts` for semantic clarity. |
 | **data_moved flag optimization (N7)** | XDP Poll | Track if RX/TX data moved each iteration. Idle-time work (frame reclaim) only runs when no data moved. |
 | **Separate PONG retransmit queue (Session 1)** | Transport | `pong_retransmit_queue_` for proper TCP reliability of PONG frames, separate from MSG retransmit. |
-| **SSL Policy template pattern (Session 1)** | Transport | `PipelineSSLPolicy` class abstracts SSL/BIO operations. Clean interface: `feed_encrypted()`, `read()`, `write()`, `get_encrypted()`. |
+| **SSL Policy template pattern (Session 1)** | Transport | SSL policies abstract TLS operations with zero-copy interface: `append_encrypted_view()` (1024-slot ring buffer), `read()`, `write()`, `set_encrypted_output()`, `encrypted_output_len()`. |
 | **process_manually + commit_manually (Session 1)** | WebSocket | Native disruptor batching pattern. Deferred commit reduces atomic operations per event. |
+| **Unified TX template (Session 2)** | Transport | `process_outbound<TxType>()` template handles MSG and PONG identically. Uses `if constexpr` for zero-overhead type selection. Single source of truth for: encrypt → build headers → add to retransmit queue. |
 
 ### Design Decisions: Not Implemented (with Rationale)
 
@@ -1344,7 +1350,7 @@ The following features were considered but NOT implemented, with documented rati
 | **TCP_CORK / Nagle-style batching** | HFT requires immediate transmission. Batching small writes adds latency. Single TLS record per TCP segment is optimal for our use case. |
 | **FIN/TCP close state machine** | For HFT simplicity, no FIN handling is implemented. On any disconnect, reconnect is the recovery strategy regardless of close type. RST provides immediate resource cleanup without TIME_WAIT delay. Exchange connections are long-lived (hours/days), and proper TCP close semantics add complexity without benefit. |
 | **Peer receive window tracking** | Rare in HFT scenario. We receive far more than we send (market data >> orders). Exchange servers have massive receive buffers and never zero-window HFT clients. If exchange is overloaded, reconnect is the strategy anyway. |
-| **Graceful PONG timeout handling** | PONGs are processed during idle time. HFT workloads are bursty, so idle time is common. Sustained high load indicates overload - system should fail fast rather than degrade. |
+| **Graceful PONG timeout handling** | PONGs use unified `process_outbound<TxType::PONG>()` template (same code path as MSG). Batch-processed during idle time. HFT workloads are bursty, so idle time is common. Sustained high load indicates overload - system should fail fast rather than degrade. |
 | **TIME_WAIT state for TCP close** | Reconnection handles cleanup. Lingering TIME_WAIT packets are rare and harmless - kernel handles them. Added complexity not justified for HFT. |
 | **Out-of-order comp_ring handling** | Position-based allocator assumes FIFO. All tested NICs (igc, Mellanox) return completions in order. Debug assertions catch violations. Fix at driver level if encountered. |
 | **Retransmit queue separate from frame pool** | Retransmit entries are 64 bytes, frames are ~2KB. Could save memory by decoupling, but added complexity not justified for typical HFT memory budgets. |
@@ -1354,6 +1360,7 @@ The following features were considered but NOT implemented, with documented rati
 | **Zero-window persist timeout** | No timeout - if peer window stays zero, connection stalls. For HFT, zero-window indicates peer overload; reconnection is the recovery strategy. |
 | **FIN-ACK retransmission** | After sending FIN, Transport exits immediately and prepares for reconnection. Lost FIN-ACK is handled by peer's timeout. Simplifies close handling for HFT. |
 | **Runtime MTU validation** | FRAME_SIZE is compile-time constant from PATH_MTU. Runtime MTU changes not supported. HFT deployments have fixed network configuration. |
+| **TCP fragmentation for large TX messages** | MSG_OUTBOX events must fit in single TCP segment (~1973 bytes with 2KB frames). Transport aborts on oversized messages. HFT messages are small; fragmentation adds latency and complexity. |
 | **Subscription response verification** | Subscription messages are sent but responses are not validated by this library. AppClient MUST implement subscription confirmation handling if needed. |
 | **Fragmented message assembly in WebSocket** | Fragment payloads are scattered in MSG_INBOX with headers between them. This library signals `is_fragmented=true` but does NOT assemble fragments into contiguous buffer. AppClient MUST implement `FragmentAssemblingClient` pattern if fragmented messages are expected. For HFT, prefer servers that send single-frame messages. |
 

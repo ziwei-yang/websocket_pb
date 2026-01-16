@@ -66,6 +66,9 @@ struct XDPPollProcess {
     static constexpr uint32_t kFrameHeadroom = FrameHeadroom;
     static constexpr uint32_t kFrameSize = FrameSize;
     static constexpr uint32_t kQueueId = 0;  // Always queue 0
+    // Pre-reserve TX slots: min(256, TX_RING_SIZE/4) to avoid exhausting small rings
+    static constexpr uint32_t TX_PRESERVE_SIZE =
+        (256 < XSK_RING_PROD__DEFAULT_NUM_DESCS / 4) ? 256 : XSK_RING_PROD__DEFAULT_NUM_DESCS / 4;
 
 public:
     // ========================================================================
@@ -101,6 +104,7 @@ public:
 
 private:
     // Main loop helper methods
+    uint32_t release_and_reserve_tx();  // Release ACKed frames + proactive TX slot reservation (idle only)
     bool submit_tx_batch();
     bool process_rx();
     void process_completions();
@@ -150,6 +154,10 @@ private:
     // RX frame tracking (via consumer sequence)
     int64_t last_released_seq_ = -1;
     uint64_t last_rx_timestamp_ns_ = 0;
+
+    // Pre-reserved TX slots (proactive reservation in idle loop)
+    uint32_t tx_preserved_count_ = 0;   // Current number of preserved slots
+    uint32_t tx_preserved_idx_ = 0;     // Starting index of preserved slots
 };
 ```
 
@@ -262,54 +270,124 @@ bool XDPPollProcess<...>::init(void* umem_area, size_t umem_size,
 
 ```cpp
 void XDPPollProcess::run() {
-    constexpr uint32_t TX_BATCH_SIZE = 32;
-    constexpr uint32_t RX_BATCH = 32;
     uint8_t trickle_counter = 0;
+    uint64_t loop_id = 0;
+
+    // Initial TX slot reservation before entering main loop
+    release_and_reserve_tx();
 
     // Direct flag access for main loop (explicit memory ordering)
     while (conn_state_->running[PROC_XDP_POLL].flag.load(std::memory_order_acquire)) {
-        bool data_moved = false;
+        // 0. TX submit (uses pre-reserved slots)
+        int32_t tx_count = profile_op([this]{ return submit_tx_batch(); }, sample, 0);
 
-        // 1. Collect and submit TX packets
-        data_moved |= submit_tx_batch();
+        // 1. RX process
+        int32_t rx_count = profile_op([this, loop_id]{ return process_rx(loop_id); }, sample, 1);
 
-        // 2. RX: rx_ring → RAW_INBOX - uses try_claim + publish
-        data_moved |= process_rx();
+        bool data_moved = (tx_count > 0) || (rx_count > 0);
 
-        // 3. (always) Inline trickle for igc driver TX completion stall
-        if ((++trickle_counter & 0x07) == 0) {
-            send_trickle();  // 43-byte self-addressed UDP to trigger NAPI
-        }
+        // 2. Trickle (every 8th iteration)
+        bool trickle_triggered = ((++trickle_counter & 0x07) == 0);
+        profile_op([this]{ send_trickle(); return 1; }, sample, 2, trickle_triggered);
 
-        // 4. (idle) comp_ring → reclaim TX UMEM by address range
-        if (!data_moved) {
-            process_completions();
-        }
+        // 3. Process completions (idle only)
+        profile_op([this]{ return process_completions(); }, sample, 3, !data_moved);
 
-        // 5. (idle) Release ACKed PONG/MSG frames
-        if (!data_moved) {
-            release_acked_tx_frames();
-        }
+        // 4. Release ACKed TX frames + Proactive TX reservation (idle only)
+        profile_op([this]{ return release_and_reserve_tx(); }, sample, 4, !data_moved);
 
-        // 6. (idle) Reclaim consumed RX UMEM → fill_ring
-        if (!data_moved) {
-            reclaim_rx_frames();
-        }
+        // 5. Reclaim RX frames (idle only)
+        profile_op([this]{ return reclaim_rx_frames(); }, sample, 5, !data_moved);
+
+        loop_id++;
     }
+}
+```
+
+### release_and_reserve_tx()
+
+Combined function that releases ACKed TX frames and proactively reserves TX ring slots.
+Called only during idle loops to eliminate reservation overhead from the hot path.
+Returns the number of TX slots reserved (for profiling):
+
+```cpp
+uint32_t XDPPollProcess::release_and_reserve_tx() {
+    // PONG frames: advance pong_release_pos up to pong_acked_pos
+    uint64_t pong_release = conn_state_->tx_frame.pong_release_pos.load(std::memory_order_relaxed);
+    uint64_t pong_acked = conn_state_->tx_frame.pong_acked_pos.load(std::memory_order_acquire);
+    while (pong_release < pong_acked) {
+        conn_state_->tx_frame.pong_release_pos.fetch_add(1, std::memory_order_release);
+        pong_release++;
+    }
+
+    // MSG frames: advance msg_release_pos up to msg_acked_pos
+    uint64_t msg_release = conn_state_->tx_frame.msg_release_pos.load(std::memory_order_relaxed);
+    uint64_t msg_acked = conn_state_->tx_frame.msg_acked_pos.load(std::memory_order_acquire);
+    while (msg_release < msg_acked) {
+        conn_state_->tx_frame.msg_release_pos.fetch_add(1, std::memory_order_release);
+        msg_release++;
+    }
+
+    // Proactive TX slot reservation
+    if (tx_preserved_count_ >= TX_PRESERVE_SIZE) return 0;  // Already have enough
+
+    uint32_t needed = TX_PRESERVE_SIZE - tx_preserved_count_;
+    uint32_t idx = 0;
+    uint32_t got = xsk_ring_prod__reserve(&tx_ring_, needed, &idx);
+
+    if (got == 0) {
+        // No slots available - fatal if below threshold
+        if (tx_preserved_count_ < TX_PRESERVE_SIZE) {
+            fprintf(stderr, "[XDP-TX] FATAL: proactive_reserve_tx failed, preserved=%u, need=%u\n",
+                    tx_preserved_count_, TX_PRESERVE_SIZE);
+            abort();
+        }
+        return 0;
+    }
+
+    if (tx_preserved_count_ == 0) {
+        tx_preserved_idx_ = idx;  // First reservation, save start index
+    }
+    tx_preserved_count_ += got;
+    return got;
 }
 ```
 
 ### submit_tx_batch()
 
-Collects frames from all TX outboxes, submits to NIC, then commits consumers:
+Collects frames from all TX outboxes using pre-reserved slots, submits to NIC, then commits consumers.
+**No reservation in hot path** - uses slots pre-reserved by `release_and_reserve_tx()`.
+
+#### Performance Note (igc driver / Intel I225/I226)
+
+The `sendto()` syscall costs **~400-600ns** and is the main bottleneck in the TX path.
+With `XDP_USE_NEED_WAKEUP` flag, the driver sets `needs_wakeup` when idle.
+For igc driver, `needs_wakeup` is almost always true because:
+1. The driver doesn't have busy-poll mode for TX
+2. It needs the syscall to trigger TX descriptor ring processing
+
+**Breakdown of `submit_tx_batch()` (~550ns total for 1 frame):**
+| Step | Time | Description |
+|------|------|-------------|
+| `has_data()` checks | ~10ns | 3 atomic loads |
+| `process_manually()` | ~50-100ns | Iterate IPC ring, write TX desc |
+| `xsk_ring_prod__submit()` | ~10ns | Atomic store |
+| **`sendto()` syscall** | **~400-600ns** | **The bottleneck** |
+| `commit_manually()` | ~30ns | 3 atomic stores |
+
+**Options to reduce TX latency:**
+1. **Batch more TX frames** - Amortize syscall cost over multiple frames
+2. **Skip `sendto()` if NIC already processing** - igc doesn't support this well
+3. **Use busy-poll on TX side** - Not supported by igc
+
+The ~550ns per TX frame is typical for AF_XDP with igc driver.
+For comparison, Mellanox mlx5 can do TX without syscall in some modes.
 
 ```cpp
 bool XDPPollProcess::submit_tx_batch() {
-    uint32_t tx_idx = 0;
     uint32_t tx_count = 0;
-    uint32_t available = 0;
 
-    // First check if any outbox has data before reserving TX slots
+    // Pre-check: any data to send?
     bool has_raw = raw_outbox_cons_ && raw_outbox_cons_->has_data();
     bool has_ack = ack_outbox_cons_ && ack_outbox_cons_->has_data();
     bool has_pong = pong_outbox_cons_ && pong_outbox_cons_->has_data();
@@ -318,15 +396,12 @@ bool XDPPollProcess::submit_tx_batch() {
         return false;  // Nothing to send
     }
 
-    // Reserve TX ring slots - must always get full batch
-    available = xsk_ring_prod__reserve(&tx_ring_, TX_BATCH_SIZE, &tx_idx);
-    if (available < TX_BATCH_SIZE) {
-        fprintf(stderr, "[XDP-TX] FATAL: TX ring reserve failed: got %u, need %u\n",
-                available, TX_BATCH_SIZE);
-        fprintf(stderr, "[XDP-TX] prod=%u cons=%u cached_prod=%u cached_cons=%u\n",
-                *tx_ring_.producer, *tx_ring_.consumer,
-                tx_ring_.cached_prod, tx_ring_.cached_cons);
-        abort();
+    // Use pre-reserved slots (no reservation here - done in proactive_reserve_tx)
+    uint32_t available = tx_preserved_count_;
+    uint32_t tx_idx = tx_preserved_idx_;
+
+    if (available == 0) {
+        return false;  // No slots available, wait for proactive_reserve_tx()
     }
 
     // Reusable lambda for collecting TX frames from any outbox
@@ -353,13 +428,12 @@ bool XDPPollProcess::submit_tx_batch() {
         pong_outbox_cons_->process_manually(collect_tx_frames);
     }
 
+    // Update preserved tracking BEFORE submit
+    tx_preserved_idx_ += tx_count;
+    tx_preserved_count_ -= tx_count;
+
     // Submit whatever we collected
     xsk_ring_prod__submit(&tx_ring_, tx_count);
-
-    // Cancel reservation for unused slots
-    if (tx_count < available) {
-        tx_ring_.cached_prod -= (available - tx_count);
-    }
 
     if (tx_count > 0) {
         // Conditional kick: only wake kernel if driver needs it
@@ -374,7 +448,6 @@ bool XDPPollProcess::submit_tx_batch() {
 
         return true;  // Data moved
     } else {
-        tx_ring_.cached_prod -= available;
         return false;
     }
 }

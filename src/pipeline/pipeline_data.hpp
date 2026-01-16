@@ -60,28 +60,29 @@ static_assert(sizeof(UMEMFrameDescriptor) == 32, "UMEMFrameDescriptor must be 32
 // ============================================================================
 
 struct alignas(64) MsgMetadata {
-    // Timestamp chain (first packet of this SSL_read batch)
-    uint64_t first_nic_timestamp_ns;       // NIC timestamp of first packet
-    uint64_t first_raw_frame_poll_cycle;   // Poll cycle when first raw frame retrieved
+    // First packet timestamps (oldest in SSL_read batch)
+    uint64_t first_nic_timestamp_ns;       // NIC HW timestamp of first packet
+    uint64_t first_nic_frame_poll_cycle;   // XDP Poll rdtscp of first packet
 
-    // Timestamp chain (latest packet)
-    uint64_t latest_nic_timestamp_ns;      // NIC timestamp of most recent packet
-    uint64_t latest_raw_frame_poll_cycle;  // Poll cycle when latest raw frame retrieved
+    // Latest packet timestamps (newest in SSL_read batch)
+    uint64_t latest_nic_timestamp_ns;      // NIC HW timestamp of latest packet
+    uint64_t latest_nic_frame_poll_cycle;  // XDP Poll rdtscp of latest packet
+    uint64_t latest_raw_frame_poll_cycle;  // Transport rdtscp of latest packet
 
-    // SSL_read timing
-    uint64_t ssl_read_cycle;               // TSC when SSL_read completed
+    // SSL timing
+    uint64_t ssl_read_cycle;               // Transport rdtscp after SSL_read()
 
     // Data location in MSG_INBOX
     uint32_t msg_inbox_offset;             // Start offset in MSG_INBOX buffer
     uint32_t decrypted_len;                // Length of decrypted data from this SSL_read
 
-    // Reserved for future use
-    uint8_t  _pad[8];
+    uint8_t _pad[8];                       // Padding to 64 bytes
 
     void clear() {
         first_nic_timestamp_ns = 0;
-        first_raw_frame_poll_cycle = 0;
+        first_nic_frame_poll_cycle = 0;
         latest_nic_timestamp_ns = 0;
+        latest_nic_frame_poll_cycle = 0;
         latest_raw_frame_poll_cycle = 0;
         ssl_read_cycle = 0;
         msg_inbox_offset = 0;
@@ -112,16 +113,17 @@ struct alignas(64) WSFrameInfo {
     // - frame_total_len gives total bytes consumed in MSG_INBOX
     uint32_t frame_total_len;              // Total WS frame length(s) including headers
 
-    // Full timestamp chain (Gap N6: renamed to match design doc)
+    // Full timestamp chain
     uint64_t first_byte_ts;                // NIC timestamp when first byte arrived
-    uint64_t first_raw_frame_poll_cycle;   // XDP Poll cycle (first raw frame)
+    uint64_t first_nic_frame_poll_cycle;   // XDP Poll rdtscp (first packet)
     uint64_t last_byte_ts;                 // NIC timestamp when frame completed
-    uint64_t latest_raw_frame_poll_cycle;  // XDP Poll cycle (latest raw frame)
+    uint64_t latest_nic_frame_poll_cycle;  // XDP Poll rdtscp (latest packet)
+    uint64_t latest_raw_frame_poll_cycle;  // Transport rdtscp (latest packet)
     uint64_t ssl_read_cycle;               // SSL_read completion cycle
     uint64_t ws_parse_cycle;               // WS frame parse completion cycle
 
     // Reserved for alignment
-    uint8_t  _pad2[32];
+    uint8_t  _pad2[24];
 
     void clear() {
         msg_inbox_offset = 0;
@@ -131,8 +133,9 @@ struct alignas(64) WSFrameInfo {
         is_fragmented = 0;
         frame_total_len = 0;
         first_byte_ts = 0;
-        first_raw_frame_poll_cycle = 0;
+        first_nic_frame_poll_cycle = 0;
         last_byte_ts = 0;
+        latest_nic_frame_poll_cycle = 0;
         latest_raw_frame_poll_cycle = 0;
         ssl_read_cycle = 0;
         ws_parse_cycle = 0;
@@ -141,81 +144,63 @@ struct alignas(64) WSFrameInfo {
 static_assert(sizeof(WSFrameInfo) == 128, "WSFrameInfo must be 128 bytes");
 
 // ============================================================================
-// PongFrameAligned - PONG payload passed through PONGS ring
+// PongFrameAligned - Pre-framed PONG data passed through PONGS ring
 // Size: 128 bytes
-// WebSocket PONG payload (max 125 bytes per RFC 6455)
+// Contains fully-built WebSocket PONG frame (header + masked payload)
+// Built by WebSocket Process, Transport just encrypts and sends
+// Max frame size: 2 + 4 + 125 = 131 bytes (but we use 128 for alignment)
 // ============================================================================
 
 struct alignas(64) PongFrameAligned {
-    uint8_t  payload[125];            // PONG payload (copied from PING)
-    uint8_t  payload_len;             // Actual payload length (0-125)
+    uint8_t  data[125];               // Pre-framed WS PONG (header + masked payload)
+    uint8_t  data_len;                // Actual frame length (header + payload)
     uint8_t  _pad[2];
 
     void clear() {
-        payload_len = 0;
+        data_len = 0;
     }
 
-    void set(const uint8_t* data, size_t len) {
-        payload_len = static_cast<uint8_t>(len > 125 ? 125 : len);
-        if (payload_len > 0) {
-            std::memcpy(payload, data, payload_len);
+    // Set pre-framed PONG data (already includes WS header and masking)
+    void set(const uint8_t* frame_data, size_t len) {
+        data_len = static_cast<uint8_t>(len > 125 ? 125 : len);
+        if (data_len > 0) {
+            std::memcpy(data, frame_data, data_len);
         }
     }
 };
 static_assert(sizeof(PongFrameAligned) == 128, "PongFrameAligned must be 128 bytes");
 
 // ============================================================================
-// MsgOutboxEvent - AppClient TX messages through MSG_OUTBOX
-// Size: 2KB (to fit large WS messages)
+// MsgOutboxEvent - Pre-framed TX data through MSG_OUTBOX
+// Size: 2KB (to fit large messages including protocol framing)
+// Transport is protocol-agnostic - this contains fully-framed data from upstream
 // ============================================================================
 
 struct alignas(2048) MsgOutboxEvent {
-    // Header room for WS framing (14 bytes max: 2-byte short + 8-byte extended + 4-byte mask)
-    // Left at beginning so data can be contiguous after WS header
-    uint8_t  header_room[14];
-
-    // User message data
-    uint8_t  data[2030];              // User payload (fits within 2KB total)
+    // Pre-framed message data (includes any protocol headers like WS frame header)
+    // Built by upstream process (e.g., WebSocket Process builds WS frames)
+    uint8_t  data[2044];              // Pre-framed data (fits within 2KB total)
     uint16_t data_len;                // Actual data length
-    uint8_t  opcode;                  // WS opcode (TEXT=1, BINARY=2)
-    uint8_t  msg_type;                // MSG_TYPE_DATA or MSG_TYPE_WS_CLOSE
+    uint8_t  msg_type;                // MSG_TYPE_DATA or MSG_TYPE_CLOSE
+    uint8_t  _pad;
 
     void clear() {
         data_len = 0;
-        opcode = WS_OP_TEXT;
         msg_type = MSG_TYPE_DATA;
     }
 
-    // Set message content
-    bool set_text(const char* msg, size_t len) {
+    // Set pre-framed data (already includes protocol headers)
+    bool set(const uint8_t* frame_data, size_t len) {
         if (len > sizeof(data)) return false;
-        std::memcpy(data, msg, len);
+        std::memcpy(data, frame_data, len);
         data_len = static_cast<uint16_t>(len);
-        opcode = WS_OP_TEXT;
         msg_type = MSG_TYPE_DATA;
         return true;
     }
 
-    bool set_binary(const uint8_t* msg, size_t len) {
-        if (len > sizeof(data)) return false;
-        std::memcpy(data, msg, len);
-        data_len = static_cast<uint16_t>(len);
-        opcode = WS_OP_BINARY;
-        msg_type = MSG_TYPE_DATA;
-        return true;
-    }
-
-    // Build CLOSE frame
-    void set_close(uint16_t status_code, const char* reason = nullptr, size_t reason_len = 0) {
-        data[0] = static_cast<uint8_t>(status_code >> 8);
-        data[1] = static_cast<uint8_t>(status_code & 0xFF);
-        data_len = 2;
-        if (reason && reason_len > 0) {
-            size_t copy_len = (reason_len > sizeof(data) - 2) ? sizeof(data) - 2 : reason_len;
-            std::memcpy(data + 2, reason, copy_len);
-            data_len += static_cast<uint16_t>(copy_len);
-        }
-        opcode = WS_OP_CLOSE;
+    // Signal close to Transport (Transport will send FIN)
+    void set_close() {
+        data_len = 0;
         msg_type = MSG_TYPE_WS_CLOSE;
     }
 };
@@ -498,42 +483,10 @@ inline constexpr uint8_t TCP_CLOSE_WAIT  = 7;
 inline constexpr uint8_t TCP_LAST_ACK    = 8;
 
 // ============================================================================
-// AckDescriptor - Simple ACK frame descriptor for ACK_OUTBOX
-// Size: 16 bytes
-// ============================================================================
-
-struct alignas(16) AckDescriptor {
-    uint64_t umem_addr;               // UMEM address of pre-built ACK packet
-    uint16_t frame_len;               // ACK packet length
-    uint8_t  _pad[6];
-
-    void clear() {
-        umem_addr = 0;
-        frame_len = 0;
-    }
-};
-static_assert(sizeof(AckDescriptor) == 16, "AckDescriptor must be 16 bytes");
-
-// ============================================================================
-// PongDescriptor - Encrypted PONG frame descriptor for PONG_OUTBOX
-// Size: 32 bytes
-// ============================================================================
-
-struct alignas(32) PongDescriptor {
-    uint64_t umem_addr;               // UMEM address of encrypted PONG packet
-    uint16_t frame_len;               // Total frame length
-    uint8_t  _pad[22];
-
-    void clear() {
-        umem_addr = 0;
-        frame_len = 0;
-    }
-};
-static_assert(sizeof(PongDescriptor) == 32, "PongDescriptor must be 32 bytes");
-
-// ============================================================================
 // IPC Ring Types (hftshm-backed disruptor rings)
 // ============================================================================
+// Note: ACK_OUTBOX and PONG_OUTBOX now use UMEMFrameDescriptor for type
+// unification with XDPPollProcess. The frame_type field distinguishes them.
 
 // IPC ring buffer using external storage (data in shared memory)
 template<typename T, size_t SIZE>
@@ -650,6 +603,57 @@ struct IPCRingProducer {
 
         // Publish
         published->store(seq, std::memory_order_release);
+    }
+
+    // ========================================================================
+    // Batch API: claim_batch() + publish_batch() for XDP batch sending
+    // ========================================================================
+
+    // Claim context returned by claim_batch()
+    struct ClaimContext {
+        int64_t start;   // First sequence in batch (inclusive)
+        int64_t end;     // Last sequence in batch (inclusive)
+        size_t count;    // Number of slots claimed
+    };
+
+    // Try to claim a batch of slots in the ring buffer
+    // Returns ClaimContext with start/end sequences, or {-1, -1, 0} if buffer full
+    ClaimContext try_claim_batch(size_t requested_count) {
+        if (requested_count == 0) {
+            return {-1, -1, 0};
+        }
+
+        auto* cursor = region_.producer_cursor();
+        auto* consumer_seq = region_.consumer_sequence(0);
+
+        // Claim batch: fetch_add by requested count
+        int64_t old_cursor = cursor->fetch_add(static_cast<int64_t>(requested_count), std::memory_order_relaxed);
+        int64_t batch_start = old_cursor + 1;
+        int64_t batch_end = old_cursor + static_cast<int64_t>(requested_count);
+        int64_t cons = consumer_seq->load(std::memory_order_acquire);
+
+        // Check if buffer has space for entire batch
+        if (batch_end - cons >= static_cast<int64_t>(element_count_)) {
+            cursor->fetch_sub(static_cast<int64_t>(requested_count), std::memory_order_relaxed);  // Rollback
+            return {-1, -1, 0};
+        }
+
+        return {batch_start, batch_end, requested_count};
+    }
+
+    // Publish a batch of sequences (makes them visible to consumers)
+    // lo and hi are inclusive: publishes sequences [lo, hi]
+    void publish_batch(int64_t lo, int64_t hi) {
+        auto* published = region_.producer_published();
+
+        // Wait for in-order publishing (ensures no gaps before our batch)
+        int64_t expected = lo - 1;
+        while (published->load(std::memory_order_acquire) != expected) {
+            __builtin_ia32_pause();
+        }
+
+        // Publish entire batch at once (only the end matters for consumers)
+        published->store(hi, std::memory_order_release);
     }
 
     // ========================================================================
@@ -858,6 +862,123 @@ struct IPCRingConsumer {
 
     // Get last processed sequence (for deferred commit tracking)
     int64_t last_processed() const { return last_processed_; }
+};
+
+// ============================================================================
+// Profiling Data Structures
+// For loop iteration profiling in XDP Poll and Transport processes
+// ============================================================================
+
+// Single loop iteration profiling record (64 bytes, cache-line aligned)
+// Records CPU cycles and per-operation details for each main loop iteration
+//
+// Size: 72 bytes
+// - uint64_t packet_nic_ns = 8 bytes
+// - uint64_t nic_poll_cycle = 8 bytes
+// - uint64_t transport_poll_cycle = 8 bytes
+// - int32_t op_details[6] = 24 bytes
+// - int32_t op_cycles[6] = 24 bytes
+struct CycleSample {
+    static constexpr size_t N = 6;  // Array size for op_details and op_cycles
+
+    uint64_t packet_nic_ns;         // NIC hardware timestamp (ns) of oldest RX packet
+    uint64_t nic_poll_cycle;        // XDP Poll rdtsc when packet retrieved from NIC
+    uint64_t transport_poll_cycle;  // Transport rdtsc when packet processed (0 for XDP Poll)
+    int32_t op_details[N];          // Per-operation details (counts, triggered flags)
+    int32_t op_cycles[N];           // Per-operation CPU cycles
+
+    void clear() {
+        packet_nic_ns = 0;
+        nic_poll_cycle = 0;
+        transport_poll_cycle = 0;
+        for (size_t i = 0; i < N; ++i) {
+            op_details[i] = 0;
+            op_cycles[i] = 0;
+        }
+    }
+};
+static_assert(sizeof(CycleSample) == 72, "CycleSample must be 72 bytes");
+
+// Circular buffer for 4M samples per process
+struct alignas(64) CycleSampleBuffer {
+    static constexpr uint32_t SAMPLE_COUNT = 4 * 1024 * 1024;  // 4M samples
+    static constexpr uint32_t MASK = SAMPLE_COUNT - 1;
+
+    CycleSample samples[SAMPLE_COUNT];
+    uint32_t write_idx;         // Next write position (wraps via MASK)
+    uint32_t total_count;       // Total samples collected (saturates at UINT32_MAX)
+
+    // Get pointer to next write slot (for direct assignment, avoids stack copy)
+    CycleSample* next_slot() {
+        return &samples[write_idx & MASK];
+    }
+
+    // Commit after writing to slot
+    void commit() {
+        write_idx++;
+        if (total_count < UINT32_MAX) total_count++;
+    }
+
+    // Copy-based record (kept for compatibility)
+    void record(const CycleSample& sample) {
+        samples[write_idx & MASK] = sample;
+        commit();
+    }
+
+    void init() {
+        write_idx = 0;
+        total_count = 0;
+    }
+};
+
+// Per-RX-packet NIC latency record (40 bytes)
+struct NicLatencySample {
+    uint64_t nic_realtime_ns;         // HW timestamp from NIC (ns) - PHC (synced to CLOCK_REALTIME)
+    uint64_t packet_bpf_timestamp_ns; // BPF entry bpf_ktime_get_ns() - CLOCK_MONOTONIC
+    uint64_t poll_cycle;              // TSC cycle when XDP Poll retrieved packet
+    uint64_t poll_timestamp_ns;       // XDP Poll clock_gettime(CLOCK_MONOTONIC)
+    uint64_t poll_realtime_ns;        // XDP Poll clock_gettime(CLOCK_REALTIME) - matches NIC PHC
+};
+static_assert(sizeof(NicLatencySample) == 40, "NicLatencySample must be 40 bytes");
+
+// Circular buffer for NIC latency samples (~160MB)
+struct alignas(64) NicLatencyBuffer {
+    static constexpr uint32_t SAMPLE_COUNT = 4 * 1024 * 1024;  // 4M samples
+    static constexpr uint32_t MASK = SAMPLE_COUNT - 1;
+
+    NicLatencySample samples[SAMPLE_COUNT];  // 4M * 40 = 160MB
+    uint32_t write_idx;
+    uint32_t total_count;
+
+    void record(uint64_t nic_rt_ns, uint64_t bpf_ts_ns, uint64_t poll_cyc,
+                uint64_t poll_ts_ns, uint64_t poll_rt_ns) {
+        uint32_t idx = write_idx & MASK;
+        samples[idx].nic_realtime_ns = nic_rt_ns;
+        samples[idx].packet_bpf_timestamp_ns = bpf_ts_ns;
+        samples[idx].poll_cycle = poll_cyc;
+        samples[idx].poll_timestamp_ns = poll_ts_ns;
+        samples[idx].poll_realtime_ns = poll_rt_ns;
+        write_idx++;
+        if (total_count < UINT32_MAX) total_count++;
+    }
+
+    void init() {
+        write_idx = 0;
+        total_count = 0;
+    }
+};
+
+// Full profiling shared memory region (~640MB total)
+struct ProfilingShm {
+    CycleSampleBuffer xdp_poll;      // 256MB - loop profiling
+    CycleSampleBuffer transport;     // 256MB - loop profiling
+    NicLatencyBuffer nic_latency;    // 128MB - per-packet NIC latency
+
+    void init() {
+        xdp_poll.init();
+        transport.init();
+        nic_latency.init();
+    }
 };
 
 }  // namespace websocket::pipeline

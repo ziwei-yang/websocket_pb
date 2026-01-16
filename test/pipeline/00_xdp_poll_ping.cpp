@@ -83,12 +83,13 @@ constexpr int XDP_POLL_CPU_CORE = 2;      // XDP Poll process core
 constexpr int TRANSPORT_CPU_CORE = 4;     // Transport process core (consumer + test)
 
 // Test configuration - set from command line
-std::string g_ping_target_ip = "139.162.79.171";
+std::string g_ping_target_ip;  // Default: auto-detect gateway
 std::string g_local_ip;  // Detected from interface
 
 // Test parameters
-constexpr int NUM_PINGS = 5000;                          // 5000 pings to send
-constexpr uint64_t TEST_TIMEOUT_NS = 5'000'000'000ULL;   // 5 second total timeout
+// Send 2x ACK_FRAMES to test UMEM frame wrapping/recycling
+constexpr int NUM_PINGS = static_cast<int>(ACK_FRAMES * 2);  // 16384 pings
+constexpr uint64_t TEST_TIMEOUT_NS = 30'000'000'000ULL;  // 30 seconds for 16384 pings
 constexpr uint64_t MSG_TIMEOUT_NS = 10'000'000ULL;       // 10ms per-ping timeout
 
 // Global shutdown flag
@@ -179,6 +180,7 @@ uint16_t icmp_checksum(const void* data, size_t len) {
 struct TestMetrics {
     // TX metrics
     std::atomic<uint64_t> tx_submitted{0};
+    std::atomic<uint64_t> tx_wrap_count{0};   // Number of times TX allocation wrapped
 
     // RX metrics
     std::atomic<uint64_t> rx_consumed{0};
@@ -200,6 +202,7 @@ struct TestMetrics {
 
     void reset() {
         tx_submitted.store(0);
+        tx_wrap_count.store(0);
         rx_consumed.store(0);
         last_rx_timestamp.store(0);
         last_rx_poll_cycle.store(0);
@@ -573,9 +576,14 @@ void stub_consumer_thread(
 // XDP Poll Thread
 // ============================================================================
 
+// Enable profiling
+static constexpr bool PROFILING_ENABLED = true;
+
 using XDPPollType = XDPPollProcess<
     IPCRingProducer<UMEMFrameDescriptor>,
-    IPCRingConsumer<UMEMFrameDescriptor>>;
+    IPCRingConsumer<UMEMFrameDescriptor>,
+    true,                    // TrickleEnabled
+    PROFILING_ENABLED>;      // Profiling
 
 void xdp_poll_thread(
     XDPPollType* xdp_poll,
@@ -586,7 +594,8 @@ void xdp_poll_thread(
     disruptor::ipc::shared_region* raw_outbox_region,
     disruptor::ipc::shared_region* ack_outbox_region,
     disruptor::ipc::shared_region* pong_outbox_region,
-    ConnStateShm* conn_state)
+    ConnStateShm* conn_state,
+    ProfilingShm* profiling)
 {
     pin_to_cpu(XDP_POLL_CPU_CORE);
 
@@ -607,6 +616,14 @@ void xdp_poll_thread(
         fprintf(stderr, "[XDP-POLL] init() failed\n");
         conn_state->shutdown_all();
         return;
+    }
+
+    // Set profiling data buffers
+    if constexpr (PROFILING_ENABLED) {
+        if (profiling) {
+            xdp_poll->set_profiling_data(&profiling->xdp_poll);
+            xdp_poll->set_nic_latency_data(&profiling->nic_latency);
+        }
     }
 
     printf("[XDP-POLL] Initialized, configuring BPF maps...\n");
@@ -723,8 +740,10 @@ public:
             return false;
         }
 
-        // Create producer for injecting test frames
+        // Create producers for injecting test frames
         raw_outbox_prod_ = new IPCRingProducer<UMEMFrameDescriptor>(*raw_outbox_region_);
+        ack_outbox_prod_ = new IPCRingProducer<UMEMFrameDescriptor>(*ack_outbox_region_);
+        pong_outbox_prod_ = new IPCRingProducer<UMEMFrameDescriptor>(*pong_outbox_region_);
 
         // Initialize shared state
         conn_state_ = static_cast<ConnStateShm*>(
@@ -737,6 +756,21 @@ public:
             return false;
         }
         conn_state_->init();
+
+        // Allocate ProfilingShm (shared between threads)
+        if constexpr (PROFILING_ENABLED) {
+            profiling_ = static_cast<ProfilingShm*>(
+                mmap(nullptr, sizeof(ProfilingShm),
+                     PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_ANONYMOUS,
+                     -1, 0));
+            if (profiling_ == MAP_FAILED) {
+                fprintf(stderr, "FAIL: Cannot allocate ProfilingShm (%zu bytes)\n", sizeof(ProfilingShm));
+                return false;
+            }
+            profiling_->init();
+            printf("ProfilingShm: %p (%zu bytes)\n", profiling_, sizeof(ProfilingShm));
+        }
 
         printf("=== Setup Complete ===\n\n");
         return true;
@@ -752,7 +786,11 @@ public:
         if (consumer_thread_.joinable()) consumer_thread_.join();
 
         delete raw_outbox_prod_;
+        delete ack_outbox_prod_;
+        delete pong_outbox_prod_;
         raw_outbox_prod_ = nullptr;
+        ack_outbox_prod_ = nullptr;
+        pong_outbox_prod_ = nullptr;
 
         delete raw_inbox_region_;
         delete raw_outbox_region_;
@@ -766,6 +804,10 @@ public:
         if (conn_state_ && conn_state_ != MAP_FAILED) {
             munmap(conn_state_, sizeof(ConnStateShm));
             conn_state_ = nullptr;
+        }
+        if (profiling_ && profiling_ != MAP_FAILED) {
+            munmap(profiling_, sizeof(ProfilingShm));
+            profiling_ = nullptr;
         }
         if (umem_area_ && umem_area_ != MAP_FAILED) {
             munmap(umem_area_, umem_size_);
@@ -786,7 +828,8 @@ public:
             raw_outbox_region_,
             ack_outbox_region_,
             pong_outbox_region_,
-            conn_state_);
+            conn_state_,
+            profiling_);
 
         printf("[MAIN] Waiting for XDP Poll to initialize...\n");
         uint64_t start = get_monotonic_ns();
@@ -879,12 +922,31 @@ public:
             }
         }
 
+        // Wait 10ms for consumer to catch up with producer
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+        // Check ring buffer status via shared_region API
+        int64_t prod_seq = raw_inbox_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t cons_seq = raw_inbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+
         uint64_t total_time_ns = get_monotonic_ns() - test_start;
         double total_time_s = total_time_ns / 1e9;
         double msg_rate = (sent > 0) ? sent / total_time_s : 0;
         uint64_t total_rx_frames = metrics_.rx_consumed.load();
         double success_rate = (sent > 0) ? 100.0 * received / sent : 0;
         double timeout_rate = (sent > 0) ? 100.0 * timeouts / sent : 0;
+
+        printf("\n");
+        printf("=== Ring Buffer Status ===\n");
+        printf("  RAW_INBOX producer: %ld\n", prod_seq);
+        printf("  RAW_INBOX consumer: %ld\n", cons_seq);
+        printf("  Consumer lag:       %ld frames\n", prod_seq - cons_seq);
+        if (prod_seq == cons_seq) {
+            printf("  Status: Consumer caught up (OK)\n");
+        } else {
+            printf("  Status: Consumer behind by %ld frames (WARN)\n", prod_seq - cons_seq);
+        }
+        printf("==========================\n");
 
         printf("\n");
         printf("=== Test Results ===\n");
@@ -894,6 +956,9 @@ public:
         printf("  Timeouts:         %d (%.1f%%)\n", timeouts, timeout_rate);
         printf("  RX frames:        %lu (total ICMP frames)\n", total_rx_frames);
         printf("  Ping rate:        %.0f ping/s\n", msg_rate);
+        printf("  TX UMEM wraps:    %lu (reused %lu frames)\n",
+               metrics_.tx_wrap_count.load(),
+               metrics_.tx_wrap_count.load() * ACK_FRAMES);
         printf("====================\n");
 
         // Print latency stats
@@ -906,6 +971,70 @@ public:
 
         printf("PASS: Received %d/%d ping replies (%.1f%% success)\n",
                received, sent, success_rate);
+        return true;
+    }
+
+    // ========================================================================
+    // ACK/PONG Outbox Test - Verify XDP Poll consumes from all TX queues
+    // ========================================================================
+
+    bool run_outbox_test() {
+        constexpr int OUTBOX_PINGS = 100;
+        printf("\n--- ACK/PONG Outbox Test (50 pings each via ACK_OUTBOX and PONG_OUTBOX) ---\n");
+
+        uint64_t pre_rx_count = metrics_.rx_consumed.load();
+        int ack_sent = 0;
+        int pong_sent = 0;
+        int received = 0;
+
+        // Send 50 pings via ACK_OUTBOX
+        printf("[OUTBOX] Sending %d pings via ACK_OUTBOX...\n", OUTBOX_PINGS / 2);
+        for (int i = 0; i < OUTBOX_PINGS / 2; i++) {
+            inject_ping_via_outbox(ack_outbox_prod_, ACK_POOL_START, ACK_FRAMES,
+                                   static_cast<uint16_t>(20000 + i), ack_inject_count_);
+            ack_sent++;
+        }
+
+        // Send 50 pings via PONG_OUTBOX
+        printf("[OUTBOX] Sending %d pings via PONG_OUTBOX...\n", OUTBOX_PINGS / 2);
+        for (int i = 0; i < OUTBOX_PINGS / 2; i++) {
+            inject_ping_via_outbox(pong_outbox_prod_, PONG_POOL_START, PONG_FRAMES,
+                                   static_cast<uint16_t>(30000 + i), pong_inject_count_);
+            pong_sent++;
+        }
+
+        // Wait for replies (up to 2 seconds total)
+        printf("[OUTBOX] Waiting for replies...\n");
+        uint64_t start = get_monotonic_ns();
+        constexpr uint64_t OUTBOX_TIMEOUT_NS = 2'000'000'000ULL;  // 2 seconds
+
+        while (get_monotonic_ns() - start < OUTBOX_TIMEOUT_NS) {
+            uint64_t current_rx = metrics_.rx_consumed.load();
+            received = static_cast<int>(current_rx - pre_rx_count);
+            if (received >= OUTBOX_PINGS) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        uint64_t final_rx = metrics_.rx_consumed.load();
+        received = static_cast<int>(final_rx - pre_rx_count);
+
+        printf("\n=== ACK/PONG Outbox Results ===\n");
+        printf("  ACK_OUTBOX sent:   %d pings\n", ack_sent);
+        printf("  PONG_OUTBOX sent:  %d pings\n", pong_sent);
+        printf("  Total sent:        %d pings\n", ack_sent + pong_sent);
+        printf("  Received:          %d replies\n", received);
+        printf("===============================\n");
+
+        if (received < OUTBOX_PINGS * 90 / 100) {  // Allow 10% loss
+            printf("FAIL: ACK/PONG outbox test - received %d/%d (< 90%%)\n",
+                   received, OUTBOX_PINGS);
+            return false;
+        }
+
+        printf("PASS: ACK/PONG outbox test - received %d/%d replies\n",
+               received, OUTBOX_PINGS);
         return true;
     }
 
@@ -939,8 +1068,46 @@ public:
         desc.nic_frame_poll_cycle = 0;
 
         raw_outbox_prod_->publish(slot);
+
+        // Detect UMEM wrap (when modulo resets to lower value)
+        uint64_t prev_inject = inject_count_;
         inject_count_++;
+        if ((prev_inject % ACK_FRAMES) > (inject_count_ % ACK_FRAMES)) {
+            metrics_.tx_wrap_count.fetch_add(1, std::memory_order_relaxed);
+        }
         metrics_.tx_submitted.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Inject ping via a specific outbox (ACK_OUTBOX or PONG_OUTBOX)
+    void inject_ping_via_outbox(IPCRingProducer<UMEMFrameDescriptor>* prod,
+                                 size_t pool_start, size_t pool_size,
+                                 uint16_t seq, uint64_t& counter) {
+        uint64_t tx_frame_idx = pool_start + (counter % pool_size);
+        uint64_t tx_addr = tx_frame_idx * FRAME_SIZE;
+        uint8_t* frame_ptr = static_cast<uint8_t*>(umem_area_) + tx_addr;
+
+        size_t frame_len = build_icmp_echo_request(frame_ptr, FRAME_SIZE, seq);
+        if (frame_len == 0) {
+            fprintf(stderr, "WARN: build_icmp_echo_request failed\n");
+            return;
+        }
+
+        int64_t slot = prod->try_claim();
+        if (slot < 0) {
+            fprintf(stderr, "WARN: Outbox full\n");
+            return;
+        }
+
+        auto& desc = (*prod)[slot];
+        desc.umem_addr = tx_addr;
+        desc.frame_len = static_cast<uint16_t>(frame_len);
+        desc.frame_type = (pool_start == ACK_POOL_START) ? FRAME_TYPE_ACK : FRAME_TYPE_PONG;
+        desc.consumed = 0;
+        desc.nic_timestamp_ns = 0;
+        desc.nic_frame_poll_cycle = 0;
+
+        prod->publish(slot);
+        counter++;
     }
 
     size_t build_icmp_echo_request(uint8_t* buffer, size_t capacity, uint16_t seq) {
@@ -1033,6 +1200,77 @@ public:
         return true;
     }
 
+    void save_profiling_data() {
+        if constexpr (!PROFILING_ENABLED) return;
+        if (!profiling_) return;
+
+        pid_t pid = getpid();
+
+        auto save_buffer = [&](CycleSampleBuffer& buf, const char* name) {
+            char filename[256];
+            snprintf(filename, sizeof(filename), "/tmp/%s_profiling_%d.bin", name, pid);
+
+            FILE* f = fopen(filename, "wb");
+            if (!f) {
+                fprintf(stderr, "[PROFILING] Failed to create %s\n", filename);
+                return;
+            }
+
+            uint32_t count = std::min(buf.total_count, CycleSampleBuffer::SAMPLE_COUNT);
+            uint32_t start_idx = (buf.total_count > CycleSampleBuffer::SAMPLE_COUNT)
+                ? (buf.write_idx & CycleSampleBuffer::MASK)
+                : 0;
+
+            // Write header: total_count, sample_count
+            fwrite(&buf.total_count, sizeof(uint32_t), 1, f);
+            fwrite(&count, sizeof(uint32_t), 1, f);
+
+            // Write samples in order (oldest to newest)
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t idx = (start_idx + i) & CycleSampleBuffer::MASK;
+                fwrite(&buf.samples[idx], sizeof(CycleSample), 1, f);
+            }
+            fclose(f);
+            printf("[PROFILING] %s saved to %s (%u samples, %u total)\n",
+                   name, filename, count, buf.total_count);
+        };
+
+        save_buffer(profiling_->xdp_poll, "xdp_poll");
+
+        // Save NIC latency data
+        {
+            char filename[256];
+            snprintf(filename, sizeof(filename), "/tmp/nic_latency_profiling_%d.bin", pid);
+
+            FILE* f = fopen(filename, "wb");
+            if (!f) {
+                fprintf(stderr, "[PROFILING] Failed to create %s\n", filename);
+                return;
+            }
+
+            const auto& buf = profiling_->nic_latency;
+            uint32_t count = std::min(buf.total_count, NicLatencyBuffer::SAMPLE_COUNT);
+            uint32_t start_idx = (buf.total_count > NicLatencyBuffer::SAMPLE_COUNT)
+                ? (buf.write_idx & NicLatencyBuffer::MASK)
+                : 0;
+
+            // Write header: total_count, sample_count
+            fwrite(&buf.total_count, sizeof(uint32_t), 1, f);
+            fwrite(&count, sizeof(uint32_t), 1, f);
+
+            // Write samples in order (oldest to newest)
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t idx = (start_idx + i) & NicLatencyBuffer::MASK;
+                fwrite(&buf.samples[idx], sizeof(NicLatencySample), 1, f);
+            }
+            fclose(f);
+            printf("[PROFILING] nic_latency saved to %s (%u samples, %u total)\n",
+                   filename, count, buf.total_count);
+        }
+
+        printf("[PROFILING] To analyze: ./build/xdp_poll_profiling %d\n", pid);
+    }
+
     void print_bpf_stats() {
         auto* bpf = xdp_poll_.get_bpf_loader();
         if (!bpf) {
@@ -1074,8 +1312,11 @@ private:
     disruptor::ipc::shared_region* ack_outbox_region_ = nullptr;
     disruptor::ipc::shared_region* pong_outbox_region_ = nullptr;
     ConnStateShm* conn_state_ = nullptr;
+    ProfilingShm* profiling_ = nullptr;
 
     IPCRingProducer<UMEMFrameDescriptor>* raw_outbox_prod_ = nullptr;
+    IPCRingProducer<UMEMFrameDescriptor>* ack_outbox_prod_ = nullptr;
+    IPCRingProducer<UMEMFrameDescriptor>* pong_outbox_prod_ = nullptr;
 
     XDPPollType xdp_poll_;
     TestMetrics metrics_;
@@ -1084,6 +1325,8 @@ private:
     std::thread consumer_thread_;
 
     uint64_t inject_count_ = 0;
+    uint64_t ack_inject_count_ = 0;
+    uint64_t pong_inject_count_ = 0;
 };
 
 // ============================================================================
@@ -1181,14 +1424,22 @@ int main(int argc, char* argv[]) {
     // Give threads time to stabilize
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    // Run test
+    // Run ACK/PONG outbox test first (verify XDP Poll consumes from all TX queues)
     int result = 0;
-    if (!test.run_ping_test()) {
+    if (!test.run_outbox_test()) {
+        result = 1;
+    }
+
+    // Run main ping test
+    if (result == 0 && !test.run_ping_test()) {
         result = 1;
     }
 
     // Print BPF stats
     test.print_bpf_stats();
+
+    // Save profiling data
+    test.save_profiling_data();
 
     // Cleanup
     test.teardown();

@@ -25,13 +25,14 @@
 // Requires BPF_F_XDP_DEV_BOUND_ONLY flag when loading
 extern int bpf_xdp_metadata_rx_timestamp(const struct xdp_md *ctx, __u64 *timestamp) __ksym;
 
-// XDP metadata structure stored before packet data
+// XDP metadata structure stored before packet data (16 bytes)
 // After bpf_xdp_adjust_meta(), this structure is placed in the metadata area.
-// Layout in UMEM: [xdp_user_metadata][packet data]
-//                 ^                  ^
-//                 data_meta          data
+// Layout in UMEM: [xdp_user_metadata (16 bytes)][packet data]
+//                 ^                              ^
+//                 data_meta                      data
 struct xdp_user_metadata {
     __u64 rx_timestamp_ns;   // Hardware RX timestamp (nanoseconds, 0 if unavailable)
+    __u64 bpf_entry_ns;      // bpf_ktime_get_ns() at XDP program entry
 };
 
 // BPF Map: AF_XDP socket map for XDP_REDIRECT
@@ -100,9 +101,9 @@ static __always_inline void inc_stat(__u32 index) {
     }
 }
 
-// Helper to extract NIC hardware timestamp into XDP metadata area
+// Helper to extract NIC hardware timestamp and BPF entry time into XDP metadata area
 // Returns 0 on success (redirect should proceed), -1 on failure (pass to kernel)
-static __always_inline int extract_hw_timestamp(struct xdp_md *ctx) {
+static __always_inline int extract_hw_timestamp(struct xdp_md *ctx, __u64 bpf_entry_ns) {
     int ret = bpf_xdp_adjust_meta(ctx, -(int)sizeof(struct xdp_user_metadata));
     if (ret != 0) {
         // adjust_meta failed - likely no headroom
@@ -118,6 +119,10 @@ static __always_inline int extract_hw_timestamp(struct xdp_md *ctx) {
         return -1;
     }
 
+    // Store BPF entry timestamp (always available)
+    meta->bpf_entry_ns = bpf_entry_ns;
+
+    // Extract NIC hardware timestamp
     __u64 timestamp = 0;
     ret = bpf_xdp_metadata_rx_timestamp(ctx, &timestamp);
     if (ret == 0 && timestamp != 0) {
@@ -171,18 +176,11 @@ static __always_inline int parse_ipv4(struct parse_ctx *pctx) {
 
     // Validate IP header length (IHL must be >= 5)
     if (ip->ihl < 5) {
-        bpf_printk("IP parse FAILED: ihl=%d < 5", ip->ihl);
         return -1;  // Reject packets with invalid IHL
     }
 
-    // Log if packet has IP options
-    if (ip->ihl > 5) {
-        bpf_printk("IP has options: ihl=%d (len=%d bytes)", ip->ihl, ip->ihl * 4);
-    }
-
-    // Check if we have the full IP header
+    // Check if we have the full IP header (including any IP options)
     if (data + (ip->ihl * 4) > pctx->data_end) {
-        bpf_printk("IP bounds check FAILED: need %d bytes", ip->ihl * 4);
         return -1;
     }
 
@@ -237,8 +235,7 @@ static __always_inline int is_exchange_packet(struct parse_ctx *pctx) {
     __u8 *src_port_val = bpf_map_lookup_elem(&exchange_ports, &pctx->tcp_sport);
 
     if (src_ip_val && *src_ip_val != 0 && src_port_val && *src_port_val != 0) {
-        inc_stat(STAT_IP_MATCH);  // Debug: Exchange IP+port matched
-        bpf_printk("MATCH: src=%pI4:%d -> REDIRECT", &pctx->ip_src, pctx->tcp_sport);
+        inc_stat(STAT_IP_MATCH);
         return 1;
     }
 
@@ -247,6 +244,9 @@ static __always_inline int is_exchange_packet(struct parse_ctx *pctx) {
 
 SEC("xdp")
 int exchange_packet_filter(struct xdp_md *ctx) {
+    // Capture BPF entry timestamp immediately (kernel monotonic clock)
+    __u64 bpf_entry_ns = bpf_ktime_get_ns();
+
     struct parse_ctx pctx = {};
     int ret;
 
@@ -293,17 +293,14 @@ int exchange_packet_filter(struct xdp_md *ctx) {
             // Check if from exchange IP and destined to us
             __u32 key = 0;
             __u32 *our_ip = bpf_map_lookup_elem(&local_ip, &key);
-            bpf_printk("ICMP: src=%x dst=%x our=%x", pctx.ip_src, pctx.ip_dst, our_ip ? *our_ip : 0);
             if (our_ip && pctx.ip_dst == *our_ip) {
                 __u8 *src_ip_val = bpf_map_lookup_elem(&exchange_ips, &pctx.ip_src);
-                bpf_printk("ICMP check: src_ip_val=%p", src_ip_val);
                 if (src_ip_val && *src_ip_val != 0) {
-                    inc_stat(STAT_EXCHANGE_PACKETS);  // Count as exchange packet
+                    inc_stat(STAT_EXCHANGE_PACKETS);
 
-                    // Extract HW timestamp into metadata area
-                    extract_hw_timestamp(ctx);
+                    // Extract HW timestamp and BPF entry time into metadata area
+                    extract_hw_timestamp(ctx, bpf_entry_ns);
 
-                    bpf_printk("ICMP REDIRECT from exchange IP");
                     // Redirect ICMP from exchange to XSK
                     return bpf_redirect_map(&xsks_map, 0, 0);
                 }
@@ -320,7 +317,6 @@ int exchange_packet_filter(struct xdp_md *ctx) {
     ret = parse_tcp(&pctx);
     if (ret < 0) {
         inc_stat(STAT_PARSE_ERRORS);
-        bpf_printk("TCP parse FAILED - passing to kernel");
         return XDP_PASS;  // Pass malformed packets to kernel
     }
 
@@ -328,14 +324,11 @@ int exchange_packet_filter(struct xdp_md *ctx) {
     if (is_exchange_packet(&pctx)) {
         inc_stat(STAT_EXCHANGE_PACKETS);
 
-        // Extract NIC hardware RX timestamp into metadata area
-        extract_hw_timestamp(ctx);
+        // Extract NIC hardware RX timestamp and BPF entry time into metadata area
+        extract_hw_timestamp(ctx, bpf_entry_ns);
 
         // Redirect to AF_XDP socket on queue 0
-        __u32 queue_id = 0;
-        int redirect_ret = bpf_redirect_map(&xsks_map, queue_id, 0);
-        bpf_printk("REDIRECT to XSK queue 0, ret=%d", redirect_ret);
-        return redirect_ret;
+        return bpf_redirect_map(&xsks_map, 0, 0);
     }
 
     // Not exchange traffic - pass to kernel stack

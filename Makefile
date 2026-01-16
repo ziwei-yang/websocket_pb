@@ -226,6 +226,8 @@ TEST_IP_LAYER_SRC := $(TEST_DIR)/test_ip_layer.cpp
 TEST_IP_OPTIMIZATIONS_SRC := $(TEST_DIR)/test_ip_optimizations.cpp
 TEST_STACK_CHECKSUM_SRC := $(TEST_DIR)/test_stack_checksum.cpp
 TEST_TCP_STATE_SRC := $(TEST_DIR)/test_tcp_state.cpp
+TEST_RETRANSMIT_QUEUE_SRC := $(TEST_DIR)/test_retransmit_queue.cpp
+TEST_SSL_POLICY_SRC := $(TEST_DIR)/test_ssl_policy.cpp
 
 # Integration test source files
 TEST_BINANCE_SRC := $(INTEGRATION_DIR)/binance.cpp
@@ -258,8 +260,10 @@ TEST_IP_LAYER_BIN := $(BUILD_DIR)/test_ip_layer
 TEST_IP_OPTIMIZATIONS_BIN := $(BUILD_DIR)/test_ip_optimizations
 TEST_STACK_CHECKSUM_BIN := $(BUILD_DIR)/test_stack_checksum
 TEST_TCP_STATE_BIN := $(BUILD_DIR)/test_tcp_state
+TEST_RETRANSMIT_QUEUE_BIN := $(BUILD_DIR)/test_retransmit_queue
+TEST_SSL_POLICY_BIN := $(BUILD_DIR)/test_ssl_policy
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp
 
 all: $(EXAMPLE_BIN)
 
@@ -478,6 +482,28 @@ test-tcp-state: $(TEST_TCP_STATE_BIN)
 	@echo "🧪 Running TCP state unit tests..."
 	./$(TEST_TCP_STATE_BIN)
 
+# Build retransmit queue tests
+$(TEST_RETRANSMIT_QUEUE_BIN): $(TEST_RETRANSMIT_QUEUE_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling retransmit queue unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run retransmit queue tests
+test-retransmit-queue: $(TEST_RETRANSMIT_QUEUE_BIN)
+	@echo "🧪 Running retransmit queue unit tests..."
+	./$(TEST_RETRANSMIT_QUEUE_BIN)
+
+# Build SSL policy tests
+$(TEST_SSL_POLICY_BIN): $(TEST_SSL_POLICY_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling SSL policy unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Test build complete: $@"
+
+# Run SSL policy tests
+test-ssl-policy: $(TEST_SSL_POLICY_BIN)
+	@echo "🧪 Running SSL policy unit tests..."
+	./$(TEST_SSL_POLICY_BIN)
+
 # ============================================================================
 # Pipeline Integration Tests (Multi-Process AF_XDP WebSocket)
 # ============================================================================
@@ -532,6 +558,83 @@ build-test-pipeline-xdp-poll: $(PIPELINE_XDP_POLL_BIN)
 test-pipeline-xdp-poll: $(PIPELINE_XDP_POLL_BIN) bpf
 	@echo "🧪 Running XDP Poll segregated test via script..."
 	./scripts/test_pipeline_xdp_poll.sh $(XDP_INTERFACE)
+
+# ============================================================================
+# XDP Poll ICMP Ping Test
+# ============================================================================
+
+PIPELINE_XDP_POLL_PING_SRC := test/pipeline/00_xdp_poll_ping.cpp
+PIPELINE_XDP_POLL_PING_BIN := $(BUILD_DIR)/test_pipeline_xdp_poll_ping
+
+# Build XDP Poll Ping test
+$(PIPELINE_XDP_POLL_PING_BIN): $(PIPELINE_XDP_POLL_PING_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling XDP Poll ICMP Ping test..."
+ifdef USE_XDP
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ XDP Poll Ping test build complete: $@"
+else
+	@echo "❌ Error: XDP Poll Ping test requires USE_XDP=1"
+	@exit 1
+endif
+
+# Build-only target for XDP Poll Ping test
+build-test-pipeline-xdp-poll-ping: $(PIPELINE_XDP_POLL_PING_BIN)
+
+# ============================================================================
+# XDP Poll TCP Test (Echo Server)
+# ============================================================================
+
+PIPELINE_XDP_POLL_TCP_SRC := test/pipeline/01_xdp_poll_tcp.cpp
+PIPELINE_XDP_POLL_TCP_BIN := $(BUILD_DIR)/test_pipeline_xdp_poll_tcp
+
+# Build XDP Poll TCP test
+$(PIPELINE_XDP_POLL_TCP_BIN): $(PIPELINE_XDP_POLL_TCP_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling XDP Poll TCP test..."
+ifdef USE_XDP
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ XDP Poll TCP test build complete: $@"
+else
+	@echo "❌ Error: XDP Poll TCP test requires USE_XDP=1"
+	@exit 1
+endif
+
+# Build-only target for XDP Poll TCP test
+build-test-pipeline-xdp-poll-tcp: $(PIPELINE_XDP_POLL_TCP_BIN)
+
+# Run XDP Poll TCP test (requires echo server at 39.162.79.171:12345)
+# Uses scripts/test_pipeline_xdp_poll.sh with test file argument
+# NOTE: Script uses sudo internally, do not invoke with sudo
+test-pipeline-xdp-poll-tcp: $(PIPELINE_XDP_POLL_TCP_BIN) bpf
+	@echo "🧪 Running XDP Poll TCP test via script..."
+	./scripts/test_pipeline_xdp_poll.sh $(XDP_INTERFACE) 01_xdp_poll_tcp.cpp
+
+# ============================================================================
+# Transport TCP Test (NoSSLPolicy with forked XDP Poll + Transport)
+# ============================================================================
+
+PIPELINE_TRANSPORT_TCP_SRC := test/pipeline/10_transport_tcp.cpp
+PIPELINE_TRANSPORT_TCP_BIN := $(BUILD_DIR)/test_pipeline_transport_tcp
+
+# Build Transport TCP test
+$(PIPELINE_TRANSPORT_TCP_BIN): $(PIPELINE_TRANSPORT_TCP_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling Transport TCP test..."
+ifdef USE_XDP
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Transport TCP test build complete: $@"
+else
+	@echo "❌ Error: Transport TCP test requires USE_XDP=1"
+	@exit 1
+endif
+
+# Build-only target for Transport TCP test
+build-test-pipeline-transport-tcp: $(PIPELINE_TRANSPORT_TCP_BIN)
+
+# Run Transport TCP test (requires echo server at 139.162.79.171:12345)
+# Uses scripts/test_xdp.sh - the verified XDP test runner
+# NOTE: Script uses sudo internally, do not invoke with sudo
+test-pipeline-transport-tcp: $(PIPELINE_TRANSPORT_TCP_BIN) bpf
+	@echo "🧪 Running Transport TCP test via script..."
+	./scripts/test_xdp.sh 10_transport_tcp.cpp
 
 # ============================================================================
 # HftShm RingBuffer Tests (requires hft-shm CLI)
@@ -617,7 +720,7 @@ test-simulator: $(SIMULATOR_BIN)
 # Unified Test Target - Run All Unit Tests
 # ============================================================================
 
-test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state
+test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy
 	@echo ""
 	@echo "╔════════════════════════════════════════════════════════════════════╗"
 	@echo "║                    ALL UNIT TESTS COMPLETED                        ║"
@@ -719,6 +822,7 @@ help:
 	@echo "  make test-ip-optimizations - Test IP layer optimizations"
 	@echo "  make test-stack-checksum - Test TCP/IP checksum calculations"
 	@echo "  make test-tcp-state     - Test TCP state machine"
+	@echo "  make test-ssl-policy    - Test SSL policy zero-copy API"
 	@echo "  make test-hftshm        - Test HftShmRingBuffer (requires hft-shm CLI)"
 	@echo ""
 	@echo "Integration Tests:"

@@ -238,7 +238,7 @@ check_bpf_object() {
         print_status "BPF object exists: $bpf_obj"
     else
         print_warning "BPF object not found. Building..."
-        if make src/xdp/bpf/exchange_filter.bpf.o USE_XDP=1 2>/dev/null; then
+        if make src/xdp/bpf/exchange_filter.bpf.o USE_XDP=1 XDP_INTERFACE="$IFACE" 2>/dev/null; then
             print_status "BPF object built successfully"
         else
             print_error "Failed to build BPF object. Run: USE_XDP=1 make"

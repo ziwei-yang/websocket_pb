@@ -95,10 +95,10 @@ inline constexpr size_t TCP_MSS = PATH_MTU - 40;  // MTU - IP(20) - TCP(20)
 // TLS overhead for record size calculation
 inline constexpr size_t TLS_RECORD_HEADER = 5;    // Content type(1) + version(2) + length(2)
 inline constexpr size_t TLS_MAC_SIZE = 16;        // AES-GCM tag
-inline constexpr size_t TLS_OVERHEAD = TLS_RECORD_HEADER + TLS_MAC_SIZE;
+inline constexpr size_t TLS13_OVERHEAD = TLS_RECORD_HEADER + TLS_MAC_SIZE;  // 5 + 16 = 21
 
 // Max TLS record payload to fit in single TCP segment
-inline constexpr size_t MAX_TLS_RECORD_PAYLOAD = TCP_MSS - TLS_OVERHEAD;
+inline constexpr size_t MAX_TLS_RECORD_PAYLOAD = TCP_MSS - TLS13_OVERHEAD;
 
 // ============================================================================
 // Batch Sizes
@@ -118,6 +118,9 @@ inline constexpr uint64_t ACK_TIMEOUT_US = 100;          // Send ACK after N mic
 
 // Retransmit timeout (initial RTO)
 inline constexpr uint64_t INITIAL_RTO_US = 200000;       // 200ms initial RTO
+
+// Retransmit check interval (skip check when busy, check every N loops when idle)
+inline constexpr uint32_t RETRANSMIT_CHECK_INTERVAL = 1024;
 
 // Trickle interval for igc driver workaround
 inline constexpr uint32_t TRICKLE_INTERVAL_ITERATIONS = 8;

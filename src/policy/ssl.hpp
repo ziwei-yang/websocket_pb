@@ -16,6 +16,15 @@
 //   - int get_fd() const
 //   - void shutdown()
 //
+// Zero-copy API (pipeline mode):
+//   - void init_zero_copy_bio()                           // Initialize zero-copy BIO mode
+//   - void set_encrypted_view(const uint8_t*, size_t)     // RX: point to UMEM encrypted data
+//   - size_t encrypted_view_consumed() const              // RX: bytes consumed from view
+//   - void clear_encrypted_view()                         // RX: done with current view
+//   - void set_encrypted_output(uint8_t*, size_t)         // TX: point to UMEM output buffer
+//   - size_t encrypted_output_len() const                 // TX: bytes written to output
+//   - void clear_encrypted_output()                       // TX: done with current output
+//
 // Userspace Transport Mode (XDP):
 //   When using XDPUserspaceTransport (AF_XDP zero-copy mode), SSL operates over
 //   a custom BIO that bridges OpenSSL to the userspace TCP/IP stack. The handshake
@@ -60,6 +69,23 @@
 
 namespace websocket {
 namespace ssl {
+
+// ============================================================================
+// Zero-Copy View Ring Buffer (shared by all policies)
+// ============================================================================
+
+/**
+ * ViewSegment - A single pointer+length view into encrypted data
+ * Used to accumulate multiple packet views before SSL decryption
+ */
+struct ViewSegment {
+    const uint8_t* data = nullptr;
+    size_t len = 0;
+};
+
+// Ring buffer constants (power of 2 for fast modulo)
+inline constexpr size_t VIEW_RING_SIZE = 1024;
+inline constexpr size_t VIEW_RING_MASK = VIEW_RING_SIZE - 1;
 
 // ============================================================================
 // OpenSSL Policy (with optional kTLS support)
@@ -438,6 +464,153 @@ struct OpenSSLPolicy {
         return SSL_get_fd(ssl_);
     }
 
+    // ========================================================================
+    // Zero-Copy BIO Methods (for pipeline operation)
+    // ========================================================================
+
+    /**
+     * Initialize zero-copy BIO for decoupled network I/O
+     * SSL reads from external pointer (RX) and writes to external pointer (TX)
+     */
+    void init_zero_copy_bio() {
+        if (!ctx_) {
+            init();
+        }
+
+        ssl_ = SSL_new(ctx_);
+        if (!ssl_) {
+            throw std::runtime_error("SSL_new() failed");
+        }
+
+        // Create zero-copy BIO method if not already created
+        if (!zc_bio_method_) {
+            zc_bio_method_ = BIO_meth_new(BIO_TYPE_MEM, "zero-copy");
+            if (!zc_bio_method_) {
+                SSL_free(ssl_);
+                ssl_ = nullptr;
+                throw std::runtime_error("BIO_meth_new() failed");
+            }
+            BIO_meth_set_read(zc_bio_method_, zc_bio_read);
+            BIO_meth_set_write(zc_bio_method_, zc_bio_write);
+            BIO_meth_set_ctrl(zc_bio_method_, zc_bio_ctrl);
+        }
+
+        // Create BIO instances with this policy as context
+        BIO* bio_in = BIO_new(zc_bio_method_);
+        BIO* bio_out = BIO_new(zc_bio_method_);
+        if (!bio_in || !bio_out) {
+            if (bio_in) BIO_free(bio_in);
+            if (bio_out) BIO_free(bio_out);
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+            throw std::runtime_error("BIO_new() failed");
+        }
+
+        // Store policy pointer in BIO data for callbacks
+        BIO_set_data(bio_in, this);
+        BIO_set_data(bio_out, this);
+        BIO_set_init(bio_in, 1);
+        BIO_set_init(bio_out, 1);
+
+        // Attach BIOs to SSL (SSL takes ownership)
+        SSL_set_bio(ssl_, bio_in, bio_out);
+
+        // Set client mode
+        SSL_set_connect_state(ssl_);
+    }
+
+    // ------------------------------------------------------------------------
+    // Zero-copy RX API: encrypted data input (pointer view, no copy)
+    // ------------------------------------------------------------------------
+
+    /**
+     * Append encrypted data view (points to UMEM, no copy)
+     * Views accumulate in ring buffer, SSL_read consumes from tail
+     * @return 0 on success, -1 if ring buffer is full
+     */
+    int append_encrypted_view(const uint8_t* data, size_t len) {
+        if (len == 0) return 0;  // Empty view is a no-op
+        // Check if ring buffer is full (head caught up to tail)
+        if (in_view_head_ - in_view_tail_ >= VIEW_RING_SIZE) {
+            return -1;  // Ring buffer full
+        }
+        in_views_[in_view_head_ & VIEW_RING_MASK].data = data;
+        in_views_[in_view_head_ & VIEW_RING_MASK].len = len;
+        in_view_head_++;
+        return 0;
+    }
+
+    /**
+     * Clear encrypted views (only called on reconnection)
+     * Resets ring buffer state
+     */
+    void clear_encrypted_view() {
+        in_view_head_ = 0;
+        in_view_tail_ = 0;
+        in_view_pos_ = 0;
+    }
+
+    // ------------------------------------------------------------------------
+    // Zero-copy TX API: encrypted data output (direct write to UMEM)
+    // ------------------------------------------------------------------------
+
+    /**
+     * Set encrypted output buffer (points to UMEM payload area)
+     * SSL_write will encrypt directly into this buffer
+     */
+    void set_encrypted_output(uint8_t* buf, size_t capacity) {
+        out_buf_ = buf;
+        out_buf_capacity_ = capacity;
+        out_buf_len_ = 0;
+    }
+
+    /**
+     * Get bytes written to encrypted output buffer
+     */
+    size_t encrypted_output_len() const {
+        return out_buf_len_;
+    }
+
+    /**
+     * Clear encrypted output buffer (done with current packet)
+     */
+    void clear_encrypted_output() {
+        out_buf_ = nullptr;
+        out_buf_capacity_ = 0;
+        out_buf_len_ = 0;
+    }
+
+    // ------------------------------------------------------------------------
+
+    /**
+     * Perform TLS handshake step (for zero-copy BIO mode)
+     * Call repeatedly until returns true (handshake complete)
+     *
+     * @return true if handshake complete, false if need more data
+     */
+    bool do_handshake_step() {
+        if (!ssl_) return false;
+        int ret = SSL_do_handshake(ssl_);
+        if (ret == 1) return true;  // Complete
+
+        int err = SSL_get_error(ssl_, ret);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            return false;  // Need more data
+        }
+
+        // Fatal error
+        return false;
+    }
+
+    /**
+     * Check if handshake is complete
+     */
+    bool is_handshake_complete() const {
+        return ssl_ && SSL_is_init_finished(ssl_);
+    }
+
+    // ========================================================================
+
     /**
      * Shutdown SSL connection (keeps ctx_ for reconnection)
      * Full cleanup happens in destructor
@@ -448,7 +621,10 @@ struct OpenSSLPolicy {
             SSL_free(ssl_);
             ssl_ = nullptr;
         }
-        // Note: ctx_ and bio_method_ kept for reconnection, freed in destructor
+        // Clear zero-copy state
+        clear_encrypted_view();
+        clear_encrypted_output();
+        // Note: ctx_, bio_method_, zc_bio_method_ kept for reconnection, freed in destructor
         ktls_enabled_ = false;
     }
 
@@ -461,6 +637,11 @@ struct OpenSSLPolicy {
         if (bio_method_) {
             BIO_meth_free(bio_method_);
             bio_method_ = nullptr;
+        }
+
+        if (zc_bio_method_) {
+            BIO_meth_free(zc_bio_method_);
+            zc_bio_method_ = nullptr;
         }
 
         if (ctx_) {
@@ -476,10 +657,91 @@ struct OpenSSLPolicy {
         return "OpenSSL";
     }
 
+private:
+    // Zero-copy BIO callbacks (read from ring buffer, write to out_buf_)
+    static int zc_bio_read(BIO* bio, char* buf, int len) {
+        auto* self = static_cast<OpenSSLPolicy*>(BIO_get_data(bio));
+        if (!self || self->in_view_tail_ == self->in_view_head_) {
+            BIO_set_retry_read(bio);
+            return -1;  // WANT_READ - ring buffer empty
+        }
+
+        size_t total_copied = 0;
+        while (total_copied < static_cast<size_t>(len) &&
+               self->in_view_tail_ != self->in_view_head_) {
+
+            const auto& seg = self->in_views_[self->in_view_tail_ & VIEW_RING_MASK];
+            size_t avail = seg.len - self->in_view_pos_;
+            size_t to_copy = (static_cast<size_t>(len) - total_copied < avail)
+                           ? (static_cast<size_t>(len) - total_copied) : avail;
+
+            memcpy(buf + total_copied, seg.data + self->in_view_pos_, to_copy);
+            total_copied += to_copy;
+            self->in_view_pos_ += to_copy;
+
+            // Move to next segment if current is exhausted
+            if (self->in_view_pos_ >= seg.len) {
+                self->in_view_tail_++;
+                self->in_view_pos_ = 0;
+            }
+        }
+
+        if (total_copied == 0) {
+            BIO_set_retry_read(bio);
+            return -1;  // WANT_READ
+        }
+        return static_cast<int>(total_copied);
+    }
+
+    static int zc_bio_write(BIO* bio, const char* buf, int len) {
+        auto* self = static_cast<OpenSSLPolicy*>(BIO_get_data(bio));
+        if (!self || !self->out_buf_) {
+            BIO_set_retry_write(bio);
+            return -1;  // WANT_WRITE
+        }
+
+        size_t space = self->out_buf_capacity_ - self->out_buf_len_;
+        if (space == 0) {
+            BIO_set_retry_write(bio);
+            return -1;  // WANT_WRITE
+        }
+
+        size_t to_copy = (static_cast<size_t>(len) < space) ? static_cast<size_t>(len) : space;
+        memcpy(self->out_buf_ + self->out_buf_len_, buf, to_copy);
+        self->out_buf_len_ += to_copy;
+        return static_cast<int>(to_copy);
+    }
+
+    static long zc_bio_ctrl(BIO* bio, int cmd, long num, void* ptr) {
+        (void)bio; (void)num; (void)ptr;
+        switch (cmd) {
+            case BIO_CTRL_FLUSH:
+                return 1;  // Success
+            case BIO_CTRL_PENDING:
+            case BIO_CTRL_WPENDING:
+                return 0;
+            default:
+                return 0;
+        }
+    }
+
+public:
     SSL_CTX* ctx_;
     SSL* ssl_;
     bool ktls_enabled_;
-    BIO_METHOD* bio_method_;  // For userspace transport BIO
+    BIO_METHOD* bio_method_;      // For userspace transport BIO
+    BIO_METHOD* zc_bio_method_ = nullptr;  // For zero-copy BIO
+
+    // Zero-copy RX state (ring buffer of UMEM encrypted data views)
+    ViewSegment in_views_[VIEW_RING_SIZE];
+    size_t in_view_head_ = 0;   // Write position (producer)
+    size_t in_view_tail_ = 0;   // Read position (consumer)
+    size_t in_view_pos_ = 0;    // Position within current segment
+
+    // Zero-copy TX state (pointer to UMEM output buffer)
+    uint8_t* out_buf_ = nullptr;
+    size_t out_buf_capacity_ = 0;
+    size_t out_buf_len_ = 0;
 };
 
 #endif // SSL_POLICY_OPENSSL
@@ -833,28 +1095,143 @@ struct LibreSSLPolicy {
         return SSL_get_fd(ssl_);
     }
 
+    // ========================================================================
+    // Zero-Copy BIO Methods (for pipeline operation)
+    // ========================================================================
+
     /**
-     * Shutdown SSL connection (keeps ctx_ for reconnection)
-     * Full cleanup happens in destructor
+     * Initialize zero-copy BIO for decoupled network I/O
+     * SSL reads from external pointer (RX) and writes to external pointer (TX)
      */
+    void init_zero_copy_bio() {
+        if (!ctx_) {
+            init();
+        }
+
+        ssl_ = SSL_new(ctx_);
+        if (!ssl_) {
+            throw std::runtime_error("SSL_new() failed");
+        }
+
+        // Create zero-copy BIO method if not already created
+        if (!zc_bio_method_) {
+            zc_bio_method_ = BIO_meth_new(BIO_TYPE_MEM, "zero-copy");
+            if (!zc_bio_method_) {
+                SSL_free(ssl_);
+                ssl_ = nullptr;
+                throw std::runtime_error("BIO_meth_new() failed");
+            }
+            BIO_meth_set_read(zc_bio_method_, zc_bio_read);
+            BIO_meth_set_write(zc_bio_method_, zc_bio_write);
+            BIO_meth_set_ctrl(zc_bio_method_, zc_bio_ctrl);
+        }
+
+        // Create BIO instances with this policy as context
+        BIO* bio_in = BIO_new(zc_bio_method_);
+        BIO* bio_out = BIO_new(zc_bio_method_);
+        if (!bio_in || !bio_out) {
+            if (bio_in) BIO_free(bio_in);
+            if (bio_out) BIO_free(bio_out);
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+            throw std::runtime_error("BIO_new() failed");
+        }
+
+        // Store policy pointer in BIO data for callbacks
+        BIO_set_data(bio_in, this);
+        BIO_set_data(bio_out, this);
+        BIO_set_init(bio_in, 1);
+        BIO_set_init(bio_out, 1);
+
+        // Attach BIOs to SSL (SSL takes ownership)
+        SSL_set_bio(ssl_, bio_in, bio_out);
+
+        // Set client mode
+        SSL_set_connect_state(ssl_);
+    }
+
+    // ------------------------------------------------------------------------
+    // Zero-copy RX API: encrypted data input (ring buffer, no copy)
+    // ------------------------------------------------------------------------
+
+    int append_encrypted_view(const uint8_t* data, size_t len) {
+        if (len == 0) return 0;
+        if (in_view_head_ - in_view_tail_ >= VIEW_RING_SIZE) {
+            return -1;  // Ring buffer full
+        }
+        in_views_[in_view_head_ & VIEW_RING_MASK].data = data;
+        in_views_[in_view_head_ & VIEW_RING_MASK].len = len;
+        in_view_head_++;
+        return 0;
+    }
+
+    void clear_encrypted_view() {
+        in_view_head_ = 0;
+        in_view_tail_ = 0;
+        in_view_pos_ = 0;
+    }
+
+    // ------------------------------------------------------------------------
+    // Zero-copy TX API: encrypted data output (direct write to UMEM)
+    // ------------------------------------------------------------------------
+
+    void set_encrypted_output(uint8_t* buf, size_t capacity) {
+        out_buf_ = buf;
+        out_buf_capacity_ = capacity;
+        out_buf_len_ = 0;
+    }
+
+    size_t encrypted_output_len() const {
+        return out_buf_len_;
+    }
+
+    void clear_encrypted_output() {
+        out_buf_ = nullptr;
+        out_buf_capacity_ = 0;
+        out_buf_len_ = 0;
+    }
+
+    // ------------------------------------------------------------------------
+
+    bool do_handshake_step() {
+        if (!ssl_) return false;
+        int ret = SSL_do_handshake(ssl_);
+        if (ret == 1) return true;
+
+        int err = SSL_get_error(ssl_, ret);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            return false;
+        }
+        return false;
+    }
+
+    bool is_handshake_complete() const {
+        return ssl_ && SSL_is_init_finished(ssl_);
+    }
+
+    // ========================================================================
+
     void shutdown() {
         if (ssl_) {
             SSL_shutdown(ssl_);
             SSL_free(ssl_);
             ssl_ = nullptr;
         }
-        // Note: ctx_ and bio_method_ kept for reconnection, freed in destructor
+        clear_encrypted_view();
+        clear_encrypted_output();
     }
 
-    /**
-     * Full cleanup - called by destructor
-     */
     void cleanup() {
-        shutdown();  // Free ssl_ first
+        shutdown();
 
         if (bio_method_) {
             BIO_meth_free(bio_method_);
             bio_method_ = nullptr;
+        }
+
+        if (zc_bio_method_) {
+            BIO_meth_free(zc_bio_method_);
+            zc_bio_method_ = nullptr;
         }
 
         if (ctx_) {
@@ -863,16 +1240,90 @@ struct LibreSSLPolicy {
         }
     }
 
-    /**
-     * Get SSL implementation name
-     */
     static constexpr const char* name() {
         return "LibreSSL";
     }
 
+private:
+    // Zero-copy BIO callbacks (read from ring buffer)
+    static int zc_bio_read(BIO* bio, char* buf, int len) {
+        auto* self = static_cast<LibreSSLPolicy*>(BIO_get_data(bio));
+        if (!self || self->in_view_tail_ == self->in_view_head_) {
+            BIO_set_retry_read(bio);
+            return -1;
+        }
+
+        size_t total_copied = 0;
+        while (total_copied < static_cast<size_t>(len) &&
+               self->in_view_tail_ != self->in_view_head_) {
+
+            const auto& seg = self->in_views_[self->in_view_tail_ & VIEW_RING_MASK];
+            size_t avail = seg.len - self->in_view_pos_;
+            size_t to_copy = (static_cast<size_t>(len) - total_copied < avail)
+                           ? (static_cast<size_t>(len) - total_copied) : avail;
+
+            memcpy(buf + total_copied, seg.data + self->in_view_pos_, to_copy);
+            total_copied += to_copy;
+            self->in_view_pos_ += to_copy;
+
+            if (self->in_view_pos_ >= seg.len) {
+                self->in_view_tail_++;
+                self->in_view_pos_ = 0;
+            }
+        }
+
+        if (total_copied == 0) {
+            BIO_set_retry_read(bio);
+            return -1;
+        }
+        return static_cast<int>(total_copied);
+    }
+
+    static int zc_bio_write(BIO* bio, const char* buf, int len) {
+        auto* self = static_cast<LibreSSLPolicy*>(BIO_get_data(bio));
+        if (!self || !self->out_buf_) {
+            BIO_set_retry_write(bio);
+            return -1;
+        }
+
+        size_t space = self->out_buf_capacity_ - self->out_buf_len_;
+        if (space == 0) {
+            BIO_set_retry_write(bio);
+            return -1;
+        }
+
+        size_t to_copy = (static_cast<size_t>(len) < space) ? static_cast<size_t>(len) : space;
+        memcpy(self->out_buf_ + self->out_buf_len_, buf, to_copy);
+        self->out_buf_len_ += to_copy;
+        return static_cast<int>(to_copy);
+    }
+
+    static long zc_bio_ctrl(BIO* bio, int cmd, long num, void* ptr) {
+        (void)bio; (void)num; (void)ptr;
+        switch (cmd) {
+            case BIO_CTRL_FLUSH: return 1;
+            case BIO_CTRL_PENDING:
+            case BIO_CTRL_WPENDING: return 0;
+            default: return 0;
+        }
+    }
+
+public:
     SSL_CTX* ctx_;
     SSL* ssl_;
-    BIO_METHOD* bio_method_;  // For userspace transport BIO
+    BIO_METHOD* bio_method_;      // For userspace transport BIO
+    BIO_METHOD* zc_bio_method_ = nullptr;  // For zero-copy BIO
+
+    // Zero-copy RX state (ring buffer)
+    ViewSegment in_views_[VIEW_RING_SIZE];
+    size_t in_view_head_ = 0;
+    size_t in_view_tail_ = 0;
+    size_t in_view_pos_ = 0;
+
+    // Zero-copy TX state
+    uint8_t* out_buf_ = nullptr;
+    size_t out_buf_capacity_ = 0;
+    size_t out_buf_len_ = 0;
 };
 
 #endif // SSL_POLICY_LIBRESSL
@@ -1241,24 +1692,107 @@ struct WolfSSLPolicy {
         return wolfSSL_get_fd(ssl_);
     }
 
+    // ========================================================================
+    // Zero-Copy Methods (for pipeline operation)
+    // WolfSSL uses I/O callbacks that read from/write to external pointers
+    // ========================================================================
+
     /**
-     * Shutdown SSL connection (keeps ctx_ for reconnection)
-     * Full cleanup happens in destructor
+     * Initialize zero-copy mode for decoupled network I/O
+     * SSL reads from external pointer (RX) and writes to external pointer (TX)
      */
+    void init_zero_copy_bio() {
+        if (!ctx_) {
+            init();
+        }
+
+        // Register zero-copy I/O callbacks
+        wolfSSL_CTX_SetIORecv(ctx_, zc_recv_cb);
+        wolfSSL_CTX_SetIOSend(ctx_, zc_send_cb);
+
+        ssl_ = wolfSSL_new(ctx_);
+        if (!ssl_) {
+            throw std::runtime_error("wolfSSL_new() failed");
+        }
+
+        // Set this object as the I/O context
+        wolfSSL_SetIOReadCtx(ssl_, this);
+        wolfSSL_SetIOWriteCtx(ssl_, this);
+    }
+
+    // ------------------------------------------------------------------------
+    // Zero-copy RX API: encrypted data input (ring buffer, no copy)
+    // ------------------------------------------------------------------------
+
+    int append_encrypted_view(const uint8_t* data, size_t len) {
+        if (len == 0) return 0;
+        if (in_view_head_ - in_view_tail_ >= VIEW_RING_SIZE) {
+            return -1;  // Ring buffer full
+        }
+        in_views_[in_view_head_ & VIEW_RING_MASK].data = data;
+        in_views_[in_view_head_ & VIEW_RING_MASK].len = len;
+        in_view_head_++;
+        return 0;
+    }
+
+    void clear_encrypted_view() {
+        in_view_head_ = 0;
+        in_view_tail_ = 0;
+        in_view_pos_ = 0;
+    }
+
+    // ------------------------------------------------------------------------
+    // Zero-copy TX API: encrypted data output (direct write to UMEM)
+    // ------------------------------------------------------------------------
+
+    void set_encrypted_output(uint8_t* buf, size_t capacity) {
+        out_buf_ = buf;
+        out_buf_capacity_ = capacity;
+        out_buf_len_ = 0;
+    }
+
+    size_t encrypted_output_len() const {
+        return out_buf_len_;
+    }
+
+    void clear_encrypted_output() {
+        out_buf_ = nullptr;
+        out_buf_capacity_ = 0;
+        out_buf_len_ = 0;
+    }
+
+    // ------------------------------------------------------------------------
+
+    bool do_handshake_step() {
+        if (!ssl_) return false;
+        int ret = wolfSSL_connect(ssl_);
+        if (ret == SSL_SUCCESS) return true;
+
+        int err = wolfSSL_get_error(ssl_, ret);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            return false;
+        }
+        return false;
+    }
+
+    bool is_handshake_complete() const {
+        return ssl_ && wolfSSL_is_init_finished(ssl_);
+    }
+
+    // ========================================================================
+
     void shutdown() {
         if (ssl_) {
             wolfSSL_shutdown(ssl_);
             wolfSSL_free(ssl_);
             ssl_ = nullptr;
         }
-        // Note: ctx_ is kept for reconnection, freed in destructor
+        clear_encrypted_view();
+        clear_encrypted_output();
     }
 
-    /**
-     * Full cleanup - called by destructor
-     */
     void cleanup() {
-        shutdown();  // Free ssl_ first
+        shutdown();
 
         if (ctx_) {
             wolfSSL_CTX_free(ctx_);
@@ -1268,15 +1802,77 @@ struct WolfSSLPolicy {
         wolfSSL_Cleanup();
     }
 
-    /**
-     * Get SSL implementation name
-     */
     static constexpr const char* name() {
         return "WolfSSL";
     }
 
+private:
+    // Zero-copy I/O callbacks for WolfSSL (read from ring buffer)
+    static int zc_recv_cb(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
+        (void)ssl;
+        auto* self = static_cast<WolfSSLPolicy*>(ctx);
+        if (self->in_view_tail_ == self->in_view_head_) {
+            return WOLFSSL_CBIO_ERR_WANT_READ;
+        }
+
+        size_t total_copied = 0;
+        while (total_copied < static_cast<size_t>(sz) &&
+               self->in_view_tail_ != self->in_view_head_) {
+
+            const auto& seg = self->in_views_[self->in_view_tail_ & VIEW_RING_MASK];
+            size_t avail = seg.len - self->in_view_pos_;
+            size_t to_copy = (static_cast<size_t>(sz) - total_copied < avail)
+                           ? (static_cast<size_t>(sz) - total_copied) : avail;
+
+            memcpy(buf + total_copied, seg.data + self->in_view_pos_, to_copy);
+            total_copied += to_copy;
+            self->in_view_pos_ += to_copy;
+
+            if (self->in_view_pos_ >= seg.len) {
+                self->in_view_tail_++;
+                self->in_view_pos_ = 0;
+            }
+        }
+
+        if (total_copied == 0) {
+            return WOLFSSL_CBIO_ERR_WANT_READ;
+        }
+        return static_cast<int>(total_copied);
+    }
+
+    static int zc_send_cb(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
+        (void)ssl;
+        auto* self = static_cast<WolfSSLPolicy*>(ctx);
+        if (!self->out_buf_) {
+            return WOLFSSL_CBIO_ERR_WANT_WRITE;
+        }
+
+        size_t space = self->out_buf_capacity_ - self->out_buf_len_;
+        if (space == 0) {
+            return WOLFSSL_CBIO_ERR_WANT_WRITE;
+        }
+
+        size_t to_copy = (static_cast<size_t>(sz) < space) ? static_cast<size_t>(sz) : space;
+        memcpy(self->out_buf_ + self->out_buf_len_, buf, to_copy);
+        self->out_buf_len_ += to_copy;
+        return static_cast<int>(to_copy);
+    }
+
+public:
     WOLFSSL_CTX* ctx_;
     WOLFSSL* ssl_;
+
+private:
+    // Zero-copy RX state (ring buffer)
+    ViewSegment in_views_[VIEW_RING_SIZE];
+    size_t in_view_head_ = 0;
+    size_t in_view_tail_ = 0;
+    size_t in_view_pos_ = 0;
+
+    // Zero-copy TX state (pointer to UMEM output buffer)
+    uint8_t* out_buf_ = nullptr;
+    size_t out_buf_capacity_ = 0;
+    size_t out_buf_len_ = 0;
 };
 
 #endif // SSL_POLICY_WOLFSSL
@@ -1335,6 +1931,7 @@ namespace websocket { namespace ssl {
  *
  * Used with SimulatorTransport where data is already decrypted.
  * All reads/writes are passed directly to the transport layer.
+ * For memory BIO mode, data passes through without encryption.
  */
 struct NoSSLPolicy {
     NoSSLPolicy() = default;
@@ -1371,14 +1968,55 @@ struct NoSSLPolicy {
     }
 
     ssize_t read(void* buf, size_t len) {
+        // Zero-copy mode: read from ring buffer (no decryption - pass through)
+        if (in_view_tail_ != in_view_head_) {
+            size_t total_copied = 0;
+            while (total_copied < len && in_view_tail_ != in_view_head_) {
+                const auto& seg = in_views_[in_view_tail_ & VIEW_RING_MASK];
+                size_t avail = seg.len - in_view_pos_;
+                size_t to_copy = (len - total_copied < avail)
+                               ? (len - total_copied) : avail;
+
+                memcpy(static_cast<uint8_t*>(buf) + total_copied,
+                       seg.data + in_view_pos_, to_copy);
+                total_copied += to_copy;
+                in_view_pos_ += to_copy;
+
+                if (in_view_pos_ >= seg.len) {
+                    in_view_tail_++;
+                    in_view_pos_ = 0;
+                }
+            }
+            if (total_copied == 0) {
+                errno = EAGAIN;
+                return -1;
+            }
+            return static_cast<ssize_t>(total_copied);
+        }
+
+        // Transport mode: read from transport
         if (!transport_ || !recv_fn_) {
-            errno = ENOTCONN;
+            errno = EAGAIN;
             return -1;
         }
         return recv_fn_(transport_, buf, len);
     }
 
     ssize_t write(const void* buf, size_t len) {
+        // Zero-copy mode: write to output buffer (no encryption - pass through)
+        if (out_buf_) {
+            size_t space = out_buf_capacity_ - out_buf_len_;
+            size_t to_copy = (len < space) ? len : space;
+            if (to_copy == 0) {
+                errno = EAGAIN;
+                return -1;
+            }
+            memcpy(out_buf_ + out_buf_len_, buf, to_copy);
+            out_buf_len_ += to_copy;
+            return static_cast<ssize_t>(to_copy);
+        }
+
+        // Transport mode: write to transport
         if (!transport_ || !send_fn_) {
             errno = ENOTCONN;
             return -1;
@@ -1388,14 +2026,99 @@ struct NoSSLPolicy {
 
     bool ktls_enabled() const { return false; }
     int get_fd() const { return -1; }
-    int pending() const { return 0; }  // No SSL buffering
-    void shutdown() { transport_ = nullptr; }
-    void cleanup() { transport_ = nullptr; }
+    size_t pending() const { return (in_view_tail_ != in_view_head_) ? 1 : 0; }  // Non-zero if data available
+
+    // ========================================================================
+    // Zero-Copy Methods (for pipeline operation)
+    // NoSSL: pass-through without encryption
+    // ========================================================================
+
+    /**
+     * Initialize zero-copy mode for decoupled network I/O
+     * For NoSSL, this just enables pointer mode (no encryption)
+     */
+    void init_zero_copy_bio() {
+        // NoSSL doesn't need any initialization - just enable pointer mode
+    }
+
+    // ------------------------------------------------------------------------
+    // Zero-copy RX API: data input (ring buffer, no copy)
+    // ------------------------------------------------------------------------
+
+    int append_encrypted_view(const uint8_t* data, size_t len) {
+        if (len == 0) return 0;
+        if (in_view_head_ - in_view_tail_ >= VIEW_RING_SIZE) {
+            return -1;  // Ring buffer full
+        }
+        in_views_[in_view_head_ & VIEW_RING_MASK].data = data;
+        in_views_[in_view_head_ & VIEW_RING_MASK].len = len;
+        in_view_head_++;
+        return 0;
+    }
+
+    void clear_encrypted_view() {
+        in_view_head_ = 0;
+        in_view_tail_ = 0;
+        in_view_pos_ = 0;
+    }
+
+    // ------------------------------------------------------------------------
+    // Zero-copy TX API: data output (direct write)
+    // ------------------------------------------------------------------------
+
+    void set_encrypted_output(uint8_t* buf, size_t capacity) {
+        out_buf_ = buf;
+        out_buf_capacity_ = capacity;
+        out_buf_len_ = 0;
+    }
+
+    size_t encrypted_output_len() const {
+        return out_buf_len_;
+    }
+
+    void clear_encrypted_output() {
+        out_buf_ = nullptr;
+        out_buf_capacity_ = 0;
+        out_buf_len_ = 0;
+    }
+
+    // ------------------------------------------------------------------------
+
+    bool do_handshake_step() {
+        return true;  // No handshake needed
+    }
+
+    bool is_handshake_complete() const {
+        return true;
+    }
+
+    // ========================================================================
+
+    void shutdown() {
+        transport_ = nullptr;
+        clear_encrypted_view();
+        clear_encrypted_output();
+    }
+
+    void cleanup() {
+        shutdown();
+    }
 
 private:
     void* transport_ = nullptr;
     ssize_t (*recv_fn_)(void*, void*, size_t) = nullptr;
     ssize_t (*send_fn_)(void*, const void*, size_t) = nullptr;
+
+    // Zero-copy RX state (ring buffer)
+    ViewSegment in_views_[VIEW_RING_SIZE];
+    size_t in_view_head_ = 0;
+    size_t in_view_tail_ = 0;
+    size_t in_view_pos_ = 0;
+
+    // Zero-copy TX state
+    uint8_t* out_buf_ = nullptr;
+    size_t out_buf_capacity_ = 0;
+    size_t out_buf_len_ = 0;
 };
 
 }}  // namespace websocket::ssl
@@ -1420,9 +2143,18 @@ using NoSSLPolicy = websocket::ssl::NoSSLPolicy;
  *   - ktls_enabled() - Check if kTLS is active
  *   - get_fd() - Get underlying file descriptor
  *   - shutdown() - Cleanup SSL connection
+ *
+ * Zero-copy API (pipeline mode):
+ *   - init_zero_copy_bio() - Initialize zero-copy BIO mode
+ *   - append_encrypted_view(ptr, len) - RX: append UMEM encrypted data to ring buffer (returns -1 if full)
+ *   - clear_encrypted_view() - RX: reset ring buffer (only on reconnection)
+ *   - set_encrypted_output(ptr, len) - TX: point to UMEM output buffer
+ *   - encrypted_output_len() - TX: bytes written to output
+ *   - clear_encrypted_output() - TX: done with current output
  */
 template<typename T>
-concept SSLPolicyConcept = requires(T ssl, int fd, void* buf, size_t len) {
+concept SSLPolicyConcept = requires(T ssl, int fd, void* buf, const uint8_t* cptr, uint8_t* ptr, size_t len) {
+    // Basic interface
     { ssl.init() } -> std::same_as<void>;
     { ssl.handshake(fd) } -> std::same_as<void>;
     { ssl.read(buf, len) } -> std::convertible_to<ssize_t>;
@@ -1430,6 +2162,14 @@ concept SSLPolicyConcept = requires(T ssl, int fd, void* buf, size_t len) {
     { ssl.ktls_enabled() } -> std::convertible_to<bool>;
     { ssl.get_fd() } -> std::convertible_to<int>;
     { ssl.shutdown() } -> std::same_as<void>;
+
+    // Zero-copy API
+    { ssl.init_zero_copy_bio() } -> std::same_as<void>;
+    { ssl.append_encrypted_view(cptr, len) } -> std::convertible_to<int>;  // Returns -1 if ring buffer full
+    { ssl.clear_encrypted_view() } -> std::same_as<void>;
+    { ssl.set_encrypted_output(ptr, len) } -> std::same_as<void>;
+    { ssl.encrypted_output_len() } -> std::convertible_to<size_t>;
+    { ssl.clear_encrypted_output() } -> std::same_as<void>;
 };
 
 // Verify our policies conform to the concept

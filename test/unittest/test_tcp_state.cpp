@@ -79,17 +79,15 @@ void test_state_names() {
 // Test retransmit queue operations
 void test_retransmit_queue() {
     TEST("Retransmit queue: add and remove")
-        RetransmitQueue queue;
+        ZeroCopyRetransmitQueue queue;
+        queue.init(1000000, 100);  // 1 MHz TSC, 100ms RTO
 
-        // Add segments
-        uint8_t data1[] = "Hello";
-        uint8_t data2[] = "World";
-
-        ASSERT(queue.add_segment(1000, TCP_FLAG_ACK, data1, 5), "Add segment 1");
-        ASSERT(queue.add_segment(1005, TCP_FLAG_ACK, data2, 5), "Add segment 2");
+        // Add segments using add_ref(seq, flags, frame_idx, frame_len, payload_len)
+        ASSERT(queue.add_ref(1000, TCP_FLAG_ACK, 0, 100, 5), "Add segment 1");
+        ASSERT(queue.add_ref(1005, TCP_FLAG_ACK, 1, 100, 5), "Add segment 2");
         ASSERT(queue.size() == 2, "Queue size should be 2");
 
-        // Remove acknowledged segments
+        // Remove acknowledged segments - remove_acked returns count
         size_t removed = queue.remove_acked(1005);
         ASSERT(removed == 1, "Should remove 1 segment");
         ASSERT(queue.size() == 1, "Queue size should be 1");
@@ -104,10 +102,11 @@ void test_retransmit_queue() {
 // Test retransmit queue with SYN/FIN (consume sequence number)
 void test_retransmit_queue_syn_fin() {
     TEST("Retransmit queue: SYN/FIN sequence consumption")
-        RetransmitQueue queue;
+        ZeroCopyRetransmitQueue queue;
+        queue.init(1000000, 100);
 
-        // SYN consumes 1 sequence number
-        queue.add_segment(1000, TCP_FLAG_SYN, nullptr, 0);
+        // SYN consumes 1 sequence number (payload_len=0, but SYN flag adds 1)
+        queue.add_ref(1000, TCP_FLAG_SYN, 0, 54, 0);  // frame_len=54 (headers only)
         ASSERT(queue.size() == 1, "SYN added");
 
         // ACK should be 1001 (seq + 1 for SYN)
@@ -116,7 +115,7 @@ void test_retransmit_queue_syn_fin() {
         ASSERT(queue.empty(), "Queue empty after SYN ACK");
 
         // FIN also consumes 1 sequence number
-        queue.add_segment(2000, TCP_FLAG_FIN, nullptr, 0);
+        queue.add_ref(2000, TCP_FLAG_FIN, 1, 54, 0);
         removed = queue.remove_acked(2001);
         ASSERT(removed == 1, "FIN acknowledged");
     END_TEST
@@ -190,18 +189,19 @@ void test_receive_buffer_partial() {
 // Test retransmit queue overflow
 void test_retransmit_queue_overflow() {
     TEST("Retransmit queue: overflow handling")
-        RetransmitQueue queue;
+        ZeroCopyRetransmitQueue queue;
+        queue.init(1000000, 100);
 
         // Fill queue (max 256 segments)
         for (int i = 0; i < 256; i++) {
-            ASSERT(queue.add_segment(i * 1460, TCP_FLAG_ACK, nullptr, 0),
+            ASSERT(queue.add_ref(i * 1460, TCP_FLAG_ACK, i, 100, 0),
                    "Add segment to queue");
         }
 
         ASSERT(queue.size() == 256, "Queue at max capacity");
 
         // Try to add one more (should fail)
-        ASSERT(!queue.add_segment(256 * 1460, TCP_FLAG_ACK, nullptr, 0),
+        ASSERT(!queue.add_ref(256 * 1460, TCP_FLAG_ACK, 256, 100, 0),
                "Queue should reject when full");
 
         ASSERT(queue.size() == 256, "Queue size unchanged");

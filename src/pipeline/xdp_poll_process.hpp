@@ -23,6 +23,7 @@
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
 #include <sys/ioctl.h>
+#include <ctime>
 #include "../xdp/bpf_loader.hpp"
 
 #include "pipeline_config.hpp"
@@ -54,14 +55,43 @@ namespace websocket::pipeline {
 template<typename RingProducer,
          typename OutboxConsumer,
          bool TrickleEnabled = true,
+         bool Profiling = false,
          uint32_t FrameHeadroom = 256,
          uint32_t FrameSize = 2048>
 struct XDPPollProcess {
     // Compile-time constants from template args
     static constexpr bool kTrickleEnabled = TrickleEnabled;
+    static constexpr bool kProfiling = Profiling;
     static constexpr uint32_t kFrameHeadroom = FrameHeadroom;
     static constexpr uint32_t kFrameSize = FrameSize;
     static constexpr uint32_t kQueueId = 0;  // Always queue 0
+    // Pre-reserve TX slots: min(256, TX_RING_SIZE/4) to avoid exhausting small rings
+    static constexpr uint32_t TX_PRESERVE_SIZE =
+        (256 < XSK_RING_PROD__DEFAULT_NUM_DESCS / 4) ? 256 : XSK_RING_PROD__DEFAULT_NUM_DESCS / 4;
+
+    // Profiling helper: wraps function, measures cycles, stores result and cycles
+    // If condition is false, skips execution and records 0 for both details and cycles
+    // Uses pointer to write directly to shared memory slot (avoids stack copy)
+    template<typename Func>
+    inline auto profile_op(Func&& func, CycleSample* slot, size_t idx, bool condition = true) {
+        using ReturnType = decltype(func());
+        if constexpr (Profiling) {
+            if (!condition) {
+                slot->op_details[idx] = 0;
+                slot->op_cycles[idx] = 0;
+                return ReturnType{};
+            }
+            uint64_t start = rdtsc();
+            auto result = func();
+            uint64_t end = rdtsc();
+            slot->op_details[idx] = static_cast<int32_t>(result);
+            slot->op_cycles[idx] = static_cast<int32_t>(end - start);
+            return result;
+        } else {
+            if (!condition) return ReturnType{};
+            return func();
+        }
+    }
 
     // ========================================================================
     // Constructor
@@ -256,35 +286,51 @@ struct XDPPollProcess {
     void run() {
         printf("[XDP-POLL] Starting main loop\n");
         uint8_t trickle_counter = 0;
+        uint64_t loop_id = 0;
+
+        // Initial TX slot reservation before entering main loop
+        release_and_reserve_tx();
 
         while (conn_state_->running[PROC_XDP_POLL].flag.load(std::memory_order_acquire)) {
-            bool data_moved = false;
-
-            // 1. Collect and submit TX packets
-            data_moved |= submit_tx_batch();
-
-            // 2. Process RX packets
-            data_moved |= process_rx();
-
-            // 3. Trickle (every 8 iterations) - always runs
-            if ((++trickle_counter & 0x07) == 0) {
-                send_trickle();
+            [[maybe_unused]] uint64_t loop_start = 0;
+            [[maybe_unused]] CycleSample* slot = nullptr;
+            if constexpr (Profiling) {
+                loop_start = rdtsc();
+                first_rx_timestamp_ns_ = 0;  // Reset for this iteration
+                first_rx_poll_cycle_ = 0;    // Reset for this iteration
+                slot = profiling_data_->next_slot();
             }
 
-            // 4. (idle) Process completion ring - only when no data moved
-            if (!data_moved) {
-                process_completions();
+            // 0. TX submit
+            int32_t tx_count = profile_op([this]{ return submit_tx_batch(); }, slot, 0);
+
+            // 1. RX process
+            int32_t rx_count = profile_op([this, loop_id]{ return process_rx(loop_id); }, slot, 1);
+
+            bool data_moved = (tx_count > 0) || (rx_count > 0);
+
+            // 2. Trickle (every 8th iteration)
+            bool trickle_triggered = ((++trickle_counter & 0x07) == 0);
+            profile_op([this]{ send_trickle(); return 1; }, slot, 2, trickle_triggered);
+
+            // 3. Process completions (idle only)
+            profile_op([this]{ return process_completions(); }, slot, 3, !data_moved);
+
+            // 4. Release ACKed TX frames + Proactive TX reservation (idle only)
+            profile_op([this]{ return release_and_reserve_tx(); }, slot, 4, !data_moved);
+
+            // 5. Reclaim RX frames (idle only)
+            profile_op([this]{ return reclaim_rx_frames(); }, slot, 5, !data_moved);
+
+            // Record sample
+            if constexpr (Profiling) {
+                slot->packet_nic_ns = first_rx_timestamp_ns_;
+                slot->nic_poll_cycle = first_rx_poll_cycle_;
+                slot->transport_poll_cycle = 0;  // Not used by XDP Poll
+                profiling_data_->commit();
             }
 
-            // 5. (idle) Release ACKed PONG/MSG frames - only when no data moved
-            if (!data_moved) {
-                release_acked_tx_frames();
-            }
-
-            // 6. (idle) Reclaim consumed RX frames - only when no data moved
-            if (!data_moved) {
-                reclaim_rx_frames();
-            }
+            loop_id++;
         }
 
         printf("[XDP-POLL] Main loop ended\n");
@@ -294,30 +340,24 @@ struct XDPPollProcess {
     // TX Path
     // ========================================================================
 
-    bool submit_tx_batch() {
-        uint32_t tx_idx = 0;
+    int32_t submit_tx_batch() {
         uint32_t tx_count = 0;
-        uint32_t available = 0;
 
-        // First check if any outbox has data before reserving TX slots
-        // This avoids reserving slots we won't use (which would desync cached_prod)
+        // Pre-check: any data to send?
         bool has_raw = raw_outbox_cons_ && raw_outbox_cons_->has_data();
         bool has_ack = ack_outbox_cons_ && ack_outbox_cons_->has_data();
         bool has_pong = pong_outbox_cons_ && pong_outbox_cons_->has_data();
 
         if (!has_raw && !has_ack && !has_pong) {
-            return false;  // Nothing to send
+            return 0;  // Nothing to send
         }
 
-        // Reserve TX ring slots - must always get full batch
-        available = xsk_ring_prod__reserve(&tx_ring_, TX_BATCH_SIZE, &tx_idx);
-        if (available < TX_BATCH_SIZE) {
-            fprintf(stderr, "[XDP-TX] FATAL: TX ring reserve failed: got %u, need %u\n",
-                    available, TX_BATCH_SIZE);
-            fprintf(stderr, "[XDP-TX] prod=%u cons=%u cached_prod=%u cached_cons=%u\n",
-                    *tx_ring_.producer, *tx_ring_.consumer,
-                    tx_ring_.cached_prod, tx_ring_.cached_cons);
-            abort();
+        // Use pre-reserved slots (no reservation here - done in proactive_reserve_tx)
+        uint32_t available = tx_preserved_count_;
+        uint32_t tx_idx = tx_preserved_idx_;
+
+        if (available == 0) {
+            return 0;  // No slots available, wait for proactive_reserve_tx()
         }
 
         // Reusable lambda for collecting TX frames from any outbox
@@ -351,13 +391,12 @@ struct XDPPollProcess {
             pong_outbox_cons_->process_manually(collect_tx_frames);
         }
 
+        // Update preserved tracking BEFORE submit
+        tx_preserved_idx_ += tx_count;
+        tx_preserved_count_ -= tx_count;
+
         // Submit whatever we collected
         xsk_ring_prod__submit(&tx_ring_, tx_count);
-
-        // Cancel reservation for unused slots (fix cached_prod desync)
-        if (tx_count < available) {
-            tx_ring_.cached_prod -= (available - tx_count);
-        }
 
         if (tx_count > 0) {
 #if DEBUG
@@ -368,6 +407,29 @@ struct XDPPollProcess {
 #endif
 
             // Conditional kick: only wake kernel if driver needs it (XDP_USE_NEED_WAKEUP)
+            //
+            // PERFORMANCE NOTE (igc driver / Intel I225/I226):
+            // The sendto() syscall costs ~400-600ns and is the main bottleneck in TX path.
+            // With XDP_USE_NEED_WAKEUP flag, the driver sets needs_wakeup when idle.
+            // For igc driver, needs_wakeup is almost always true because:
+            //   1. The driver doesn't have busy-poll mode for TX
+            //   2. It needs the syscall to trigger TX descriptor ring processing
+            //
+            // submit_tx_batch() breakdown (~550ns total for 1 frame):
+            //   - has_data() checks: ~10ns (3 atomic loads)
+            //   - process_manually(): ~50-100ns (iterate IPC ring, write TX desc)
+            //   - xsk_ring_prod__submit(): ~10ns (atomic store)
+            //   - sendto() syscall: ~400-600ns (the bottleneck)
+            //   - commit_manually(): ~30ns (3 atomic stores)
+            //
+            // Options to reduce TX latency:
+            //   1. Batch more TX frames - amortize syscall cost over multiple frames
+            //   2. Skip sendto() if NIC already processing - igc doesn't support well
+            //   3. Use busy-poll on TX side - not supported by igc
+            //
+            // The ~550ns per TX frame is typical for AF_XDP with igc driver.
+            // For comparison, Mellanox mlx5 can do TX without syscall in some modes.
+            //
             if (xsk_ring_prod__needs_wakeup(&tx_ring_)) {
                 [[maybe_unused]] int ret = sendto(xsk_fd_, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
 #if DEBUG
@@ -384,11 +446,10 @@ struct XDPPollProcess {
             if (has_ack) ack_outbox_cons_->commit_manually();
             if (has_pong) pong_outbox_cons_->commit_manually();
 
-            return true;  // Data moved
+            return static_cast<int32_t>(tx_count);  // Return TX frame count
         } else {
             // We had data but couldn't collect any frames
-            // cached_prod already reset by lines 362-365 above
-            return false;
+            return 0;
         }
     }
 
@@ -396,11 +457,11 @@ struct XDPPollProcess {
     // RX Path
     // ========================================================================
 
-    bool process_rx() {
+    int32_t process_rx(uint64_t loop_id) {
         uint32_t rx_idx;
         uint32_t nb_pkts = xsk_ring_cons__peek(&rx_ring_, RX_BATCH, &rx_idx);
 
-        if (nb_pkts == 0) return false;
+        if (nb_pkts == 0) return 0;
 #if DEBUG
         static uint32_t total_rx = 0;
         total_rx += nb_pkts;
@@ -429,19 +490,44 @@ struct XDPPollProcess {
             desc.frame_type = FRAME_TYPE_RX;
             desc.consumed = 0;
 
-            // Read NIC timestamp from metadata (if available)
-            // Timestamp stored 8 bytes before packet data
-            // BPF program uses bpf_xdp_adjust_meta() to store timestamp
-            // Layout: [xdp_user_metadata (8 bytes)][packet data]
-            //         ^                            ^
-            //         data_meta                    data (rx_desc->addr)
-            uint64_t* ts_ptr = reinterpret_cast<uint64_t*>(
-                static_cast<uint8_t*>(umem_area_) + rx_desc->addr - 8);
-            desc.nic_timestamp_ns = *ts_ptr;
+            // Read XDP metadata from headroom (16 bytes before packet data)
+            // BPF program uses bpf_xdp_adjust_meta() to store timestamps
+            // Layout: [xdp_user_metadata (16 bytes)][packet data]
+            //         ^                              ^
+            //         data_meta                      data (rx_desc->addr)
+            struct xdp_user_metadata {
+                uint64_t rx_timestamp_ns;  // NIC hardware timestamp
+                uint64_t bpf_entry_ns;     // BPF entry bpf_ktime_get_ns()
+            };
+            auto* meta = reinterpret_cast<xdp_user_metadata*>(
+                static_cast<uint8_t*>(umem_area_) + rx_desc->addr - sizeof(xdp_user_metadata));
+            desc.nic_timestamp_ns = meta->rx_timestamp_ns;
+            uint64_t bpf_entry_ns = meta->bpf_entry_ns;
             last_rx_timestamp_ns_ = desc.nic_timestamp_ns;  // Track for testing
+            if (i == 0) {
+                first_rx_timestamp_ns_ = desc.nic_timestamp_ns;  // First packet's timestamp for profiling
+                first_rx_poll_cycle_ = poll_cycle;               // First packet's poll cycle for profiling
+            }
+
+            // Record NIC latency sample (when profiling enabled)
+            if constexpr (Profiling) {
+                if (nic_latency_data_) {
+                    // Get poll timestamps in both clock domains
+                    struct timespec ts_mono, ts_real;
+                    clock_gettime(CLOCK_MONOTONIC, &ts_mono);
+                    clock_gettime(CLOCK_REALTIME, &ts_real);
+                    uint64_t poll_timestamp_ns = static_cast<uint64_t>(ts_mono.tv_sec) * 1'000'000'000ULL +
+                                                 static_cast<uint64_t>(ts_mono.tv_nsec);
+                    uint64_t poll_realtime_ns = static_cast<uint64_t>(ts_real.tv_sec) * 1'000'000'000ULL +
+                                                static_cast<uint64_t>(ts_real.tv_nsec);
+                    nic_latency_data_->record(desc.nic_timestamp_ns, bpf_entry_ns,
+                                              poll_cycle, poll_timestamp_ns, poll_realtime_ns);
+                }
+            }
+
 #if DEBUG
-            fprintf(stderr, "[XDP-RX] Frame addr=%lu ts_ptr=%p raw_ts=%lu slot=%ld\n",
-                    rx_desc->addr, (void*)ts_ptr, desc.nic_timestamp_ns, slot);
+            fprintf(stderr, "[XDP-RX] Frame addr=%lu meta=%p nic_ts=%lu bpf_ts=%lu slot=%ld\n",
+                    rx_desc->addr, (void*)meta, desc.nic_timestamp_ns, bpf_entry_ns, slot);
             fflush(stderr);
 #endif
 
@@ -453,18 +539,18 @@ struct XDPPollProcess {
 
         xsk_ring_cons__release(&rx_ring_, nb_pkts);
         rx_packets_ += nb_pkts;
-        return true;  // Data moved
+        return static_cast<int32_t>(nb_pkts);  // Return RX frame count
     }
 
     // ========================================================================
     // Completion Processing
     // ========================================================================
 
-    void process_completions() {
+    int32_t process_completions() {
         uint32_t comp_idx;
         uint32_t nb_completed = xsk_ring_cons__peek(&comp_ring_, COMP_BATCH, &comp_idx);
 
-        if (nb_completed == 0) return;
+        if (nb_completed == 0) return 0;
 
 #if DEBUG
         static uint32_t total_completions = 0;
@@ -521,14 +607,17 @@ struct XDPPollProcess {
 
         xsk_ring_cons__release(&comp_ring_, nb_completed);
         tx_completions_ += nb_completed;
+        return static_cast<int32_t>(nb_completed);
     }
 
     // ========================================================================
-    // Release ACKed TX Frames (helper, called from process_completions)
-    // Advances release_pos for PONG/MSG frames when Transport has ACKed them
+    // Release ACKed TX Frames + Proactive TX Reservation (idle loop only)
+    // 1. Advances release_pos for PONG/MSG frames when Transport has ACKed them
+    // 2. Reserves TX ring slots to maintain TX_PRESERVE_SIZE
+    // Returns number of TX slots reserved (for profiling)
     // ========================================================================
 
-    void release_acked_tx_frames() {
+    uint32_t release_and_reserve_tx() {
         // PONG frames: advance pong_release_pos up to pong_acked_pos
         uint64_t pong_release = conn_state_->tx_frame.pong_release_pos.load(std::memory_order_relaxed);
         uint64_t pong_acked = conn_state_->tx_frame.pong_acked_pos.load(std::memory_order_acquire);
@@ -544,28 +633,54 @@ struct XDPPollProcess {
             conn_state_->tx_frame.msg_release_pos.fetch_add(1, std::memory_order_release);
             msg_release++;
         }
+
+        // Proactive TX slot reservation
+        if (tx_preserved_count_ >= TX_PRESERVE_SIZE) return 0;  // Already have enough
+
+        uint32_t needed = TX_PRESERVE_SIZE - tx_preserved_count_;
+        uint32_t idx = 0;
+        uint32_t got = xsk_ring_prod__reserve(&tx_ring_, needed, &idx);
+
+        if (got == 0) {
+            // No slots available - fatal if below threshold
+            if (tx_preserved_count_ < TX_PRESERVE_SIZE) {
+                fprintf(stderr, "[XDP-TX] FATAL: proactive_reserve_tx failed, preserved=%u, need=%u\n",
+                        tx_preserved_count_, TX_PRESERVE_SIZE);
+                fprintf(stderr, "[XDP-TX] prod=%u cons=%u cached_prod=%u cached_cons=%u\n",
+                        *tx_ring_.producer, *tx_ring_.consumer,
+                        tx_ring_.cached_prod, tx_ring_.cached_cons);
+                abort();
+            }
+            return 0;
+        }
+
+        if (tx_preserved_count_ == 0) {
+            tx_preserved_idx_ = idx;  // First reservation, save start index
+        }
+        tx_preserved_count_ += got;
+        return got;
     }
 
     // ========================================================================
     // RX Frame Reclaim
     // ========================================================================
 
-    void reclaim_rx_frames() {
+    int32_t reclaim_rx_frames() {
         // Read Transport's consumer sequence to know which frames are safe to reclaim
         // Transport advances consumer sequence after processing each frame
         int64_t consumer_pos = raw_inbox_prod_->consumer_sequence();
 
         // Nothing to reclaim if consumer hasn't advanced past our last release
-        if (consumer_pos <= last_released_seq_) return;
+        if (consumer_pos <= last_released_seq_) return 0;
 
         // Calculate how many frames to reclaim
         int64_t to_reclaim = consumer_pos - last_released_seq_;
-        if (to_reclaim <= 0) return;
+        if (to_reclaim <= 0) return 0;
 
         // Reserve fill ring slots
         uint32_t fill_idx;
         uint32_t available = xsk_ring_prod__reserve(&fill_ring_, static_cast<uint32_t>(to_reclaim), &fill_idx);
-        if (available == 0) return;
+        if (available == 0) return 0;
 
         // Reclaim frames from RAW_INBOX ring buffer
         // Read descriptor addresses from the ring at positions [last_released_seq_+1, consumer_pos]
@@ -584,6 +699,7 @@ struct XDPPollProcess {
             xsk_ring_prod__submit(&fill_ring_, reclaimed);
             last_released_seq_ += reclaimed;
         }
+        return static_cast<int32_t>(reclaimed);
     }
 
     // ========================================================================
@@ -623,6 +739,10 @@ struct XDPPollProcess {
     // Stats
     uint64_t rx_packets() const { return rx_packets_; }
     uint64_t tx_completions() const { return tx_completions_; }
+
+    // Profiling
+    void set_profiling_data(CycleSampleBuffer* data) { profiling_data_ = data; }
+    void set_nic_latency_data(NicLatencyBuffer* data) { nic_latency_data_ = data; }
 
     // ========================================================================
     // Cleanup
@@ -766,6 +886,16 @@ private:
     // For testing/debugging
     int64_t last_released_seq_ = -1;
     uint64_t last_rx_timestamp_ns_ = 0;
+    uint64_t first_rx_timestamp_ns_ = 0;  // First RX timestamp in current loop iteration (for profiling)
+    uint64_t first_rx_poll_cycle_ = 0;    // First RX poll cycle in current loop iteration (for profiling)
+
+    // Profiling data (optional, set via set_profiling_data())
+    CycleSampleBuffer* profiling_data_ = nullptr;
+    NicLatencyBuffer* nic_latency_data_ = nullptr;
+
+    // Pre-reserved TX slots (proactive reservation in idle loop)
+    uint32_t tx_preserved_count_ = 0;   // Current number of preserved slots
+    uint32_t tx_preserved_idx_ = 0;     // Starting index of preserved slots
 
 #if DEBUG
     // For FIFO ordering verification (design doc: abort on out-of-order)
