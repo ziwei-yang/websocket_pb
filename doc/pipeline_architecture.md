@@ -10,6 +10,7 @@ Multi-process pipeline architecture for ultra-low-latency WebSocket using AF_XDP
 - [Handshake Phase (Setup)](pipeline_handshake.md)
 - [XDP Poll Process (Core 2)](pipeline_0_nic.md)
 - [Transport Process (Core 4)](pipeline_1_trans.md)
+- [BSD Socket Transport (Alternative)](pipeline_1_BSDSocket.md)
 - [WebSocket Process (Core 6)](pipeline_2_ws.md)
 - [AppClient Process (Core 8)](pipeline_3_app.md)
 
@@ -231,12 +232,13 @@ NIC tx_ring
 ```
 WebSocket (Core 6)
     │ Receives PING frame from server during WS parsing
-    │ Extracts payload (up to 125 bytes per RFC 6455)
-    │ Publishes plaintext PONG: PongFrameAligned {payload, payload_len}
-    ▼ PONGS ring (plaintext, 64 entries)
+    │ Builds complete WS PONG frame using build_pong_frame() from core/http.hpp
+    │ Publishes complete frame: PongFrameAligned {frame, frame_len}
+    ▼ PONGS ring (complete WS PONG frames, 64 entries)
 Transport (Core 4)
     │ process_manually() on PONGS ring during idle time (!data_moved)
-    │ SSL_write(pong_payload) → encrypts to bio_out_
+    │ SSL_write(pong_frame, pong_frame_len) → encrypts complete WS frame
+    │ (Transport is protocol-agnostic: just encrypts raw bytes)
     │ BIO_ctrl_pending() → read encrypted TLS record
     │ Allocates frame from PONG_FRAMES pool (position-based)
     │ Builds TCP packet with encrypted TLS payload
@@ -895,16 +897,22 @@ The pipeline uses a **fork-first architecture** where all processes are forked B
    - Signal xdp_ready flag
    - Enter main loop
 
-7. Transport child: Perform handshake via IPC rings
+7. Transport child: Perform TCP/TLS handshake via IPC rings
    - Wait for xdp_ready from XDP Poll
    - TCP handshake (SYN → SYN-ACK → ACK) via IPC rings
    - TLS handshake via IPC rings (WolfSSL native I/O callbacks)
-   - WebSocket upgrade via IPC rings
-   - Send subscription message via IPC rings
-   - Signal ws_ready flag
+   - Signal tls_ready flag (Transport is protocol-agnostic, no WS knowledge)
    - Enter main loop
 
-8. Parent (AppClient): Wait for handshake, run main loop
+8. WebSocket child: Perform HTTP+WS handshake via MSG_OUTBOX/MSG_INBOX
+   - Wait for tls_ready from Transport
+   - Build HTTP upgrade request, publish to MSG_OUTBOX
+   - Poll MSG_METADATA_INBOX for HTTP 101 response
+   - Build subscription message as WS TEXT frame, publish to MSG_OUTBOX
+   - Signal ws_ready flag
+   - Enter main event loop (event_processor.run())
+
+9. Parent (AppClient): Wait for handshake, run main loop
    - Wait for ws_ready with timeout (60s)
    - Enter user application loop
 ```

@@ -10,14 +10,19 @@
 
 ## Overview
 
-WebSocket Process is a **WebSocket frame parser and dispatcher**. It consumes decrypted TLS data from MSG_INBOX (guided by MSG_METADATA_INBOX metadata events) and produces WSFrameInfo events for AppClient.
+WebSocket Process handles **HTTP+WS handshake** and **WebSocket frame parsing/dispatching**. After Transport signals `tls_ready`, it performs the HTTP upgrade handshake, then consumes decrypted TLS data from MSG_INBOX and produces WSFrameInfo events for AppClient.
 
 **Key Responsibilities**:
-1. Consume MSG_METADATA_INBOX events via `event_processor.run()` (auto-consumer)
-2. Read decrypted data from MSG_INBOX at offsets specified in metadata
-3. Parse WebSocket frames using `parse_websocket_frame()` from core/http.hpp
-4. Handle control frames (PING → queue PONG, CLOSE → signal Transport)
-5. Publish WSFrameInfo with full timestamp chain for data frames
+1. Perform HTTP+WS handshake after Transport signals `tls_ready`
+   - Build and send HTTP upgrade request via MSG_OUTBOX
+   - Validate HTTP 101 response from MSG_INBOX
+   - Send subscription message(s) via MSG_OUTBOX
+   - Signal `ws_ready` when handshake complete
+2. Consume MSG_METADATA_INBOX events via `event_processor.run()` (auto-consumer)
+3. Read decrypted data from MSG_INBOX at offsets specified in metadata
+4. Parse WebSocket frames using `parse_websocket_frame()` from core/http.hpp
+5. Handle control frames (PING → build complete PONG frame, CLOSE → signal Transport)
+6. Publish WSFrameInfo with full timestamp chain for data frames
 
 ---
 
@@ -37,12 +42,193 @@ WebSocket Process is a **WebSocket frame parser and dispatcher**. It consumes de
 
 // WebSocket & Timing
 #include <core/http.hpp>      // parse_websocket_frame(), WebSocketFrame, WebSocketOpcode
+                              // build_websocket_upgrade_request(), validate_http_upgrade_response()
+                              // build_pong_frame(), build_websocket_header_zerocopy()
 #include <core/timing.hpp>    // rdtscp()
 
 // Namespace aliases for cleaner code
 using websocket::http::parse_websocket_frame;
 using websocket::http::WebSocketFrame;
 using websocket::http::WebSocketOpcode;
+using websocket::http::build_websocket_upgrade_request;
+using websocket::http::validate_http_upgrade_response;
+using websocket::http::build_pong_frame;
+using websocket::http::build_websocket_header_zerocopy;
+```
+
+---
+
+## Handshake Phase
+
+After Transport Process completes TCP/TLS handshake and signals `tls_ready`, WebSocket Process performs the HTTP+WS level handshake before entering the main event loop.
+
+**Two-Phase Operation**:
+- **Phase 1 (Handshake)**: Manual polling on MSG_METADATA_INBOX, blocking until HTTP 101 received
+- **Phase 2 (Main Loop)**: `event_processor.run()` auto-consumer for WebSocket frames
+
+### Handshake Steps
+
+```
+1. Wait for `tls_ready` flag from Transport (busy-poll)
+2. Build HTTP upgrade request with Sec-WebSocket-Key
+3. Publish to MSG_OUTBOX (Transport encrypts and sends)
+4. Poll MSG_METADATA_INBOX for HTTP response
+5. Read response from MSG_INBOX, validate "101 Switching Protocols"
+6. Build subscription message as WS TEXT frame
+7. Publish to MSG_OUTBOX
+8. Signal `ws_ready` flag for AppClient
+9. Enter main event loop (event_processor.run())
+```
+
+### Handshake Data Flow
+
+```
+Transport signals tls_ready
+         │
+         ▼
+WebSocket builds HTTP upgrade request
+         │
+         ▼ MSG_OUTBOX (raw HTTP bytes in data field)
+Transport (encrypts + sends via RAW_OUTBOX)
+         │
+         ▼
+Server receives HTTP upgrade, sends HTTP 101 response
+         │
+         ▼
+Transport (receives + decrypts via MSG_INBOX)
+         │
+         ▼ MSG_METADATA_INBOX + MSG_INBOX
+WebSocket polls and validates HTTP 101
+         │
+         ▼
+WebSocket builds subscription as WS TEXT frame
+         │
+         ▼ MSG_OUTBOX (complete WS frame: header + JSON payload)
+Transport (encrypts + sends)
+         │
+         ▼
+WebSocket signals ws_ready
+         │
+         ▼
+Enter event_processor.run() for main loop
+```
+
+### HTTP Upgrade Request Building
+
+```cpp
+void WebSocketProcess::send_http_upgrade_request(const char* host, const char* path,
+                                                   const std::vector<std::pair<std::string, std::string>>& custom_headers) {
+    // Build HTTP upgrade request using core/http.hpp
+    char request_buf[4096];
+    size_t request_len = build_websocket_upgrade_request(host, path, custom_headers,
+                                                          request_buf, sizeof(request_buf));
+
+    // Publish to MSG_OUTBOX (Transport treats as raw bytes)
+    int64_t seq = msg_outbox_producer_.try_claim();
+    if (seq < 0) std::abort();  // MSG_OUTBOX full - should not happen during handshake
+
+    auto& event = msg_outbox_producer_[seq];
+    // Copy request into data field (raw HTTP, no WS framing)
+    memcpy(event.data, request_buf, request_len);
+    event.data_len = static_cast<uint16_t>(request_len);
+    event.msg_type = MSG_TYPE_DATA;  // Transport just encrypts and sends raw bytes
+    event.opcode = 0;  // Not used for raw HTTP
+
+    msg_outbox_producer_.publish(seq);
+}
+```
+
+### HTTP Response Validation
+
+```cpp
+// State for partial HTTP response accumulation (similar to PartialWebSocketFrame)
+struct PartialHttpResponse {
+    uint8_t buffer[4096];
+    size_t accumulated = 0;
+    bool headers_complete = false;
+
+    // Check if we have complete HTTP headers (ends with \r\n\r\n)
+    bool try_complete() {
+        if (accumulated < 4) return false;
+        for (size_t i = 0; i <= accumulated - 4; ++i) {
+            if (buffer[i] == '\r' && buffer[i+1] == '\n' &&
+                buffer[i+2] == '\r' && buffer[i+3] == '\n') {
+                headers_complete = true;
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+bool WebSocketProcess::recv_http_upgrade_response() {
+    PartialHttpResponse response;
+
+    // Manual polling loop - process_manually on MSG_METADATA_INBOX
+    while (!response.headers_complete) {
+        // Poll for new metadata events
+        msg_metadata_consumer_.process_manually([&](MsgMetadata& meta, int64_t seq) {
+            // Read decrypted data from MSG_INBOX
+            const uint8_t* data = msg_inbox_.data_at(meta.msg_inbox_offset);
+            size_t to_copy = std::min(meta.decrypted_len,
+                                       sizeof(response.buffer) - response.accumulated);
+            memcpy(response.buffer + response.accumulated, data, to_copy);
+            response.accumulated += to_copy;
+            response.try_complete();
+        });
+        msg_metadata_consumer_.commit_manually();
+
+        // Timeout check (prevent infinite loop)
+        // ... timeout handling omitted for clarity
+    }
+
+    // Validate response contains "101"
+    return validate_http_upgrade_response(response.buffer, response.accumulated);
+}
+```
+
+### Subscription Message Sending
+
+```cpp
+void WebSocketProcess::send_subscription_messages() {
+    // subscription_json_ is pre-configured in HandshakeConfig (shared memory)
+    const char* json = handshake_config_->subscription_json;
+    size_t json_len = strlen(json);
+
+    // Build complete WS TEXT frame (header + payload)
+    int64_t seq = msg_outbox_producer_.try_claim();
+    if (seq < 0) std::abort();
+
+    auto& event = msg_outbox_producer_[seq];
+
+    // Build WS header in header_room (right-aligned)
+    // Header is 6 bytes for payload < 126: [0x81, 0x80|len, mask[4]]
+    size_t header_len = build_websocket_header_zerocopy(
+        event.header_room + 14 - 6,  // Right-align 6-byte header
+        json_len, 0x01);             // opcode 0x01 = TEXT
+
+    // Copy payload
+    memcpy(event.data, json, json_len);
+    event.data_len = static_cast<uint16_t>(json_len);
+    event.opcode = 0x01;  // TEXT
+    event.msg_type = MSG_TYPE_DATA;
+
+    msg_outbox_producer_.publish(seq);
+}
+```
+
+### Handshake Configuration
+
+WebSocket Process receives handshake parameters from shared memory (set by parent before fork):
+
+```cpp
+// In ConnStateShm or separate HandshakeConfig structure
+struct HandshakeConfig {
+    char target_host[256];              // e.g., "stream.binance.com"
+    char target_path[512];              // e.g., "/ws"
+    char custom_headers[2048];          // Pre-formatted additional headers
+    char subscription_json[4096];       // e.g., {"method":"SUBSCRIBE","params":["btcusdt@aggTrade"],"id":1}
+};
 ```
 
 ---
@@ -89,6 +275,17 @@ private:
     PongsProducer& pongs_producer_;
     MsgOutboxProducer& msg_outbox_producer_;
     std::atomic<bool>* running_;
+
+    // === HANDSHAKE STATE ===
+    // WebSocket Process performs HTTP+WS handshake after Transport signals tls_ready
+    std::atomic<bool>* tls_ready_;          // Input: Transport signals TLS handshake complete
+    std::atomic<bool>* ws_ready_;           // Output: Signal to AppClient that WS is ready
+    HandshakeConfig* handshake_config_;     // Shared memory: host, path, subscription JSON
+    bool handshake_complete_ = false;
+    bool subscription_sent_ = false;
+
+    // HTTP response accumulation during handshake (before event_processor.run())
+    PartialHttpResponse http_response_;
 
     // Ring buffer and barrier (from 01_shared_headers/disruptor/, IPC mode with external storage)
     disruptor::ring_buffer<MsgMetadata, MSG_METADATA_SIZE,
@@ -159,11 +356,22 @@ private:
     MsgMetadata fragment_first_metadata_;       // Timestamps from first fragment (TEXT/BINARY with FIN=0)
 
 public:
+    // === HANDSHAKE METHODS (Phase 1: called before run()) ===
+    bool init_with_handshake();  // Main entry: performs full HTTP+WS handshake
+    void shutdown();             // Signal halt to event_processor
+
+    // === MAIN LOOP (Phase 2: blocking event_processor.run()) ===
     // event_processor.run() calls this for each MsgMetadata event
     void on_event(MsgMetadata& meta, int64_t sequence, bool end_of_batch) override;
     void run();
 
 private:
+    // Handshake helpers
+    void send_http_upgrade_request();
+    bool recv_http_upgrade_response();
+    void send_subscription_messages();
+
+    // Frame handling
     void handle_complete_frame(const uint8_t* frame_start, const WebSocketFrame& frame, size_t consumed);
     void publish_ws_frame_info(const uint8_t* frame_start, const WebSocketFrame& frame,
                                size_t consumed, uint64_t ws_parse_cycle);
@@ -316,7 +524,7 @@ void WebSocketProcess::handle_complete_frame(const uint8_t* frame_start,
 
     // WebSocketOpcode enum from core/http.hpp
     if (frame.opcode == static_cast<uint8_t>(WebSocketOpcode::PING)) {
-        // Queue PONG response - FATAL if ring full
+        // Build complete PONG frame and queue - FATAL if ring full
         // NOTE: PONGS_SIZE exhaustion triggers abort. This is intentional for HFT:
         //   1. If Transport is not processing PONGs fast enough, it indicates system overload
         //   2. Graceful degradation would hide latency problems
@@ -325,8 +533,12 @@ void WebSocketProcess::handle_complete_frame(const uint8_t* frame_start,
         if (seq < 0) std::abort();  // PONGS ring full - Transport overloaded
 
         auto& pong = pongs_producer_[seq];
-        pong.pong.payload_len = std::min(frame.payload_len, (uint64_t)125);
-        memcpy(pong.pong.payload, frame.payload, pong.pong.payload_len);
+        // Build complete WS PONG frame using build_pong_frame() from core/http.hpp
+        // Zero mask for no-op XOR (client frames must be masked per RFC 6455)
+        uint8_t mask[4] = {0, 0, 0, 0};
+        // Limit payload to 119 bytes to fit complete frame in 125 bytes (6-byte header + payload)
+        size_t payload_len = std::min(frame.payload_len, (uint64_t)119);
+        pong.frame_len = build_pong_frame(frame.payload, payload_len, pong.frame, mask);
         pongs_producer_.publish(seq);
 
     } else if (frame.opcode == static_cast<uint8_t>(WebSocketOpcode::CLOSE)) {
@@ -625,11 +837,11 @@ size_t build_ws_header(uint8_t* header, uint8_t opcode, size_t payload_len) {
 
 | Ring | Role | API |
 |------|------|-----|
-| MSG_METADATA_INBOX | Consumer | `event_processor.run()` with `on_event()` handler |
+| MSG_METADATA_INBOX | Consumer | `event_processor.run()` with `on_event()` handler; manual polling during handshake |
 | MSG_INBOX | Reader | `data_at(offset)` - read-only access |
 | WS_FRAME_INFO_RING | Producer | `try_claim()` + `publish()` |
-| PONGS | Producer | `try_claim()` + `publish()` |
-| MSG_OUTBOX | Producer | `try_claim()` + `publish()` (for CLOSE) |
+| PONGS | Producer | `try_claim()` + `publish()` (complete WS PONG frame, not just payload) |
+| MSG_OUTBOX | Producer | `try_claim()` + `publish()` (handshake: HTTP upgrade, subscription; main loop: CLOSE) |
 
 ---
 
