@@ -138,7 +138,6 @@ struct XDPPollProcess {
                 bpf_loader_ = std::make_unique<websocket::xdp::BPFLoader>();
                 bpf_loader_->load(interface_, bpf_path);
                 bpf_loader_->attach();
-                printf("[XDP-POLL] BPF program loaded and attached\n");
             } catch (const std::exception& e) {
                 fprintf(stderr, "[XDP-POLL] BPF loading failed: %s\n", e.what());
                 bpf_loader_.reset();
@@ -208,24 +207,10 @@ struct XDPPollProcess {
         rx_ring_.cached_cons = *rx_ring_.consumer;
         rx_ring_.cached_prod = *rx_ring_.producer;
 
-        fprintf(stderr, "[XDP-POLL] XSK created: fd=%d tx_size=%u rx_size=%u\n",
-                xsk_fd_, xsk_cfg.tx_size, xsk_cfg.rx_size);
-        fprintf(stderr, "[XDP-POLL] TX ring: prod=%u cons=%u mask=%u\n",
-                *tx_ring_.producer, *tx_ring_.consumer, tx_ring_.mask);
-        fprintf(stderr, "[XDP-POLL] TX ring: size=%u flags=%u cached_prod=%u cached_cons=%u\n",
-                tx_ring_.size, *tx_ring_.flags, tx_ring_.cached_prod, tx_ring_.cached_cons);
-        fprintf(stderr, "[XDP-POLL] Ring addresses: fill=%p tx=%p rx=%p comp=%p\n",
-                (void*)&fill_ring_, (void*)&tx_ring_, (void*)&rx_ring_, (void*)&comp_ring_);
-        fprintf(stderr, "[XDP-POLL] Fill ring: prod=%u cons=%u mask=%u cached_prod=%u cached_cons=%u\n",
-                *fill_ring_.producer, *fill_ring_.consumer, fill_ring_.mask,
-                fill_ring_.cached_prod, fill_ring_.cached_cons);
-        fflush(stderr);
-
         // Register XSK socket with BPF program
         if (bpf_loader_) {
             try {
                 bpf_loader_->register_xsk_socket(xsk_);
-                printf("[XDP-POLL] XSK socket registered with BPF\n");
             } catch (const std::exception& e) {
                 fprintf(stderr, "[XDP-POLL] Failed to register XSK: %s\n", e.what());
                 cleanup();
@@ -242,8 +227,6 @@ struct XDPPollProcess {
         setsockopt(xsk_fd_, SOL_SOCKET, SO_BUSY_POLL, &usec, sizeof(usec));
 
         // Populate fill ring with RX pool frames
-        printf("[XDP-POLL] Populating fill ring with %zu frames (fill_size=%u)...\n",
-               RX_FRAMES, umem_cfg.fill_size);
         uint32_t idx = 0;
         ret = xsk_ring_prod__reserve(&fill_ring_, RX_FRAMES, &idx);
         if (ret != static_cast<int>(RX_FRAMES)) {
@@ -258,13 +241,6 @@ struct XDPPollProcess {
         }
         xsk_ring_prod__submit(&fill_ring_, RX_FRAMES);
 
-        fprintf(stderr, "[XDP-POLL] After fill ring submit:\n");
-        fprintf(stderr, "[XDP-POLL]   Fill: cached_prod=%u cached_cons=%u\n",
-                fill_ring_.cached_prod, fill_ring_.cached_cons);
-        fprintf(stderr, "[XDP-POLL]   TX:   cached_prod=%u cached_cons=%u\n",
-                tx_ring_.cached_prod, tx_ring_.cached_cons);
-        fflush(stderr);
-
         // Create trickle socket
         if constexpr (kTrickleEnabled) {
             create_trickle_socket();
@@ -275,7 +251,6 @@ struct XDPPollProcess {
             conn_state_->set_handshake_xdp_ready();
         }
 
-        printf("[XDP-POLL] Initialized on %s queue %u\n", interface_, kQueueId);
         return true;
     }
 
@@ -284,7 +259,6 @@ struct XDPPollProcess {
     // ========================================================================
 
     void run() {
-        printf("[XDP-POLL] Starting main loop\n");
         uint8_t trickle_counter = 0;
         uint64_t loop_id = 0;
 
@@ -332,8 +306,6 @@ struct XDPPollProcess {
 
             loop_id++;
         }
-
-        printf("[XDP-POLL] Main loop ended\n");
     }
 
     // ========================================================================
@@ -399,6 +371,7 @@ struct XDPPollProcess {
         xsk_ring_prod__submit(&tx_ring_, tx_count);
 
         if (tx_count > 0) {
+            static uint32_t tx_total = 0;
 #if DEBUG
             static uint32_t tx_submit_count = 0;
             tx_submit_count += tx_count;
@@ -462,6 +435,7 @@ struct XDPPollProcess {
         uint32_t nb_pkts = xsk_ring_cons__peek(&rx_ring_, RX_BATCH, &rx_idx);
 
         if (nb_pkts == 0) return 0;
+
 #if DEBUG
         static uint32_t total_rx = 0;
         total_rx += nb_pkts;
@@ -489,6 +463,7 @@ struct XDPPollProcess {
             desc.nic_frame_poll_cycle = poll_cycle;
             desc.frame_type = FRAME_TYPE_RX;
             desc.consumed = 0;
+            desc.acked = 0;
 
             // Read XDP metadata from headroom (16 bytes before packet data)
             // BPF program uses bpf_xdp_adjust_meta() to store timestamps

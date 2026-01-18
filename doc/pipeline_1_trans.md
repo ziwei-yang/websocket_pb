@@ -653,6 +653,30 @@ All SSL implementations are in `src/policy/ssl.hpp`:
 | `WolfSSLPolicy` | WolfSSL | Lightweight, embedded-friendly |
 | `NoSSLPolicy` | None | Pass-through for plain TCP (no encryption) |
 
+### MTU Considerations for Userspace TCP
+
+**Critical**: The userspace TCP stack does NOT support IP fragmentation. All packets must fit within the network MTU (typically 1500 bytes).
+
+**Problem**: OpenSSL 3.x's default ClientHello can be ~1540 bytes due to TLS 1.3 extensions (key_share, supported_versions, etc.). With TCP/IP/Ethernet headers (54 bytes), this creates a 1594-byte packet that exceeds the 1500-byte MTU and gets dropped.
+
+**Solution**: OpenSSL and LibreSSL policies are configured to limit TLS to version 1.2:
+
+```cpp
+// In OpenSSLPolicy::init() and LibreSSLPolicy::init()
+SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
+SSL_CTX_set_max_proto_version(ctx_, TLS1_2_VERSION);  // Prevents large TLS 1.3 ClientHello
+SSL_CTX_set_options(ctx_, SSL_OP_NO_TICKET);          // Further reduces ClientHello size
+```
+
+**ClientHello Size Comparison**:
+| Configuration | ClientHello Size | With Headers | MTU Status |
+|---------------|------------------|--------------|------------|
+| OpenSSL default (TLS 1.3) | ~1540 bytes | ~1594 bytes | **EXCEEDS MTU** |
+| OpenSSL TLS 1.2 only | ~200 bytes | ~254 bytes | OK |
+| WolfSSL default | ~180 bytes | ~234 bytes | OK |
+
+**Note**: WolfSSL has a smaller default ClientHello and works without special configuration. This MTU limitation only affects the userspace TCP stack (XDP mode). BSD socket mode uses kernel TCP which handles fragmentation automatically.
+
 ### NoSSLPolicy for Plain TCP
 
 For scenarios where TLS encryption is not required (e.g., internal networks, testing, or protocols that don't use TLS), use `NoSSLPolicy`:
@@ -2210,6 +2234,274 @@ inline bool seq_leq(uint32_t a, uint32_t b) {
 2. FIN handling: rcv_nxt++, send FIN-ACK, transition to CLOSE_WAIT, send our FIN, transition to LAST_ACK
 3. RST handling: immediately set is_running=false and stop processing
 4. LAST_ACK state: wait for peer's ACK of our FIN before fully closing
+
+---
+
+## Out-of-Order (OOO) TCP Segment Handling
+
+TCP segments can arrive out of order due to network path variations, packet loss/retransmission, or load balancing. Transport Process handles OOO segments differently in **handshake phase** vs **main loop phase**.
+
+### OOO Reorder Buffer
+
+OOO handling is implemented in a separate template-based header `src/stack/tcp/tcp_reorder.hpp`, decoupled from UMEM-specific types:
+
+```cpp
+// src/stack/tcp/tcp_reorder.hpp
+namespace userspace_stack {
+
+template<typename PayloadPtr>
+struct ZeroCopyOOOSegment {
+    uint32_t seq = 0;           // TCP sequence number
+    uint16_t len = 0;           // Payload length in bytes
+    bool valid = false;         // Is this slot in use?
+    PayloadPtr data{};          // Pointer to payload data (zero-copy)
+};
+
+template<typename PayloadPtr, size_t MaxSegments = 8>
+class ZeroCopyTCPReorderBuffer {
+public:
+    bool buffer_segment(uint32_t seq, uint16_t len, PayloadPtr data);
+    bool is_buffered(uint32_t seq) const;
+
+    template<typename DeliverCallback>
+    size_t try_deliver(uint32_t& rcv_nxt, DeliverCallback&& callback);
+
+    void clear();
+    size_t count() const;
+    bool is_full() const;
+    bool is_empty() const;
+};
+
+}  // namespace userspace_stack
+```
+
+**Transport Process Usage**:
+
+```cpp
+// transport_process.hpp
+#include "../stack/tcp/tcp_reorder.hpp"
+
+using OOOBuffer = userspace_stack::ZeroCopyTCPReorderBuffer<const uint8_t*>;
+OOOBuffer ooo_buffer_;
+```
+
+**Design Benefits**:
+- Template-based: decoupled from UMEM/pipeline-specific types
+- Zero-copy: stores pointers to external data, no copying
+- Fixed-size buffer: predictable memory usage (default 8 segments)
+- Callback-based delivery: flexible integration with SSL or handshake paths
+
+### Main Loop: Zero-Copy OOO Handling
+
+**Key Insight**: In the disruptor pattern, `commit_manually()` is called **after** all frames are processed. All UMEMs in a batch stay valid until the end of `process_rx()`.
+
+```
+Network arrival order (out of order):
+┌─────────────────────────────────────────────────────────────┐
+│  Frame 1: seq=1000 (expected=1000) ✓ IN-ORDER              │
+│  Frame 2: seq=1200 (expected=1100) ✗ OOO (gap=100)         │
+│  Frame 3: seq=1100 (expected=1100) ✓ FILLS GAP             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Processing Flow**:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ process_manually() lambda                                                │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Frame 1 (seq=1000):                                                     │
+│  ├─ seq_diff = 1000 - 1000 = 0  ✓ in-order                              │
+│  ├─ append_encrypted_view(payload)  → SSL view ring                     │
+│  ├─ rcv_nxt = 1100                                                       │
+│  └─ return true  ───────────────────────────────────► continue          │
+│                                                                          │
+│  Frame 2 (seq=1200):                                                     │
+│  ├─ seq_diff = 1200 - 1100 = 100  ✗ gap detected!                       │
+│  ├─ ooo_buffer_.buffer_segment(1200, len, payload)                      │
+│  ├─ do NOT append to SSL view                                           │
+│  └─ return true  ───────────────────────────────────► continue          │
+│       ↑                                                                  │
+│       └── KEY: return true allows seeing Frame 3!                        │
+│                                                                          │
+│  Frame 3 (seq=1100):                                                     │
+│  ├─ seq_diff = 1100 - 1100 = 0  ✓ in-order (fills gap!)                 │
+│  ├─ append_encrypted_view(payload)  → SSL view ring                     │
+│  ├─ rcv_nxt = 1200                                                       │
+│  ├─ ooo_buffer_.try_deliver(rcv_nxt, callback):                          │
+│  │   └─ finds segment seq=1200 == rcv_nxt ✓                             │
+│  │   └─ callback(data, offset=0, len) → append to SSL view              │
+│  │   └─ rcv_nxt updated to 1300                                          │
+│  └─ return true                                                          │
+│                                                                          │
+├──────────────────────────────────────────────────────────────────────────┤
+│ AFTER process_manually() completes:                                      │
+│                                                                          │
+│  ssl_read_to_msg_inbox()  ← reads from correctly ordered SSL view        │
+│  commit_manually()        ← NOW frames are released (UMEMs recycled)     │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**SSL View Ring (Correct Order)**:
+
+```
+Before OOO handling:          After OOO handling:
+┌─────────────────┐           ┌─────────────────┐
+│ seg 0: 1000-1100│           │ seg 0: 1000-1100│
+├─────────────────┤           ├─────────────────┤
+│ seg 1: (empty)  │           │ seg 1: 1100-1200│  ← Frame 3
+├─────────────────┤           ├─────────────────┤
+│ seg 2: (empty)  │           │ seg 2: 1200-1300│  ← From OOO buffer
+└─────────────────┘           └─────────────────┘
+```
+
+**Code** (`process_rx()` in transport_process.hpp):
+
+```cpp
+if (parsed.payload_len > 0) {
+    int32_t seq_diff = static_cast<int32_t>(parsed.seq - conn_state_->rcv_nxt);
+
+    if (seq_diff > 0) {
+        // GAP: segment ahead of expected - buffer UMEM pointer (zero-copy)
+        if (!ooo_buffer_.is_buffered(parsed.seq)) {
+            ooo_buffer_.buffer_segment(parsed.seq,
+                                       static_cast<uint16_t>(parsed.payload_len),
+                                       reinterpret_cast<const uint8_t*>(parsed.payload));
+        }
+        out_of_order = true;
+        return true;  // Continue processing - UMEMs valid until commit_manually()
+    }
+
+    // ... process in-order segment, append to SSL view ...
+
+    // Deliver any now-in-order segments via callback
+    ooo_buffer_.try_deliver(conn_state_->rcv_nxt,
+        [this](const uint8_t* data, uint16_t offset, uint16_t len) {
+            if (ssl_policy_.append_encrypted_view(data + offset, len) != 0) {
+                fprintf(stderr, "[FATAL] SSL view ring buffer overflow (OOO)\n");
+                std::abort();
+            }
+            return true;  // Continue delivery
+        });
+}
+```
+
+**try_deliver() callback signature**: `bool callback(PayloadPtr data, uint16_t offset, uint16_t len)`
+- `data`: pointer to segment payload
+- `offset`: bytes to skip (for overlap handling when segment starts before rcv_nxt)
+- `len`: bytes to deliver (after offset)
+- Returns `true` to continue delivery, `false` to abort
+
+### Handshake: Copy-Based OOO Handling
+
+During TLS handshake, we **copy** data to `handshake_rx_buf_[]` because TLS records can span multiple TCP segments and we need frame-by-frame commit control.
+
+```cpp
+// tls_handshake_recv() - copies data instead of zero-copy
+memcpy(handshake_rx_buf_ + handshake_rx_len_, parsed.payload, parsed.payload_len);
+```
+
+**Handshake OOO uses `return false`** to stop processing and wait for missing segments:
+
+```cpp
+if (seq_diff > 0) {
+    // Buffer using same reorder buffer
+    if (!ooo_buffer_.is_buffered(parsed.seq)) {
+        ooo_buffer_.buffer_segment(parsed.seq,
+                                   static_cast<uint16_t>(parsed.payload_len),
+                                   parsed.payload);
+    }
+    send_ack_during_handshake();  // Trigger fast retransmit
+    return false;  // STOP - wait for missing segment
+}
+
+// Deliver OOO segments to handshake buffer
+ooo_buffer_.try_deliver(tcp_params_.rcv_nxt,
+    [this](const uint8_t* data, uint16_t offset, uint16_t len) {
+        size_t space = sizeof(handshake_rx_buf_) - handshake_rx_len_;
+        if (len > space) {
+            fprintf(stderr, "[FATAL] OOO: Handshake buffer overflow\n");
+            std::abort();
+        }
+        memcpy(handshake_rx_buf_ + handshake_rx_len_, data + offset, len);
+        handshake_rx_len_ += len;
+        conn_state_->rcv_nxt = tcp_params_.rcv_nxt;  // Sync after delivery
+        return true;
+    });
+```
+
+### UMEM Lifecycle (Why Zero-Copy Works in Main Loop)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        process_rx() call                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ process_manually() lambda                                    │   │
+│  │   ├─ Frame 1: return true  ──► cursor advances               │   │
+│  │   ├─ Frame 2: return true  ──► cursor advances (OOO stored)  │   │
+│  │   └─ Frame 3: return true  ──► cursor advances               │   │
+│  │                                                              │   │
+│  │   ALL UMEM FRAMES STILL VALID HERE                          │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              │                                      │
+│                              ▼                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ ssl_read_to_msg_inbox()                                      │   │
+│  │   └─ Reads from SSL view ring (points to valid UMEMs)       │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                              │                                      │
+│                              ▼                                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ commit_manually()                                            │   │
+│  │   └─ NOW frames are released, UMEMs can be recycled         │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Strategy Comparison
+
+| Aspect | Main Loop | Handshake |
+|--------|-----------|-----------|
+| **Return value** | `true` (continue) | `false` (stop) |
+| **Data storage** | UMEM pointer (zero-copy) | Copy to `handshake_rx_buf_[]` |
+| **OOO buffer** | `ooo_buffer_.buffer_segment()` | Same buffer, different callback |
+| **Delivery** | `try_deliver()` → SSL view | `try_deliver()` → handshake buffer |
+| **Why?** | All frames in batch valid until `commit_manually()` | Need per-frame commit for TLS record boundaries |
+| **Performance** | Zero-copy, minimal latency | Small overhead (handshake is infrequent) |
+| **Buffer size** | 8 slots × pointer (configurable via template) | 32KB handshake buffer |
+
+### Duplicate and Overlap Handling
+
+Both phases handle duplicate/overlapping segments. For inline processing:
+
+```cpp
+} else if (seq_diff < 0) {
+    int32_t overlap = -seq_diff;
+    if (static_cast<size_t>(overlap) >= parsed.payload_len) {
+        return true;  // Entire segment is duplicate, skip
+    }
+    // Partial overlap - skip duplicate bytes
+    parsed.payload += overlap;
+    parsed.payload_len -= overlap;
+    parsed.seq = conn_state_->rcv_nxt;
+}
+```
+
+For OOO delivery, `try_deliver()` handles overlaps internally via the `offset` parameter:
+
+```cpp
+// Inside ZeroCopyTCPReorderBuffer::try_deliver()
+} else if (diff < 0 && seg_end > rcv_nxt) {
+    // Overlap: segment starts before rcv_nxt but extends past it
+    uint16_t overlap = static_cast<uint16_t>(rcv_nxt - seg_seq);
+    uint16_t useful_len = segments_[i].len - overlap;
+    callback(segments_[i].data, overlap, useful_len);  // offset = overlap
+}
+```
 
 ---
 

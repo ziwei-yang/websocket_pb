@@ -263,7 +263,7 @@ TEST_TCP_STATE_BIN := $(BUILD_DIR)/test_tcp_state
 TEST_RETRANSMIT_QUEUE_BIN := $(BUILD_DIR)/test_retransmit_queue
 TEST_SSL_POLICY_BIN := $(BUILD_DIR)/test_ssl_policy
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http
 
 all: $(EXAMPLE_BIN)
 
@@ -508,12 +508,29 @@ test-ssl-policy: $(TEST_SSL_POLICY_BIN)
 # Pipeline Integration Tests (Multi-Process AF_XDP WebSocket)
 # ============================================================================
 
+# Common pipeline headers - all pipeline tests depend on these
+# When any header changes, affected tests will be rebuilt
+PIPELINE_HEADERS := \
+    src/pipeline/transport_process.hpp \
+    src/pipeline/xdp_poll_process.hpp \
+    src/pipeline/pipeline_data.hpp \
+    src/pipeline/pipeline_config.hpp \
+    src/pipeline/msg_inbox.hpp \
+    src/pipeline/ws_parser.hpp \
+    src/pipeline/pipeline.hpp \
+    src/pipeline/websocket_process.hpp \
+    src/pipeline/app_client.hpp \
+    src/pipeline/handshake_manager.hpp \
+    src/stack/userspace_stack.hpp \
+    src/policy/ssl.hpp \
+    src/core/timing.hpp
+
 # Pipeline source and binary
 PIPELINE_BINANCE_SRC := $(INTEGRATION_DIR)/binance_pipeline.cpp
 PIPELINE_BINANCE_BIN := $(BUILD_DIR)/binance_pipeline
 
 # Build pipeline Binance integration test
-$(PIPELINE_BINANCE_BIN): $(PIPELINE_BINANCE_SRC) | $(BUILD_DIR)
+$(PIPELINE_BINANCE_BIN): $(PIPELINE_BINANCE_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
 	@echo "🔨 Compiling Pipeline Binance integration test..."
 ifdef USE_XDP
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
@@ -539,7 +556,7 @@ PIPELINE_XDP_POLL_SRC := test/pipeline/00_xdp_poll.cpp
 PIPELINE_XDP_POLL_BIN := $(BUILD_DIR)/test_pipeline_xdp_poll
 
 # Build XDP Poll test
-$(PIPELINE_XDP_POLL_BIN): $(PIPELINE_XDP_POLL_SRC) | $(BUILD_DIR)
+$(PIPELINE_XDP_POLL_BIN): $(PIPELINE_XDP_POLL_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
 	@echo "🔨 Compiling XDP Poll segregated test..."
 ifdef USE_XDP
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
@@ -567,7 +584,7 @@ PIPELINE_XDP_POLL_PING_SRC := test/pipeline/00_xdp_poll_ping.cpp
 PIPELINE_XDP_POLL_PING_BIN := $(BUILD_DIR)/test_pipeline_xdp_poll_ping
 
 # Build XDP Poll Ping test
-$(PIPELINE_XDP_POLL_PING_BIN): $(PIPELINE_XDP_POLL_PING_SRC) | $(BUILD_DIR)
+$(PIPELINE_XDP_POLL_PING_BIN): $(PIPELINE_XDP_POLL_PING_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
 	@echo "🔨 Compiling XDP Poll ICMP Ping test..."
 ifdef USE_XDP
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
@@ -588,7 +605,7 @@ PIPELINE_XDP_POLL_TCP_SRC := test/pipeline/01_xdp_poll_tcp.cpp
 PIPELINE_XDP_POLL_TCP_BIN := $(BUILD_DIR)/test_pipeline_xdp_poll_tcp
 
 # Build XDP Poll TCP test
-$(PIPELINE_XDP_POLL_TCP_BIN): $(PIPELINE_XDP_POLL_TCP_SRC) | $(BUILD_DIR)
+$(PIPELINE_XDP_POLL_TCP_BIN): $(PIPELINE_XDP_POLL_TCP_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
 	@echo "🔨 Compiling XDP Poll TCP test..."
 ifdef USE_XDP
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
@@ -616,7 +633,7 @@ PIPELINE_TRANSPORT_TCP_SRC := test/pipeline/10_transport_tcp.cpp
 PIPELINE_TRANSPORT_TCP_BIN := $(BUILD_DIR)/test_pipeline_transport_tcp
 
 # Build Transport TCP test
-$(PIPELINE_TRANSPORT_TCP_BIN): $(PIPELINE_TRANSPORT_TCP_SRC) | $(BUILD_DIR)
+$(PIPELINE_TRANSPORT_TCP_BIN): $(PIPELINE_TRANSPORT_TCP_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
 	@echo "🔨 Compiling Transport TCP test..."
 ifdef USE_XDP
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
@@ -635,6 +652,118 @@ build-test-pipeline-transport-tcp: $(PIPELINE_TRANSPORT_TCP_BIN)
 test-pipeline-transport-tcp: $(PIPELINE_TRANSPORT_TCP_BIN) bpf
 	@echo "🧪 Running Transport TCP test via script..."
 	./scripts/test_xdp.sh 10_transport_tcp.cpp
+
+# ============================================================================
+# Transport HTTP Test (NoSSLPolicy with forked XDP Poll + Transport)
+# Tests plain HTTP against ipinfo.io:80
+# ============================================================================
+
+PIPELINE_TRANSPORT_HTTP_SRC := test/pipeline/11_transport_http.cpp
+PIPELINE_TRANSPORT_HTTP_BIN := $(BUILD_DIR)/test_pipeline_transport_http
+
+# Build Transport HTTP test
+$(PIPELINE_TRANSPORT_HTTP_BIN): $(PIPELINE_TRANSPORT_HTTP_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+	@echo "🔨 Compiling Transport HTTP test..."
+ifdef USE_XDP
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Transport HTTP test build complete: $@"
+else
+	@echo "❌ Error: Transport HTTP test requires USE_XDP=1"
+	@exit 1
+endif
+
+# Build-only target for Transport HTTP test
+build-test-pipeline-transport-http: $(PIPELINE_TRANSPORT_HTTP_BIN)
+
+# Run Transport HTTP test (connects to ipinfo.io:80)
+# Uses scripts/test_xdp.sh - the verified XDP test runner
+# NOTE: Script uses sudo internally, do not invoke with sudo
+test-pipeline-transport-http: $(PIPELINE_TRANSPORT_HTTP_BIN) bpf
+	@echo "🧪 Running Transport HTTP test via script..."
+	./scripts/test_xdp.sh 11_transport_http.cpp
+
+# ============================================================================
+# Transport HTTPS WolfSSL Test (WolfSSLPolicy with forked XDP Poll + Transport)
+# Tests HTTPS against www.gnu.org:443
+# ============================================================================
+
+PIPELINE_TRANSPORT_HTTPS_WOLFSSL_SRC := test/pipeline/12_transport_https_wolfssl.cpp
+PIPELINE_TRANSPORT_HTTPS_WOLFSSL_BIN := $(BUILD_DIR)/test_pipeline_transport_https_wolfssl
+
+# Build Transport HTTPS WolfSSL test
+$(PIPELINE_TRANSPORT_HTTPS_WOLFSSL_BIN): $(PIPELINE_TRANSPORT_HTTPS_WOLFSSL_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+	@echo "🔨 Compiling Transport HTTPS WolfSSL test..."
+ifdef USE_XDP
+ifdef USE_WOLFSSL
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Transport HTTPS WolfSSL test build complete: $@"
+else
+	@echo "❌ Error: Transport HTTPS WolfSSL test requires USE_WOLFSSL=1"
+	@exit 1
+endif
+else
+	@echo "❌ Error: Transport HTTPS WolfSSL test requires USE_XDP=1"
+	@exit 1
+endif
+
+build-test-pipeline-transport_https_wolfssl: $(PIPELINE_TRANSPORT_HTTPS_WOLFSSL_BIN)
+
+test-pipeline-transport-https-wolfssl: $(PIPELINE_TRANSPORT_HTTPS_WOLFSSL_BIN) bpf
+	@echo "🧪 Running Transport HTTPS WolfSSL test via script..."
+	./scripts/test_xdp.sh 12_transport_https_wolfssl.cpp
+
+# ============================================================================
+# Transport HTTPS OpenSSL Test (OpenSSLPolicy with forked XDP Poll + Transport)
+# Tests HTTPS against www.gnu.org:443
+# ============================================================================
+
+PIPELINE_TRANSPORT_HTTPS_OPENSSL_SRC := test/pipeline/13_transport_https_openssl.cpp
+PIPELINE_TRANSPORT_HTTPS_OPENSSL_BIN := $(BUILD_DIR)/test_pipeline_transport_https_openssl
+
+$(PIPELINE_TRANSPORT_HTTPS_OPENSSL_BIN): $(PIPELINE_TRANSPORT_HTTPS_OPENSSL_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+	@echo "🔨 Compiling Transport HTTPS OpenSSL test..."
+ifdef USE_XDP
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Transport HTTPS OpenSSL test build complete: $@"
+else
+	@echo "❌ Error: Transport HTTPS OpenSSL test requires USE_XDP=1"
+	@exit 1
+endif
+
+build-test-pipeline-transport_https_openssl: $(PIPELINE_TRANSPORT_HTTPS_OPENSSL_BIN)
+
+test-pipeline-transport-https-openssl: $(PIPELINE_TRANSPORT_HTTPS_OPENSSL_BIN) bpf
+	@echo "🧪 Running Transport HTTPS OpenSSL test via script..."
+	./scripts/test_xdp.sh 13_transport_https_openssl.cpp
+
+# ============================================================================
+# Transport HTTPS LibreSSL Test (LibreSSLPolicy with forked XDP Poll + Transport)
+# Tests HTTPS against www.gnu.org:443
+# ============================================================================
+
+PIPELINE_TRANSPORT_HTTPS_LIBRESSL_SRC := test/pipeline/14_transport_https_libressl.cpp
+PIPELINE_TRANSPORT_HTTPS_LIBRESSL_BIN := $(BUILD_DIR)/test_pipeline_transport_https_libressl
+
+$(PIPELINE_TRANSPORT_HTTPS_LIBRESSL_BIN): $(PIPELINE_TRANSPORT_HTTPS_LIBRESSL_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+	@echo "🔨 Compiling Transport HTTPS LibreSSL test..."
+ifdef USE_XDP
+ifdef USE_LIBRESSL
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Transport HTTPS LibreSSL test build complete: $@"
+else
+	@echo "❌ Error: Transport HTTPS LibreSSL test requires USE_LIBRESSL=1"
+	@exit 1
+endif
+else
+	@echo "❌ Error: Transport HTTPS LibreSSL test requires USE_XDP=1"
+	@exit 1
+endif
+
+build-test-pipeline-transport_https_libressl: $(PIPELINE_TRANSPORT_HTTPS_LIBRESSL_BIN)
+
+test-pipeline-transport-https-libressl: $(PIPELINE_TRANSPORT_HTTPS_LIBRESSL_BIN) bpf
+	@echo "🧪 Running Transport HTTPS LibreSSL test via script..."
+	./scripts/test_xdp.sh 14_transport_https_libressl.cpp
 
 # ============================================================================
 # HftShm RingBuffer Tests (requires hft-shm CLI)
@@ -830,6 +959,7 @@ help:
 	@echo "  make test-xdp-binance   - XDP zero-copy test with Binance (requires sudo)"
 	@echo "  make test-pipeline-binance - Multi-process pipeline test (requires sudo)"
 	@echo "  make test-pipeline-xdp-poll - XDP Poll segregated test (wire loopback, sudo)"
+	@echo "  make test-pipeline-transport-http - Plain HTTP test against ipinfo.io:80"
 	@echo ""
 	@echo "Benchmark:"
 	@echo "  make benchmark-binance  - Latency benchmark (100 warmup, 300 samples)"

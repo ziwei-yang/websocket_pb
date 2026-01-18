@@ -40,7 +40,8 @@ struct alignas(32) UMEMFrameDescriptor {
     uint16_t frame_len;              // Actual frame length (Ethernet + IP + TCP + payload)
     uint8_t  frame_type;             // FrameType enum (RX/ACK/PONG/MSG)
     uint8_t  consumed;               // Set by Transport when frame processing done
-    uint8_t  _pad[4];                // Padding to 32 bytes
+    uint8_t  acked;                  // Set when OOO ACK sent for this frame (prevents repeat ACKs)
+    uint8_t  _pad[3];                // Padding to 32 bytes
 
     void clear() {
         umem_addr = 0;
@@ -49,6 +50,7 @@ struct alignas(32) UMEMFrameDescriptor {
         frame_len = 0;
         frame_type = FRAME_TYPE_RX;
         consumed = 0;
+        acked = 0;
     }
 };
 static_assert(sizeof(UMEMFrameDescriptor) == 32, "UMEMFrameDescriptor must be 32 bytes");

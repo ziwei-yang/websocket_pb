@@ -165,8 +165,14 @@ struct OpenSSLPolicy {
             throw std::runtime_error("SSL_CTX_new() failed");
         }
 
-        // Set minimum TLS version to 1.2 for security and kTLS compatibility
+        // Set TLS version to 1.2 for security and kTLS compatibility
+        // Also limit to TLS 1.2 max to reduce ClientHello size (TLS 1.3 extensions are large)
+        // This prevents MTU issues with userspace TCP stack (no fragmentation support)
         SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
+        SSL_CTX_set_max_proto_version(ctx_, TLS1_2_VERSION);
+
+        // Disable session tickets to further reduce ClientHello size
+        SSL_CTX_set_options(ctx_, SSL_OP_NO_TICKET);
 
         // Disable verification for simplicity (HFT optimization)
         // In production, you should verify certificates!
@@ -313,20 +319,10 @@ struct OpenSSLPolicy {
                 // Handshake successful - stop trickle thread, switch to inline trickle
                 transport->stop_rx_trickle_thread();
                 ktls_enabled_ = false;
-                printf("[SSL] Handshake complete (userspace transport)\n");
                 return;
             }
 
             int err = SSL_get_error(ssl_, ret);
-            if (retries < 5 || retries % 100 == 0) {
-                printf("[SSL-DEBUG] Handshake attempt #%d: ret=%d, err=%d (%s), errno=%d\n",
-                       retries, ret, err,
-                       err == SSL_ERROR_WANT_READ ? "WANT_READ" :
-                       err == SSL_ERROR_WANT_WRITE ? "WANT_WRITE" :
-                       err == SSL_ERROR_SYSCALL ? "SYSCALL" :
-                       err == SSL_ERROR_SSL ? "SSL" : "OTHER",
-                       errno);
-            }
 
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
                 // Would block, poll and retry
@@ -349,7 +345,6 @@ struct OpenSSLPolicy {
             // Fatal error
             char err_buf[256];
             ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
-            printf("[SSL-ERROR] Fatal error after %d retries: %s\n", retries, err_buf);
             SSL_free(ssl_);
             ssl_ = nullptr;
             throw std::runtime_error(std::string("SSL handshake failed: ") + err_buf);
@@ -384,17 +379,8 @@ struct OpenSSLPolicy {
                 return -1;
             }
 
-            // Fatal SSL error - log and set errno
-            unsigned long err_code = ERR_get_error();
-            if (err_code != 0) {
-                char err_buf[256];
-                ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
-                printf("[SSL ERROR] SSL_read failed: %s (ssl_err=%d)\n", err_buf, err);
-            } else {
-                printf("[SSL ERROR] SSL_read failed: ssl_error=%d\n", err);
-            }
-
-            errno = EIO;  // Fatal error
+            // Fatal SSL error
+            errno = EIO;
             return -1;
         }
     }
@@ -421,17 +407,8 @@ struct OpenSSLPolicy {
                 return -1;
             }
 
-            // Fatal SSL error - log and set errno
-            unsigned long err_code = ERR_get_error();
-            if (err_code != 0) {
-                char err_buf[256];
-                ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
-                printf("[SSL ERROR] SSL_write failed: %s (ssl_err=%d)\n", err_buf, err);
-            } else {
-                printf("[SSL ERROR] SSL_write failed: ssl_error=%d\n", err);
-            }
-
-            errno = EIO;  // Fatal error
+            // Fatal SSL error
+            errno = EIO;
             return -1;
         }
     }
@@ -484,7 +461,8 @@ struct OpenSSLPolicy {
 
         // Create zero-copy BIO method if not already created
         if (!zc_bio_method_) {
-            zc_bio_method_ = BIO_meth_new(BIO_TYPE_MEM, "zero-copy");
+            // Use SOURCE_SINK type with unique index (required for proper BIO lifecycle)
+            zc_bio_method_ = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "zero-copy");
             if (!zc_bio_method_) {
                 SSL_free(ssl_);
                 ssl_ = nullptr;
@@ -493,6 +471,8 @@ struct OpenSSLPolicy {
             BIO_meth_set_read(zc_bio_method_, zc_bio_read);
             BIO_meth_set_write(zc_bio_method_, zc_bio_write);
             BIO_meth_set_ctrl(zc_bio_method_, zc_bio_ctrl);
+            BIO_meth_set_create(zc_bio_method_, zc_bio_create);
+            BIO_meth_set_destroy(zc_bio_method_, zc_bio_destroy);
         }
 
         // Create BIO instances with this policy as context
@@ -550,6 +530,21 @@ struct OpenSSLPolicy {
         in_view_pos_ = 0;
     }
 
+    /**
+     * Get the number of view segments that have been fully consumed by SSL.
+     * Used to safely release UMEM frames.
+     */
+    size_t view_segments_consumed() const {
+        return in_view_tail_;
+    }
+
+    /**
+     * Check if there are any partially consumed view segments.
+     */
+    bool has_partial_view() const {
+        return in_view_pos_ > 0;
+    }
+
     // ------------------------------------------------------------------------
     // Zero-copy TX API: encrypted data output (direct write to UMEM)
     // ------------------------------------------------------------------------
@@ -569,6 +564,11 @@ struct OpenSSLPolicy {
      */
     size_t encrypted_output_len() const {
         return out_buf_len_;
+    }
+
+    // Reset output length without clearing buffer pointer (for handshake loops)
+    void reset_encrypted_output_len() {
+        out_buf_len_ = 0;
     }
 
     /**
@@ -713,16 +713,47 @@ private:
     }
 
     static long zc_bio_ctrl(BIO* bio, int cmd, long num, void* ptr) {
-        (void)bio; (void)num; (void)ptr;
+        (void)num; (void)ptr;
+        auto* self = static_cast<OpenSSLPolicy*>(BIO_get_data(bio));
         switch (cmd) {
             case BIO_CTRL_FLUSH:
                 return 1;  // Success
             case BIO_CTRL_PENDING:
+                // Return bytes available to read in view ring
+                if (self && self->in_view_tail_ != self->in_view_head_) {
+                    size_t pending = 0;
+                    size_t tail = self->in_view_tail_;
+                    size_t head = self->in_view_head_;
+                    // Sum all segments from tail to head
+                    for (size_t i = tail; i != head; i++) {
+                        pending += self->in_views_[i & VIEW_RING_MASK].len;
+                    }
+                    // Subtract already-consumed portion of current segment
+                    if (tail != head) {
+                        pending -= self->in_view_pos_;
+                    }
+                    return static_cast<long>(pending);
+                }
+                return 0;
             case BIO_CTRL_WPENDING:
                 return 0;
             default:
                 return 0;
         }
+    }
+
+    static int zc_bio_create(BIO* bio) {
+        if (!bio) return 0;
+        BIO_set_init(bio, 0);
+        BIO_set_data(bio, nullptr);
+        return 1;
+    }
+
+    static int zc_bio_destroy(BIO* bio) {
+        if (!bio) return 0;
+        BIO_set_init(bio, 0);
+        BIO_set_data(bio, nullptr);
+        return 1;
     }
 
 public:
@@ -822,8 +853,14 @@ struct LibreSSLPolicy {
             throw std::runtime_error("SSL_CTX_new() failed");
         }
 
-        // Set minimum TLS version to 1.2 for security
+        // Set TLS version to 1.2 for security
+        // Also limit to TLS 1.2 max to reduce ClientHello size (TLS 1.3 extensions are large)
+        // This prevents MTU issues with userspace TCP stack (no fragmentation support)
         SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
+        SSL_CTX_set_max_proto_version(ctx_, TLS1_2_VERSION);
+
+        // Disable session tickets to further reduce ClientHello size
+        SSL_CTX_set_options(ctx_, SSL_OP_NO_TICKET);
 
         // Disable verification for simplicity
         // In production, you should verify certificates!
@@ -944,20 +981,10 @@ struct LibreSSLPolicy {
 
             if (ret == 1) {
                 // Handshake successful
-                printf("[SSL] Handshake complete (userspace transport)\n");
                 return;
             }
 
             int err = SSL_get_error(ssl_, ret);
-            if (retries < 5 || retries % 100 == 0) {
-                printf("[SSL-DEBUG] Handshake attempt #%d: ret=%d, err=%d (%s), errno=%d\n",
-                       retries, ret, err,
-                       err == SSL_ERROR_WANT_READ ? "WANT_READ" :
-                       err == SSL_ERROR_WANT_WRITE ? "WANT_WRITE" :
-                       err == SSL_ERROR_SYSCALL ? "SYSCALL" :
-                       err == SSL_ERROR_SSL ? "SSL" : "OTHER",
-                       errno);
-            }
 
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
                 // Would block, poll and retry
@@ -980,7 +1007,6 @@ struct LibreSSLPolicy {
             // Fatal error
             char err_buf[256];
             ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
-            printf("[SSL-ERROR] Fatal error after %d retries: %s\n", retries, err_buf);
             SSL_free(ssl_);
             ssl_ = nullptr;
             throw std::runtime_error(std::string("SSL handshake failed: ") + err_buf);
@@ -1015,17 +1041,8 @@ struct LibreSSLPolicy {
                 return -1;
             }
 
-            // Fatal SSL error - log and set errno
-            unsigned long err_code = ERR_get_error();
-            if (err_code != 0) {
-                char err_buf[256];
-                ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
-                printf("[SSL ERROR] SSL_read failed: %s (ssl_err=%d)\n", err_buf, err);
-            } else {
-                printf("[SSL ERROR] SSL_read failed: ssl_error=%d\n", err);
-            }
-
-            errno = EIO;  // Fatal error
+            // Fatal SSL error
+            errno = EIO;
             return -1;
         }
     }
@@ -1052,17 +1069,8 @@ struct LibreSSLPolicy {
                 return -1;
             }
 
-            // Fatal SSL error - log and set errno
-            unsigned long err_code = ERR_get_error();
-            if (err_code != 0) {
-                char err_buf[256];
-                ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
-                printf("[SSL ERROR] SSL_write failed: %s (ssl_err=%d)\n", err_buf, err);
-            } else {
-                printf("[SSL ERROR] SSL_write failed: ssl_error=%d\n", err);
-            }
-
-            errno = EIO;  // Fatal error
+            // Fatal SSL error
+            errno = EIO;
             return -1;
         }
     }
@@ -1115,7 +1123,8 @@ struct LibreSSLPolicy {
 
         // Create zero-copy BIO method if not already created
         if (!zc_bio_method_) {
-            zc_bio_method_ = BIO_meth_new(BIO_TYPE_MEM, "zero-copy");
+            // Use SOURCE_SINK type with unique index (required for proper BIO lifecycle)
+            zc_bio_method_ = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "zero-copy");
             if (!zc_bio_method_) {
                 SSL_free(ssl_);
                 ssl_ = nullptr;
@@ -1124,6 +1133,8 @@ struct LibreSSLPolicy {
             BIO_meth_set_read(zc_bio_method_, zc_bio_read);
             BIO_meth_set_write(zc_bio_method_, zc_bio_write);
             BIO_meth_set_ctrl(zc_bio_method_, zc_bio_ctrl);
+            BIO_meth_set_create(zc_bio_method_, zc_bio_create);
+            BIO_meth_set_destroy(zc_bio_method_, zc_bio_destroy);
         }
 
         // Create BIO instances with this policy as context
@@ -1171,6 +1182,21 @@ struct LibreSSLPolicy {
         in_view_pos_ = 0;
     }
 
+    /**
+     * Get the number of view segments that have been fully consumed by SSL.
+     * Used to safely release UMEM frames.
+     */
+    size_t view_segments_consumed() const {
+        return in_view_tail_;
+    }
+
+    /**
+     * Check if there are any partially consumed view segments.
+     */
+    bool has_partial_view() const {
+        return in_view_pos_ > 0;
+    }
+
     // ------------------------------------------------------------------------
     // Zero-copy TX API: encrypted data output (direct write to UMEM)
     // ------------------------------------------------------------------------
@@ -1183,6 +1209,11 @@ struct LibreSSLPolicy {
 
     size_t encrypted_output_len() const {
         return out_buf_len_;
+    }
+
+    // Reset output length without clearing buffer pointer (for handshake loops)
+    void reset_encrypted_output_len() {
+        out_buf_len_ = 0;
     }
 
     void clear_encrypted_output() {
@@ -1299,13 +1330,42 @@ private:
     }
 
     static long zc_bio_ctrl(BIO* bio, int cmd, long num, void* ptr) {
-        (void)bio; (void)num; (void)ptr;
+        (void)num; (void)ptr;
+        auto* self = static_cast<LibreSSLPolicy*>(BIO_get_data(bio));
         switch (cmd) {
             case BIO_CTRL_FLUSH: return 1;
             case BIO_CTRL_PENDING:
+                // Return bytes available to read in view ring
+                if (self && self->in_view_tail_ != self->in_view_head_) {
+                    size_t pending = 0;
+                    size_t tail = self->in_view_tail_;
+                    size_t head = self->in_view_head_;
+                    for (size_t i = tail; i != head; i++) {
+                        pending += self->in_views_[i & VIEW_RING_MASK].len;
+                    }
+                    if (tail != head) {
+                        pending -= self->in_view_pos_;
+                    }
+                    return static_cast<long>(pending);
+                }
+                return 0;
             case BIO_CTRL_WPENDING: return 0;
             default: return 0;
         }
+    }
+
+    static int zc_bio_create(BIO* bio) {
+        if (!bio) return 0;
+        BIO_set_init(bio, 0);
+        BIO_set_data(bio, nullptr);
+        return 1;
+    }
+
+    static int zc_bio_destroy(BIO* bio) {
+        if (!bio) return 0;
+        BIO_set_init(bio, 0);
+        BIO_set_data(bio, nullptr);
+        return 1;
     }
 
 public:
@@ -1432,19 +1492,20 @@ struct WolfSSLPolicy {
      * @throws std::runtime_error if initialization fails
      */
     void init() {
-        // Initialize WolfSSL library
         wolfSSL_Init();
 
         // Create TLS 1.2 client method
         WOLFSSL_METHOD* method = wolfTLSv1_2_client_method();
-        ctx_ = wolfSSL_CTX_new(method);
+        if (!method) {
+            throw std::runtime_error("wolfTLSv1_2_client_method() failed");
+        }
 
+        ctx_ = wolfSSL_CTX_new(method);
         if (!ctx_) {
             throw std::runtime_error("wolfSSL_CTX_new() failed");
         }
 
-        // Disable verification for simplicity (HFT optimization)
-        // In production, you should verify certificates!
+        // Disable verification (HFT optimization - verify in production!)
         wolfSSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);
     }
 
@@ -1551,20 +1612,10 @@ struct WolfSSLPolicy {
             if (ret == SSL_SUCCESS) {
                 // Handshake successful - stop trickle thread, switch to inline trickle
                 transport->stop_rx_trickle_thread();
-                printf("[SSL] Handshake complete (userspace transport)\n");
                 return;
             }
 
             int err = wolfSSL_get_error(ssl_, ret);
-            if (retries < 5 || retries % 100 == 0) {
-                printf("[SSL-DEBUG] Handshake attempt #%d: ret=%d, err=%d (%s), errno=%d\n",
-                       retries, ret, err,
-                       err == SSL_ERROR_WANT_READ ? "WANT_READ" :
-                       err == SSL_ERROR_WANT_WRITE ? "WANT_WRITE" :
-                       err == SSL_ERROR_SYSCALL ? "SYSCALL" :
-                       err == SSL_ERROR_SSL ? "SSL" : "OTHER",
-                       errno);
-            }
 
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
                 // Would block, poll and retry
@@ -1587,7 +1638,6 @@ struct WolfSSLPolicy {
             // Fatal error
             char err_buf[256];
             wolfSSL_ERR_error_string(err, err_buf);
-            printf("[SSL-ERROR] Fatal error after %d retries: %s\n", retries, err_buf);
             wolfSSL_free(ssl_);
             ssl_ = nullptr;
             throw std::runtime_error(std::string("SSL handshake failed: ") + err_buf);
@@ -1622,12 +1672,8 @@ struct WolfSSLPolicy {
                 return -1;
             }
 
-            // Fatal SSL error - log and set errno
-            char err_buf[256];
-            wolfSSL_ERR_error_string(err, err_buf);
-            printf("[SSL ERROR] wolfSSL_read failed: %s (err=%d)\n", err_buf, err);
-
-            errno = EIO;  // Fatal error
+            // Fatal SSL error
+            errno = EIO;
             return -1;
         }
     }
@@ -1654,12 +1700,8 @@ struct WolfSSLPolicy {
                 return -1;
             }
 
-            // Fatal SSL error - log and set errno
-            char err_buf[256];
-            wolfSSL_ERR_error_string(err, err_buf);
-            printf("[SSL ERROR] wolfSSL_write failed: %s (err=%d)\n", err_buf, err);
-
-            errno = EIO;  // Fatal error
+            // Fatal SSL error
+            errno = EIO;
             return -1;
         }
     }
@@ -1741,6 +1783,23 @@ struct WolfSSLPolicy {
         in_view_pos_ = 0;
     }
 
+    /**
+     * Get the number of view segments that have been fully consumed by SSL.
+     * Used to safely release UMEM frames - only commit frames whose data
+     * has been completely read by SSL.
+     */
+    size_t view_segments_consumed() const {
+        return in_view_tail_;
+    }
+
+    /**
+     * Check if there are any partially consumed view segments.
+     * If in_view_pos_ > 0, the current tail segment is partially consumed.
+     */
+    bool has_partial_view() const {
+        return in_view_pos_ > 0;
+    }
+
     // ------------------------------------------------------------------------
     // Zero-copy TX API: encrypted data output (direct write to UMEM)
     // ------------------------------------------------------------------------
@@ -1753,6 +1812,11 @@ struct WolfSSLPolicy {
 
     size_t encrypted_output_len() const {
         return out_buf_len_;
+    }
+
+    // Reset output length without clearing buffer pointer (for handshake loops)
+    void reset_encrypted_output_len() {
+        out_buf_len_ = 0;
     }
 
     void clear_encrypted_output() {
@@ -1807,7 +1871,7 @@ struct WolfSSLPolicy {
     }
 
 private:
-    // Zero-copy I/O callbacks for WolfSSL (read from ring buffer)
+    // Zero-copy I/O callbacks for WolfSSL
     static int zc_recv_cb(WOLFSSL* ssl, char* buf, int sz, void* ctx) {
         (void)ssl;
         auto* self = static_cast<WolfSSLPolicy*>(ctx);
@@ -1820,6 +1884,13 @@ private:
                self->in_view_tail_ != self->in_view_head_) {
 
             const auto& seg = self->in_views_[self->in_view_tail_ & VIEW_RING_MASK];
+
+            if (!seg.data || seg.len == 0) {
+                self->in_view_tail_++;
+                self->in_view_pos_ = 0;
+                continue;
+            }
+
             size_t avail = seg.len - self->in_view_pos_;
             size_t to_copy = (static_cast<size_t>(sz) - total_copied < avail)
                            ? (static_cast<size_t>(sz) - total_copied) : avail;
@@ -2060,6 +2131,21 @@ struct NoSSLPolicy {
         in_view_head_ = 0;
         in_view_tail_ = 0;
         in_view_pos_ = 0;
+    }
+
+    /**
+     * Get the number of view segments that have been fully consumed.
+     * Used to safely release UMEM frames.
+     */
+    size_t view_segments_consumed() const {
+        return in_view_tail_;
+    }
+
+    /**
+     * Check if there are any partially consumed view segments.
+     */
+    bool has_partial_view() const {
+        return in_view_pos_ > 0;
     }
 
     // ------------------------------------------------------------------------

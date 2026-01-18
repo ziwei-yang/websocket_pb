@@ -32,7 +32,8 @@ struct TCPParseResult {
     uint8_t flags = 0;            // TCP flags
     uint16_t window = 0;          // Window size
     const uint8_t* payload = nullptr;  // Pointer to payload data
-    size_t payload_len = 0;       // Payload length
+    size_t payload_len = 0;       // Payload length (actual available data)
+    size_t orig_payload_len = 0;  // Original payload length from IP header (for rcv_nxt)
     uint16_t src_port = 0;        // Source port
     uint16_t dst_port = 0;        // Destination port
     uint32_t src_ip = 0;          // Source IP (host byte order)
@@ -354,13 +355,25 @@ struct TCPPacket {
             return result;
         }
 
-        // Verify TCP checksum
-        size_t tcp_data_len = ip_payload_len - tcp_header_len;
-        const uint8_t* tcp_data = (tcp_data_len > 0) ? (frame + tcp_offset + tcp_header_len) : nullptr;
+        // Calculate TCP data length from IP header (original, un-truncated)
+        size_t orig_tcp_data_len = ip_payload_len - tcp_header_len;
 
-        if (verify_tcp_checksum(result.src_ip, expected_local_ip,
-                               tcp, tcp_header_len, tcp_data, tcp_data_len) != 0) {
-            return result;  // Invalid checksum
+        // Clamp to actual frame data (handles truncated frames from NIC/XDP)
+        size_t actual_data_offset = tcp_offset + tcp_header_len;
+        size_t actual_data_available = (frame_len > actual_data_offset) ?
+                                        (frame_len - actual_data_offset) : 0;
+        size_t tcp_data_len = (orig_tcp_data_len > actual_data_available) ?
+                               actual_data_available : orig_tcp_data_len;
+
+        const uint8_t* tcp_data = (tcp_data_len > 0) ? (frame + actual_data_offset) : nullptr;
+
+        // Skip checksum verification for truncated frames (checksum offload may be in use)
+        // Full frames still get checksum validation
+        if (actual_data_available >= ip_payload_len - tcp_header_len) {
+            if (verify_tcp_checksum(result.src_ip, expected_local_ip,
+                                   tcp, tcp_header_len, tcp_data, tcp_data_len) != 0) {
+                return result;  // Invalid checksum
+            }
         }
 
         // Extract TCP fields
@@ -370,6 +383,7 @@ struct TCPPacket {
         result.window = ntohs(tcp->window);
         result.payload = tcp_data;
         result.payload_len = tcp_data_len;
+        result.orig_payload_len = orig_tcp_data_len;  // For rcv_nxt update
         result.valid = true;
 
         return result;

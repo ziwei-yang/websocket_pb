@@ -24,6 +24,7 @@
 #include "ws_parser.hpp"
 #include "../core/timing.hpp"
 #include "../stack/userspace_stack.hpp"
+#include "../stack/tcp/tcp_reorder.hpp"
 #include "../policy/ssl.hpp"  // OpenSSLPolicy, LibreSSLPolicy, WolfSSLPolicy, NoSSLPolicy
 
 namespace websocket::pipeline {
@@ -295,28 +296,22 @@ struct TransportProcess {
         msg_inbox_ = msg_inbox;
         conn_state_ = conn_state;
 
-        fprintf(stderr, "[TRANSPORT] init_with_handshake() called\n");
-        fflush(stderr);
-
         // Initialize timestamp tracking
         reset_timestamps();
 
         // Initialize retransmit queues and pre-calculate cycle thresholds
         msg_retransmit_queue_.clear();
         pong_retransmit_queue_.clear();
+        // Handshake buffer and RX frame tracking reset
+        handshake_rx_len_ = 0;
+        handshake_rx_appended_ = 0;
         uint64_t tsc_freq = conn_state_->tsc_freq_hz;
         rto_cycles_ = (ZeroCopyRetransmitQueue::DEFAULT_RTO_US * tsc_freq) / 1000000;
         ack_timeout_cycles_ = (ACK_TIMEOUT_US * tsc_freq) / 1000000;
 
-        fprintf(stderr, "[TRANSPORT] Starting TCP/TLS handshake to %s:%u\n", target_host, target_port);
-        fflush(stderr);
-
         // Initialize userspace TCP stack with local network info from shared state
         {
             char local_ip_str[16], gateway_ip_str[16], netmask_str[16];
-            // Local IP is stored in network byte order, convert to host for string conversion
-            fprintf(stderr, "[TRANSPORT] conn_state_->local_ip = 0x%08x\n", conn_state_->local_ip);
-            fflush(stderr);
             uint32_t local_ip_h = ntohl(conn_state_->local_ip);
             snprintf(local_ip_str, sizeof(local_ip_str), "%u.%u.%u.%u",
                      (local_ip_h >> 24) & 0xFF, (local_ip_h >> 16) & 0xFF,
@@ -327,15 +322,10 @@ struct TransportProcess {
                      (local_ip_h >> 24) & 0xFF, (local_ip_h >> 16) & 0xFF,
                      (local_ip_h >> 8) & 0xFF);
             snprintf(netmask_str, sizeof(netmask_str), "255.255.255.0");
-            fprintf(stderr, "[TRANSPORT] Initializing stack: local=%s gateway=%s\n", local_ip_str, gateway_ip_str);
-            fflush(stderr);
             try {
                 stack_.init(local_ip_str, gateway_ip_str, netmask_str, conn_state_->local_mac);
-                fprintf(stderr, "[TRANSPORT] Stack initialized successfully\n");
-                fflush(stderr);
             } catch (const std::exception& e) {
                 fprintf(stderr, "[TRANSPORT] Stack init exception: %s\n", e.what());
-                fflush(stderr);
                 return false;
             }
         }
@@ -343,25 +333,18 @@ struct TransportProcess {
         // Step 1: TCP handshake via IPC rings
         // This uses the userspace TCP stack to send SYN, receive SYN-ACK, send ACK
         if (!perform_tcp_handshake_via_ipc(target_host, target_port)) {
-            fprintf(stderr, "[TRANSPORT] TCP handshake failed\n");
             return false;
         }
         conn_state_->set_handshake_tcp_ready();
-        printf("[TRANSPORT] TCP connected\n");
 
         // Step 2: TLS handshake (skip if using NoSSLPolicy)
         if (!perform_tls_handshake_via_ipc(target_host)) {
-            fprintf(stderr, "[TRANSPORT] TLS handshake failed\n");
             return false;
         }
         conn_state_->set_handshake_tls_ready();
-        printf("[TRANSPORT] TLS connected\n");
 
         // NOTE: Application protocol handshakes (WebSocket upgrade, HTTP, etc.)
         // are handled by upstream processes via MSG_OUTBOX/MSG_INBOX after tls_ready
-
-        fprintf(stderr, "[TRANSPORT] TCP/TLS handshake complete (RTO=%lu cycles)\n", rto_cycles_);
-        fflush(stderr);
         return true;
     }
 
@@ -422,7 +405,6 @@ struct TransportProcess {
         rto_cycles_ = (ZeroCopyRetransmitQueue::DEFAULT_RTO_US * tsc_freq) / 1000000;
         ack_timeout_cycles_ = (ACK_TIMEOUT_US * tsc_freq) / 1000000;
 
-        printf("[TRANSPORT] Initialized (RTO=%lu cycles, ACK_TIMEOUT=%lu cycles)\n", rto_cycles_, ack_timeout_cycles_);
         return true;
     }
 
@@ -431,8 +413,6 @@ struct TransportProcess {
     // ========================================================================
 
     void run() {
-        printf("[TRANSPORT] Starting main loop\n");
-
         // Mark ourselves as ready so XDP Poll can start processing
         conn_state_->set_ready(PROC_TRANSPORT);
 
@@ -502,7 +482,6 @@ struct TransportProcess {
             loop_id++;
         }
 
-        printf("[TRANSPORT] Main loop ended\n");
     }
 
     // ========================================================================
@@ -511,6 +490,7 @@ struct TransportProcess {
 
     uint32_t process_rx() {
         uint32_t rx_count = 0;
+        uint32_t payload_frames = 0;  // Frames with payload (added to SSL view ring)
         bool out_of_order = false;
 
         // Use process_manually() with lambda for batched processing
@@ -559,14 +539,6 @@ struct TransportProcess {
                     conn_state_->remote_port);
 
                 if (!parsed.valid) {
-                    // Debug: hexdump first 64 bytes (limited to 10 occurrences)
-                    static int invalid_count = 0;
-                    if (invalid_count++ < 10) {
-                        fprintf(stderr, "[TRANSPORT] Invalid packet len=%u: ", desc.frame_len);
-                        for (uint16_t i = 0; i < desc.frame_len && i < 64; i++)
-                            fprintf(stderr, "%02x", frame[i]);
-                        fprintf(stderr, "\n");
-                    }
                     return true;
                 }
 
@@ -575,13 +547,43 @@ struct TransportProcess {
                     process_ack(parsed.ack, parsed.window);
                 }
 
-                // Check sequence number
-                if (parsed.seq != conn_state_->rcv_nxt) {
-                    out_of_order = true;
-                    return true;
+                // Check sequence number for out-of-order detection
+                if (parsed.payload_len > 0) {
+                    int32_t seq_diff = static_cast<int32_t>(parsed.seq - conn_state_->rcv_nxt);
+
+                    if (seq_diff > 0) {
+                        // GAP detected: segment ahead of expected
+
+                        // Skip if we already sent an OOO ACK for this frame
+                        if (desc.acked) {
+                            return true;  // Continue without triggering another ACK
+                        }
+
+                        // Buffer UMEM pointer (zero-copy - frame NOT committed, UMEM stays valid)
+                        if (!ooo_buffer_.is_buffered(parsed.seq)) {
+                            ooo_buffer_.buffer_segment(parsed.seq,
+                                                       static_cast<uint16_t>(parsed.payload_len),
+                                                       reinterpret_cast<const uint8_t*>(parsed.payload));
+                        }
+                        out_of_order = true;
+                        desc.acked = 1;  // Mark frame so we don't send another ACK on reprocess
+                        // Continue processing - UMEMs stay valid until commit_manually()
+                        // Don't add to SSL view yet (stored in OOO buffer above)
+                        return true;
+                    } else if (seq_diff < 0) {
+                        // Duplicate or overlapping segment
+                        int32_t overlap = -seq_diff;
+                        if (static_cast<size_t>(overlap) >= parsed.payload_len) {
+                            return true;  // Entire segment is duplicate, skip
+                        }
+                        // Partial overlap - adjust payload
+                        parsed.payload += overlap;
+                        parsed.payload_len -= overlap;
+                        parsed.seq = conn_state_->rcv_nxt;
+                    }
                 }
 
-                // Update rcv_nxt (plain assignment - Transport only)
+                // Update rcv_nxt using actual payload length for in-order data
                 conn_state_->rcv_nxt += parsed.payload_len;
 
                 // Append encrypted view to ring buffer for SSL decryption (zero-copy: points to UMEM)
@@ -591,9 +593,22 @@ struct TransportProcess {
                         fprintf(stderr, "[FATAL] SSL view ring buffer overflow - aborting\n");
                         std::abort();
                     }
+                    payload_frames++;  // Track frames with payload for commit logic
+                    packets_since_ack_++;  // Only count payload packets for ACK threshold
+
+                    // Check OOO buffer for now-in-order segments
+                    ooo_buffer_.try_deliver(conn_state_->rcv_nxt,
+                        [this](const uint8_t* data, uint16_t offset, uint16_t len) {
+                            if (ssl_policy_.append_encrypted_view(data + offset, len) != 0) {
+                                fprintf(stderr, "[FATAL] SSL view ring buffer overflow (OOO) - aborting\n");
+                                std::abort();
+                            }
+                            return true;
+                        });
                 }
 
-                packets_since_ack_++;
+                // Note: packets_since_ack_ only incremented for payload packets (above)
+                // Don't ACK pure ACKs - prevents ACK storm
 
                 // Mark frame as consumed for XDP Poll to reclaim
                 desc.consumed = 1;
@@ -608,7 +623,17 @@ struct TransportProcess {
             ssl_read_to_msg_inbox();
         }
 
-        raw_inbox_cons_->commit_manually();
+        // Commit frames - for SSL, frames should only be released after SSL has consumed
+        // For NoSSLPolicy, read() immediately consumes all data, safe to commit
+        // For real SSL (TLS), we defer commit until SSL has no partial data pending
+        if constexpr (std::is_same_v<SSLPolicy, ssl::NoSSLPolicy>) {
+            // NoSSL: immediate commit (no decryption delay)
+            raw_inbox_cons_->commit_manually();
+        } else {
+            // Real SSL: defer commit until SSL has consumed all data from frames
+            rx_frames_pending_ += payload_frames;
+            commit_rx_consumed();
+        }
 
         // Out of order - send duplicate ACK for fast retransmit
         if (out_of_order) {
@@ -616,6 +641,24 @@ struct TransportProcess {
         }
 
         return rx_count;
+    }
+
+    // Helper: Commit RX frames after SSL has fully consumed from view ring
+    // Only commits when SSL has no partial data pending (needs more frames to decrypt)
+    void commit_rx_consumed() {
+        if (rx_frames_pending_ == 0) {
+            return;
+        }
+
+        // Key insight: if SSL has no partial view, it has consumed all the data
+        // it can from the current frames. Safe to commit and release to XDP Poll.
+        //
+        // For NoSSLPolicy: read() immediately consumes all data, has_partial_view() = false
+        // For real SSL: has_partial_view() = true if mid-TLS-record (needs more data)
+        if (!ssl_policy_.has_partial_view()) {
+            raw_inbox_cons_->commit_manually();
+            rx_frames_pending_ = 0;
+        }
     }
 
     void ssl_read_to_msg_inbox() {
@@ -708,10 +751,6 @@ struct TransportProcess {
             if constexpr (Type == TxType::MSG) return *raw_outbox_prod_;
             else return *pong_outbox_prod_;
         }();
-        auto& alloc_pos = [this]() -> std::atomic<uint64_t>& {
-            if constexpr (Type == TxType::MSG) return conn_state_->tx_frame.msg_alloc_pos;
-            else return conn_state_->tx_frame.pong_alloc_pos;
-        }();
         auto& rtx_queue = [this]() -> ZeroCopyRetransmitQueue& {
             if constexpr (Type == TxType::MSG) return msg_retransmit_queue_;
             else return pong_retransmit_queue_;
@@ -760,13 +799,14 @@ struct TransportProcess {
                 }
 
                 // ZERO-COPY TX: Allocate frame FIRST (need UMEM address for output buffer)
-                uint32_t frame_idx;
+                // FrameAllocResult contains both frame_idx and alloc_pos for retransmit tracking
+                FrameAllocResult alloc_result;
                 if constexpr (Type == TxType::MSG) {
-                    frame_idx = allocate_msg_frame();
+                    alloc_result = allocate_msg_frame();
                 } else {
-                    frame_idx = allocate_pong_frame();
+                    alloc_result = allocate_pong_frame();
                 }
-                if (frame_idx == UINT32_MAX) {
+                if (!alloc_result.success()) {
                     fprintf(stderr, "[TRANSPORT] FATAL: %s frame pool exhausted\n", type_name);
                     std::abort();
                 }
@@ -775,7 +815,7 @@ struct TransportProcess {
                 constexpr size_t HEADER_LEN = userspace_stack::ETH_HEADER_LEN +
                                               userspace_stack::IP_HEADER_LEN +
                                               userspace_stack::TCP_HEADER_MIN_LEN;
-                uint64_t umem_addr = frame_idx_to_addr(frame_idx, frame_size_);
+                uint64_t umem_addr = frame_idx_to_addr(alloc_result.frame_idx, frame_size_);
                 uint8_t* frame = umem_area_ + umem_addr;
                 uint8_t* payload_ptr = frame + HEADER_LEN;
                 size_t payload_capacity = frame_size_ - HEADER_LEN;
@@ -809,7 +849,7 @@ struct TransportProcess {
 
                 // Build headers + add to retransmit queue
                 auto [umem_addr_ret, frame_len] = prepare_encrypted_packet(
-                    frame_idx, encrypted_len, alloc_pos, rtx_queue);
+                    alloc_result.frame_idx, encrypted_len, alloc_result.alloc_pos, rtx_queue);
 
                 // Write descriptor to output ring (different descriptor types)
                 int64_t out_seq = batch_start + slot_idx;
@@ -862,7 +902,7 @@ struct TransportProcess {
     std::pair<uint64_t, uint16_t> prepare_encrypted_packet(
             uint32_t frame_idx,
             size_t encrypted_len,
-            std::atomic<uint64_t>& alloc_pos,
+            uint64_t alloc_pos_val,  // The actual allocation position (pre-increment value)
             ZeroCopyRetransmitQueue& rtx_queue) {
         // HFT DESIGN DECISION: Abort on buffer full
         if (rtx_queue.size() >= ZeroCopyRetransmitQueue::MAX_SEGMENTS) {
@@ -872,9 +912,6 @@ struct TransportProcess {
 
         // ZERO-COPY TX: Encrypted payload already written to UMEM by SSL_write
         // Just need to build headers in-place (no payload copy)
-        constexpr size_t HEADER_LEN = userspace_stack::ETH_HEADER_LEN +
-                                      userspace_stack::IP_HEADER_LEN +
-                                      userspace_stack::TCP_HEADER_MIN_LEN;
         uint64_t umem_addr = frame_idx_to_addr(frame_idx, frame_size_);
         uint8_t* frame = umem_area_ + umem_addr;
 
@@ -898,8 +935,7 @@ struct TransportProcess {
         // Update snd_nxt BEFORE adding to retransmit queue
         conn_state_->snd_nxt = seq_end;
 
-        // Add to retransmit queue
-        uint64_t alloc_pos_val = alloc_pos.load(std::memory_order_relaxed);
+        // Add to retransmit queue (alloc_pos_val is the actual frame allocation position)
         uint64_t now_tsc = rdtsc();
 
         RetransmitSegmentRef ref;
@@ -1144,6 +1180,13 @@ struct TransportProcess {
     // Frame Allocation
     // ========================================================================
 
+    // Return type for frame allocation (frame_idx and alloc_pos for retransmit tracking)
+    struct FrameAllocResult {
+        uint32_t frame_idx;
+        uint64_t alloc_pos;
+        bool success() const { return frame_idx != UINT32_MAX; }
+    };
+
     uint32_t allocate_ack_frame() {
         uint32_t pos = conn_state_->tx_frame.ack_alloc_pos.fetch_add(1, std::memory_order_relaxed);
         uint32_t rel = conn_state_->tx_frame.ack_release_pos.load(std::memory_order_acquire);
@@ -1154,24 +1197,24 @@ struct TransportProcess {
         return ACK_POOL_START + (pos % ACK_FRAMES);
     }
 
-    uint32_t allocate_pong_frame() {
-        uint32_t pos = conn_state_->tx_frame.pong_alloc_pos.fetch_add(1, std::memory_order_relaxed);
-        uint32_t rel = conn_state_->tx_frame.pong_release_pos.load(std::memory_order_acquire);
+    FrameAllocResult allocate_pong_frame() {
+        uint64_t pos = conn_state_->tx_frame.pong_alloc_pos.fetch_add(1, std::memory_order_relaxed);
+        uint64_t rel = conn_state_->tx_frame.pong_release_pos.load(std::memory_order_acquire);
         if (pos - rel >= PONG_FRAMES) {
             conn_state_->tx_frame.pong_alloc_pos.fetch_sub(1, std::memory_order_relaxed);
-            return UINT32_MAX;
+            return {UINT32_MAX, 0};
         }
-        return PONG_POOL_START + (pos % PONG_FRAMES);
+        return {static_cast<uint32_t>(PONG_POOL_START + (pos % PONG_FRAMES)), pos};
     }
 
-    uint32_t allocate_msg_frame() {
-        uint32_t pos = conn_state_->tx_frame.msg_alloc_pos.fetch_add(1, std::memory_order_relaxed);
-        uint32_t rel = conn_state_->tx_frame.msg_release_pos.load(std::memory_order_acquire);
+    FrameAllocResult allocate_msg_frame() {
+        uint64_t pos = conn_state_->tx_frame.msg_alloc_pos.fetch_add(1, std::memory_order_relaxed);
+        uint64_t rel = conn_state_->tx_frame.msg_release_pos.load(std::memory_order_acquire);
         if (pos - rel >= MSG_FRAMES) {
             conn_state_->tx_frame.msg_alloc_pos.fetch_sub(1, std::memory_order_relaxed);
-            return UINT32_MAX;
+            return {UINT32_MAX, 0};
         }
-        return MSG_POOL_START + (pos % MSG_FRAMES);
+        return {static_cast<uint32_t>(MSG_POOL_START + (pos % MSG_FRAMES)), pos};
     }
 
     // ========================================================================
@@ -1202,24 +1245,16 @@ private:
      * Uses UserspaceStack to build/parse packets, IPC rings for I/O
      */
     bool perform_tcp_handshake_via_ipc(const char* target_host, uint16_t target_port) {
-        fprintf(stderr, "[TRANSPORT] TCP handshake to %s:%u via IPC\n", target_host, target_port);
-        fflush(stderr);
-
         // Resolve hostname to IP
         struct addrinfo hints = {}, *res = nullptr;
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
         int gai_ret = getaddrinfo(target_host, nullptr, &hints, &res);
         if (gai_ret != 0 || !res) {
-            fprintf(stderr, "[TRANSPORT] DNS resolution failed: %s\n", gai_strerror(gai_ret));
             return false;
         }
         uint32_t remote_ip = ntohl(reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr.s_addr);
         freeaddrinfo(res);
-        fprintf(stderr, "[TRANSPORT] Resolved %s to %u.%u.%u.%u\n", target_host,
-               (remote_ip >> 24) & 0xFF, (remote_ip >> 16) & 0xFF,
-               (remote_ip >> 8) & 0xFF, remote_ip & 0xFF);
-        fflush(stderr);
 
         // Initialize TCP params
         tcp_params_.remote_ip = remote_ip;
@@ -1237,36 +1272,23 @@ private:
         conn_state_->remote_port = target_port;
         conn_state_->remote_ip = htonl(remote_ip);
 
-        fprintf(stderr, "[TRANSPORT] TCP params: local=%u.%u.%u.%u:%u remote=%u.%u.%u.%u:%u ISN=%u\n",
-               (tcp_params_.local_ip >> 24) & 0xFF, (tcp_params_.local_ip >> 16) & 0xFF,
-               (tcp_params_.local_ip >> 8) & 0xFF, tcp_params_.local_ip & 0xFF, tcp_params_.local_port,
-               (tcp_params_.remote_ip >> 24) & 0xFF, (tcp_params_.remote_ip >> 16) & 0xFF,
-               (tcp_params_.remote_ip >> 8) & 0xFF, tcp_params_.remote_ip & 0xFF, tcp_params_.remote_port,
-               tcp_params_.snd_nxt);
-        fflush(stderr);
-
         // Allocate frame for SYN
-        uint32_t syn_frame_idx = allocate_msg_frame();
-        if (syn_frame_idx == UINT32_MAX) {
-            fprintf(stderr, "[TRANSPORT] Failed to allocate SYN frame\n");
+        auto syn_alloc = allocate_msg_frame();
+        if (!syn_alloc.success()) {
             return false;
         }
-        uint64_t syn_addr = frame_idx_to_addr(syn_frame_idx, frame_size_);
+        uint64_t syn_addr = frame_idx_to_addr(syn_alloc.frame_idx, frame_size_);
         uint8_t* syn_buffer = umem_area_ + syn_addr;
 
         // Build SYN packet
         size_t syn_len = stack_.build_syn(syn_buffer, frame_size_, tcp_params_);
         if (syn_len == 0) {
-            fprintf(stderr, "[TRANSPORT] Failed to build SYN packet\n");
             return false;
         }
-        fprintf(stderr, "[TRANSPORT] Built SYN packet (len=%zu)\n", syn_len);
-        fflush(stderr);
 
         // Send SYN via RAW_OUTBOX
         int64_t syn_seq = raw_outbox_prod_->try_claim();
         if (syn_seq < 0) {
-            fprintf(stderr, "[TRANSPORT] Failed to claim RAW_OUTBOX slot for SYN\n");
             return false;
         }
         auto& syn_desc = (*raw_outbox_prod_)[syn_seq];
@@ -1277,10 +1299,8 @@ private:
         syn_desc.consumed = 0;
         raw_outbox_prod_->publish(syn_seq);
         tcp_params_.snd_nxt++;  // SYN consumes 1 seq
-        fprintf(stderr, "[TRANSPORT] SYN sent, waiting for SYN-ACK...\n");
-        fflush(stderr);
 
-        // Wait for SYN-ACK via RAW_INBOX
+        // Wait for SYN-ACK via RAW_INBOX using process_manually()
         auto start = std::chrono::steady_clock::now();
         constexpr int timeout_ms = 5000;
         bool got_synack = false;
@@ -1289,41 +1309,41 @@ private:
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
             if (elapsed >= timeout_ms) {
-                fprintf(stderr, "[TRANSPORT] SYN-ACK timeout after %ldms\n", elapsed);
                 return false;
             }
 
-            UMEMFrameDescriptor rx_desc;
-            if (raw_inbox_cons_->try_consume(rx_desc)) {
-                uint8_t* frame = umem_area_ + rx_desc.umem_addr;
-                auto parsed = stack_.parse_tcp(frame, rx_desc.frame_len,
-                                               tcp_params_.local_port,
-                                               tcp_params_.remote_ip,
-                                               tcp_params_.remote_port);
-                if (parsed.valid && (parsed.flags & userspace_stack::TCP_FLAG_SYN) &&
-                    (parsed.flags & userspace_stack::TCP_FLAG_ACK)) {
-                    // Got SYN-ACK
-                    fprintf(stderr, "[TRANSPORT] Received SYN-ACK (seq=%u ack=%u)\n", parsed.seq, parsed.ack);
-                    fflush(stderr);
-                    tcp_params_.rcv_nxt = parsed.seq + 1;  // SYN consumes 1 seq
-                    tcp_params_.snd_una = parsed.ack;
-                    conn_state_->rcv_nxt = tcp_params_.rcv_nxt;
-                    conn_state_->snd_una = tcp_params_.snd_una;
-                    conn_state_->snd_nxt = tcp_params_.snd_nxt;
-                    conn_state_->peer_recv_window = parsed.window;
-                    got_synack = true;
-                } else if (parsed.valid) {
-                    fprintf(stderr, "[TRANSPORT] Got unexpected packet flags=0x%02x\n", parsed.flags);
-                    fflush(stderr);
-                }
+            raw_inbox_cons_->process_manually(
+                [&](UMEMFrameDescriptor& rx_desc, int64_t) -> bool {
+                    uint8_t* frame = umem_area_ + rx_desc.umem_addr;
+                    auto parsed = stack_.parse_tcp(frame, rx_desc.frame_len,
+                                                   tcp_params_.local_port,
+                                                   tcp_params_.remote_ip,
+                                                   tcp_params_.remote_port);
+                    if (parsed.valid && (parsed.flags & userspace_stack::TCP_FLAG_SYN) &&
+                        (parsed.flags & userspace_stack::TCP_FLAG_ACK)) {
+                        // Got SYN-ACK
+                        tcp_params_.rcv_nxt = parsed.seq + 1;  // SYN consumes 1 seq
+                        tcp_params_.snd_una = parsed.ack;
+                        conn_state_->rcv_nxt = tcp_params_.rcv_nxt;
+                        conn_state_->snd_una = tcp_params_.snd_una;
+                        conn_state_->snd_nxt = tcp_params_.snd_nxt;
+                        conn_state_->peer_recv_window = parsed.window;
+                        got_synack = true;
+                    }
+                    return true;  // Continue processing, commit this frame
+                }, 1);  // Process one frame at a time
+
+            // Always commit after processing - TCP handshake doesn't need SSL, safe to release UMEM
+            raw_inbox_cons_->commit_manually();
+
+            if (!got_synack) {
+                usleep(100);
             }
-            usleep(100);
         }
 
         // Send ACK to complete 3-way handshake
         uint32_t ack_frame_idx = allocate_ack_frame();
         if (ack_frame_idx == UINT32_MAX) {
-            fprintf(stderr, "[TRANSPORT] Failed to allocate ACK frame\n");
             return false;
         }
         uint64_t ack_addr = frame_idx_to_addr(ack_frame_idx, frame_size_);
@@ -1331,13 +1351,11 @@ private:
 
         size_t ack_len = stack_.build_ack(ack_buffer, frame_size_, tcp_params_);
         if (ack_len == 0) {
-            fprintf(stderr, "[TRANSPORT] Failed to build ACK packet\n");
             return false;
         }
 
         int64_t ack_seq = ack_outbox_prod_->try_claim();
         if (ack_seq < 0) {
-            fprintf(stderr, "[TRANSPORT] Failed to claim ACK_OUTBOX slot\n");
             return false;
         }
         auto& ack_desc = (*ack_outbox_prod_)[ack_seq];
@@ -1349,9 +1367,6 @@ private:
         ack_desc.consumed = 0;
         ack_outbox_prod_->publish(ack_seq);
 
-        fprintf(stderr, "[TRANSPORT] TCP ESTABLISHED (snd_nxt=%u rcv_nxt=%u)\n",
-               tcp_params_.snd_nxt, tcp_params_.rcv_nxt);
-        fflush(stderr);
         return true;
     }
 
@@ -1362,25 +1377,32 @@ private:
     bool perform_tls_handshake_via_ipc(const char* target_host) {
         // NoSSLPolicy: skip TLS handshake entirely (plain TCP)
         if constexpr (std::is_same_v<SSLPolicy, NoSSLPolicy>) {
-            fprintf(stderr, "[TRANSPORT] NoSSL mode - skipping TLS handshake\n");
-            fflush(stderr);
+            rx_frames_pending_ = 0;
             return true;
-        }
+        } else {
 
-        fprintf(stderr, "[TRANSPORT] TLS handshake to %s via IPC\n", target_host);
-        fflush(stderr);
+        // Initialize handshake RX buffer
+        handshake_rx_len_ = 0;
+        handshake_rx_appended_ = 0;
+
+        // Initialize OOO buffer
+        ooo_buffer_.clear();
 
         // Initialize SSL policy with zero-copy BIO (creates context and SSL object)
         ssl_policy_.init_zero_copy_bio();
 
+        rx_frames_pending_ = 0;
+
         // Set SNI (Server Name Indication)
 #ifdef SSL_POLICY_WOLFSSL
-        wolfSSL_UseSNI(ssl_policy_.ssl(), WOLFSSL_SNI_HOST_NAME,
+        wolfSSL_UseSNI(ssl_policy_.ssl_, WOLFSSL_SNI_HOST_NAME,
                        target_host, static_cast<unsigned short>(strlen(target_host)));
+#else
+        // OpenSSL/LibreSSL SNI
+        SSL_set_tlsext_host_name(ssl_policy_.ssl_, target_host);
 #endif
 
-        // Allocate a handshake output buffer in UMEM
-        // This buffer will be used for all handshake TX operations
+        // Allocate a handshake output buffer
         uint8_t handshake_out_buf[4096];
         ssl_policy_.set_encrypted_output(handshake_out_buf, sizeof(handshake_out_buf));
 
@@ -1388,87 +1410,111 @@ private:
         auto start = std::chrono::steady_clock::now();
         constexpr int timeout_ms = 10000;
         bool handshake_complete = false;
+        int iteration = 0;
 
         while (!handshake_complete) {
+            iteration++;
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
             if (elapsed >= timeout_ms) {
-                fprintf(stderr, "[TRANSPORT] TLS handshake timeout after %ldms\n", elapsed);
                 ssl_policy_.clear_encrypted_output();
                 return false;
             }
 
-            // Try to advance handshake
 #ifdef SSL_POLICY_WOLFSSL
             int ret = wolfSSL_connect(ssl_policy_.ssl_);
+
             if (ret == WOLFSSL_SUCCESS) {
                 handshake_complete = true;
                 break;
             }
 
             int err = wolfSSL_get_error(ssl_policy_.ssl_, ret);
+
             if (err == WOLFSSL_ERROR_WANT_READ) {
-                // Need to receive data from network
                 if (!tls_handshake_recv()) {
                     usleep(100);
                 }
             } else if (err == WOLFSSL_ERROR_WANT_WRITE) {
-                // Need to send data to network
                 tls_handshake_send_from_buffer(handshake_out_buf);
             } else {
-                char err_buf[256];
-                wolfSSL_ERR_error_string(err, err_buf);
-                fprintf(stderr, "[TRANSPORT] TLS handshake error: %s (err=%d)\n", err_buf, err);
                 ssl_policy_.clear_encrypted_output();
                 return false;
             }
 #else
-            fprintf(stderr, "[TRANSPORT] TLS handshake requires WolfSSL\n");
-            ssl_policy_.clear_encrypted_output();
-            return false;
+            // OpenSSL/LibreSSL handshake
+            int ret = SSL_do_handshake(ssl_policy_.ssl_);
+
+            if (ret == 1) {
+                handshake_complete = true;
+                break;
+            }
+
+            int err = SSL_get_error(ssl_policy_.ssl_, ret);
+            size_t pending_out = ssl_policy_.encrypted_output_len();
+
+            if (err == SSL_ERROR_WANT_READ) {
+                // First, send any pending output data before waiting for input
+                if (pending_out > 0) {
+                    tls_handshake_send_from_buffer(handshake_out_buf);
+                }
+                if (!tls_handshake_recv()) {
+                    usleep(100);
+                }
+            } else if (err == SSL_ERROR_WANT_WRITE) {
+                tls_handshake_send_from_buffer(handshake_out_buf);
+            } else {
+                ssl_policy_.clear_encrypted_output();
+                return false;
+            }
 #endif
 
             // Always check for pending outbound data and send it
             tls_handshake_send_from_buffer(handshake_out_buf);
         }
 
+        // Final commit: when handshake succeeds, SSL has consumed all needed data
+        raw_inbox_cons_->commit_manually();
         ssl_policy_.clear_encrypted_output();
-        fprintf(stderr, "[TRANSPORT] TLS handshake complete\n");
-        fflush(stderr);
+
+        rx_frames_pending_ = 0;
+
         return true;
+        } // else (SSL policies)
     }
 
     // Helper: Send pending encrypted data via IPC during TLS handshake
-    // Uses the handshake output buffer, copies to UMEM frame, then sends
     bool tls_handshake_send_from_buffer(uint8_t* handshake_buf) {
-        // NoSSLPolicy: no TLS handshake data to send
         if constexpr (std::is_same_v<SSLPolicy, NoSSLPolicy>) {
             (void)handshake_buf;
             return false;
         } else {
         size_t pending = ssl_policy_.encrypted_output_len();
-        if (pending == 0) return false;
+        if (pending == 0) {
+            return false;
+        }
 
-        // Allocate frame and build TCP packet
-        uint32_t frame_idx = allocate_msg_frame();
-        if (frame_idx == UINT32_MAX) return false;
+        auto alloc = allocate_msg_frame();
+        if (!alloc.success()) {
+            return false;
+        }
 
-        uint64_t addr = frame_idx_to_addr(frame_idx, frame_size_);
+        uint64_t addr = frame_idx_to_addr(alloc.frame_idx, frame_size_);
         uint8_t* frame = umem_area_ + addr;
 
-        // During handshake, encrypted data is in the handshake buffer
-        // Copy to UMEM frame and build packet
         size_t frame_len = stack_.build_data(frame, frame_size_, tcp_params_,
                                               handshake_buf, pending);
-        if (frame_len == 0) return false;
+        if (frame_len == 0) {
+            return false;
+        }
 
-        // Reset output buffer position for next handshake message
-        // (clear_encrypted_output would clear the pointer, we just want to reset len)
-        ssl_policy_.out_buf_len_ = 0;
-
-        // Publish to RAW_OUTBOX
         int64_t seq = raw_outbox_prod_->try_claim();
-        if (seq < 0) return false;
+        if (seq < 0) {
+            return false;
+        }
+
+        ssl_policy_.reset_encrypted_output_len();
+
         auto& desc = (*raw_outbox_prod_)[seq];
         desc.umem_addr = addr;
         desc.frame_len = static_cast<uint16_t>(frame_len);
@@ -1479,44 +1525,112 @@ private:
 
         tcp_params_.snd_nxt += pending;
         conn_state_->snd_nxt = tcp_params_.snd_nxt;
+
         return true;
         }  // else (real SSL policy)
     }
 
     // Helper: Receive encrypted data via IPC during TLS handshake
+    // During handshake, we COPY data to a buffer (handshake is small and infrequent)
     bool tls_handshake_recv() {
-        UMEMFrameDescriptor rx_desc;
-        if (!raw_inbox_cons_->try_consume(rx_desc)) return false;
+        bool got_data = false;
 
-        uint8_t* frame = umem_area_ + rx_desc.umem_addr;
-        auto parsed = stack_.parse_tcp(frame, rx_desc.frame_len,
-                                        tcp_params_.local_port,
-                                        tcp_params_.remote_ip,
-                                        tcp_params_.remote_port);
-        if (!parsed.valid) return false;
+        raw_inbox_cons_->process_manually(
+            [&](UMEMFrameDescriptor& desc, int64_t) -> bool {
+                uint8_t* frame = umem_area_ + desc.umem_addr;
 
-        // Update ACK tracking
-        if (parsed.flags & userspace_stack::TCP_FLAG_ACK) {
-            tcp_params_.snd_una = parsed.ack;
-            conn_state_->snd_una = parsed.ack;
-        }
+                auto parsed = stack_.parse_tcp(frame, desc.frame_len,
+                                                tcp_params_.local_port,
+                                                tcp_params_.remote_ip,
+                                                tcp_params_.remote_port);
 
-        // Update receive sequence
-        if (parsed.payload_len > 0) {
-            tcp_params_.rcv_nxt += parsed.payload_len;
-            conn_state_->rcv_nxt = tcp_params_.rcv_nxt;
-            // Append encrypted view for SSL to read during handshake
-            if (ssl_policy_.append_encrypted_view(
-                    reinterpret_cast<const uint8_t*>(parsed.payload), parsed.payload_len) != 0) {
-                fprintf(stderr, "[FATAL] SSL view ring buffer overflow during handshake - aborting\n");
+                if (!parsed.valid) {
+                    return true;  // Skip invalid, continue to next
+                }
+
+                // Update ACK tracking
+                if (parsed.flags & userspace_stack::TCP_FLAG_ACK) {
+                    tcp_params_.snd_una = parsed.ack;
+                    conn_state_->snd_una = parsed.ack;
+                }
+
+                if (parsed.payload_len > 0) {
+                    int32_t seq_diff = static_cast<int32_t>(parsed.seq - tcp_params_.rcv_nxt);
+
+                    if (seq_diff > 0) {
+                        // GAP: segment ahead of expected - buffer UMEM pointer
+                        if (!ooo_buffer_.is_buffered(parsed.seq)) {
+                            ooo_buffer_.buffer_segment(parsed.seq,
+                                                       static_cast<uint16_t>(parsed.payload_len),
+                                                       parsed.payload);
+                        }
+                        send_ack_during_handshake();
+                        return false;  // Don't commit - UMEM stays valid
+                    } else if (seq_diff < 0) {
+                        int32_t overlap = -seq_diff;
+                        if (static_cast<size_t>(overlap) >= parsed.payload_len) {
+                            send_ack_during_handshake();
+                            return true;  // Duplicate, skip
+                        }
+                        // Partial overlap - skip duplicate part
+                        parsed.payload += overlap;
+                        parsed.payload_len -= overlap;
+                        parsed.seq = tcp_params_.rcv_nxt;
+                    }
+
+                    tcp_params_.rcv_nxt += parsed.payload_len;
+                    conn_state_->rcv_nxt = tcp_params_.rcv_nxt;
+
+                    // Copy to handshake buffer
+                    size_t space = sizeof(handshake_rx_buf_) - handshake_rx_len_;
+                    if (parsed.payload_len > space) {
+                        fprintf(stderr, "[FATAL] Handshake RX buffer overflow\n");
+                        std::abort();
+                    }
+                    memcpy(handshake_rx_buf_ + handshake_rx_len_, parsed.payload, parsed.payload_len);
+                    handshake_rx_len_ += parsed.payload_len;
+                    got_data = true;
+
+                    // Check OOO buffer for now-in-order segments
+                    ooo_buffer_.try_deliver(tcp_params_.rcv_nxt,
+                        [this](const uint8_t* data, uint16_t offset, uint16_t len) {
+                            size_t space = sizeof(handshake_rx_buf_) - handshake_rx_len_;
+                            if (len > space) {
+                                fprintf(stderr, "[FATAL] OOO: Handshake buffer overflow\n");
+                                std::abort();
+                            }
+                            memcpy(handshake_rx_buf_ + handshake_rx_len_, data + offset, len);
+                            handshake_rx_len_ += len;
+                            conn_state_->rcv_nxt = tcp_params_.rcv_nxt;
+                            return true;
+                        });
+
+                    // Only send ACK when we received payload data (don't ACK pure ACKs)
+                    send_ack_during_handshake();
+                }
+
+                // No ACK for pure ACK frames (payload_len == 0) - prevents ACK storm
+                return true;  // Continue processing more frames
+            }, 16);  // Process up to 16 frames per call
+
+        raw_inbox_cons_->commit_manually();
+
+        // Append new data to SSL view ring
+        size_t new_data = handshake_rx_len_ - handshake_rx_appended_;
+        if (new_data > 0) {
+            uint8_t* new_data_ptr = handshake_rx_buf_ + handshake_rx_appended_;
+            if (ssl_policy_.append_encrypted_view(new_data_ptr, new_data) != 0) {
+                fprintf(stderr, "[FATAL] SSL view ring buffer overflow during handshake\n");
                 std::abort();
             }
-            // Send ACK
-            send_ack_during_handshake();
+            handshake_rx_appended_ = handshake_rx_len_;
         }
 
-        return parsed.payload_len > 0;
+        return got_data;
     }
+
+    // NOTE: Handshake commit is now done immediately in tls_handshake_recv()
+    // because we copy TLS data to a stable buffer, allowing immediate frame release.
 
     // Helper: Send ACK during handshake
     void send_ack_during_handshake() {
@@ -1611,6 +1725,23 @@ private:
     ZeroCopyRetransmitQueue pong_retransmit_queue_;  // PONG frames
     uint64_t rto_cycles_ = 0;          // Calculated from TSC frequency in init()
     uint64_t ack_timeout_cycles_ = 0;  // Calculated from TSC frequency in init()
+
+    // Handshake RX buffer - used to copy TLS data during handshake
+    // This allows immediate frame commit while keeping data valid for SSL
+    // Size: 32KB is enough for typical TLS 1.3 handshake (< 16KB)
+    static constexpr size_t HANDSHAKE_RX_BUF_SIZE = 32768;
+    uint8_t handshake_rx_buf_[HANDSHAKE_RX_BUF_SIZE];
+    size_t handshake_rx_len_ = 0;              // Total data length in buffer
+    size_t handshake_rx_appended_ = 0;         // How much has been appended to SSL view
+
+    // Out-of-order (OOO) buffer for TCP segment reordering
+    // Zero-copy: stores UMEM pointers, frames stay valid until batch commit
+    // process_manually() returns true for all frames -> UMEMs valid until commit_manually()
+    using OOOBuffer = userspace_stack::ZeroCopyTCPReorderBuffer<const uint8_t*>;
+    OOOBuffer ooo_buffer_;
+
+    // RX frame lifecycle - track frames pending SSL consumption in main loop
+    size_t rx_frames_pending_ = 0;
 
     // IP identification counter for outgoing packets
     uint16_t ip_id_ = 0;

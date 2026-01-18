@@ -6,7 +6,7 @@
 # - Uses dedicated test interface ONLY (default: enp108s0)
 # - NEVER modifies default route or other interfaces
 # - ProtonVPN and other interfaces remain untouched
-# - 3-minute watchdog timeout to auto-cleanup on hang
+# - 1-minute watchdog timeout to auto-cleanup on hang
 # - AF_XDP zero-copy mode with device-bound BPF
 #
 # Usage: ./scripts/test_xdp.sh [OPTIONS] <test_source|selftest> [test_args...]
@@ -17,7 +17,7 @@
 #
 # Options:
 #   -i, --interface IFACE   Network interface (default: enp108s0)
-#   -t, --timeout SECS      Watchdog timeout (default: 180 = 3 minutes)
+#   -t, --timeout SECS      Watchdog timeout (default: 60 = 1 minute)
 #   --reload                Reload NIC driver before setup
 #   --skip-clock-sync       Skip NIC clock synchronization
 #   -h, --help              Show help
@@ -37,14 +37,20 @@ set -e
 # ============================================================================
 
 INTERFACE="enp108s0"
-TIMEOUT=180  # 3 minutes default
+TIMEOUT=60   # 1 minute default
 RELOAD_DRIVER=false
 SKIP_CLOCK_SYNC=false
+HIDE_LOG=true   # Default: hide terminal output, log to file only
+LOG_DIR="./log"
+LOG_FILE=""
 TEST_SOURCE=""
 TEST_ARGS=()
 
 # Echo server configuration
 ECHO_SERVER_IP="139.162.79.171"
+HTTP_TARGET_HOST="nginx.org"
+HTTP_TARGET_IP=""  # Resolved at runtime for HTTP tests
+HTTP_TARGET_PORT=80
 ECHO_SERVER_PORT="12345"
 
 # Paths
@@ -54,10 +60,17 @@ BPF_OBJ="src/xdp/bpf/exchange_filter.bpf.o"
 
 # State
 ECHO_ROUTE_ADDED=false
+HTTP_ROUTE_ADDED=false
 GATEWAY_IP=""
 WATCHDOG_PID=""
 TEST_PID=""
+
+# Original interface settings (saved before xdp_prepare modifies them)
 ORIGINAL_QUEUES=""
+ORIGINAL_GRO=""
+ORIGINAL_LRO=""
+ORIGINAL_RX_USECS=""
+ORIGINAL_TX_USECS=""
 
 # Colors
 RED='\033[0;31m'
@@ -91,6 +104,55 @@ die() {
     exit 1
 }
 
+# Setup automatic logging to file
+# Always creates log file; --hide-log suppresses terminal output but prints start/done
+setup_logging() {
+    # Skip logging for selftest
+    if [[ "$TEST_SOURCE" == "selftest" ]]; then
+        return
+    fi
+
+    # Create log directory
+    mkdir -p "$LOG_DIR"
+
+    # Derive log filename from test source (basename only)
+    local test_basename
+    test_basename=$(basename "$TEST_SOURCE")
+    LOG_FILE="$LOG_DIR/${test_basename}.log"
+
+    if [[ "$HIDE_LOG" == "true" ]]; then
+        # Print start message to terminal before redirecting
+        echo "[START] $TEST_SOURCE -> $LOG_FILE"
+        # Save original stdout (fd 3) for done message
+        exec 3>&1
+        # Redirect stdout and stderr to log file only (no terminal output)
+        exec > "$LOG_FILE" 2>&1
+    else
+        # Redirect stdout and stderr to tee with line buffering (stdbuf -oL)
+        # This ensures output is flushed after each line
+        exec > >(stdbuf -oL tee "$LOG_FILE") 2>&1
+    fi
+
+    echo ""
+    echo "=========================================="
+    echo "  Log started: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "  Test: $TEST_SOURCE"
+    echo "  Log file: $LOG_FILE"
+    echo "=========================================="
+    echo ""
+}
+
+# Print done message to terminal when using --hide-log
+print_done_message() {
+    if [[ "$HIDE_LOG" == "true" && -n "$LOG_FILE" ]]; then
+        if [[ $1 -eq 0 ]]; then
+            echo "[DONE] PASS - $LOG_FILE" >&3
+        else
+            echo "[DONE] FAIL (exit $1) - $LOG_FILE" >&3
+        fi
+    fi
+}
+
 # ============================================================================
 # Usage
 # ============================================================================
@@ -108,9 +170,11 @@ Commands:
 
 Options:
   -i, --interface IFACE   Network interface (default: enp108s0)
-  -t, --timeout SECS      Watchdog timeout (default: 180 = 3 minutes)
+  -t, --timeout SECS      Watchdog timeout (default: 60 = 1 minute)
   --reload                Reload NIC driver before setup
   --skip-clock-sync       Skip NIC clock synchronization
+  --show-log              Show output on terminal (default: hidden, logs saved to ./log/<test>.log)
+  --hide-log              Hide terminal output (default behavior)
   -h, --help              Show help
 
 Examples:
@@ -151,6 +215,14 @@ parse_args() {
                 ;;
             --skip-clock-sync)
                 SKIP_CLOCK_SYNC=true
+                shift
+                ;;
+            --show-log)
+                HIDE_LOG=false
+                shift
+                ;;
+            --hide-log)
+                HIDE_LOG=true
                 shift
                 ;;
             -h|--help)
@@ -275,6 +347,61 @@ is_xdp_driver() {
 }
 
 # ============================================================================
+# Interface Settings Functions
+# ============================================================================
+
+# Save original interface settings before xdp_prepare modifies them
+save_interface_settings() {
+    log_info "Saving original interface settings for $INTERFACE..."
+
+    # Save queue count
+    ORIGINAL_QUEUES=$(ethtool -l "$INTERFACE" 2>/dev/null | grep -A 5 "Current hardware settings" | grep "Combined:" | awk '{print $2}')
+
+    # Save GRO/LRO state
+    ORIGINAL_GRO=$(ethtool -k "$INTERFACE" 2>/dev/null | grep "generic-receive-offload:" | awk '{print $2}')
+    ORIGINAL_LRO=$(ethtool -k "$INTERFACE" 2>/dev/null | grep "large-receive-offload:" | awk '{print $2}')
+
+    # Save coalescing
+    ORIGINAL_RX_USECS=$(ethtool -c "$INTERFACE" 2>/dev/null | grep "^rx-usecs:" | awk '{print $2}')
+    ORIGINAL_TX_USECS=$(ethtool -c "$INTERFACE" 2>/dev/null | grep "^tx-usecs:" | awk '{print $2}')
+
+    log_ok "Saved: queues=$ORIGINAL_QUEUES, gro=$ORIGINAL_GRO, lro=$ORIGINAL_LRO, rx-usecs=$ORIGINAL_RX_USECS, tx-usecs=$ORIGINAL_TX_USECS"
+}
+
+# Restore original interface settings after XDP cleanup
+restore_interface_settings() {
+    log_info "Restoring original interface settings for $INTERFACE..."
+
+    # Restore queue count
+    if [[ -n "$ORIGINAL_QUEUES" && "$ORIGINAL_QUEUES" != "1" ]]; then
+        sudo ethtool -L "$INTERFACE" combined "$ORIGINAL_QUEUES" 2>/dev/null || true
+        log_ok "Restored queue count to $ORIGINAL_QUEUES"
+    fi
+
+    # Restore GRO
+    if [[ -n "$ORIGINAL_GRO" && "$ORIGINAL_GRO" == "on" ]]; then
+        sudo ethtool -K "$INTERFACE" gro on 2>/dev/null || true
+        log_ok "Restored GRO to on"
+    fi
+
+    # Restore LRO
+    if [[ -n "$ORIGINAL_LRO" && "$ORIGINAL_LRO" == "on" ]]; then
+        sudo ethtool -K "$INTERFACE" lro on 2>/dev/null || true
+        log_ok "Restored LRO to on"
+    fi
+
+    # Restore coalescing (only if was non-zero)
+    if [[ -n "$ORIGINAL_RX_USECS" && "$ORIGINAL_RX_USECS" != "0" ]]; then
+        sudo ethtool -C "$INTERFACE" rx-usecs "$ORIGINAL_RX_USECS" 2>/dev/null || true
+    fi
+    if [[ -n "$ORIGINAL_TX_USECS" && "$ORIGINAL_TX_USECS" != "0" ]]; then
+        sudo ethtool -C "$INTERFACE" tx-usecs "$ORIGINAL_TX_USECS" 2>/dev/null || true
+    fi
+
+    log_ok "Interface settings restored"
+}
+
+# ============================================================================
 # Watchdog Functions
 # ============================================================================
 
@@ -318,6 +445,25 @@ watchdog_process() {
 
         # Force cleanup XDP
         sudo ip link set "$interface" xdp off 2>/dev/null || true
+
+        # Force restore interface settings
+        echo -e "${YELLOW}Restoring interface settings...${NC}"
+        if [[ -n "$ORIGINAL_QUEUES" && "$ORIGINAL_QUEUES" != "1" ]]; then
+            sudo ethtool -L "$interface" combined "$ORIGINAL_QUEUES" 2>/dev/null || true
+        fi
+        if [[ "$ORIGINAL_GRO" == "on" ]]; then
+            sudo ethtool -K "$interface" gro on 2>/dev/null || true
+        fi
+        if [[ "$ORIGINAL_LRO" == "on" ]]; then
+            sudo ethtool -K "$interface" lro on 2>/dev/null || true
+        fi
+        if [[ -n "$ORIGINAL_RX_USECS" && "$ORIGINAL_RX_USECS" != "0" ]]; then
+            sudo ethtool -C "$interface" rx-usecs "$ORIGINAL_RX_USECS" 2>/dev/null || true
+        fi
+        if [[ -n "$ORIGINAL_TX_USECS" && "$ORIGINAL_TX_USECS" != "0" ]]; then
+            sudo ethtool -C "$interface" tx-usecs "$ORIGINAL_TX_USECS" 2>/dev/null || true
+        fi
+        echo -e "${GREEN}Interface settings restored${NC}"
     fi
 }
 
@@ -443,9 +589,17 @@ run_selftest() {
     echo ""
     echo "--- XDP Attach/Detach Cycle Test ---"
 
-    # Save original queue count
-    ORIGINAL_QUEUES=$(ethtool -l "$INTERFACE" 2>/dev/null | grep -A 5 "Current hardware settings" | grep "Combined:" | awk '{print $2}')
-    echo "        Original queue count: $ORIGINAL_QUEUES"
+    # Save all original interface settings
+    save_interface_settings
+
+    echo ""
+    echo "--- Saved Interface State ---"
+    echo "  Queues:     $ORIGINAL_QUEUES"
+    echo "  GRO:        $ORIGINAL_GRO"
+    echo "  LRO:        $ORIGINAL_LRO"
+    echo "  RX-usecs:   $ORIGINAL_RX_USECS"
+    echo "  TX-usecs:   $ORIGINAL_TX_USECS"
+    echo ""
 
     run_check "Set NIC to 1 queue" "sudo ethtool -L $INTERFACE combined 1"
 
@@ -490,11 +644,63 @@ run_selftest() {
         sudo rmdir "$bpf_pin_dir" 2>/dev/null || true
     fi
 
-    # Restore original queue count
+    # Restore original interface settings
+    restore_interface_settings
+
+    echo ""
+    echo "--- Verifying Restored State ---"
+    local current_queues
+    local current_gro
+    local current_lro
+    current_queues=$(ethtool -l "$INTERFACE" 2>/dev/null | grep -A 5 "Current" | grep "Combined:" | awk '{print $2}')
+    current_gro=$(ethtool -k "$INTERFACE" 2>/dev/null | grep "generic-receive-offload:" | awk '{print $2}')
+    current_lro=$(ethtool -k "$INTERFACE" 2>/dev/null | grep "large-receive-offload:" | awk '{print $2}')
+
+    run_check "Queue count restored ($ORIGINAL_QUEUES)" "[[ \"$current_queues\" == \"$ORIGINAL_QUEUES\" ]]"
+    run_check "GRO restored ($ORIGINAL_GRO)" "[[ \"$current_gro\" == \"$ORIGINAL_GRO\" ]]"
+    run_check "LRO restored ($ORIGINAL_LRO)" "[[ \"$current_lro\" == \"$ORIGINAL_LRO\" ]]"
+
+    echo ""
+    echo "--- Watchdog Restoration Test ---"
+    echo "        Simulating watchdog timeout scenario..."
+
+    # Modify interface settings (like xdp_prepare does)
+    sudo ethtool -L "$INTERFACE" combined 1 2>/dev/null || true
+    if [[ "$ORIGINAL_GRO" == "on" ]]; then
+        sudo ethtool -K "$INTERFACE" gro off 2>/dev/null || true
+    fi
+
+    echo "        Modified: queues=1, gro=off"
+
+    # Simulate watchdog inline restoration (same code as in watchdog_process)
+    echo "        Running watchdog restoration logic..."
     if [[ -n "$ORIGINAL_QUEUES" && "$ORIGINAL_QUEUES" != "1" ]]; then
-        echo "        Restoring queue count to $ORIGINAL_QUEUES"
         sudo ethtool -L "$INTERFACE" combined "$ORIGINAL_QUEUES" 2>/dev/null || true
     fi
+    if [[ "$ORIGINAL_GRO" == "on" ]]; then
+        sudo ethtool -K "$INTERFACE" gro on 2>/dev/null || true
+    fi
+    if [[ "$ORIGINAL_LRO" == "on" ]]; then
+        sudo ethtool -K "$INTERFACE" lro on 2>/dev/null || true
+    fi
+    if [[ -n "$ORIGINAL_RX_USECS" && "$ORIGINAL_RX_USECS" != "0" ]]; then
+        sudo ethtool -C "$INTERFACE" rx-usecs "$ORIGINAL_RX_USECS" 2>/dev/null || true
+    fi
+    if [[ -n "$ORIGINAL_TX_USECS" && "$ORIGINAL_TX_USECS" != "0" ]]; then
+        sudo ethtool -C "$INTERFACE" tx-usecs "$ORIGINAL_TX_USECS" 2>/dev/null || true
+    fi
+
+    # Verify watchdog restoration worked
+    local wd_queues
+    local wd_gro
+    local wd_lro
+    wd_queues=$(ethtool -l "$INTERFACE" 2>/dev/null | grep -A 5 "Current" | grep "Combined:" | awk '{print $2}')
+    wd_gro=$(ethtool -k "$INTERFACE" 2>/dev/null | grep "generic-receive-offload:" | awk '{print $2}')
+    wd_lro=$(ethtool -k "$INTERFACE" 2>/dev/null | grep "large-receive-offload:" | awk '{print $2}')
+
+    run_check "Watchdog: queue count restored ($ORIGINAL_QUEUES)" "[[ \"$wd_queues\" == \"$ORIGINAL_QUEUES\" ]]"
+    run_check "Watchdog: GRO restored ($ORIGINAL_GRO)" "[[ \"$wd_gro\" == \"$ORIGINAL_GRO\" ]]"
+    run_check "Watchdog: LRO restored ($ORIGINAL_LRO)" "[[ \"$wd_lro\" == \"$ORIGINAL_LRO\" ]]"
 
     echo ""
     echo "========================================"
@@ -536,13 +742,17 @@ map_test_source() {
             TEST_BIN="build/test_pipeline_xdp_poll_tcp"
             MAKE_TARGET="build-test-pipeline-xdp-poll-tcp"
             ;;
-        01_xdp_poll_ping)
+        00_xdp_poll_ping)
             TEST_BIN="build/test_pipeline_xdp_poll_ping"
             MAKE_TARGET="build-test-pipeline-xdp-poll-ping"
             ;;
         10_transport_tcp)
             TEST_BIN="build/test_pipeline_transport_tcp"
             MAKE_TARGET="build-test-pipeline-transport-tcp"
+            ;;
+        11_transport_http)
+            TEST_BIN="build/test_pipeline_transport_http"
+            MAKE_TARGET="build-test-pipeline-transport-http"
             ;;
         *)
             # Generic pattern: NN_name.cpp -> test_pipeline_name
@@ -563,6 +773,19 @@ build_test() {
 
     log_info "Building test: $MAKE_TARGET"
 
+    # Determine SSL library flags based on test name
+    local SSL_FLAGS=""
+    if [[ "$MAKE_TARGET" == *"wolfssl"* ]]; then
+        SSL_FLAGS="USE_WOLFSSL=1"
+        log_info "Detected WolfSSL test, adding USE_WOLFSSL=1"
+    elif [[ "$MAKE_TARGET" == *"libressl"* ]]; then
+        SSL_FLAGS="USE_LIBRESSL=1"
+        log_info "Detected LibreSSL test, adding USE_LIBRESSL=1"
+    elif [[ "$MAKE_TARGET" == *"openssl"* ]]; then
+        SSL_FLAGS="USE_OPENSSL=1"
+        log_info "Detected OpenSSL test, adding USE_OPENSSL=1"
+    fi
+
     # Build BPF first if needed
     if [[ ! -f "$BPF_OBJ" ]]; then
         log_info "Building BPF program first..."
@@ -570,7 +793,7 @@ build_test() {
     fi
 
     # Build test binary (as normal user, no sudo)
-    make "$MAKE_TARGET" USE_XDP=1 XDP_INTERFACE="$INTERFACE" || die "Failed to build test: $MAKE_TARGET"
+    make "$MAKE_TARGET" USE_XDP=1 XDP_INTERFACE="$INTERFACE" $SSL_FLAGS || die "Failed to build test: $MAKE_TARGET"
 
     log_ok "Test binary built: $TEST_BIN"
 }
@@ -609,33 +832,24 @@ get_gateway() {
 }
 
 setup_echo_route() {
-    log_info "Setting up route to echo server via $INTERFACE..."
+    # NEVER add routes - they bypass VPN policy routing and trigger kill switch
+    # Traffic will use default VPN routing (safe)
+    log_info "Using default routing for echo server $ECHO_SERVER_IP (VPN-safe)"
+    ECHO_ROUTE_ADDED=false
+}
 
-    # Check if route already exists
-    if ip route show "$ECHO_SERVER_IP" 2>/dev/null | grep -q "$INTERFACE"; then
-        log_ok "Route to echo server already exists"
-        ECHO_ROUTE_ADDED=false
-        return 0
+# Resolve HTTP target hostname for HTTP tests (no route added - VPN-safe)
+setup_http_route() {
+    # Resolve hostname to IPv4 (XDP stack only supports IPv4)
+    HTTP_TARGET_IP=$(getent ahostsv4 "$HTTP_TARGET_HOST" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
+    if [[ -z "$HTTP_TARGET_IP" ]]; then
+        log_warn "Could not resolve $HTTP_TARGET_HOST"
+        return 1
     fi
-
-    if ! get_gateway; then
-        log_warn "Skipping route setup (no gateway)"
-        return 0
-    fi
-
-    # Add route with high metric (low priority)
-    if sudo ip route add "$ECHO_SERVER_IP/32" via "$GATEWAY_IP" dev "$INTERFACE" metric 9999 2>/dev/null; then
-        ECHO_ROUTE_ADDED=true
-        log_ok "Route to echo server added via $GATEWAY_IP (metric 9999)"
-    else
-        # Check if it was added anyway
-        if ip route show "$ECHO_SERVER_IP" 2>/dev/null | grep -q "$INTERFACE"; then
-            log_ok "Route already exists"
-            ECHO_ROUTE_ADDED=false
-        else
-            log_warn "Could not add route to echo server"
-        fi
-    fi
+    # NEVER add routes - they bypass VPN policy routing and trigger kill switch
+    # Traffic will use default VPN routing (safe)
+    log_info "Using default routing for $HTTP_TARGET_HOST ($HTTP_TARGET_IP) (VPN-safe)"
+    HTTP_ROUTE_ADDED=false
 }
 
 run_xdp_prepare() {
@@ -746,13 +960,10 @@ cleanup() {
         sudo ip link set dev "$INTERFACE" xdp off 2>/dev/null || true
     fi
 
-    # Remove echo server route if we added it
-    if [[ "$ECHO_ROUTE_ADDED" == "true" ]]; then
-        if ip route show "$ECHO_SERVER_IP" 2>/dev/null | grep -q "$INTERFACE"; then
-            log_info "Removing route to $ECHO_SERVER_IP..."
-            sudo ip route del "$ECHO_SERVER_IP" dev "$INTERFACE" 2>/dev/null || true
-        fi
-    fi
+    # Restore interface settings (queues, GRO, LRO, coalescing)
+    restore_interface_settings
+
+    # NOTE: Routes are no longer added (VPN-safe), so no route cleanup needed
 
     # Verify connectivity
     if ping -c 1 -W 2 1.1.1.1 &>/dev/null; then
@@ -771,6 +982,9 @@ cleanup() {
 main() {
     # Parse arguments
     parse_args "$@"
+
+    # Setup automatic logging (before any output)
+    setup_logging
 
     # Safety: must not run as root
     check_not_root
@@ -824,9 +1038,19 @@ main() {
         make bpf USE_XDP=1 XDP_INTERFACE="$INTERFACE" || die "Failed to build BPF program"
     fi
 
+    # Save interface settings before xdp_prepare modifies them
+    save_interface_settings
+
     run_xdp_prepare
     run_clock_sync
-    setup_echo_route
+
+    # Set up route based on test type (HTTP tests need different routing)
+    if [[ "$TEST_SOURCE" == *"http"* ]]; then
+        setup_http_route
+    else
+        setup_echo_route
+    fi
+
     build_test
     set_capabilities
     prepare_shm
@@ -845,8 +1069,13 @@ main() {
     echo "--- Interface State ---"
     ip addr show dev "$INTERFACE" 2>/dev/null | grep -E "inet |state " || true
     echo ""
-    echo "--- Route to Echo Server ---"
-    ip route show "$ECHO_SERVER_IP" 2>/dev/null || echo "(no route)"
+    if [[ "$TEST_SOURCE" == *"http"* ]]; then
+        echo "--- Route to HTTP Target ($HTTP_TARGET_IP) ---"
+        ip route show "$HTTP_TARGET_IP" 2>/dev/null || echo "(no route)"
+    else
+        echo "--- Route to Echo Server ---"
+        ip route show "$ECHO_SERVER_IP" 2>/dev/null || echo "(no route)"
+    fi
     echo ""
 
     # Run test
@@ -888,6 +1117,9 @@ main() {
 
     # Stop watchdog (test completed before timeout)
     stop_watchdog
+
+    # Print done message to terminal (for --hide-log mode)
+    print_done_message $TEST_RESULT
 
     # Cleanup via trap
     exit $TEST_RESULT

@@ -1,0 +1,1354 @@
+// test/pipeline/11_transport_http.cpp
+// Test TransportProcess<NoSSLPolicy> with XDP Poll against plain HTTP
+//
+// Usage: ./test_pipeline_transport_http <interface> <bpf_path> <ignored> <ignored>
+// (Called by scripts/test_xdp.sh 11_transport_http.cpp)
+//
+// This test:
+// - Forks XDP Poll process (core 2) and Transport process (core 4)
+// - Connects to nginx.org on port 80 (plain HTTP, hardcoded)
+// - Sends HTTP GET requests every 0.5s until 3 messages sent OR 5 seconds elapsed
+// - Verifies HTTP 200 responses via MSG_METADATA
+// - Verifies HTTP/1.1 keep-alive: all requests must use the same connection
+// - Verifies responses in MSG_INBOX are in series (not mixed out of order)
+// - Waits 2 seconds after sending, then checks ringbuffer consumer caught up
+// - Verifies response is complete (contains full HTML like curl output)
+//
+// Safety: Uses dedicated test interface, never touches default route
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <csignal>
+#include <atomic>
+#include <chrono>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <net/if.h>
+#include <arpa/inet.h>
+#include <sys/ioctl.h>
+#include <netdb.h>
+
+#ifdef USE_XDP
+
+#define DEBUG 0
+#define DEBUG_IPC 0
+
+// pipeline_data.hpp must be included FIRST as it includes disruptor headers
+// before pipeline_config.hpp to avoid CACHE_LINE_SIZE macro conflict
+#include "../../src/pipeline/pipeline_data.hpp"
+#include "../../src/pipeline/xdp_poll_process.hpp"
+#include "../../src/pipeline/transport_process.hpp"
+#include "../../src/pipeline/msg_inbox.hpp"
+#include "../../src/policy/ssl.hpp"  // NoSSLPolicy
+
+using namespace websocket::pipeline;
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+namespace {
+
+// CPU core assignments for latency-critical processes
+constexpr int XDP_POLL_CPU_CORE = 2;
+constexpr int TRANSPORT_CPU_CORE = 4;
+
+// Test parameters
+constexpr int MAX_MESSAGES = 3;                            // Max HTTP requests to send
+constexpr int TIMEOUT_SECONDS = 5;                         // Total timeout
+constexpr int SEND_INTERVAL_MS = 500;                      // Send every 0.5s
+constexpr int FINAL_DRAIN_MS = 2000;                       // Wait 2s after sending to check ringbuffer
+
+// Hardcoded target (ignores script args)
+static constexpr const char* HTTP_HOST = "nginx.org";
+static constexpr uint16_t HTTP_PORT = 80;
+
+// HTTP request format
+static const char* HTTP_REQUEST =
+    "GET / HTTP/1.1\r\n"
+    "Host: nginx.org\r\n"
+    "User-Agent: xdp-test/1.0\r\n"
+    "Connection: keep-alive\r\n"
+    "\r\n";
+
+// Test configuration
+std::string g_local_ip;  // Detected from interface
+
+// Global shutdown flag
+std::atomic<bool> g_shutdown{false};
+
+void signal_handler(int) {
+    g_shutdown.store(true, std::memory_order_release);
+}
+
+// Pin current process to specified CPU core with SCHED_FIFO priority
+void pin_to_cpu(int core) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core, &cpuset);
+    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
+        fprintf(stderr, "[CPU] WARNING: Failed to pin to core %d: %s\n", core, strerror(errno));
+        return;
+    }
+
+    struct sched_param param = {};
+    param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+    if (sched_setscheduler(0, SCHED_FIFO, &param) != 0) {
+        fprintf(stderr, "[CPU] WARNING: Failed to set SCHED_FIFO on core %d: %s\n", core, strerror(errno));
+    }
+
+    fprintf(stderr, "[CPU] Pinned to core %d\n", core);
+}
+
+uint64_t get_monotonic_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + ts.tv_nsec;
+}
+
+// TSC frequency calibration
+double g_tsc_freq_ghz = 0.0;
+
+void calibrate_tsc() {
+    uint64_t start_tsc = rdtsc();
+    uint64_t start_ns = get_monotonic_ns();
+    usleep(100000);  // 100ms
+    uint64_t end_tsc = rdtsc();
+    uint64_t end_ns = get_monotonic_ns();
+
+    uint64_t elapsed_tsc = end_tsc - start_tsc;
+    uint64_t elapsed_ns = end_ns - start_ns;
+    g_tsc_freq_ghz = static_cast<double>(elapsed_tsc) / static_cast<double>(elapsed_ns);
+    printf("[TSC] Calibrated: %.3f GHz (%.3f cycles/ns)\n", g_tsc_freq_ghz, g_tsc_freq_ghz);
+}
+
+// Resolve hostname to IP at runtime
+std::string resolve_hostname(const char* hostname) {
+    struct addrinfo hints = {}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(hostname, nullptr, &hints, &res) != 0 || !res) {
+        fprintf(stderr, "FAIL: Cannot resolve %s\n", hostname);
+        return "";
+    }
+
+    auto* addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr);
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
+    freeaddrinfo(res);
+
+    printf("Resolved %s -> %s\n", hostname, ip_str);
+    return ip_str;
+}
+
+}  // namespace
+
+// ============================================================================
+// IPC Ring Creation
+// ============================================================================
+
+class IPCRingManager {
+public:
+    IPCRingManager() {
+        time_t now = time(nullptr);
+        struct tm* tm_info = localtime(&now);
+        char timestamp[32];
+        strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);
+        ipc_ring_dir_ = std::string("transport_http_test_") + timestamp;
+    }
+
+    ~IPCRingManager() {
+        cleanup();
+    }
+
+    bool create_ring(const char* name, size_t buffer_size, size_t event_size, uint8_t max_consumers = 1) {
+        std::string base_path = std::string("/dev/shm/hft/") + ipc_ring_dir_ + "/" + name;
+        std::string hdr_path = base_path + ".hdr";
+        std::string dat_path = base_path + ".dat";
+
+        uint32_t producer_offset = hftshm::default_producer_offset();
+        uint32_t consumer_0_offset = hftshm::default_consumer_0_offset();
+        uint32_t header_size = hftshm::header_segment_size(max_consumers);
+
+        int hdr_fd = open(hdr_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (hdr_fd < 0) {
+            fprintf(stderr, "[IPC] Failed to create header: %s\n", hdr_path.c_str());
+            return false;
+        }
+        if (ftruncate(hdr_fd, header_size) < 0) {
+            close(hdr_fd);
+            return false;
+        }
+        void* hdr_ptr = mmap(nullptr, header_size, PROT_READ | PROT_WRITE, MAP_SHARED, hdr_fd, 0);
+        close(hdr_fd);
+        if (hdr_ptr == MAP_FAILED) return false;
+
+        hftshm::metadata_init(hdr_ptr, max_consumers, event_size, buffer_size,
+                              producer_offset, consumer_0_offset, header_size);
+
+        auto* cursor = reinterpret_cast<std::atomic<int64_t>*>(
+            static_cast<char*>(hdr_ptr) + producer_offset);
+        auto* published = reinterpret_cast<std::atomic<int64_t>*>(
+            static_cast<char*>(hdr_ptr) + producer_offset + hftshm::CACHE_LINE);
+        cursor->store(-1, std::memory_order_relaxed);
+        published->store(-1, std::memory_order_relaxed);
+
+        for (uint8_t i = 0; i < max_consumers; ++i) {
+            auto* cons_seq = reinterpret_cast<std::atomic<int64_t>*>(
+                static_cast<char*>(hdr_ptr) + consumer_0_offset + i * 2 * hftshm::CACHE_LINE);
+            cons_seq->store(-1, std::memory_order_relaxed);
+        }
+
+        munmap(hdr_ptr, header_size);
+
+        int dat_fd = open(dat_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (dat_fd < 0) {
+            fprintf(stderr, "[IPC] Failed to create data: %s\n", dat_path.c_str());
+            unlink(hdr_path.c_str());
+            return false;
+        }
+        if (ftruncate(dat_fd, buffer_size) < 0) {
+            close(dat_fd);
+            unlink(hdr_path.c_str());
+            return false;
+        }
+
+        void* dat_ptr = mmap(nullptr, buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, dat_fd, 0);
+        close(dat_fd);
+        if (dat_ptr == MAP_FAILED) {
+            unlink(hdr_path.c_str());
+            return false;
+        }
+        memset(dat_ptr, 0, buffer_size);
+        munmap(dat_ptr, buffer_size);
+
+        return true;
+    }
+
+    bool create_all_rings() {
+        mkdir("/dev/shm/hft", 0755);
+        std::string full_dir = "/dev/shm/hft/" + ipc_ring_dir_;
+        if (mkdir(full_dir.c_str(), 0755) < 0 && errno != EEXIST) {
+            fprintf(stderr, "[IPC] Failed to create directory: %s\n", full_dir.c_str());
+            return false;
+        }
+
+        // XDP Poll <-> Transport rings (all use UMEMFrameDescriptor for type unification)
+        if (!create_ring("raw_inbox", RAW_INBOX_SIZE * sizeof(UMEMFrameDescriptor),
+                         sizeof(UMEMFrameDescriptor), 1)) return false;
+        if (!create_ring("raw_outbox", RAW_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
+                         sizeof(UMEMFrameDescriptor), 1)) return false;
+        if (!create_ring("ack_outbox", ACK_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
+                         sizeof(UMEMFrameDescriptor), 1)) return false;
+        if (!create_ring("pong_outbox", PONG_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
+                         sizeof(UMEMFrameDescriptor), 1)) return false;
+
+        // Transport <-> Test (Parent) rings
+        if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
+                         sizeof(MsgOutboxEvent), 1)) return false;
+        if (!create_ring("msg_metadata", MSG_METADATA_SIZE * sizeof(MsgMetadata),
+                         sizeof(MsgMetadata), 1)) return false;
+        if (!create_ring("pongs", PONGS_SIZE * sizeof(PongFrameAligned),
+                         sizeof(PongFrameAligned), 1)) return false;
+
+        printf("[IPC] Created all ring files in %s\n", full_dir.c_str());
+        return true;
+    }
+
+    void cleanup() {
+        if (ipc_ring_dir_.empty()) return;
+
+        std::string base = "/dev/shm/hft/" + ipc_ring_dir_;
+        const char* ring_names[] = {
+            "raw_inbox", "raw_outbox", "ack_outbox", "pong_outbox",
+            "msg_outbox", "msg_metadata", "pongs"
+        };
+
+        for (const char* name : ring_names) {
+            unlink((base + "/" + name + ".hdr").c_str());
+            unlink((base + "/" + name + ".dat").c_str());
+        }
+        rmdir(base.c_str());
+    }
+
+    std::string get_ring_name(const char* ring) const {
+        return ipc_ring_dir_ + "/" + ring;
+    }
+
+private:
+    std::string ipc_ring_dir_;
+};
+
+// ============================================================================
+// Network Helpers
+// ============================================================================
+
+bool get_interface_mac(const char* interface, uint8_t* mac_out) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return false;
+
+    struct ifreq ifr = {};
+    strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+        close(fd);
+        return false;
+    }
+    close(fd);
+
+    memcpy(mac_out, ifr.ifr_hwaddr.sa_data, 6);
+    return true;
+}
+
+bool get_interface_ip(const char* interface, std::string& ip_out) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return false;
+
+    struct ifreq ifr = {};
+    strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
+    ifr.ifr_addr.sa_family = AF_INET;
+
+    if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
+        close(fd);
+        return false;
+    }
+    close(fd);
+
+    struct sockaddr_in* addr = (struct sockaddr_in*)&ifr.ifr_addr;
+    ip_out = inet_ntoa(addr->sin_addr);
+    return true;
+}
+
+bool get_gateway_mac(const char* interface, const char* gateway_ip, uint8_t* mac_out) {
+    FILE* fp = fopen("/proc/net/arp", "r");
+    if (!fp) return false;
+
+    char line[256];
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return false;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        char ip[64], hw_type[16], flags[16], mac_str[32], mask[16], dev[32];
+        if (sscanf(line, "%63s %15s %15s %31s %15s %31s",
+                   ip, hw_type, flags, mac_str, mask, dev) == 6) {
+            if (strcmp(ip, gateway_ip) == 0 && strcmp(dev, interface) == 0) {
+                unsigned int m[6];
+                if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                           &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                    for (int i = 0; i < 6; i++) mac_out[i] = (uint8_t)m[i];
+                    fclose(fp);
+                    return true;
+                }
+            }
+        }
+    }
+    fclose(fp);
+    return false;
+}
+
+bool get_default_gateway(const char* interface, std::string& gateway_out) {
+    FILE* fp = fopen("/proc/net/route", "r");
+    if (!fp) return false;
+
+    char line[256];
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return false;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        char iface[32];
+        unsigned int dest, gateway, flags;
+        if (sscanf(line, "%31s %x %x %x", iface, &dest, &gateway, &flags) >= 4) {
+            if (strcmp(iface, interface) == 0 && dest == 0 && gateway != 0) {
+                struct in_addr addr;
+                addr.s_addr = gateway;
+                gateway_out = inet_ntoa(addr);
+                fclose(fp);
+                return true;
+            }
+        }
+    }
+    fclose(fp);
+    return false;
+}
+
+// ============================================================================
+// Type Aliases
+// ============================================================================
+
+// Enable profiling
+static constexpr bool PROFILING_ENABLED = true;
+
+// XDP Poll Process types (with profiling enabled)
+using XDPPollType = XDPPollProcess<
+    IPCRingProducer<UMEMFrameDescriptor>,
+    IPCRingConsumer<UMEMFrameDescriptor>,
+    true,                                   // TrickleEnabled
+    PROFILING_ENABLED>;                     // Profiling
+
+// Transport Process types (with profiling enabled)
+// All outbox rings use UMEMFrameDescriptor for XDPPollProcess compatibility
+using TransportType = TransportProcess<
+    NoSSLPolicy,
+    IPCRingConsumer<UMEMFrameDescriptor>,  // RawInboxCons
+    IPCRingProducer<UMEMFrameDescriptor>,  // RawOutboxProd
+    IPCRingProducer<UMEMFrameDescriptor>,  // AckOutboxProd (unified type)
+    IPCRingProducer<UMEMFrameDescriptor>,  // PongOutboxProd (unified type)
+    IPCRingConsumer<MsgOutboxEvent>,       // MsgOutboxCons
+    IPCRingProducer<MsgMetadata>,          // MsgMetadataProd
+    IPCRingConsumer<PongFrameAligned>,     // PongsCons
+    PROFILING_ENABLED>;                    // Profiling
+
+// ============================================================================
+// Test Class
+// ============================================================================
+
+class TransportHTTPTest {
+public:
+    TransportHTTPTest(const char* interface, const char* bpf_path)
+        : interface_(interface), bpf_path_(bpf_path) {}
+
+    bool setup() {
+        printf("\n=== Setting up Transport HTTP Test ===\n");
+        printf("Interface:   %s\n", interface_);
+        printf("BPF Path:    %s\n", bpf_path_);
+
+        // Resolve HTTP target
+        http_target_ip_ = resolve_hostname(HTTP_HOST);
+        if (http_target_ip_.empty()) {
+            fprintf(stderr, "FAIL: Cannot resolve %s\n", HTTP_HOST);
+            return false;
+        }
+        printf("Target:      %s:%u (%s)\n\n", HTTP_HOST, HTTP_PORT, http_target_ip_.c_str());
+
+        calibrate_tsc();
+
+        // Get interface MAC
+        if (!get_interface_mac(interface_, local_mac_)) {
+            fprintf(stderr, "FAIL: Cannot get MAC address for %s\n", interface_);
+            return false;
+        }
+        printf("Local MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+               local_mac_[0], local_mac_[1], local_mac_[2],
+               local_mac_[3], local_mac_[4], local_mac_[5]);
+
+        // Get interface IP
+        if (!get_interface_ip(interface_, local_ip_)) {
+            fprintf(stderr, "FAIL: Cannot get IP address for %s\n", interface_);
+            return false;
+        }
+        printf("Local IP:  %s\n", local_ip_.c_str());
+        g_local_ip = local_ip_;
+
+        // Get gateway
+        if (!get_default_gateway(interface_, gateway_ip_)) {
+            fprintf(stderr, "FAIL: Cannot get gateway for %s\n", interface_);
+            return false;
+        }
+        printf("Gateway:   %s\n", gateway_ip_.c_str());
+
+        // Ping gateway to populate ARP cache
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "ping -c 1 -W 1 %s >/dev/null 2>&1", gateway_ip_.c_str());
+        [[maybe_unused]] int ping_ret = system(cmd);
+
+        if (!get_gateway_mac(interface_, gateway_ip_.c_str(), gateway_mac_)) {
+            fprintf(stderr, "FAIL: Cannot get gateway MAC for %s\n", gateway_ip_.c_str());
+            return false;
+        }
+        printf("Gateway MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+               gateway_mac_[0], gateway_mac_[1], gateway_mac_[2],
+               gateway_mac_[3], gateway_mac_[4], gateway_mac_[5]);
+
+        // NOTE: Route to HTTP target must be set up by the test script (test_xdp.sh)
+        // before running this binary. The script should detect HTTP tests and add
+        // a route for the resolved IP via the test interface gateway.
+        printf("HTTP Target IP: %s (route must be set by test script)\n", http_target_ip_.c_str());
+
+        // Create IPC rings
+        if (!ipc_manager_.create_all_rings()) {
+            fprintf(stderr, "FAIL: Cannot create IPC rings\n");
+            return false;
+        }
+
+        // Allocate UMEM (shared between processes via MAP_SHARED)
+        umem_size_ = UMEM_TOTAL_SIZE;
+        umem_area_ = mmap(nullptr, umem_size_,
+                         PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB,
+                         -1, 0);
+        if (umem_area_ == MAP_FAILED) {
+            printf("WARN: Huge pages not available, using regular pages\n");
+            umem_area_ = mmap(nullptr, umem_size_,
+                              PROT_READ | PROT_WRITE,
+                              MAP_SHARED | MAP_ANONYMOUS,
+                              -1, 0);
+            if (umem_area_ == MAP_FAILED) {
+                fprintf(stderr, "FAIL: Cannot allocate UMEM\n");
+                return false;
+            }
+        }
+        printf("UMEM: %p (%zu bytes)\n", umem_area_, umem_size_);
+
+        // Allocate MsgInbox (shared)
+        msg_inbox_ = static_cast<MsgInbox*>(
+            mmap(nullptr, sizeof(MsgInbox),
+                 PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_ANONYMOUS,
+                 -1, 0));
+        if (msg_inbox_ == MAP_FAILED) {
+            fprintf(stderr, "FAIL: Cannot allocate MsgInbox\n");
+            return false;
+        }
+        msg_inbox_->init();
+        printf("MsgInbox: %p\n", msg_inbox_);
+
+        // Allocate ConnStateShm (shared)
+        conn_state_ = static_cast<ConnStateShm*>(
+            mmap(nullptr, sizeof(ConnStateShm),
+                 PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_ANONYMOUS,
+                 -1, 0));
+        if (conn_state_ == MAP_FAILED) {
+            fprintf(stderr, "FAIL: Cannot allocate ConnStateShm\n");
+            return false;
+        }
+        conn_state_->init();
+
+        // Set target and network config in shared state (use resolved IP)
+        strncpy(conn_state_->target_host, http_target_ip_.c_str(), sizeof(conn_state_->target_host) - 1);
+        conn_state_->target_port = HTTP_PORT;
+        strncpy(conn_state_->bpf_path, bpf_path_, sizeof(conn_state_->bpf_path) - 1);
+        strncpy(conn_state_->interface_name, interface_, sizeof(conn_state_->interface_name) - 1);
+
+        // Set local IP in network byte order
+        struct in_addr addr;
+        inet_aton(local_ip_.c_str(), &addr);
+        conn_state_->local_ip = addr.s_addr;
+
+        // Set local MAC
+        memcpy(conn_state_->local_mac, local_mac_, 6);
+        memcpy(conn_state_->remote_mac, gateway_mac_, 6);
+
+        // Set TSC frequency
+        conn_state_->tsc_freq_hz = static_cast<uint64_t>(g_tsc_freq_ghz * 1e9);
+
+        printf("ConnStateShm: %p\n", conn_state_);
+
+        // Allocate ProfilingShm (shared between processes)
+        if constexpr (PROFILING_ENABLED) {
+            profiling_ = static_cast<ProfilingShm*>(
+                mmap(nullptr, sizeof(ProfilingShm),
+                     PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_ANONYMOUS,
+                     -1, 0));
+            if (profiling_ == MAP_FAILED) {
+                fprintf(stderr, "FAIL: Cannot allocate ProfilingShm (%zu bytes)\n", sizeof(ProfilingShm));
+                return false;
+            }
+            profiling_->init();
+            printf("ProfilingShm: %p (%zu bytes)\n", profiling_, sizeof(ProfilingShm));
+        }
+
+        // Open shared regions (after ring files created, before fork)
+        try {
+            raw_inbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_inbox"));
+            raw_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_outbox"));
+            ack_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("ack_outbox"));
+            pong_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pong_outbox"));
+            msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
+            msg_metadata_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata"));
+            pongs_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pongs"));
+        } catch (const std::exception& e) {
+            fprintf(stderr, "FAIL: Cannot open shared regions: %s\n", e.what());
+            return false;
+        }
+
+        printf("=== Setup Complete ===\n\n");
+        return true;
+    }
+
+    void teardown() {
+        printf("\n=== Teardown ===\n");
+
+        if (conn_state_) conn_state_->shutdown_all();
+        g_shutdown.store(true);
+
+        // Wait for child processes
+        if (xdp_pid_ > 0) {
+            kill(xdp_pid_, SIGTERM);
+            waitpid(xdp_pid_, nullptr, 0);
+        }
+        if (transport_pid_ > 0) {
+            kill(transport_pid_, SIGTERM);
+            waitpid(transport_pid_, nullptr, 0);
+        }
+
+        // Cleanup shared regions
+        delete raw_inbox_region_;
+        delete raw_outbox_region_;
+        delete ack_outbox_region_;
+        delete pong_outbox_region_;
+        delete msg_outbox_region_;
+        delete msg_metadata_region_;
+        delete pongs_region_;
+
+        if (conn_state_ && conn_state_ != MAP_FAILED) {
+            munmap(conn_state_, sizeof(ConnStateShm));
+        }
+        if (msg_inbox_ && msg_inbox_ != MAP_FAILED) {
+            munmap(msg_inbox_, sizeof(MsgInbox));
+        }
+        if (profiling_ && profiling_ != MAP_FAILED) {
+            munmap(profiling_, sizeof(ProfilingShm));
+        }
+        if (umem_area_ && umem_area_ != MAP_FAILED) {
+            munmap(umem_area_, umem_size_);
+        }
+
+        printf("=== Teardown Complete ===\n");
+    }
+
+    bool fork_processes() {
+        // Fork XDP Poll process
+        xdp_pid_ = fork();
+        if (xdp_pid_ < 0) {
+            fprintf(stderr, "FAIL: fork() for XDP Poll failed\n");
+            return false;
+        }
+
+        if (xdp_pid_ == 0) {
+            // Child: XDP Poll process
+            run_xdp_poll_process();
+            _exit(0);
+        }
+
+        printf("[PARENT] Forked XDP Poll process (PID %d)\n", xdp_pid_);
+
+        // Wait for XDP Poll to be ready
+        printf("[PARENT] Waiting for XDP Poll ready...\n");
+        if (!conn_state_->wait_for_handshake_xdp_ready(10000000)) {
+            fprintf(stderr, "FAIL: Timeout waiting for XDP Poll ready\n");
+            return false;
+        }
+        printf("[PARENT] XDP Poll ready\n");
+
+        // Fork Transport process
+        transport_pid_ = fork();
+        if (transport_pid_ < 0) {
+            fprintf(stderr, "FAIL: fork() for Transport failed\n");
+            return false;
+        }
+
+        if (transport_pid_ == 0) {
+            // Child: Transport process
+            run_transport_process();
+            _exit(0);
+        }
+
+        printf("[PARENT] Forked Transport process (PID %d)\n", transport_pid_);
+
+        // Wait for TCP handshake to complete (TLS skipped for NoSSLPolicy)
+        printf("[PARENT] Waiting for TCP handshake...\n");
+        auto start = std::chrono::steady_clock::now();
+        while (!conn_state_->is_handshake_tls_ready()) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (elapsed > 10000) {
+                fprintf(stderr, "FAIL: Timeout waiting for TCP handshake\n");
+                return false;
+            }
+            if (!conn_state_->is_running(PROC_TRANSPORT)) {
+                fprintf(stderr, "FAIL: Transport process exited during handshake\n");
+                return false;
+            }
+            usleep(1000);
+        }
+        printf("[PARENT] TCP handshake complete (TLS skipped for NoSSLPolicy)\n");
+
+        return true;
+    }
+
+    bool run_http_test() {
+        printf("\n--- HTTP GET Test (max %d msgs, %dms interval, %ds timeout) ---\n",
+               MAX_MESSAGES, SEND_INTERVAL_MS, TIMEOUT_SECONDS);
+
+        // Create producer/consumer for parent
+        IPCRingProducer<MsgOutboxEvent> msg_outbox_prod(*msg_outbox_region_);
+        IPCRingConsumer<MsgMetadata> msg_metadata_cons(*msg_metadata_region_);
+
+        int sent = 0;
+        int received_chunks = 0;     // Number of MSG_METADATA chunks received
+        int complete_responses = 0;  // Number of complete HTTP responses
+        size_t total_response_bytes = 0;
+        bool connection_closed = false;
+        bool keep_alive_working = true;  // Track if HTTP/1.1 keep-alive is maintained
+
+        // Response ordering tracking
+        // Track MSG_INBOX offsets to verify responses arrive in series (not mixed)
+        bool responses_in_order = true;
+        int current_response_num = 0;           // Which response we're currently receiving
+        uint32_t current_response_start = 0;    // MSG_INBOX offset where current response started
+        uint32_t last_chunk_end = 0;            // End offset of last chunk (start + len)
+        bool in_response = false;               // Are we currently in the middle of a response?
+
+        // Response size tracking - verify all responses are similar size
+        std::vector<size_t> response_sizes;
+        response_sizes.reserve(MAX_MESSAGES);
+
+        // Buffer to accumulate response for completeness check
+        std::string accumulated_response;
+        accumulated_response.reserve(1024 * 1024);  // Reserve 1MB
+
+        auto start_time = std::chrono::steady_clock::now();
+        auto last_send_time = start_time - std::chrono::seconds(1);  // Send immediately first time
+
+        size_t http_request_len = strlen(HTTP_REQUEST);
+
+        // Debug: print initial MSG_OUTBOX state
+        {
+            int64_t prod_seq = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
+            int64_t cons_seq = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+            printf("[DEBUG] Initial MSG_OUTBOX state: producer=%ld, consumer=%ld\n", prod_seq, cons_seq);
+        }
+
+        // Helper lambda to process received data
+        auto process_response_chunk = [&](const MsgMetadata& meta) {
+            if (meta.decrypted_len == 0) return;
+
+            total_response_bytes += meta.decrypted_len;
+            received_chunks++;
+
+            // Get data pointer
+            const char* data = reinterpret_cast<const char*>(msg_inbox_->data_at(meta.msg_inbox_offset));
+            uint32_t chunk_start = meta.msg_inbox_offset;
+            uint32_t chunk_end = chunk_start + meta.decrypted_len;
+
+            // Accumulate response for completeness check
+            accumulated_response.append(data, meta.decrypted_len);
+
+            // Extract first line (HTTP status) for logging
+            const char* eol = static_cast<const char*>(memchr(data, '\r', meta.decrypted_len));
+            size_t status_len = eol ? static_cast<size_t>(eol - data) : std::min<size_t>(meta.decrypted_len, 60);
+
+            // Check for HTTP response start (new response)
+            bool is_response_start = (meta.decrypted_len >= 12 && strncmp(data, "HTTP/1.", 7) == 0);
+
+            if (is_response_start) {
+                // Starting a new HTTP response
+                current_response_num++;
+                printf("[RECV] Response #%d start @ offset %u: %.*s\n",
+                       current_response_num, chunk_start, (int)status_len, data);
+
+                // Verify ordering: if we were in a previous response, it should have ended
+                if (in_response) {
+                    fprintf(stderr, "[ORDER] ERROR: Response #%d started before previous response ended!\n",
+                            current_response_num);
+                    fprintf(stderr, "[ORDER]   Previous response start: %u, last chunk end: %u\n",
+                            current_response_start, last_chunk_end);
+                    fprintf(stderr, "[ORDER]   New response start: %u\n", chunk_start);
+                    responses_in_order = false;
+                }
+
+                current_response_start = chunk_start;
+                in_response = true;
+
+                // Check for Connection: close header (would break keep-alive)
+                const char* conn_header = strstr(data, "Connection: close");
+                if (conn_header && (conn_header - data) < static_cast<ssize_t>(meta.decrypted_len)) {
+                    fprintf(stderr, "[WARN] Server sent 'Connection: close' - keep-alive may not work\n");
+                }
+            } else {
+                // Continuation chunk
+                printf("[RECV] Chunk %d @ offset %u: %u bytes\n", received_chunks, chunk_start, meta.decrypted_len);
+
+                // Verify ordering: chunk should follow previous chunk in sequence
+                if (in_response && chunk_start != last_chunk_end) {
+                    // Allow for some gap due to circular buffer wrapping, but flag if unexpected
+                    // In a proper implementation, chunks should be contiguous
+                    if (chunk_start < current_response_start) {
+                        fprintf(stderr, "[ORDER] ERROR: Chunk offset %u < response start %u (out of order)\n",
+                                chunk_start, current_response_start);
+                        responses_in_order = false;
+                    }
+                }
+            }
+
+            last_chunk_end = chunk_end;
+
+            // Check for complete HTTP response (look for end of HTML)
+            // GNU.org returns HTML, so we check for </html>
+            if (accumulated_response.find("</html>") != std::string::npos ||
+                accumulated_response.find("</HTML>") != std::string::npos) {
+                complete_responses++;
+                size_t resp_size = accumulated_response.size();
+                response_sizes.push_back(resp_size);
+                printf("[RECV] Complete response #%d received (%zu bytes, offsets %u-%u)\n",
+                       complete_responses, resp_size,
+                       current_response_start, last_chunk_end);
+                // Mark response as ended
+                in_response = false;
+                // Clear accumulator for next response
+                accumulated_response.clear();
+            }
+        };
+
+        // Main test loop: send requests until MAX_MESSAGES or TIMEOUT
+        while (sent < MAX_MESSAGES) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+            if (elapsed_s >= TIMEOUT_SECONDS) {
+                printf("[TEST] Timeout reached after %ld seconds\n", elapsed_s);
+                break;
+            }
+
+            // Check if Transport is still running (keep-alive verification)
+            if (!conn_state_->is_running(PROC_TRANSPORT)) {
+                fprintf(stderr, "[TEST] Transport process exited - HTTP/1.1 keep-alive FAILED\n");
+                connection_closed = true;
+                keep_alive_working = false;
+                break;
+            }
+
+            // Debug: every 1 second, print ring buffer state
+            static auto last_debug = start_time;
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_debug).count() >= 1) {
+                int64_t msg_out_prod = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
+                int64_t msg_out_cons = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+                int64_t raw_out_prod = raw_outbox_region_->producer_published()->load(std::memory_order_acquire);
+                int64_t raw_out_cons = raw_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+                int64_t raw_in_prod = raw_inbox_region_->producer_published()->load(std::memory_order_acquire);
+                int64_t raw_in_cons = raw_inbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+                printf("[DEBUG] MSG_OUTBOX prod=%ld cons=%ld | RAW_OUTBOX prod=%ld cons=%ld | RAW_INBOX prod=%ld cons=%ld | sent=%d\n",
+                       msg_out_prod, msg_out_cons, raw_out_prod, raw_out_cons, raw_in_prod, raw_in_cons, sent);
+                last_debug = now;
+            }
+
+            // Send next message if interval has passed
+            auto since_last = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_send_time).count();
+            if (since_last >= SEND_INTERVAL_MS) {
+                // Send via MSG_OUTBOX: try_claim() + fill + publish()
+                int64_t slot = msg_outbox_prod.try_claim();
+                if (slot >= 0) {
+                    auto& event = msg_outbox_prod[slot];
+                    event.data_len = static_cast<uint16_t>(http_request_len);
+                    event.msg_type = MSG_TYPE_DATA;
+                    memcpy(event.data, HTTP_REQUEST, http_request_len);
+                    msg_outbox_prod.publish(slot);
+                    sent++;
+                    last_send_time = now;
+                    printf("[SENT] HTTP GET #%d (via same connection - keep-alive)\n", sent);
+                }
+            }
+
+            // Check for HTTP responses via MSG_METADATA
+            MsgMetadata meta;
+            while (msg_metadata_cons.try_consume(meta)) {
+                process_response_chunk(meta);
+            }
+
+            usleep(1000);  // 1ms poll
+        }
+
+        // Verify keep-alive is still working after sending all requests
+        if (!connection_closed && !conn_state_->is_running(PROC_TRANSPORT)) {
+            fprintf(stderr, "[TEST] Transport died after sending - HTTP/1.1 keep-alive FAILED\n");
+            connection_closed = true;
+            keep_alive_working = false;
+        }
+
+        // Wait to receive remaining responses:
+        // - Must wait at least FINAL_DRAIN_MS (2s) for ringbuffer check
+        // - Continue until all responses received or reasonable timeout (10s total)
+        printf("[TEST] Waiting for responses (min %dms)...\n", FINAL_DRAIN_MS);
+        auto drain_start = std::chrono::steady_clock::now();
+        constexpr int MAX_DRAIN_MS = 10000;  // Max 10s total drain for slow servers
+
+        while (true) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - drain_start).count();
+
+            // Must drain for at least FINAL_DRAIN_MS, then can exit early if all responses received
+            bool min_drain_done = (elapsed_ms >= FINAL_DRAIN_MS);
+            bool all_responses = (complete_responses >= sent);
+            bool max_drain_reached = (elapsed_ms >= MAX_DRAIN_MS);
+
+            if ((min_drain_done && all_responses) || max_drain_reached) {
+                if (max_drain_reached && !all_responses) {
+                    printf("[TEST] Max drain reached (%dms), got %d/%d responses\n",
+                           MAX_DRAIN_MS, complete_responses, sent);
+                }
+                break;
+            }
+
+            // Check keep-alive during drain
+            if (!conn_state_->is_running(PROC_TRANSPORT)) {
+                if (complete_responses < sent) {
+                    fprintf(stderr, "[TEST] Transport died during drain - HTTP/1.1 keep-alive FAILED\n");
+                    keep_alive_working = false;
+                }
+                break;
+            }
+
+            // Drain responses
+            MsgMetadata meta;
+            while (msg_metadata_cons.try_consume(meta)) {
+                process_response_chunk(meta);
+            }
+
+            usleep(1000);  // 1ms poll
+        }
+
+        // Final 2s wait for ringbuffer status check (as per requirement)
+        printf("[TEST] Final %dms wait for ringbuffer check...\n", FINAL_DRAIN_MS);
+        auto final_wait_start = std::chrono::steady_clock::now();
+        while (true) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - final_wait_start).count();
+            if (elapsed_ms >= FINAL_DRAIN_MS) break;
+
+            // Continue draining any remaining data
+            MsgMetadata meta;
+            while (msg_metadata_cons.try_consume(meta)) {
+                process_response_chunk(meta);
+            }
+            usleep(1000);
+        }
+
+        // Final response check - if there's accumulated data without </html>, it might be incomplete
+        if (!accumulated_response.empty()) {
+            printf("[WARN] Partial response remaining (%zu bytes) - may be incomplete\n",
+                   accumulated_response.size());
+        }
+
+        // Check response size similarity (all responses should be similar size)
+        bool sizes_similar = true;
+        size_t min_size = 0, max_size = 0, avg_size = 0;
+        if (!response_sizes.empty()) {
+            min_size = *std::min_element(response_sizes.begin(), response_sizes.end());
+            max_size = *std::max_element(response_sizes.begin(), response_sizes.end());
+            size_t sum = 0;
+            for (size_t s : response_sizes) sum += s;
+            avg_size = sum / response_sizes.size();
+
+            // Check if max is within 20% of min (allowing for minor server-side variation)
+            if (min_size > 0) {
+                double ratio = static_cast<double>(max_size) / static_cast<double>(min_size);
+                sizes_similar = (ratio <= 1.20);  // Max 20% difference
+            }
+        }
+
+        printf("\n=== Test Results ===\n");
+        printf("  Sent:              %d requests\n", sent);
+        printf("  Complete responses: %d (%.0f%%)\n", complete_responses,
+               sent > 0 ? 100.0 * complete_responses / sent : 0);
+        printf("  Total chunks:      %d\n", received_chunks);
+        printf("  Total bytes:       %zu\n", total_response_bytes);
+        printf("  Keep-alive:        %s\n", keep_alive_working ? "WORKING" : "FAILED");
+        printf("  Response order:    %s\n", responses_in_order ? "IN SERIES" : "MIXED (OUT OF ORDER)");
+
+        // Print individual response sizes
+        printf("  Response sizes:    ");
+        for (size_t i = 0; i < response_sizes.size(); ++i) {
+            printf("%zu", response_sizes[i]);
+            if (i < response_sizes.size() - 1) printf(", ");
+        }
+        printf(" bytes\n");
+        printf("  Size range:        min=%zu, max=%zu, avg=%zu (similar: %s)\n",
+               min_size, max_size, avg_size, sizes_similar ? "yes" : "NO - FAIL");
+
+        // Verify ring buffer status (STRICT CHECK)
+        printf("\n--- Ring Buffer Status (after %dms drain) ---\n", FINAL_DRAIN_MS);
+        int64_t metadata_prod_seq = msg_metadata_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t metadata_cons_seq = msg_metadata_cons.sequence();
+        bool metadata_caught_up = metadata_cons_seq >= metadata_prod_seq;
+        printf("  MSG_METADATA producer: %ld, consumer: %ld\n", metadata_prod_seq, metadata_cons_seq);
+        printf("  Consumer caught up: %s\n", metadata_caught_up ? "yes" : "NO - FAIL");
+
+        int64_t outbox_prod_seq = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t outbox_cons_seq = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+        bool outbox_caught_up = outbox_cons_seq >= outbox_prod_seq;
+        printf("  MSG_OUTBOX producer: %ld, consumer: %ld\n", outbox_prod_seq, outbox_cons_seq);
+        printf("  Consumer caught up: %s\n", outbox_caught_up ? "yes" : "NO - FAIL");
+
+        printf("====================\n");
+        fflush(stdout);
+
+        // Signal children to stop and wait for them
+        conn_state_->shutdown_all();
+        if (xdp_pid_ > 0) waitpid(xdp_pid_, nullptr, 0);
+        if (transport_pid_ > 0) waitpid(transport_pid_, nullptr, 0);
+        xdp_pid_ = 0;
+        transport_pid_ = 0;
+
+        // Save profiling data to /tmp
+        save_profiling_data();
+
+        // === STRICT FAILURE CONDITIONS ===
+
+        // 1. Check HTTP/1.1 keep-alive
+        if (!keep_alive_working) {
+            printf("\nFAIL: HTTP/1.1 keep-alive not working - connection was closed\n");
+            return false;
+        }
+
+        // 2. Check response ordering (must be in series, not mixed)
+        if (!responses_in_order) {
+            printf("\nFAIL: Responses in MSG_INBOX are out of order (mixed)\n");
+            return false;
+        }
+
+        // 3. Check we received complete responses
+        if (complete_responses == 0) {
+            printf("\nFAIL: No complete HTTP responses received (no </html> found)\n");
+            return false;
+        }
+
+        if (complete_responses < sent) {
+            printf("\nFAIL: Only %d/%d complete responses received\n", complete_responses, sent);
+            return false;
+        }
+
+        // 4. Check ringbuffer consumer caught up with producer (STRICT)
+        if (!metadata_caught_up) {
+            printf("\nFAIL: MSG_METADATA consumer did not catch up with producer\n");
+            return false;
+        }
+
+        if (!outbox_caught_up) {
+            printf("\nFAIL: MSG_OUTBOX consumer did not catch up with producer\n");
+            return false;
+        }
+
+        // 5. Verify response size is reasonable (GNU.org homepage is typically 5KB+)
+        if (total_response_bytes < 1000) {
+            printf("\nFAIL: Response too small (%zu bytes) - expected full HTML page\n",
+                   total_response_bytes);
+            return false;
+        }
+
+        // 6. Verify response sizes are similar (same page requested multiple times)
+        if (!sizes_similar) {
+            printf("\nFAIL: Response sizes differ too much (min=%zu, max=%zu, ratio=%.2f)\n",
+                   min_size, max_size, max_size > 0 ? static_cast<double>(max_size) / min_size : 0);
+            return false;
+        }
+
+        printf("\nPASS: HTTP/1.1 keep-alive working, %d/%d responses in series, sizes similar (%zu bytes avg)\n",
+               complete_responses, sent, avg_size);
+        return true;
+    }
+
+    void save_profiling_data() {
+        if constexpr (!PROFILING_ENABLED) return;
+        if (!profiling_) return;
+
+        pid_t pid = getpid();
+
+        // Helper to save a CycleSampleBuffer to file
+        auto save_buffer = [pid](const CycleSampleBuffer& buf, const char* name) {
+            char filename[256];
+            snprintf(filename, sizeof(filename), "/tmp/%s_profiling_%d.bin", name, pid);
+
+            FILE* f = fopen(filename, "wb");
+            if (!f) {
+                fprintf(stderr, "[PROFILING] Failed to create %s\n", filename);
+                return;
+            }
+
+            uint32_t count = std::min(buf.total_count, CycleSampleBuffer::SAMPLE_COUNT);
+            uint32_t start_idx = (buf.total_count > CycleSampleBuffer::SAMPLE_COUNT)
+                ? (buf.write_idx & CycleSampleBuffer::MASK)
+                : 0;
+
+            // Write header: total_count, sample_count
+            fwrite(&buf.total_count, sizeof(uint32_t), 1, f);
+            fwrite(&count, sizeof(uint32_t), 1, f);
+
+            // Write samples in order (oldest to newest)
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t idx = (start_idx + i) & CycleSampleBuffer::MASK;
+                fwrite(&buf.samples[idx], sizeof(CycleSample), 1, f);
+            }
+            fclose(f);
+            printf("[PROFILING] %s saved to %s (%u samples, %u total)\n",
+                   name, filename, count, buf.total_count);
+        };
+
+        save_buffer(profiling_->xdp_poll, "xdp_poll");
+        save_buffer(profiling_->transport, "transport");
+
+        // Save NIC latency data
+        {
+            char filename[256];
+            snprintf(filename, sizeof(filename), "/tmp/nic_latency_profiling_%d.bin", pid);
+
+            FILE* f = fopen(filename, "wb");
+            if (!f) {
+                fprintf(stderr, "[PROFILING] Failed to create %s\n", filename);
+                return;
+            }
+
+            const auto& buf = profiling_->nic_latency;
+            uint32_t count = std::min(buf.total_count, NicLatencyBuffer::SAMPLE_COUNT);
+            uint32_t start_idx = (buf.total_count > NicLatencyBuffer::SAMPLE_COUNT)
+                ? (buf.write_idx & NicLatencyBuffer::MASK)
+                : 0;
+
+            // Write header: total_count, sample_count
+            fwrite(&buf.total_count, sizeof(uint32_t), 1, f);
+            fwrite(&count, sizeof(uint32_t), 1, f);
+
+            // Write samples in order (oldest to newest)
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t idx = (start_idx + i) & NicLatencyBuffer::MASK;
+                fwrite(&buf.samples[idx], sizeof(NicLatencySample), 1, f);
+            }
+            fclose(f);
+            printf("[PROFILING] nic_latency saved to %s (%u samples, %u total)\n",
+                   filename, count, buf.total_count);
+        }
+    }
+
+private:
+    // XDP Poll child process
+    void run_xdp_poll_process() {
+        pin_to_cpu(XDP_POLL_CPU_CORE);
+
+        // Create ring adapters in child process
+        IPCRingProducer<UMEMFrameDescriptor> raw_inbox_prod(*raw_inbox_region_);
+        IPCRingConsumer<UMEMFrameDescriptor> raw_outbox_cons(*raw_outbox_region_);
+        IPCRingConsumer<UMEMFrameDescriptor> ack_outbox_cons(*ack_outbox_region_);
+        IPCRingConsumer<UMEMFrameDescriptor> pong_outbox_cons(*pong_outbox_region_);
+
+        XDPPollType xdp_poll(interface_);
+
+        // Set profiling data buffers
+        if constexpr (PROFILING_ENABLED) {
+            xdp_poll.set_profiling_data(&profiling_->xdp_poll);
+            xdp_poll.set_nic_latency_data(&profiling_->nic_latency);
+        }
+
+        bool ok = xdp_poll.init(
+            umem_area_, umem_size_, bpf_path_,
+            &raw_inbox_prod,
+            &raw_outbox_cons,
+            &ack_outbox_cons,
+            &pong_outbox_cons,
+            conn_state_);
+
+        if (!ok) {
+            fprintf(stderr, "[XDP-POLL] init() failed\n");
+            conn_state_->shutdown_all();
+            return;
+        }
+
+        // Configure BPF maps for HTTP target traffic
+        auto* bpf = xdp_poll.get_bpf_loader();
+        if (bpf) {
+            fprintf(stderr, "[XDP-POLL] Configuring BPF maps: local_ip=%s, exchange_ip=%s, port=%u\n",
+                    g_local_ip.c_str(), http_target_ip_.c_str(), HTTP_PORT);
+            bpf->set_local_ip(g_local_ip.c_str());
+            bpf->add_exchange_ip(http_target_ip_.c_str());
+            bpf->add_exchange_port(HTTP_PORT);
+        } else {
+            fprintf(stderr, "[XDP-POLL] WARNING: BPF loader is NULL!\n");
+        }
+        xdp_poll.run();
+        xdp_poll.cleanup();
+    }
+
+    // Transport child process
+    void run_transport_process() {
+        pin_to_cpu(TRANSPORT_CPU_CORE);
+
+        // Create ring adapters in child process (all use UMEMFrameDescriptor)
+        IPCRingConsumer<UMEMFrameDescriptor> raw_inbox_cons(*raw_inbox_region_);
+        IPCRingProducer<UMEMFrameDescriptor> raw_outbox_prod(*raw_outbox_region_);
+        IPCRingProducer<UMEMFrameDescriptor> ack_outbox_prod(*ack_outbox_region_);
+        IPCRingProducer<UMEMFrameDescriptor> pong_outbox_prod(*pong_outbox_region_);
+        IPCRingConsumer<MsgOutboxEvent> msg_outbox_cons(*msg_outbox_region_);
+        IPCRingProducer<MsgMetadata> msg_metadata_prod(*msg_metadata_region_);
+        IPCRingConsumer<PongFrameAligned> pongs_cons(*pongs_region_);
+
+        TransportType transport;
+
+        // Set profiling data buffer
+        if constexpr (PROFILING_ENABLED) {
+            transport.set_profiling_data(&profiling_->transport);
+        }
+
+        // Pass the resolved IP to init_with_handshake
+        bool ok = transport.init_with_handshake(
+            umem_area_, FRAME_SIZE,
+            http_target_ip_.c_str(), HTTP_PORT,
+            &raw_inbox_cons,
+            &raw_outbox_prod,
+            &ack_outbox_prod,
+            &pong_outbox_prod,
+            &msg_outbox_cons,
+            &msg_metadata_prod,
+            &pongs_cons,
+            msg_inbox_,
+            conn_state_);
+
+        if (!ok) {
+            fprintf(stderr, "[TRANSPORT] init_with_handshake() failed\n");
+            conn_state_->shutdown_all();
+            return;
+        }
+
+        // Debug: Print MSG_OUTBOX state and tx_frame before run()
+        {
+            int64_t pub = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
+            int64_t con = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+            size_t avail = msg_outbox_cons.available();
+            fprintf(stderr, "[TRANSPORT] Before run(): MSG_OUTBOX pub=%ld con=%ld avail=%zu\n", pub, con, avail);
+
+            uint32_t msg_alloc = conn_state_->tx_frame.msg_alloc_pos.load(std::memory_order_acquire);
+            uint32_t msg_rel = conn_state_->tx_frame.msg_release_pos.load(std::memory_order_acquire);
+            fprintf(stderr, "[TRANSPORT] tx_frame: msg_alloc=%u msg_release=%u diff=%u MSG_FRAMES=%zu\n",
+                    msg_alloc, msg_rel, msg_alloc - msg_rel, MSG_FRAMES);
+        }
+
+        transport.run();
+    }
+
+    const char* interface_;
+    const char* bpf_path_;
+    std::string http_target_ip_;  // Resolved IP of HTTP_HOST
+
+    IPCRingManager ipc_manager_;
+
+    void* umem_area_ = nullptr;
+    size_t umem_size_ = 0;
+    uint8_t local_mac_[6] = {};
+    uint8_t gateway_mac_[6] = {};
+    std::string local_ip_;
+    std::string gateway_ip_;
+
+    MsgInbox* msg_inbox_ = nullptr;
+    ConnStateShm* conn_state_ = nullptr;
+    ProfilingShm* profiling_ = nullptr;
+
+    disruptor::ipc::shared_region* raw_inbox_region_ = nullptr;
+    disruptor::ipc::shared_region* raw_outbox_region_ = nullptr;
+    disruptor::ipc::shared_region* ack_outbox_region_ = nullptr;
+    disruptor::ipc::shared_region* pong_outbox_region_ = nullptr;
+    disruptor::ipc::shared_region* msg_outbox_region_ = nullptr;
+    disruptor::ipc::shared_region* msg_metadata_region_ = nullptr;
+    disruptor::ipc::shared_region* pongs_region_ = nullptr;
+
+    pid_t xdp_pid_ = 0;
+    pid_t transport_pid_ = 0;
+};
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main(int argc, char* argv[]) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <interface> <bpf_path> [ignored...]\n", argv[0]);
+        fprintf(stderr, "NOTE: Do NOT run directly. Use: ./scripts/test_xdp.sh 11_transport_http.cpp\n");
+        fprintf(stderr, "\nThis test:\n");
+        fprintf(stderr, "  - Forks XDP Poll (core 2) and Transport<NoSSLPolicy> (core 4)\n");
+        fprintf(stderr, "  - Connects to %s:%u (hardcoded, ignores arguments)\n", HTTP_HOST, HTTP_PORT);
+        fprintf(stderr, "  - Sends up to %d HTTP GET requests at %dms intervals (same connection)\n", MAX_MESSAGES, SEND_INTERVAL_MS);
+        fprintf(stderr, "  - Verifies HTTP/1.1 keep-alive (fails if connection closes)\n");
+        fprintf(stderr, "  - Verifies responses in MSG_INBOX are in series (not mixed)\n");
+        fprintf(stderr, "  - Verifies full HTML response received (</html> marker)\n");
+        fprintf(stderr, "  - Waits %dms, then verifies ringbuffer consumer caught up\n", FINAL_DRAIN_MS);
+        fprintf(stderr, "  - Timeout: %d seconds\n", TIMEOUT_SECONDS);
+        return 1;
+    }
+
+    const char* interface = argv[1];
+    const char* bpf_path = argv[2];
+    // Note: argv[3] and argv[4] (echo_ip, echo_port) are ignored - we use hardcoded HTTP_HOST:HTTP_PORT
+
+    // PREVENT ROOT USER FROM RUNNING
+    if (geteuid() == 0) {
+        fprintf(stderr, "========================================\n");
+        fprintf(stderr, "ERROR: Do NOT run as root!\n");
+        fprintf(stderr, "========================================\n");
+        fprintf(stderr, "\nRun via the wrapper script which sets capabilities properly:\n");
+        fprintf(stderr, "  ./scripts/test_xdp.sh 11_transport_http.cpp\n");
+        return 1;
+    }
+
+    // Install signal handlers
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    printf("==============================================\n");
+    printf("  Transport HTTP Test (NoSSLPolicy)           \n");
+    printf("==============================================\n");
+    printf("  Interface:  %s\n", interface);
+    printf("  Target:     %s:%u (hardcoded)\n", HTTP_HOST, HTTP_PORT);
+    printf("  Messages:   up to %d (every %dms)\n", MAX_MESSAGES, SEND_INTERVAL_MS);
+    printf("  Keep-alive: HTTP/1.1 (same connection)\n");
+    printf("  Ordering:   verify responses in series\n");
+    printf("  Drain:      %dms then check ringbuffer\n", FINAL_DRAIN_MS);
+    printf("  Timeout:    %d seconds\n", TIMEOUT_SECONDS);
+    printf("==============================================\n\n");
+
+    TransportHTTPTest test(interface, bpf_path);
+
+    // Setup
+    if (!test.setup()) {
+        fprintf(stderr, "\nFATAL: Setup failed\n");
+        return 1;
+    }
+
+    // Fork processes
+    if (!test.fork_processes()) {
+        fprintf(stderr, "\nFATAL: Failed to fork processes\n");
+        test.teardown();
+        return 1;
+    }
+
+    // Give processes time to stabilize
+    usleep(500000);  // 500ms
+
+    // Run test
+    int result = 0;
+    if (!test.run_http_test()) {
+        result = 1;
+    }
+
+    // Cleanup
+    test.teardown();
+
+    // Summary
+    printf("\n==============================================\n");
+    if (result == 0) {
+        printf("  TEST PASSED\n");
+    } else {
+        printf("  TEST FAILED\n");
+    }
+    printf("==============================================\n");
+
+    return result;
+}
+
+#else  // !USE_XDP
+
+int main() {
+    fprintf(stderr, "Error: Build with USE_XDP=1\n");
+    fprintf(stderr, "Example: make build-test-pipeline-transport-http USE_XDP=1\n");
+    return 1;
+}
+
+#endif  // USE_XDP
