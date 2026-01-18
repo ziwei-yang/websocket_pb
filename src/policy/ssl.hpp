@@ -43,6 +43,8 @@
 #include <cstring>
 #include <unistd.h>  // usleep() for DPDK handshake polling
 
+#include "../pipeline/pipeline_config.hpp"  // NIC_MTU, TCP_MSS, MAX_TLS_RECORD_PAYLOAD
+
 // ============================================================================
 // Library Detection and Headers
 // ============================================================================
@@ -165,14 +167,19 @@ struct OpenSSLPolicy {
             throw std::runtime_error("SSL_CTX_new() failed");
         }
 
-        // Set TLS version to 1.2 for security and kTLS compatibility
-        // Also limit to TLS 1.2 max to reduce ClientHello size (TLS 1.3 extensions are large)
-        // This prevents MTU issues with userspace TCP stack (no fragmentation support)
+        // Set TLS version range: 1.2 minimum, 1.3 maximum
+        // TLS 1.3 ClientHello can be ~1540 bytes, exceeding MTU. The Hybrid Approach
+        // handles this via TCP segmentation in tls_handshake_send_from_buffer().
         SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
-        SSL_CTX_set_max_proto_version(ctx_, TLS1_2_VERSION);
+        SSL_CTX_set_max_proto_version(ctx_, TLS1_3_VERSION);
 
-        // Disable session tickets to further reduce ClientHello size
+        // Disable session tickets (reduces ClientHello size slightly)
         SSL_CTX_set_options(ctx_, SSL_OP_NO_TICKET);
+
+        // Limit TLS record size to fit in single TCP segment (Hybrid Approach for MTU)
+        // MAX_TLS_RECORD_PAYLOAD = TCP_MSS - TLS13_OVERHEAD (from pipeline_config.hpp)
+        // This is derived from NIC_MTU which is a compile-time argument
+        SSL_CTX_set_max_send_fragment(ctx_, pipeline::MAX_TLS_RECORD_PAYLOAD);
 
         // Disable verification for simplicity (HFT optimization)
         // In production, you should verify certificates!
@@ -853,14 +860,19 @@ struct LibreSSLPolicy {
             throw std::runtime_error("SSL_CTX_new() failed");
         }
 
-        // Set TLS version to 1.2 for security
-        // Also limit to TLS 1.2 max to reduce ClientHello size (TLS 1.3 extensions are large)
-        // This prevents MTU issues with userspace TCP stack (no fragmentation support)
+        // Set TLS version range: 1.2 minimum, 1.3 maximum
+        // TLS 1.3 ClientHello can be ~1540 bytes, exceeding MTU. The Hybrid Approach
+        // handles this via TCP segmentation in tls_handshake_send_from_buffer().
         SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
-        SSL_CTX_set_max_proto_version(ctx_, TLS1_2_VERSION);
+        SSL_CTX_set_max_proto_version(ctx_, TLS1_3_VERSION);
 
-        // Disable session tickets to further reduce ClientHello size
+        // Disable session tickets (reduces ClientHello size slightly)
         SSL_CTX_set_options(ctx_, SSL_OP_NO_TICKET);
+
+        // Limit TLS record size to fit in single TCP segment (Hybrid Approach for MTU)
+        // MAX_TLS_RECORD_PAYLOAD = TCP_MSS - TLS13_OVERHEAD (from pipeline_config.hpp)
+        // This is derived from NIC_MTU which is a compile-time argument
+        SSL_CTX_set_max_send_fragment(ctx_, pipeline::MAX_TLS_RECORD_PAYLOAD);
 
         // Disable verification for simplicity
         // In production, you should verify certificates!
@@ -1494,16 +1506,20 @@ struct WolfSSLPolicy {
     void init() {
         wolfSSL_Init();
 
-        // Create TLS 1.2 client method
-        WOLFSSL_METHOD* method = wolfTLSv1_2_client_method();
+        // Create flexible TLS client method (supports TLS 1.2 and 1.3)
+        // TLS 1.3 ClientHello is handled by TCP segmentation in tls_handshake_send_from_buffer()
+        WOLFSSL_METHOD* method = wolfSSLv23_client_method();
         if (!method) {
-            throw std::runtime_error("wolfTLSv1_2_client_method() failed");
+            throw std::runtime_error("wolfSSLv23_client_method() failed");
         }
 
         ctx_ = wolfSSL_CTX_new(method);
         if (!ctx_) {
             throw std::runtime_error("wolfSSL_CTX_new() failed");
         }
+
+        // Set minimum TLS version to 1.2
+        wolfSSL_CTX_SetMinVersion(ctx_, WOLFSSL_TLSV1_2);
 
         // Disable verification (HFT optimization - verify in production!)
         wolfSSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);

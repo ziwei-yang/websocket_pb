@@ -536,10 +536,10 @@ struct XDPUserspaceTransport {
      */
     void init(const char* interface, const char* bpf_path, bool zero_copy = true) {
         // 1. Configure and initialize XDP
-        // Uses compile-time defaults from xdp_transport.hpp (XDP_INTERFACE, XDP_MTU, XDP_HEADROOM)
+        // Uses compile-time defaults from xdp_transport.hpp (XDP_INTERFACE, NIC_MTU, XDP_HEADROOM)
         websocket::xdp::XDPConfig config;
         config.interface = interface;
-        // config.frame_size uses XDP_FRAME_SIZE by default (calculated from XDP_MTU)
+        // config.frame_size uses XDP_FRAME_SIZE by default (calculated from NIC_MTU)
         config.zero_copy = zero_copy;
 
         xdp_.init(config, bpf_path);
@@ -590,10 +590,10 @@ struct XDPUserspaceTransport {
     void init(const char* interface, const char* bpf_path,
               const char* domain, uint16_t port) {
         // 1. Configure and initialize XDP
-        // Uses compile-time defaults from xdp_transport.hpp (XDP_INTERFACE, XDP_MTU, XDP_HEADROOM)
+        // Uses compile-time defaults from xdp_transport.hpp (XDP_INTERFACE, NIC_MTU, XDP_HEADROOM)
         websocket::xdp::XDPConfig config;
         config.interface = interface;
-        // config.frame_size uses XDP_FRAME_SIZE by default (calculated from XDP_MTU)
+        // config.frame_size uses XDP_FRAME_SIZE by default (calculated from NIC_MTU)
 
         xdp_.init(config, bpf_path);
 

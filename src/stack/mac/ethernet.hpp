@@ -17,6 +17,11 @@
 #include <stdexcept>
 #include <arpa/inet.h>
 
+// NIC_MTU must be passed as a compile-time argument via -DNIC_MTU=<value>
+#ifndef NIC_MTU
+#error "NIC_MTU must be defined at compile time (e.g., -DNIC_MTU=1500)"
+#endif
+
 namespace userspace_stack {
 
 // Ethernet frame constants
@@ -113,7 +118,7 @@ struct MACLayer {
         if (!dst_mac || !payload) {
             return 0;
         }
-        if (len == 0 || len > 1500) {
+        if (len == 0 || len > NIC_MTU) {
             return 0;
         }
         if (ETH_HEADER_LEN + len > current_tx_->capacity) {

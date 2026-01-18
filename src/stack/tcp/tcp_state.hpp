@@ -16,6 +16,11 @@
 #include <cstdint>
 #include <string>
 
+// NIC_MTU must be passed as a compile-time argument via -DNIC_MTU=<value>
+#ifndef NIC_MTU
+#error "NIC_MTU must be defined at compile time (e.g., -DNIC_MTU=1500)"
+#endif
+
 namespace userspace_stack {
 
 // TCP states (simplified for client)
@@ -44,7 +49,7 @@ constexpr uint8_t TCP_FLAG_CWR = 0x80;
 // TCP header constants
 constexpr size_t TCP_HEADER_MIN_LEN = 20;
 constexpr size_t TCP_HEADER_MAX_LEN = 60;
-constexpr uint16_t USERSPACE_TCP_MSS = 1460;       // Maximum segment size (1500 - 20 IP - 20 TCP)
+constexpr uint16_t USERSPACE_TCP_MSS = NIC_MTU - 40;  // MSS = MTU - IP(20) - TCP(20)
 constexpr uint32_t TCP_MAX_WINDOW = 65535;
 
 // TCP options

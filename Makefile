@@ -119,10 +119,13 @@ ifeq ($(UNAME_S),Linux)
             ifdef XDP_INTERFACE
                 CXXFLAGS += -DXDP_INTERFACE='"$(XDP_INTERFACE)"'
                 $(info XDP Interface: $(XDP_INTERFACE))
-                # Auto-detect MTU from interface if not specified
-                ifndef XDP_MTU
-                    XDP_MTU := $(shell cat /sys/class/net/$(XDP_INTERFACE)/mtu 2>/dev/null || echo 1500)
-                    $(info XDP MTU: $(XDP_MTU) (auto-detected))
+                # Auto-detect NIC_MTU from interface if not specified
+                ifndef NIC_MTU
+                    NIC_MTU := $(shell cat /sys/class/net/$(XDP_INTERFACE)/mtu 2>/dev/null)
+                    ifeq ($(NIC_MTU),)
+                        $(error Failed to detect MTU for $(XDP_INTERFACE). Specify NIC_MTU manually.)
+                    endif
+                    $(info XDP MTU: $(NIC_MTU) (auto-detected))
                 endif
                 # Auto-detect headroom based on driver if not specified
                 # Driver-specific defaults: mlx5/igc/i40e/ice/ixgbe=256 (XDP metadata), others=0
@@ -142,12 +145,11 @@ ifeq ($(UNAME_S),Linux)
                     $(info XDP Headroom: $(XDP_HEADROOM))
                 endif
             endif
-            ifdef XDP_MTU
-                CXXFLAGS += -DXDP_MTU=$(XDP_MTU)
-                ifndef XDP_INTERFACE
-                    $(info XDP MTU: $(XDP_MTU))
-                endif
+            # NIC_MTU is required - auto-detected from interface or must be specified
+            ifndef NIC_MTU
+                $(error NIC_MTU is required. Specify XDP_INTERFACE for auto-detection or NIC_MTU=<value>)
             endif
+            CXXFLAGS += -DNIC_MTU=$(NIC_MTU)
             $(info Building with XDP support enabled)
         else
             $(error XDP requested but dependencies not found. Install libbpf-dev and libxdp-dev)
@@ -155,6 +157,11 @@ ifeq ($(UNAME_S),Linux)
     # BSD Sockets (default or explicit)
     else
         TRANSPORT_INFO := BSD sockets
+        # NIC_MTU is required for TCP MSS calculations
+        ifndef NIC_MTU
+            $(error NIC_MTU is required. Usage: make NIC_MTU=1500)
+        endif
+        CXXFLAGS += -DNIC_MTU=$(NIC_MTU)
         ifdef USE_SOCKET
             $(info Building with BSD sockets (explicit USE_SOCKET=1))
         endif
@@ -194,6 +201,12 @@ else ifeq ($(UNAME_S),Darwin)
     else
         IO_INFO := select
     endif
+
+    # NIC_MTU is required for TCP MSS calculations
+    ifndef NIC_MTU
+        $(error NIC_MTU is required. Usage: make NIC_MTU=1500)
+    endif
+    CXXFLAGS += -DNIC_MTU=$(NIC_MTU)
 
     $(info Building for macOS with $(IO_INFO) + $(SSL_INFO))
 else

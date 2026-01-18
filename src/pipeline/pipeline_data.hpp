@@ -455,7 +455,7 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         remote_port = 0;
         std::memset(local_mac, 0, 6);
         std::memset(remote_mac, 0, 6);
-        peer_mss = 1460;
+        peer_mss = TCP_MSS;  // From pipeline_config.hpp (NIC_MTU - 40)
         last_ack_cycle = 0;
         srtt_us = 100000;   // Initial 100ms
         rttvar_us = 50000;  // Initial 50ms

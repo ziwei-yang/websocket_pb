@@ -12,16 +12,17 @@ namespace websocket::pipeline {
 // Compile-time Configuration (passed via Makefile -D flags)
 // ============================================================================
 
-#ifndef PATH_MTU
-#define PATH_MTU 1500
+// NIC_MTU must be passed as a compile-time argument via -DNIC_MTU=<value>
+#ifndef NIC_MTU
+#error "NIC_MTU must be defined at compile time (e.g., -DNIC_MTU=1500)"
 #endif
 
 // FRAME_SIZE calculation: MTU + headers, rounded up to 1KB alignment
-// Formula: ((PATH_MTU + 94 + 1023) / 1024) * 1024
+// Formula: ((NIC_MTU + 94 + 1023) / 1024) * 1024
 // - 94 bytes for: Ethernet(14) + IP(20) + TCP(60 max options)
 // - 1KB alignment for cache efficiency
 #ifndef FRAME_SIZE
-#define FRAME_SIZE (((PATH_MTU + 94 + 1023) / 1024) * 1024)
+#define FRAME_SIZE (((NIC_MTU + 94 + 1023) / 1024) * 1024)
 #endif
 
 // Cache line size (configurable for different architectures)
@@ -90,7 +91,7 @@ inline constexpr size_t MSG_INBOX_SIZE = 64 * 1024 * 1024;
 // TCP/TLS Configuration
 // ============================================================================
 
-inline constexpr size_t TCP_MSS = PATH_MTU - 40;  // MTU - IP(20) - TCP(20)
+inline constexpr size_t TCP_MSS = NIC_MTU - 40;  // MTU - IP(20) - TCP(20)
 
 // TLS overhead for record size calculation
 inline constexpr size_t TLS_RECORD_HEADER = 5;    // Content type(1) + version(2) + length(2)
@@ -188,7 +189,7 @@ namespace shm_paths {
 // Compile-time Validation
 // ============================================================================
 
-static_assert(FRAME_SIZE >= PATH_MTU + 94, "FRAME_SIZE must fit PATH_MTU + headers");
+static_assert(FRAME_SIZE >= NIC_MTU + 94, "FRAME_SIZE must fit NIC_MTU + headers");
 static_assert((FRAME_SIZE & (FRAME_SIZE - 1)) == 0 || FRAME_SIZE % 1024 == 0,
               "FRAME_SIZE should be power of 2 or 1KB aligned");
 static_assert(RX_FRAMES + ACK_FRAMES + PONG_FRAMES + MSG_FRAMES == TOTAL_UMEM_FRAMES,

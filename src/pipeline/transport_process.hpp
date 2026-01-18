@@ -1484,6 +1484,8 @@ private:
     }
 
     // Helper: Send pending encrypted data via IPC during TLS handshake
+    // Supports multi-segment transmission for large TLS handshake messages (e.g., ClientHello)
+    // that exceed the TCP MSS. This is the "Hybrid Approach" for MTU handling.
     bool tls_handshake_send_from_buffer(uint8_t* handshake_buf) {
         if constexpr (std::is_same_v<SSLPolicy, NoSSLPolicy>) {
             (void)handshake_buf;
@@ -1494,36 +1496,98 @@ private:
             return false;
         }
 
-        auto alloc = allocate_msg_frame();
-        if (!alloc.success()) {
-            return false;
+        // Calculate MSS for segmentation (MTU - IP(20) - TCP(20) = 1460 for MTU 1500)
+        constexpr size_t MSS = TCP_MSS;
+
+        // If data fits in single segment, use fast path
+        if (pending <= MSS) {
+            auto alloc = allocate_msg_frame();
+            if (!alloc.success()) {
+                return false;
+            }
+
+            uint64_t addr = frame_idx_to_addr(alloc.frame_idx, frame_size_);
+            uint8_t* frame = umem_area_ + addr;
+
+            size_t frame_len = stack_.build_data(frame, frame_size_, tcp_params_,
+                                                  handshake_buf, pending);
+            if (frame_len == 0) {
+                return false;
+            }
+
+            int64_t seq = raw_outbox_prod_->try_claim();
+            if (seq < 0) {
+                return false;
+            }
+
+            ssl_policy_.reset_encrypted_output_len();
+
+            auto& desc = (*raw_outbox_prod_)[seq];
+            desc.umem_addr = addr;
+            desc.frame_len = static_cast<uint16_t>(frame_len);
+            desc.frame_type = FRAME_TYPE_MSG;
+            desc.nic_frame_poll_cycle = rdtsc();
+            desc.consumed = 0;
+            raw_outbox_prod_->publish(seq);
+
+            tcp_params_.snd_nxt += pending;
+            conn_state_->snd_nxt = tcp_params_.snd_nxt;
+
+            return true;
         }
 
-        uint64_t addr = frame_idx_to_addr(alloc.frame_idx, frame_size_);
-        uint8_t* frame = umem_area_ + addr;
+        // Multi-segment path: split large handshake data across multiple TCP segments
+        // This handles TLS 1.3 ClientHello (~1540 bytes) or other large handshake messages
+        size_t sent = 0;
+        while (sent < pending) {
+            size_t seg_len = std::min(MSS, pending - sent);
 
-        size_t frame_len = stack_.build_data(frame, frame_size_, tcp_params_,
-                                              handshake_buf, pending);
-        if (frame_len == 0) {
-            return false;
-        }
+            auto alloc = allocate_msg_frame();
+            if (!alloc.success()) {
+                // Partial send - update state for what was sent
+                if (sent > 0) {
+                    tcp_params_.snd_nxt += sent;
+                    conn_state_->snd_nxt = tcp_params_.snd_nxt;
+                }
+                return sent > 0;
+            }
 
-        int64_t seq = raw_outbox_prod_->try_claim();
-        if (seq < 0) {
-            return false;
+            uint64_t addr = frame_idx_to_addr(alloc.frame_idx, frame_size_);
+            uint8_t* frame = umem_area_ + addr;
+
+            size_t frame_len = stack_.build_data(frame, frame_size_, tcp_params_,
+                                                  handshake_buf + sent, seg_len);
+            if (frame_len == 0) {
+                if (sent > 0) {
+                    tcp_params_.snd_nxt += sent;
+                    conn_state_->snd_nxt = tcp_params_.snd_nxt;
+                }
+                return sent > 0;
+            }
+
+            int64_t seq = raw_outbox_prod_->try_claim();
+            if (seq < 0) {
+                if (sent > 0) {
+                    tcp_params_.snd_nxt += sent;
+                    conn_state_->snd_nxt = tcp_params_.snd_nxt;
+                }
+                return sent > 0;
+            }
+
+            auto& desc = (*raw_outbox_prod_)[seq];
+            desc.umem_addr = addr;
+            desc.frame_len = static_cast<uint16_t>(frame_len);
+            desc.frame_type = FRAME_TYPE_MSG;
+            desc.nic_frame_poll_cycle = rdtsc();
+            desc.consumed = 0;
+            raw_outbox_prod_->publish(seq);
+
+            // Update tcp_params_ for next segment (sequence number advances)
+            tcp_params_.snd_nxt += seg_len;
+            sent += seg_len;
         }
 
         ssl_policy_.reset_encrypted_output_len();
-
-        auto& desc = (*raw_outbox_prod_)[seq];
-        desc.umem_addr = addr;
-        desc.frame_len = static_cast<uint16_t>(frame_len);
-        desc.frame_type = FRAME_TYPE_MSG;
-        desc.nic_frame_poll_cycle = rdtsc();
-        desc.consumed = 0;
-        raw_outbox_prod_->publish(seq);
-
-        tcp_params_.snd_nxt += pending;
         conn_state_->snd_nxt = tcp_params_.snd_nxt;
 
         return true;

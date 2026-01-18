@@ -79,7 +79,7 @@ namespace xdp {
 //
 // XDP_INTERFACE: Network interface for XDP (REQUIRED)
 // XDP_HEADROOM:  Bytes reserved before packet data in UMEM frame (auto: 0 for most drivers, 256 for mlx5)
-// XDP_MTU:       Maximum transmission unit (auto-detected from interface)
+// NIC_MTU:      Maximum transmission unit (auto-detected from interface via Makefile)
 // ============================================================================
 
 #ifndef XDP_INTERFACE
@@ -90,11 +90,13 @@ namespace xdp {
 #define XDP_HEADROOM 0
 #endif
 
-#ifndef XDP_MTU
-#define XDP_MTU 3502
+// NIC_MTU must be passed as a compile-time argument via -DNIC_MTU=<value>
+#ifndef NIC_MTU
+#error "NIC_MTU must be defined at compile time (e.g., -DNIC_MTU=1500)"
 #endif
 
 // Calculate frame size: MTU + Ethernet(14) + IP(20) + TCP(60 max) + margin, round up to power of 2
+// For MTU=1500: 1500 + 14 + 20 + 60 + 500 = 2094 -> 2048 (rounded)
 // For MTU=3502: 3502 + 14 + 20 + 60 + 500 = 4096
 constexpr uint32_t xdp_calculate_frame_size(uint32_t mtu) {
     uint32_t min_size = mtu + 14 + 20 + 60 + 500;  // Headers + margin
@@ -104,7 +106,7 @@ constexpr uint32_t xdp_calculate_frame_size(uint32_t mtu) {
     return v + 1;
 }
 
-constexpr uint32_t XDP_FRAME_SIZE = xdp_calculate_frame_size(XDP_MTU);
+constexpr uint32_t XDP_FRAME_SIZE = xdp_calculate_frame_size(NIC_MTU);
 
 /**
  * XDP Transport Configuration
@@ -112,7 +114,7 @@ constexpr uint32_t XDP_FRAME_SIZE = xdp_calculate_frame_size(XDP_MTU);
 struct XDPConfig {
     const char* interface;      // Network interface (e.g., "eth0")
     uint32_t queue_id;          // RX/TX queue ID (usually 0)
-    uint32_t frame_size;        // UMEM frame size (default: calculated from XDP_MTU)
+    uint32_t frame_size;        // UMEM frame size (default: calculated from NIC_MTU)
     uint32_t num_frames;        // Number of UMEM frames (default: 65536)
     bool zero_copy;             // Enable zero-copy mode (requires driver support)
     uint32_t batch_size;        // Batch size for TX/RX (default: 64)
@@ -129,7 +131,7 @@ struct XDPConfig {
     XDPConfig()
         : interface(XDP_INTERFACE)
         , queue_id(0)
-        , frame_size(XDP_FRAME_SIZE)  // Calculated from XDP_MTU (4096 for MTU=3502)
+        , frame_size(XDP_FRAME_SIZE)  // Calculated from NIC_MTU
         , num_frames(65536)           // 16x larger for high throughput
         , zero_copy(true)   // Enable zero-copy by default for HFT (igc driver supports it)
         , batch_size(64)
