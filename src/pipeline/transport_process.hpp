@@ -496,7 +496,7 @@ struct TransportProcess {
         // Use process_manually() with lambda for batched processing
         // This is the disruptor pattern: process batch, then commit_manually()
         raw_inbox_cons_->process_manually(
-            [&](UMEMFrameDescriptor& desc, int64_t seq) -> bool {
+            [&](UMEMFrameDescriptor& desc, int64_t) -> bool {
                 rx_count++;
                 // Capture Transport timestamp immediately
                 uint64_t raw_poll_cycle = rdtscp();
@@ -633,6 +633,12 @@ struct TransportProcess {
             // Real SSL: defer commit until SSL has consumed all data from frames
             rx_frames_pending_ += payload_frames;
             commit_rx_consumed();
+
+            // FIX: Commit pure ACK frames only when no payload is pending
+            // They have no payload, so no SSL decryption needed
+            if (rx_frames_pending_ == 0 && rx_count > 0 && payload_frames == 0) {
+                raw_inbox_cons_->commit_manually();
+            }
         }
 
         // Out of order - send duplicate ACK for fast retransmit
@@ -1425,6 +1431,13 @@ private:
             int ret = wolfSSL_connect(ssl_policy_.ssl_);
 
             if (ret == WOLFSSL_SUCCESS) {
+                // FIX: TLS 1.3 client Finished message may be pending even on SUCCESS.
+                // Must send it before declaring handshake complete, otherwise server
+                // will close connection (missing Finished = incomplete handshake).
+                size_t pending = ssl_policy_.encrypted_output_len();
+                if (pending > 0) {
+                    tls_handshake_send_from_buffer(handshake_out_buf);
+                }
                 handshake_complete = true;
                 break;
             }
@@ -1432,6 +1445,11 @@ private:
             int err = wolfSSL_get_error(ssl_policy_.ssl_, ret);
 
             if (err == WOLFSSL_ERROR_WANT_READ) {
+                // Send any pending output before waiting for input
+                size_t pending = ssl_policy_.encrypted_output_len();
+                if (pending > 0) {
+                    tls_handshake_send_from_buffer(handshake_out_buf);
+                }
                 if (!tls_handshake_recv()) {
                     usleep(100);
                 }

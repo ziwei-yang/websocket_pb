@@ -708,11 +708,17 @@ struct IPCRingConsumer {
     size_t element_mask_;          // element_count - 1 (for element indexing)
     int64_t sequence_ = -1;        // Last committed sequence
     int64_t last_processed_ = -1;  // Last processed sequence (for deferred commit)
+    uint8_t consumer_index_ = 0;   // Consumer index for multi-consumer support
 
-    explicit IPCRingConsumer(disruptor::ipc::shared_region& r) : region_(r) {
+    explicit IPCRingConsumer(disruptor::ipc::shared_region& r, uint8_t consumer_index = 0)
+        : region_(r), consumer_index_(consumer_index) {
         // Compute element-based sizes (metadata stores bytes, we need element count)
         element_count_ = region_.buffer_size() / sizeof(T);
         element_mask_ = element_count_ - 1;
+
+        // Read initial sequence from shared memory to resume from where previous consumer left off
+        sequence_ = region_.consumer_sequence(consumer_index_)->load(std::memory_order_acquire);
+        last_processed_ = sequence_;
     }
 
     // Non-copyable but movable
@@ -748,7 +754,7 @@ struct IPCRingConsumer {
         item = data[sequence_ & element_mask_];
 
         // Update consumer sequence (allows producer to reclaim slot)
-        region_.consumer_sequence(0)->store(sequence_, std::memory_order_release);
+        region_.consumer_sequence(consumer_index_)->store(sequence_, std::memory_order_release);
 
         if (end_of_batch) {
             *end_of_batch = (sequence_ >= avail);
@@ -831,7 +837,7 @@ struct IPCRingConsumer {
     void commit_manually() {
         if (last_processed_ > sequence_) {
             sequence_ = last_processed_;
-            region_.consumer_sequence(0)->store(sequence_, std::memory_order_release);
+            region_.consumer_sequence(consumer_index_)->store(sequence_, std::memory_order_release);
         }
         last_processed_ = -1;  // Reset for next batch
     }

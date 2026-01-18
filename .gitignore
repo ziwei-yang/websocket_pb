@@ -129,3 +129,4 @@ scripts/output/
 
 # Temporary run files
 /tmp/run_*.sh
+issue/
