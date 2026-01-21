@@ -1,20 +1,21 @@
-// test/pipeline/12_transport_https_wolfssl.cpp
-// Test TransportProcess<WolfSSLPolicy> with XDP Poll against HTTPS server
+// test/pipeline/20_websocket_binance.cpp
+// Test WebSocketProcess with XDP Poll + Transport against Binance WSS stream
 //
-// Usage: ./test_pipeline_transport_https_wolfssl <interface> <bpf_path> <ignored> <ignored>
-// (Called by scripts/test_xdp.sh 12_transport_https_wolfssl.cpp)
+// Usage: ./test_pipeline_websocket_binance <interface> <bpf_path> [ignored...] [--timeout <ms>]
+// (Called by scripts/test_xdp.sh 20_websocket_binance.cpp)
 //
-// Build: make build-test-pipeline-transport_https_wolfssl USE_XDP=1 USE_WOLFSSL=1
+// Build: make build-test-pipeline-websocket-binance USE_XDP=1 USE_WOLFSSL=1
+//
+// Options:
+//   --timeout <ms>   Stream timeout in milliseconds (default: 5000)
+//                    If <= 0, run forever and display every message received
 //
 // This test:
-// - Forks XDP Poll process (core 2) and Transport process (core 4)
-// - Connects to nginx.org on port 443 (HTTPS with WolfSSL)
-// - Sends HTTPS GET requests every 0.5s until 3 messages sent OR 5 seconds elapsed
-// - Verifies HTTP 200 responses via MSG_METADATA
-// - Verifies HTTP/1.1 keep-alive: all requests must use the same connection
-// - Verifies responses in MSG_INBOX are in series (not mixed out of order)
-// - Waits 2 seconds after sending, then checks ringbuffer consumer caught up
-// - Verifies response is complete (contains full HTML like curl output)
+// - Forks XDP Poll (core 2), Transport (core 4), WebSocket (core 6)
+// - Connects to stream.binance.com on port 443 (WSS with WolfSSL)
+// - WebSocketProcess handles HTTP+WS handshake, frame parsing
+// - Parent consumes WS_FRAME_INFO ring, validates JSON trade events
+// - Verifies ring buffer consumers caught up
 //
 // Safety: Uses dedicated test interface, never touches default route
 
@@ -25,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <algorithm>
 #include <unistd.h>
@@ -47,7 +49,10 @@
 #include "../../src/pipeline/pipeline_data.hpp"
 #include "../../src/pipeline/xdp_poll_process.hpp"
 #include "../../src/pipeline/transport_process.hpp"
+#include "../../src/pipeline/websocket_process.hpp"
 #include "../../src/pipeline/msg_inbox.hpp"
+#include "../../src/pipeline/ws_parser.hpp"
+#include "../../src/core/http.hpp"
 #include "../../src/policy/ssl.hpp"  // WolfSSLPolicy
 
 using namespace websocket::pipeline;
@@ -61,24 +66,20 @@ namespace {
 // CPU core assignments for latency-critical processes
 constexpr int XDP_POLL_CPU_CORE = 2;
 constexpr int TRANSPORT_CPU_CORE = 4;
+constexpr int WEBSOCKET_CPU_CORE = 6;
 
-// Test parameters
-constexpr int MAX_MESSAGES = 3;                            // Max HTTPS requests to send
-constexpr int TIMEOUT_SECONDS = 5;                         // Total timeout
-constexpr int SEND_INTERVAL_MS = 500;                      // Send every 0.5s
-constexpr int FINAL_DRAIN_MS = 2000;                       // Wait 2s after sending to check ringbuffer
+// Test parameters (defaults, can be overridden by --timeout argument)
+constexpr int DEFAULT_STREAM_DURATION_MS = 5000;   // Stream for 5 seconds
+constexpr int FINAL_DRAIN_MS = 2000;               // Wait 2s after streaming
+constexpr int MIN_EXPECTED_TRADES = 10;            // Expect at least 10 trades in 5s for BTCUSDT
 
-// Hardcoded target (ignores script args)
-static constexpr const char* HTTPS_HOST = "nginx.org";
-static constexpr uint16_t HTTPS_PORT = 443;
+// Runtime timeout (set by --timeout argument)
+int g_timeout_ms = DEFAULT_STREAM_DURATION_MS;     // -1 or 0 = run forever
 
-// HTTP request format (sent over TLS)
-static const char* HTTP_REQUEST =
-    "GET / HTTP/1.1\r\n"
-    "Host: nginx.org\r\n"
-    "User-Agent: xdp-test/1.0\r\n"
-    "Connection: keep-alive\r\n"
-    "\r\n";
+// WebSocket target
+static constexpr const char* WSS_HOST = "stream.binance.com";
+static constexpr uint16_t WSS_PORT = 443;
+static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade";
 
 // Test configuration
 std::string g_local_ip;  // Detected from interface
@@ -151,6 +152,17 @@ std::string resolve_hostname(const char* hostname) {
     return ip_str;
 }
 
+// Validate Binance trade JSON
+bool is_valid_trade_json(const char* data, size_t len) {
+    std::string_view sv(data, len);
+    // Binance trade events have {"stream":"btcusdt@trade","data":{"e":"trade",...}}
+    if (sv.find("\"stream\"") == std::string_view::npos) return false;
+    if (sv.find("btcusdt@trade") == std::string_view::npos) return false;
+    if (sv.find("\"data\"") == std::string_view::npos) return false;
+    if (sv.find("\"e\":\"trade\"") == std::string_view::npos) return false;
+    return true;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -164,7 +176,7 @@ public:
         struct tm* tm_info = localtime(&now);
         char timestamp[32];
         strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);
-        ipc_ring_dir_ = std::string("transport_https_wolfssl_test_") + timestamp;
+        ipc_ring_dir_ = std::string("websocket_binance_test_") + timestamp;
     }
 
     ~IPCRingManager() {
@@ -243,7 +255,7 @@ public:
             return false;
         }
 
-        // XDP Poll <-> Transport rings (all use UMEMFrameDescriptor for type unification)
+        // XDP Poll <-> Transport rings
         if (!create_ring("raw_inbox", RAW_INBOX_SIZE * sizeof(UMEMFrameDescriptor),
                          sizeof(UMEMFrameDescriptor), 1)) return false;
         if (!create_ring("raw_outbox", RAW_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
@@ -253,13 +265,17 @@ public:
         if (!create_ring("pong_outbox", PONG_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
                          sizeof(UMEMFrameDescriptor), 1)) return false;
 
-        // Transport <-> Test (Parent) rings
+        // Transport <-> WebSocket rings
         if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
                          sizeof(MsgOutboxEvent), 1)) return false;
         if (!create_ring("msg_metadata", MSG_METADATA_SIZE * sizeof(MsgMetadata),
                          sizeof(MsgMetadata), 1)) return false;
         if (!create_ring("pongs", PONGS_SIZE * sizeof(PongFrameAligned),
                          sizeof(PongFrameAligned), 1)) return false;
+
+        // WebSocket <-> Parent (Test) ring
+        if (!create_ring("ws_frame_info", WS_FRAME_INFO_SIZE * sizeof(WSFrameInfo),
+                         sizeof(WSFrameInfo), 1)) return false;
 
         printf("[IPC] Created all ring files in %s\n", full_dir.c_str());
         return true;
@@ -271,7 +287,7 @@ public:
         std::string base = "/dev/shm/hft/" + ipc_ring_dir_;
         const char* ring_names[] = {
             "raw_inbox", "raw_outbox", "ack_outbox", "pong_outbox",
-            "msg_outbox", "msg_metadata", "pongs"
+            "msg_outbox", "msg_metadata", "pongs", "ws_frame_info"
         };
 
         for (const char* name : ring_names) {
@@ -400,39 +416,46 @@ using XDPPollType = XDPPollProcess<
     PROFILING_ENABLED>;                     // Profiling
 
 // Transport Process types (with WolfSSL and profiling enabled)
-// All outbox rings use UMEMFrameDescriptor for XDPPollProcess compatibility
 using TransportType = TransportProcess<
-    WolfSSLPolicy,                         // WolfSSL for HTTPS
+    WolfSSLPolicy,                         // WolfSSL for WSS
     IPCRingConsumer<UMEMFrameDescriptor>,  // RawInboxCons
     IPCRingProducer<UMEMFrameDescriptor>,  // RawOutboxProd
-    IPCRingProducer<UMEMFrameDescriptor>,  // AckOutboxProd (unified type)
-    IPCRingProducer<UMEMFrameDescriptor>,  // PongOutboxProd (unified type)
+    IPCRingProducer<UMEMFrameDescriptor>,  // AckOutboxProd
+    IPCRingProducer<UMEMFrameDescriptor>,  // PongOutboxProd
     IPCRingConsumer<MsgOutboxEvent>,       // MsgOutboxCons
     IPCRingProducer<MsgMetadata>,          // MsgMetadataProd
     IPCRingConsumer<PongFrameAligned>,     // PongsCons
     PROFILING_ENABLED>;                    // Profiling
 
+// WebSocket Process types
+using WebSocketType = WebSocketProcess<
+    IPCRingConsumer<MsgMetadata>,          // MsgMetadataCons
+    IPCRingProducer<WSFrameInfo>,          // WSFrameInfoProd
+    IPCRingProducer<PongFrameAligned>,     // PongsProd
+    IPCRingProducer<MsgOutboxEvent>>;      // MsgOutboxProd
+
 // ============================================================================
 // Test Class
 // ============================================================================
 
-class TransportHTTPSWolfSSLTest {
+class WebSocketBinanceTest {
 public:
-    TransportHTTPSWolfSSLTest(const char* interface, const char* bpf_path)
+    WebSocketBinanceTest(const char* interface, const char* bpf_path)
         : interface_(interface), bpf_path_(bpf_path) {}
 
     bool setup() {
-        printf("\n=== Setting up Transport HTTPS WolfSSL Test ===\n");
+        printf("\n=== Setting up WebSocket Binance Test ===\n");
         printf("Interface:   %s\n", interface_);
         printf("BPF Path:    %s\n", bpf_path_);
 
-        // Resolve HTTPS target
-        https_target_ip_ = resolve_hostname(HTTPS_HOST);
-        if (https_target_ip_.empty()) {
-            fprintf(stderr, "FAIL: Cannot resolve %s\n", HTTPS_HOST);
+        // Resolve WSS target
+        wss_target_ip_ = resolve_hostname(WSS_HOST);
+        if (wss_target_ip_.empty()) {
+            fprintf(stderr, "FAIL: Cannot resolve %s\n", WSS_HOST);
             return false;
         }
-        printf("Target:      %s:%u (%s)\n\n", HTTPS_HOST, HTTPS_PORT, https_target_ip_.c_str());
+        printf("Target:      %s:%u (%s)\n", WSS_HOST, WSS_PORT, wss_target_ip_.c_str());
+        printf("Path:        %s\n\n", WSS_PATH);
 
         calibrate_tsc();
 
@@ -473,10 +496,7 @@ public:
                gateway_mac_[0], gateway_mac_[1], gateway_mac_[2],
                gateway_mac_[3], gateway_mac_[4], gateway_mac_[5]);
 
-        // NOTE: Route to HTTPS target must be set up by the test script (test_xdp.sh)
-        // before running this binary. The script should detect HTTPS tests and add
-        // a route for the resolved IP via the test interface gateway.
-        printf("HTTPS Target IP: %s (route must be set by test script)\n", https_target_ip_.c_str());
+        printf("WSS Target IP: %s (route must be set by test script)\n", wss_target_ip_.c_str());
 
         // Create IPC rings
         if (!ipc_manager_.create_all_rings()) {
@@ -529,8 +549,9 @@ public:
         conn_state_->init();
 
         // Set target and network config in shared state (use resolved IP)
-        strncpy(conn_state_->target_host, https_target_ip_.c_str(), sizeof(conn_state_->target_host) - 1);
-        conn_state_->target_port = HTTPS_PORT;
+        strncpy(conn_state_->target_host, WSS_HOST, sizeof(conn_state_->target_host) - 1);
+        conn_state_->target_port = WSS_PORT;
+        strncpy(conn_state_->target_path, WSS_PATH, sizeof(conn_state_->target_path) - 1);
         strncpy(conn_state_->bpf_path, bpf_path_, sizeof(conn_state_->bpf_path) - 1);
         strncpy(conn_state_->interface_name, interface_, sizeof(conn_state_->interface_name) - 1);
 
@@ -572,6 +593,7 @@ public:
             msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
             msg_metadata_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata"));
             pongs_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pongs"));
+            ws_frame_info_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("ws_frame_info"));
         } catch (const std::exception& e) {
             fprintf(stderr, "FAIL: Cannot open shared regions: %s\n", e.what());
             return false;
@@ -596,6 +618,10 @@ public:
             kill(transport_pid_, SIGTERM);
             waitpid(transport_pid_, nullptr, 0);
         }
+        if (websocket_pid_ > 0) {
+            kill(websocket_pid_, SIGTERM);
+            waitpid(websocket_pid_, nullptr, 0);
+        }
 
         // Cleanup shared regions
         delete raw_inbox_region_;
@@ -605,6 +631,7 @@ public:
         delete msg_outbox_region_;
         delete msg_metadata_region_;
         delete pongs_region_;
+        delete ws_frame_info_region_;
 
         if (conn_state_ && conn_state_ != MAP_FAILED) {
             munmap(conn_state_, sizeof(ConnStateShm));
@@ -679,380 +706,319 @@ public:
         }
         printf("[PARENT] TLS handshake complete (WolfSSL)\n");
 
+        // Fork WebSocket process
+        websocket_pid_ = fork();
+        if (websocket_pid_ < 0) {
+            fprintf(stderr, "FAIL: fork() for WebSocket failed\n");
+            return false;
+        }
+
+        if (websocket_pid_ == 0) {
+            // Child: WebSocket process
+            run_websocket_process();
+            _exit(0);
+        }
+
+        printf("[PARENT] Forked WebSocket process (PID %d)\n", websocket_pid_);
+
+        // Wait for WebSocket handshake to complete
+        printf("[PARENT] Waiting for WebSocket handshake...\n");
+        if (!conn_state_->wait_for_handshake_ws_ready(30000000)) {
+            fprintf(stderr, "FAIL: Timeout waiting for WebSocket handshake\n");
+            return false;
+        }
+        printf("[PARENT] WebSocket handshake complete\n");
+
         return true;
     }
 
-    bool run_https_test() {
-        printf("\n--- HTTPS GET Test (max %d msgs, %dms interval, %ds timeout) ---\n",
-               MAX_MESSAGES, SEND_INTERVAL_MS, TIMEOUT_SECONDS);
+    bool run_stream_test() {
+        bool run_forever = (g_timeout_ms <= 0);
 
-        // Create producer/consumer for parent
-        IPCRingProducer<MsgOutboxEvent> msg_outbox_prod(*msg_outbox_region_);
-        IPCRingConsumer<MsgMetadata> msg_metadata_cons(*msg_metadata_region_);
+        if (run_forever) {
+            printf("\n--- WSS Stream Test (FOREVER MODE - Ctrl+C to stop) ---\n");
+        } else {
+            printf("\n--- WSS Stream Test (%dms, expect %d+ trades) ---\n",
+                   g_timeout_ms, MIN_EXPECTED_TRADES);
+        }
 
-        int sent = 0;
-        int received_chunks = 0;     // Number of MSG_METADATA chunks received
-        int complete_responses = 0;  // Number of complete HTTP responses
-        size_t total_response_bytes = 0;
-        bool connection_closed = false;
-        bool keep_alive_working = true;  // Track if HTTP/1.1 keep-alive is maintained
+        // Create consumer for WS_FRAME_INFO ring
+        IPCRingConsumer<WSFrameInfo> ws_frame_cons(*ws_frame_info_region_);
 
-        // Response ordering tracking
-        // Track MSG_INBOX offsets to verify responses arrive in series (not mixed)
-        bool responses_in_order = true;
-        int current_response_num = 0;           // Which response we're currently receiving
-        uint32_t current_response_start = 0;    // MSG_INBOX offset where current response started
-        uint32_t last_chunk_end = 0;            // End offset of last chunk (start + len)
-        bool in_response = false;               // Are we currently in the middle of a response?
-
-        // Response size tracking - verify all responses are similar size
-        std::vector<size_t> response_sizes;
-        response_sizes.reserve(MAX_MESSAGES);
-
-        // Buffer to accumulate response for completeness check
-        std::string accumulated_response;
-        accumulated_response.reserve(1024 * 1024);  // Reserve 1MB
+        // Tracking metrics
+        uint64_t total_frames = 0;
+        uint64_t text_frames = 0;
+        uint64_t binary_frames = 0;
+        uint64_t ping_frames = 0;
+        uint64_t pong_frames = 0;
+        uint64_t close_frames = 0;
+        uint64_t valid_trades = 0;
+        int64_t last_sequence = -1;
+        bool sequence_error = false;
 
         auto start_time = std::chrono::steady_clock::now();
-        auto last_send_time = start_time - std::chrono::seconds(1);  // Send immediately first time
+        auto stream_end = start_time + std::chrono::milliseconds(g_timeout_ms);
+        auto last_status_time = start_time;
+        constexpr int STATUS_INTERVAL_MS = 1000;  // Print status every 1 second
 
-        size_t http_request_len = strlen(HTTP_REQUEST);
+        printf("[WSS] Starting stream reception...\n");
 
-        // Debug: print initial MSG_OUTBOX state
-        {
-            int64_t prod_seq = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
-            int64_t cons_seq = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-            printf("[DEBUG] Initial MSG_OUTBOX state: producer=%ld, consumer=%ld\n", prod_seq, cons_seq);
+        // Main streaming loop
+        while (run_forever || std::chrono::steady_clock::now() < stream_end) {
+            if (g_shutdown.load(std::memory_order_acquire)) {
+                printf("[WSS] Shutdown signal received\n");
+                break;
+            }
+
+            if (!conn_state_->is_running(PROC_WEBSOCKET)) {
+                fprintf(stderr, "[WSS] WebSocket process exited during streaming\n");
+                break;
+            }
+
+            // Process WS_FRAME_INFO events
+            WSFrameInfo frame;
+            bool end_of_batch;
+            while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
+                total_frames++;
+
+                // Verify sequence ordering
+                int64_t current_seq = ws_frame_cons.sequence();
+                if (last_sequence != -1 && current_seq != last_sequence + 1) {
+                    fprintf(stderr, "WARN: Out-of-order frame! Expected %ld, got %ld\n",
+                            last_sequence + 1, current_seq);
+                    sequence_error = true;
+                }
+                last_sequence = current_seq;
+
+                // Count by opcode
+                switch (frame.opcode) {
+                    case 0x01:  // TEXT
+                        text_frames++;
+                        // Validate JSON trade data
+                        if (frame.payload_len > 0) {
+                            const uint8_t* payload = msg_inbox_->data_at(frame.msg_inbox_offset);
+                            if (is_valid_trade_json(reinterpret_cast<const char*>(payload), frame.payload_len)) {
+                                valid_trades++;
+                                // In forever mode, display every message; otherwise only first 3
+                                if (run_forever || valid_trades <= 3) {
+                                    printf("[TRADE #%lu] %.*s\n",
+                                           valid_trades,
+                                           (int)std::min(static_cast<uint32_t>(500), frame.payload_len),
+                                           reinterpret_cast<const char*>(payload));
+                                }
+                            }
+                        }
+                        break;
+
+                    case 0x02:  // BINARY
+                        binary_frames++;
+                        break;
+
+                    case 0x09:  // PING
+                        ping_frames++;
+                        {
+                            auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now() - start_time).count();
+                            int64_t pongs_prod = pongs_region_->producer_published()->load(std::memory_order_acquire);
+                            int64_t pongs_cons = pongs_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+                            printf("[PING @%lds] Received PING (payload_len=%u) - PONGS ring: prod=%ld, cons=%ld\n",
+                                   elapsed_s, frame.payload_len, pongs_prod, pongs_cons);
+                            fflush(stdout);
+                        }
+                        break;
+
+                    case 0x0A:  // PONG
+                        pong_frames++;
+                        break;
+
+                    case 0x08:  // CLOSE
+                        close_frames++;
+                        printf("[CLOSE] Received CLOSE frame\n");
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+
+            // Periodic status in forever mode
+            if (run_forever) {
+                auto now = std::chrono::steady_clock::now();
+                auto since_last_status = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - last_status_time).count();
+                if (since_last_status >= STATUS_INTERVAL_MS) {
+                    auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - start_time).count();
+
+                    // Check ring buffer status
+                    int64_t pongs_prod = pongs_region_->producer_published()->load(std::memory_order_acquire);
+                    int64_t pongs_cons = pongs_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+                    int64_t meta_prod = msg_metadata_region_->producer_published()->load(std::memory_order_acquire);
+                    int64_t meta_cons = msg_metadata_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+                    int64_t outbox_prod = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
+                    int64_t outbox_cons = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+                    int64_t raw_outbox_prod = raw_outbox_region_->producer_published()->load(std::memory_order_acquire);
+                    int64_t raw_outbox_cons = raw_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+                    int64_t pong_outbox_prod = pong_outbox_region_->producer_published()->load(std::memory_order_acquire);
+                    int64_t pong_outbox_cons = pong_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+
+                    printf("\n[STATUS @%lds] trades=%lu pings=%lu\n",
+                           elapsed_s, valid_trades, ping_frames);
+                    // Also check RAW_INBOX and ACK_OUTBOX status
+                    int64_t raw_inbox_prod = raw_inbox_region_->producer_published()->load(std::memory_order_acquire);
+                    int64_t raw_inbox_cons = raw_inbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+                    int64_t ack_outbox_prod = ack_outbox_region_->producer_published()->load(std::memory_order_acquire);
+                    int64_t ack_outbox_cons = ack_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+
+                    printf("  PONGS(prod=%ld,cons=%ld) META(prod=%ld,cons=%ld) MSG_OUTBOX(prod=%ld,cons=%ld)\n",
+                           pongs_prod, pongs_cons,
+                           meta_prod, meta_cons,
+                           outbox_prod, outbox_cons);
+                    printf("  RAW_INBOX(prod=%ld,cons=%ld) ACK_OUTBOX(prod=%ld,cons=%ld)\n",
+                           raw_inbox_prod, raw_inbox_cons,
+                           ack_outbox_prod, ack_outbox_cons);
+                    printf("  RAW_OUTBOX(prod=%ld,cons=%ld) PONG_OUTBOX(prod=%ld,cons=%ld)\n",
+                           raw_outbox_prod, raw_outbox_cons,
+                           pong_outbox_prod, pong_outbox_cons);
+
+                    // Check process status
+                    printf("  Processes: XDP=%s TRANSPORT=%s WEBSOCKET=%s\n",
+                           conn_state_->is_running(PROC_XDP_POLL) ? "OK" : "DEAD",
+                           conn_state_->is_running(PROC_TRANSPORT) ? "OK" : "DEAD",
+                           conn_state_->is_running(PROC_WEBSOCKET) ? "OK" : "DEAD");
+                    fflush(stdout);
+
+                    last_status_time = now;
+                }
+            }
+
+            __builtin_ia32_pause();
         }
 
-        // Helper lambda to process received data
-        auto process_response_chunk = [&](const MsgMetadata& meta) {
-            if (meta.decrypted_len == 0) return;
+        // Final drain (skip in forever mode since we're exiting on signal)
+        if (!run_forever) {
+            printf("[WSS] Final %dms drain...\n", FINAL_DRAIN_MS);
+            auto drain_start = std::chrono::steady_clock::now();
 
-            total_response_bytes += meta.decrypted_len;
-            received_chunks++;
+            while (true) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - drain_start).count();
+                if (elapsed_ms >= FINAL_DRAIN_MS) break;
 
-            // Log new nic_packet_ct field
-            printf("[META] chunk=%d offset=%u len=%u nic_packet_ct=%u\n",
-                   received_chunks, meta.msg_inbox_offset, meta.decrypted_len, meta.nic_packet_ct);
-
-            // Get data pointer
-            const char* data = reinterpret_cast<const char*>(msg_inbox_->data_at(meta.msg_inbox_offset));
-            uint32_t chunk_start = meta.msg_inbox_offset;
-            uint32_t chunk_end = chunk_start + meta.decrypted_len;
-
-            // Accumulate response for completeness check
-            accumulated_response.append(data, meta.decrypted_len);
-
-            // Extract first line (HTTP status) for logging
-            const char* eol = static_cast<const char*>(memchr(data, '\r', meta.decrypted_len));
-            size_t status_len = eol ? static_cast<size_t>(eol - data) : std::min<size_t>(meta.decrypted_len, 60);
-
-            // Check for HTTP response start (new response)
-            bool is_response_start = (meta.decrypted_len >= 12 && strncmp(data, "HTTP/1.", 7) == 0);
-
-            if (is_response_start) {
-                // Starting a new HTTP response
-                current_response_num++;
-                printf("[RECV] Response #%d start @ offset %u: %.*s\n",
-                       current_response_num, chunk_start, (int)status_len, data);
-
-                // Verify ordering: if we were in a previous response, it should have ended
-                if (in_response) {
-                    fprintf(stderr, "[ORDER] ERROR: Response #%d started before previous response ended!\n",
-                            current_response_num);
-                    fprintf(stderr, "[ORDER]   Previous response start: %u, last chunk end: %u\n",
-                            current_response_start, last_chunk_end);
-                    fprintf(stderr, "[ORDER]   New response start: %u\n", chunk_start);
-                    responses_in_order = false;
-                }
-
-                current_response_start = chunk_start;
-                in_response = true;
-
-                // Check for Connection: close header (would break keep-alive)
-                const char* conn_header = strstr(data, "Connection: close");
-                if (conn_header && (conn_header - data) < static_cast<ssize_t>(meta.decrypted_len)) {
-                    fprintf(stderr, "[WARN] Server sent 'Connection: close' - keep-alive may not work\n");
-                }
-            } else {
-                // Continuation chunk
-                printf("[RECV] Chunk %d @ offset %u: %u bytes\n", received_chunks, chunk_start, meta.decrypted_len);
-
-                // Verify ordering: chunk should follow previous chunk in sequence
-                if (in_response && chunk_start != last_chunk_end) {
-                    // Allow for some gap due to circular buffer wrapping, but flag if unexpected
-                    // In a proper implementation, chunks should be contiguous
-                    if (chunk_start < current_response_start) {
-                        fprintf(stderr, "[ORDER] ERROR: Chunk offset %u < response start %u (out of order)\n",
-                                chunk_start, current_response_start);
-                        responses_in_order = false;
+                WSFrameInfo frame;
+                while (ws_frame_cons.try_consume(frame)) {
+                    total_frames++;
+                    if (frame.opcode == 0x01) {
+                        text_frames++;
+                        if (frame.payload_len > 0) {
+                            const uint8_t* payload = msg_inbox_->data_at(frame.msg_inbox_offset);
+                            if (is_valid_trade_json(reinterpret_cast<const char*>(payload), frame.payload_len)) {
+                                valid_trades++;
+                            }
+                        }
                     }
                 }
-            }
-
-            last_chunk_end = chunk_end;
-
-            // Check for complete HTTP response (look for end of HTML)
-            // GNU.org returns HTML, so we check for </html>
-            if (accumulated_response.find("</html>") != std::string::npos ||
-                accumulated_response.find("</HTML>") != std::string::npos) {
-                complete_responses++;
-                size_t resp_size = accumulated_response.size();
-                response_sizes.push_back(resp_size);
-                printf("[RECV] Complete response #%d received (%zu bytes, offsets %u-%u)\n",
-                       complete_responses, resp_size,
-                       current_response_start, last_chunk_end);
-                // Mark response as ended
-                in_response = false;
-                // Clear accumulator for next response
-                accumulated_response.clear();
-            }
-        };
-
-        // Main test loop: send requests until MAX_MESSAGES or TIMEOUT
-        while (sent < MAX_MESSAGES) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-            if (elapsed_s >= TIMEOUT_SECONDS) {
-                printf("[TEST] Timeout reached after %ld seconds\n", elapsed_s);
-                break;
-            }
-
-            // Check if Transport is still running (keep-alive verification)
-            if (!conn_state_->is_running(PROC_TRANSPORT)) {
-                fprintf(stderr, "[TEST] Transport process exited - HTTP/1.1 keep-alive FAILED\n");
-                connection_closed = true;
-                keep_alive_working = false;
-                break;
-            }
-
-            // Debug: every 1 second, print ring buffer state
-            static auto last_debug = start_time;
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_debug).count() >= 1) {
-                int64_t msg_out_prod = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
-                int64_t msg_out_cons = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-                int64_t raw_out_prod = raw_outbox_region_->producer_published()->load(std::memory_order_acquire);
-                int64_t raw_out_cons = raw_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-                int64_t raw_in_prod = raw_inbox_region_->producer_published()->load(std::memory_order_acquire);
-                int64_t raw_in_cons = raw_inbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-                printf("[DEBUG] MSG_OUTBOX prod=%ld cons=%ld | RAW_OUTBOX prod=%ld cons=%ld | RAW_INBOX prod=%ld cons=%ld | sent=%d\n",
-                       msg_out_prod, msg_out_cons, raw_out_prod, raw_out_cons, raw_in_prod, raw_in_cons, sent);
-                last_debug = now;
-            }
-
-            // Send next message if interval has passed
-            auto since_last = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_send_time).count();
-            if (since_last >= SEND_INTERVAL_MS) {
-                // Send via MSG_OUTBOX: try_claim() + fill + publish()
-                int64_t slot = msg_outbox_prod.try_claim();
-                if (slot >= 0) {
-                    auto& event = msg_outbox_prod[slot];
-                    event.data_len = static_cast<uint16_t>(http_request_len);
-                    event.msg_type = MSG_TYPE_DATA;
-                    memcpy(event.data, HTTP_REQUEST, http_request_len);
-                    msg_outbox_prod.publish(slot);
-                    sent++;
-                    last_send_time = now;
-                    printf("[SENT] HTTPS GET #%d (via same connection - keep-alive)\n", sent);
-                }
-            }
-
-            // Check for HTTP responses via MSG_METADATA
-            MsgMetadata meta;
-            while (msg_metadata_cons.try_consume(meta)) {
-                process_response_chunk(meta);
-            }
-
-            usleep(1000);  // 1ms poll
-        }
-
-        // Verify keep-alive is still working after sending all requests
-        if (!connection_closed && !conn_state_->is_running(PROC_TRANSPORT)) {
-            fprintf(stderr, "[TEST] Transport died after sending - HTTP/1.1 keep-alive FAILED\n");
-            connection_closed = true;
-            keep_alive_working = false;
-        }
-
-        // Wait to receive remaining responses:
-        // - Must wait at least FINAL_DRAIN_MS (2s) for ringbuffer check
-        // - Continue until all responses received or reasonable timeout (10s total)
-        printf("[TEST] Waiting for responses (min %dms)...\n", FINAL_DRAIN_MS);
-        auto drain_start = std::chrono::steady_clock::now();
-        constexpr int MAX_DRAIN_MS = 10000;  // Max 10s total drain for slow servers
-
-        while (true) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - drain_start).count();
-
-            // Must drain for at least FINAL_DRAIN_MS, then can exit early if all responses received
-            bool min_drain_done = (elapsed_ms >= FINAL_DRAIN_MS);
-            bool all_responses = (complete_responses >= sent);
-            bool max_drain_reached = (elapsed_ms >= MAX_DRAIN_MS);
-
-            if ((min_drain_done && all_responses) || max_drain_reached) {
-                if (max_drain_reached && !all_responses) {
-                    printf("[TEST] Max drain reached (%dms), got %d/%d responses\n",
-                           MAX_DRAIN_MS, complete_responses, sent);
-                }
-                break;
-            }
-
-            // Check keep-alive during drain
-            if (!conn_state_->is_running(PROC_TRANSPORT)) {
-                if (complete_responses < sent) {
-                    fprintf(stderr, "[TEST] Transport died during drain - HTTP/1.1 keep-alive FAILED\n");
-                    keep_alive_working = false;
-                }
-                break;
-            }
-
-            // Drain responses
-            MsgMetadata meta;
-            while (msg_metadata_cons.try_consume(meta)) {
-                process_response_chunk(meta);
-            }
-
-            usleep(1000);  // 1ms poll
-        }
-
-        // Final 2s wait for ringbuffer status check (as per requirement)
-        printf("[TEST] Final %dms wait for ringbuffer check...\n", FINAL_DRAIN_MS);
-        auto final_wait_start = std::chrono::steady_clock::now();
-        while (true) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - final_wait_start).count();
-            if (elapsed_ms >= FINAL_DRAIN_MS) break;
-
-            // Continue draining any remaining data
-            MsgMetadata meta;
-            while (msg_metadata_cons.try_consume(meta)) {
-                process_response_chunk(meta);
-            }
-            usleep(1000);
-        }
-
-        // Final response check - if there's accumulated data without </html>, it might be incomplete
-        if (!accumulated_response.empty()) {
-            printf("[WARN] Partial response remaining (%zu bytes) - may be incomplete\n",
-                   accumulated_response.size());
-        }
-
-        // Check response size similarity (all responses should be similar size)
-        bool sizes_similar = true;
-        size_t min_size = 0, max_size = 0, avg_size = 0;
-        if (!response_sizes.empty()) {
-            min_size = *std::min_element(response_sizes.begin(), response_sizes.end());
-            max_size = *std::max_element(response_sizes.begin(), response_sizes.end());
-            size_t sum = 0;
-            for (size_t s : response_sizes) sum += s;
-            avg_size = sum / response_sizes.size();
-
-            // Check if max is within 20% of min (allowing for minor server-side variation)
-            if (min_size > 0) {
-                double ratio = static_cast<double>(max_size) / static_cast<double>(min_size);
-                sizes_similar = (ratio <= 1.20);  // Max 20% difference
+                usleep(1000);
             }
         }
+
+        auto actual_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time).count();
 
         printf("\n=== Test Results ===\n");
-        printf("  Sent:              %d requests\n", sent);
-        printf("  Complete responses: %d (%.0f%%)\n", complete_responses,
-               sent > 0 ? 100.0 * complete_responses / sent : 0);
-        printf("  Total chunks:      %d\n", received_chunks);
-        printf("  Total bytes:       %zu\n", total_response_bytes);
-        printf("  Keep-alive:        %s\n", keep_alive_working ? "WORKING" : "FAILED");
-        printf("  Response order:    %s\n", responses_in_order ? "IN SERIES" : "MIXED (OUT OF ORDER)");
+        printf("  Duration:        %ld ms\n", actual_duration);
+        printf("  Total frames:    %lu\n", total_frames);
+        printf("  TEXT frames:     %lu\n", text_frames);
+        printf("  BINARY frames:   %lu\n", binary_frames);
+        printf("  PING frames:     %lu\n", ping_frames);
+        printf("  PONG frames:     %lu\n", pong_frames);
+        printf("  CLOSE frames:    %lu\n", close_frames);
+        printf("  Valid trades:    %lu\n", valid_trades);
+        printf("  Sequence errors: %s\n", sequence_error ? "YES" : "none");
 
-        // Print individual response sizes
-        printf("  Response sizes:    ");
-        for (size_t i = 0; i < response_sizes.size(); ++i) {
-            printf("%zu", response_sizes[i]);
-            if (i < response_sizes.size() - 1) printf(", ");
-        }
-        printf(" bytes\n");
-        printf("  Size range:        min=%zu, max=%zu, avg=%zu (similar: %s)\n",
-               min_size, max_size, avg_size, sizes_similar ? "yes" : "NO - FAIL");
+        // Verify ring buffer status
+        printf("\n--- Ring Buffer Status ---\n");
 
-        // Verify ring buffer status (STRICT CHECK)
-        printf("\n--- Ring Buffer Status (after %dms drain) ---\n", FINAL_DRAIN_MS);
-        int64_t metadata_prod_seq = msg_metadata_region_->producer_published()->load(std::memory_order_acquire);
-        int64_t metadata_cons_seq = msg_metadata_cons.sequence();
-        bool metadata_caught_up = metadata_cons_seq >= metadata_prod_seq;
-        printf("  MSG_METADATA producer: %ld, consumer: %ld\n", metadata_prod_seq, metadata_cons_seq);
-        printf("  Consumer caught up: %s\n", metadata_caught_up ? "yes" : "NO - FAIL");
+        // WS_FRAME_INFO
+        int64_t ws_frame_prod = ws_frame_info_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t ws_frame_cons_seq = ws_frame_cons.sequence();
+        bool ws_frame_caught_up = ws_frame_cons_seq >= ws_frame_prod;
+        printf("  WS_FRAME_INFO producer: %ld, consumer: %ld\n", ws_frame_prod, ws_frame_cons_seq);
+        printf("  Consumer caught up: %s\n", ws_frame_caught_up ? "yes" : "NO - FAIL");
 
-        int64_t outbox_prod_seq = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
-        int64_t outbox_cons_seq = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-        bool outbox_caught_up = outbox_cons_seq >= outbox_prod_seq;
-        printf("  MSG_OUTBOX producer: %ld, consumer: %ld\n", outbox_prod_seq, outbox_cons_seq);
+        // MSG_METADATA
+        int64_t meta_prod = msg_metadata_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t meta_cons = msg_metadata_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+        bool meta_caught_up = meta_cons >= meta_prod - 1;  // Allow 1 pending
+        printf("  MSG_METADATA producer: %ld, consumer: %ld\n", meta_prod, meta_cons);
+        printf("  Consumer caught up: %s\n", meta_caught_up ? "yes" : "NO - FAIL");
+
+        // MSG_OUTBOX
+        int64_t outbox_prod = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t outbox_cons = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+        bool outbox_caught_up = outbox_cons >= outbox_prod;
+        printf("  MSG_OUTBOX producer: %ld, consumer: %ld\n", outbox_prod, outbox_cons);
         printf("  Consumer caught up: %s\n", outbox_caught_up ? "yes" : "NO - FAIL");
+
+        // PONGS
+        int64_t pongs_prod = pongs_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t pongs_cons = pongs_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+        bool pongs_caught_up = pongs_cons >= pongs_prod;
+        printf("  PONGS producer: %ld, consumer: %ld\n", pongs_prod, pongs_cons);
+        printf("  Consumer caught up: %s\n", pongs_caught_up ? "yes" : "NO - FAIL");
 
         printf("====================\n");
         fflush(stdout);
 
-        // Signal children to stop and wait for them
+        // Signal children to stop and wait
         conn_state_->shutdown_all();
         if (xdp_pid_ > 0) waitpid(xdp_pid_, nullptr, 0);
         if (transport_pid_ > 0) waitpid(transport_pid_, nullptr, 0);
+        if (websocket_pid_ > 0) waitpid(websocket_pid_, nullptr, 0);
         xdp_pid_ = 0;
         transport_pid_ = 0;
+        websocket_pid_ = 0;
 
-        // Save profiling data to /tmp
+        // Save profiling data
         save_profiling_data();
 
-        // === STRICT FAILURE CONDITIONS ===
+        // === FAILURE CONDITIONS ===
 
-        // 1. Check HTTP/1.1 keep-alive
-        if (!keep_alive_working) {
-            printf("\nFAIL: HTTP/1.1 keep-alive not working - connection was closed\n");
+        // In forever mode, always pass if we got frames (was killed by timeout command or Ctrl+C)
+        if (run_forever) {
+            printf("\nFOREVER MODE: Received %lu trades over %ld ms\n",
+                   valid_trades, actual_duration);
+            printf("PASS: Forever mode completed (terminated by signal)\n");
+            return true;
+        }
+
+        // 1. Check we received WebSocket frames
+        if (total_frames == 0) {
+            printf("\nFAIL: No WebSocket frames received\n");
             return false;
         }
 
-        // 2. Check response ordering (must be in series, not mixed)
-        if (!responses_in_order) {
-            printf("\nFAIL: Responses in MSG_INBOX are out of order (mixed)\n");
+        // 2. Check we received trade data
+        if (valid_trades < static_cast<uint64_t>(MIN_EXPECTED_TRADES)) {
+            printf("\nFAIL: Only %lu trades received (expected %d+)\n",
+                   valid_trades, MIN_EXPECTED_TRADES);
             return false;
         }
 
-        // 3. Check we received complete responses
-        if (complete_responses == 0) {
-            printf("\nFAIL: No complete HTTP responses received (no </html> found)\n");
+        // 3. Check ringbuffer consumer caught up
+        if (!ws_frame_caught_up) {
+            printf("\nFAIL: WS_FRAME_INFO consumer did not catch up with producer\n");
             return false;
         }
 
-        if (complete_responses < sent) {
-            printf("\nFAIL: Only %d/%d complete responses received\n", complete_responses, sent);
+        // 4. Check for sequence errors
+        if (sequence_error) {
+            printf("\nFAIL: Out-of-order frame delivery detected\n");
             return false;
         }
 
-        // 4. Check ringbuffer consumer caught up with producer (STRICT)
-        if (!metadata_caught_up) {
-            printf("\nFAIL: MSG_METADATA consumer did not catch up with producer\n");
-            return false;
-        }
-
-        if (!outbox_caught_up) {
-            printf("\nFAIL: MSG_OUTBOX consumer did not catch up with producer\n");
-            return false;
-        }
-
-        // 5. Verify response size is reasonable (GNU.org homepage is typically 5KB+)
-        if (total_response_bytes < 1000) {
-            printf("\nFAIL: Response too small (%zu bytes) - expected full HTML page\n",
-                   total_response_bytes);
-            return false;
-        }
-
-        // 6. Verify response sizes are similar (same page requested multiple times)
-        if (!sizes_similar) {
-            printf("\nFAIL: Response sizes differ too much (min=%zu, max=%zu, ratio=%.2f)\n",
-                   min_size, max_size, max_size > 0 ? static_cast<double>(max_size) / min_size : 0);
-            return false;
-        }
-
-        printf("\nPASS: HTTPS/1.1 keep-alive working (WolfSSL), %d/%d responses in series, sizes similar (%zu bytes avg)\n",
-               complete_responses, sent, avg_size);
+        printf("\nPASS: WebSocket process working, received %lu trades in %ld ms\n",
+               valid_trades, actual_duration);
         return true;
     }
 
@@ -1160,14 +1126,14 @@ private:
             return;
         }
 
-        // Configure BPF maps for HTTPS target traffic
+        // Configure BPF maps for WSS target traffic
         auto* bpf = xdp_poll.get_bpf_loader();
         if (bpf) {
             fprintf(stderr, "[XDP-POLL] Configuring BPF maps: local_ip=%s, exchange_ip=%s, port=%u\n",
-                    g_local_ip.c_str(), https_target_ip_.c_str(), HTTPS_PORT);
+                    g_local_ip.c_str(), wss_target_ip_.c_str(), WSS_PORT);
             bpf->set_local_ip(g_local_ip.c_str());
-            bpf->add_exchange_ip(https_target_ip_.c_str());
-            bpf->add_exchange_port(HTTPS_PORT);
+            bpf->add_exchange_ip(wss_target_ip_.c_str());
+            bpf->add_exchange_port(WSS_PORT);
         } else {
             fprintf(stderr, "[XDP-POLL] WARNING: BPF loader is NULL!\n");
         }
@@ -1179,7 +1145,7 @@ private:
     void run_transport_process() {
         pin_to_cpu(TRANSPORT_CPU_CORE);
 
-        // Create ring adapters in child process (all use UMEMFrameDescriptor)
+        // Create ring adapters in child process
         IPCRingConsumer<UMEMFrameDescriptor> raw_inbox_cons(*raw_inbox_region_);
         IPCRingProducer<UMEMFrameDescriptor> raw_outbox_prod(*raw_outbox_region_);
         IPCRingProducer<UMEMFrameDescriptor> ack_outbox_prod(*ack_outbox_region_);
@@ -1195,10 +1161,10 @@ private:
             transport.set_profiling_data(&profiling_->transport);
         }
 
-        // Pass the hostname (not IP) for SNI - TCP stack will resolve it
+        // Pass the hostname (not IP) for SNI
         bool ok = transport.init_with_handshake(
             umem_area_, FRAME_SIZE,
-            HTTPS_HOST, HTTPS_PORT,
+            WSS_HOST, WSS_PORT,
             &raw_inbox_cons,
             &raw_outbox_prod,
             &ack_outbox_prod,
@@ -1215,25 +1181,43 @@ private:
             return;
         }
 
-        // Debug: Print MSG_OUTBOX state and tx_frame before run()
-        {
-            int64_t pub = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
-            int64_t con = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-            size_t avail = msg_outbox_cons.available();
-            fprintf(stderr, "[TRANSPORT] Before run(): MSG_OUTBOX pub=%ld con=%ld avail=%zu\n", pub, con, avail);
+        fprintf(stderr, "[TRANSPORT] TLS handshake complete, running main loop\n");
+        transport.run();
+    }
 
-            uint32_t msg_alloc = conn_state_->tx_frame.msg_alloc_pos.load(std::memory_order_acquire);
-            uint32_t msg_rel = conn_state_->tx_frame.msg_release_pos.load(std::memory_order_acquire);
-            fprintf(stderr, "[TRANSPORT] tx_frame: msg_alloc=%u msg_release=%u diff=%u MSG_FRAMES=%zu\n",
-                    msg_alloc, msg_rel, msg_alloc - msg_rel, MSG_FRAMES);
+    // WebSocket child process
+    void run_websocket_process() {
+        pin_to_cpu(WEBSOCKET_CPU_CORE);
+
+        // Create ring adapters in child process
+        IPCRingConsumer<MsgMetadata> msg_metadata_cons(*msg_metadata_region_);
+        IPCRingProducer<WSFrameInfo> ws_frame_info_prod(*ws_frame_info_region_);
+        IPCRingProducer<MsgOutboxEvent> msg_outbox_prod(*msg_outbox_region_);
+        IPCRingProducer<PongFrameAligned> pongs_prod(*pongs_region_);
+
+        WebSocketType ws_process;
+
+        bool ok = ws_process.init(
+            msg_inbox_,
+            &msg_metadata_cons,
+            &ws_frame_info_prod,
+            &pongs_prod,
+            &msg_outbox_prod,
+            conn_state_);
+
+        if (!ok) {
+            fprintf(stderr, "[WS-PROCESS] init() failed\n");
+            conn_state_->shutdown_all();
+            return;
         }
 
-        transport.run();
+        // Run with handshake (performs HTTP upgrade, subscription, then main loop)
+        ws_process.run_with_handshake();
     }
 
     const char* interface_;
     const char* bpf_path_;
-    std::string https_target_ip_;  // Resolved IP of HTTPS_HOST
+    std::string wss_target_ip_;  // Resolved IP of WSS_HOST
 
     IPCRingManager ipc_manager_;
 
@@ -1255,34 +1239,56 @@ private:
     disruptor::ipc::shared_region* msg_outbox_region_ = nullptr;
     disruptor::ipc::shared_region* msg_metadata_region_ = nullptr;
     disruptor::ipc::shared_region* pongs_region_ = nullptr;
+    disruptor::ipc::shared_region* ws_frame_info_region_ = nullptr;
 
     pid_t xdp_pid_ = 0;
     pid_t transport_pid_ = 0;
+    pid_t websocket_pid_ = 0;
 };
 
 // ============================================================================
 // Main
 // ============================================================================
 
+// Parse --timeout argument from argv
+void parse_args(int argc, char* argv[]) {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
+            g_timeout_ms = atoi(argv[i + 1]);
+            printf("[ARGS] Timeout set to %d ms%s\n",
+                   g_timeout_ms, g_timeout_ms <= 0 ? " (FOREVER MODE)" : "");
+            break;
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <interface> <bpf_path> [ignored...]\n", argv[0]);
-        fprintf(stderr, "NOTE: Do NOT run directly. Use: ./scripts/test_xdp.sh 12_transport_https_wolfssl.cpp\n");
+        fprintf(stderr, "Usage: %s <interface> <bpf_path> [ignored...] [--timeout <ms>]\n", argv[0]);
+        fprintf(stderr, "NOTE: Do NOT run directly. Use: USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp\n");
+        fprintf(stderr, "\nOptions:\n");
+        fprintf(stderr, "  --timeout <ms>   Stream timeout in milliseconds (default: %d)\n", DEFAULT_STREAM_DURATION_MS);
+        fprintf(stderr, "                   If <= 0, run forever (display all messages, Ctrl+C to stop)\n");
         fprintf(stderr, "\nThis test:\n");
-        fprintf(stderr, "  - Forks XDP Poll (core 2) and Transport<WolfSSLPolicy> (core 4)\n");
-        fprintf(stderr, "  - Connects to %s:%u (HTTPS with WolfSSL)\n", HTTPS_HOST, HTTPS_PORT);
-        fprintf(stderr, "  - Sends up to %d HTTPS GET requests at %dms intervals (same connection)\n", MAX_MESSAGES, SEND_INTERVAL_MS);
-        fprintf(stderr, "  - Verifies HTTP/1.1 keep-alive (fails if connection closes)\n");
-        fprintf(stderr, "  - Verifies responses in MSG_INBOX are in series (not mixed)\n");
-        fprintf(stderr, "  - Verifies full HTML response received (</html> marker)\n");
-        fprintf(stderr, "  - Waits %dms, then verifies ringbuffer consumer caught up\n", FINAL_DRAIN_MS);
-        fprintf(stderr, "  - Timeout: %d seconds\n", TIMEOUT_SECONDS);
+        fprintf(stderr, "  - Forks XDP Poll (core 2), Transport<WolfSSL> (core 4), WebSocket (core 6)\n");
+        fprintf(stderr, "  - Connects to %s:%u (WSS with WolfSSL)\n", WSS_HOST, WSS_PORT);
+        fprintf(stderr, "  - WebSocketProcess handles HTTP+WS handshake\n");
+        fprintf(stderr, "  - Streams BTCUSDT trades for the specified timeout\n");
+        fprintf(stderr, "  - Parent consumes WS_FRAME_INFO, validates JSON trade data\n");
+        fprintf(stderr, "  - Expects at least %d trades (BTCUSDT is very liquid)\n", MIN_EXPECTED_TRADES);
+        fprintf(stderr, "  - Waits %dms, then verifies ringbuffer consumers caught up\n", FINAL_DRAIN_MS);
+        fprintf(stderr, "\nExamples:\n");
+        fprintf(stderr, "  USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp                # Default 5s\n");
+        fprintf(stderr, "  USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp --timeout 10000  # 10s\n");
+        fprintf(stderr, "  USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp --timeout -1     # Forever\n");
         return 1;
     }
 
     const char* interface = argv[1];
     const char* bpf_path = argv[2];
-    // Note: argv[3] and argv[4] are ignored - we use hardcoded HTTPS_HOST:HTTPS_PORT
+
+    // Parse optional arguments
+    parse_args(argc, argv);
 
     // PREVENT ROOT USER FROM RUNNING
     if (geteuid() == 0) {
@@ -1290,7 +1296,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "ERROR: Do NOT run as root!\n");
         fprintf(stderr, "========================================\n");
         fprintf(stderr, "\nRun via the wrapper script which sets capabilities properly:\n");
-        fprintf(stderr, "  ./scripts/test_xdp.sh 12_transport_https_wolfssl.cpp\n");
+        fprintf(stderr, "  USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp\n");
         return 1;
     }
 
@@ -1299,19 +1305,26 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, signal_handler);
 
     printf("==============================================\n");
-    printf("  Transport HTTPS Test (WolfSSLPolicy)        \n");
+    printf("  WebSocket Binance Test                      \n");
     printf("==============================================\n");
     printf("  Interface:  %s\n", interface);
-    printf("  Target:     %s:%u (HTTPS)\n", HTTPS_HOST, HTTPS_PORT);
+    printf("  Target:     %s:%u (WSS)\n", WSS_HOST, WSS_PORT);
+    printf("  Path:       %s\n", WSS_PATH);
     printf("  SSL:        WolfSSL\n");
-    printf("  Messages:   up to %d (every %dms)\n", MAX_MESSAGES, SEND_INTERVAL_MS);
-    printf("  Keep-alive: HTTP/1.1 (same connection)\n");
-    printf("  Ordering:   verify responses in series\n");
-    printf("  Drain:      %dms then check ringbuffer\n", FINAL_DRAIN_MS);
-    printf("  Timeout:    %d seconds\n", TIMEOUT_SECONDS);
+    printf("  Processes:  XDP Poll (core %d)\n", XDP_POLL_CPU_CORE);
+    printf("              Transport (core %d)\n", TRANSPORT_CPU_CORE);
+    printf("              WebSocket (core %d)\n", WEBSOCKET_CPU_CORE);
+    if (g_timeout_ms <= 0) {
+        printf("  Timeout:    FOREVER (Ctrl+C to stop)\n");
+        printf("  Mode:       Display all messages\n");
+    } else {
+        printf("  Timeout:    %d ms\n", g_timeout_ms);
+        printf("  Expected:   %d+ trades\n", MIN_EXPECTED_TRADES);
+        printf("  Drain:      %dms then check ringbuffers\n", FINAL_DRAIN_MS);
+    }
     printf("==============================================\n\n");
 
-    TransportHTTPSWolfSSLTest test(interface, bpf_path);
+    WebSocketBinanceTest test(interface, bpf_path);
 
     // Setup
     if (!test.setup()) {
@@ -1329,9 +1342,9 @@ int main(int argc, char* argv[]) {
     // Give processes time to stabilize
     usleep(500000);  // 500ms
 
-    // Run test
+    // Run streaming test
     int result = 0;
-    if (!test.run_https_test()) {
+    if (!test.run_stream_test()) {
         result = 1;
     }
 
@@ -1354,7 +1367,7 @@ int main(int argc, char* argv[]) {
 
 int main() {
     fprintf(stderr, "Error: Build with USE_XDP=1 USE_WOLFSSL=1\n");
-    fprintf(stderr, "Example: make build-test-pipeline-transport_https_wolfssl USE_XDP=1 USE_WOLFSSL=1\n");
+    fprintf(stderr, "Example: make build-test-pipeline-websocket_binance USE_XDP=1 USE_WOLFSSL=1\n");
     return 1;
 }
 

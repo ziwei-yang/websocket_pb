@@ -775,8 +775,8 @@ public:
 
             MsgMetadata meta;
             while (msg_metadata_cons.try_consume(meta)) {
-                printf("[WS] Got MSG_METADATA: decrypted_len=%u, msg_inbox_offset=%u\n",
-                       meta.decrypted_len, meta.msg_inbox_offset);
+                printf("[WS] Got MSG_METADATA: decrypted_len=%u, msg_inbox_offset=%u, nic_packet_ct=%u\n",
+                       meta.decrypted_len, meta.msg_inbox_offset, meta.nic_packet_ct);
                 if (meta.decrypted_len > 0) {
                     const uint8_t* data = msg_inbox_->data_at(meta.msg_inbox_offset);
                     printf("[WS] Received response (%u bytes): %.*s\n",
@@ -852,6 +852,10 @@ public:
 
                 received_chunks++;
                 total_bytes += meta.decrypted_len;
+
+                // Log new nic_packet_ct field
+                printf("[META] chunk=%d offset=%u len=%u nic_packet_ct=%u\n",
+                       received_chunks, meta.msg_inbox_offset, meta.decrypted_len, meta.nic_packet_ct);
 
                 const uint8_t* data = msg_inbox_->data_at(meta.msg_inbox_offset);
                 size_t data_len = meta.decrypted_len;

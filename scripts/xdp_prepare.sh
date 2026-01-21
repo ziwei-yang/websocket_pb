@@ -2,9 +2,14 @@
 # XDP Preparation Script
 # Prepares the NIC and environment for AF_XDP zero-copy operation
 #
-# Usage: ./scripts/xdp_prepare.sh [--reload] <interface>
+# Usage: ./scripts/xdp_prepare.sh [--reload] [--domain <hostname>] <interface>
 # Example: ./scripts/xdp_prepare.sh enp108s0
 #          ./scripts/xdp_prepare.sh --reload enp108s0  # Reload NIC driver first
+#          ./scripts/xdp_prepare.sh --domain stream.binance.com enp108s0
+#
+# Options:
+#   --reload              Reload NIC driver to reset stuck XDP state
+#   --domain <hostname>   Update /etc/hosts with latest DNS for hostname
 #
 # The --reload flag is useful when XDP gets stuck after a previous session.
 # This is a known issue with the igc driver.
@@ -14,14 +19,21 @@ set -e
 # Parse arguments
 RELOAD_DRIVER=0
 IFACE="enp108s0"
+DOMAIN=""
 
-for arg in "$@"; do
-    case "$arg" in
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --reload)
             RELOAD_DRIVER=1
+            shift
+            ;;
+        --domain)
+            DOMAIN="$2"
+            shift 2
             ;;
         *)
-            IFACE="$arg"
+            IFACE="$1"
+            shift
             ;;
     esac
 done
@@ -50,6 +62,47 @@ print_header() {
     echo "  XDP Preparation: $IFACE"
     echo "========================================"
     echo ""
+}
+
+# Update /etc/hosts with latest DNS result for a domain
+# This is needed for domains with severe IP churn (e.g., stream.binance.com)
+update_domain_hosts() {
+    if [[ -z "$DOMAIN" ]]; then
+        return 0
+    fi
+
+    echo "Updating /etc/hosts for $DOMAIN..."
+
+    # Get fresh DNS result (bypass local cache using external DNS)
+    local new_ip=$(dig +short "$DOMAIN" @8.8.8.8 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+
+    if [[ -z "$new_ip" ]]; then
+        # Fallback to default resolver
+        new_ip=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
+    fi
+
+    if [[ -z "$new_ip" ]]; then
+        print_warning "Could not resolve $DOMAIN"
+        return 1
+    fi
+
+    # Check current /etc/hosts entry
+    local current_ip=$(grep -E "^[0-9].*[[:space:]]${DOMAIN}$" /etc/hosts 2>/dev/null | awk '{print $1}' | head -1)
+
+    if [[ "$current_ip" == "$new_ip" ]]; then
+        print_status "$DOMAIN already points to $new_ip in /etc/hosts"
+        return 0
+    fi
+
+    # Remove old entry (if any) and add new one
+    sudo sed -i "/[[:space:]]${DOMAIN}$/d" /etc/hosts
+    echo "$new_ip $DOMAIN" | sudo tee -a /etc/hosts >/dev/null
+
+    if [[ -n "$current_ip" ]]; then
+        print_status "$DOMAIN updated in /etc/hosts: $current_ip → $new_ip"
+    else
+        print_status "$DOMAIN added to /etc/hosts: $new_ip"
+    fi
 }
 
 # Check if interface exists
@@ -349,6 +402,7 @@ start_clock_sync() {
 print_header
 check_interface
 check_root
+update_domain_hosts
 reload_nic_driver
 check_xdp_support
 set_nic_queue

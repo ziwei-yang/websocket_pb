@@ -78,7 +78,10 @@ struct alignas(64) MsgMetadata {
     uint32_t msg_inbox_offset;             // Start offset in MSG_INBOX buffer
     uint32_t decrypted_len;                // Length of decrypted data from this SSL_read
 
-    uint8_t _pad[8];                       // Padding to 64 bytes
+    // Packet counting
+    uint32_t nic_packet_ct;                // Number of NIC packets in this SSL_read batch
+
+    uint8_t _pad[4];                       // Padding to 64 bytes
 
     void clear() {
         first_nic_timestamp_ns = 0;
@@ -89,6 +92,7 @@ struct alignas(64) MsgMetadata {
         ssl_read_cycle = 0;
         msg_inbox_offset = 0;
         decrypted_len = 0;
+        nic_packet_ct = 0;
     }
 };
 static_assert(sizeof(MsgMetadata) == 64, "MsgMetadata must be 64 bytes");
@@ -100,20 +104,24 @@ static_assert(sizeof(MsgMetadata) == 64, "MsgMetadata must be 64 bytes");
 // ============================================================================
 
 struct alignas(64) WSFrameInfo {
-    // Location in MSG_INBOX (for non-fragmented messages)
-    uint32_t msg_inbox_offset;             // Start offset of WS payload in MSG_INBOX
-    uint32_t payload_len;                  // WebSocket payload length
+    // Location in MSG_INBOX - valid for ALL messages including partial frames
+    uint32_t msg_inbox_offset;             // Start offset of THIS frame/fragment's payload
+    uint32_t payload_len;                  // THIS frame/fragment's payload length
 
     // WebSocket frame info
-    uint8_t  opcode;                       // WS opcode (TEXT=1, BINARY=2, etc.)
-    uint8_t  is_fin;                       // FIN bit set (last frame of message)
-    uint8_t  is_fragmented;                // True if payload spans multiple fragments
-    uint8_t  _pad1;
+    uint8_t  opcode;                       // WS opcode (TEXT=1, BINARY=2, PING=9, etc.)
+    bool     is_fin;                       // FIN bit from WS header
+    bool     is_fragmented;                // True if partial frame OR fragmented WS message
+    bool     is_last_fragment;             // True if this is the final fragment/part
 
-    // For fragmented messages (is_fragmented=true):
-    // - msg_inbox_offset is NOT valid (fragments scattered)
-    // - frame_total_len gives total bytes consumed in MSG_INBOX
-    uint32_t frame_total_len;              // Total WS frame length(s) including headers
+    // Each fragment generates a separate WSFrameInfo event immediately.
+    // This allows AppClient to process fragments incrementally for lower latency.
+    //
+    // Fragment/partial handling:
+    //   - is_fragmented=false: Complete single-frame message
+    //   - is_fragmented=true, is_last_fragment=false: Partial frame or intermediate fragment
+    //   - is_fragmented=true, is_last_fragment=true: Final fragment (message complete)
+    uint32_t frame_total_len;              // THIS frame's total length (header + payload)
 
     // Full timestamp chain
     uint64_t first_byte_ts;                // NIC timestamp when first byte arrived
@@ -121,25 +129,37 @@ struct alignas(64) WSFrameInfo {
     uint64_t last_byte_ts;                 // NIC timestamp when frame completed
     uint64_t latest_nic_frame_poll_cycle;  // XDP Poll rdtscp (latest packet)
     uint64_t latest_raw_frame_poll_cycle;  // Transport rdtscp (latest packet)
-    uint64_t ssl_read_cycle;               // SSL_read completion cycle
+
+    // SSL_read timing (replaces single ssl_read_cycle)
+    uint64_t first_ssl_read_cycle;         // TSC cycle of first SSL_read for this frame
+    uint64_t last_ssl_read_cycle;          // TSC cycle of last SSL_read for this frame
+    uint32_t ssl_read_ct;                  // Number of SSL_read calls for this frame
+
+    // Packet counting
+    uint32_t nic_packet_ct;                // Number of NIC packets for this frame
+
     uint64_t ws_parse_cycle;               // WS frame parse completion cycle
 
-    // Reserved for alignment
-    uint8_t  _pad2[24];
+    // Padding adjusted for new fields
+    uint8_t  _pad2[40];                    // Padding to maintain 128-byte alignment
 
     void clear() {
         msg_inbox_offset = 0;
         payload_len = 0;
         opcode = 0;
-        is_fin = 0;
-        is_fragmented = 0;
+        is_fin = false;
+        is_fragmented = false;
+        is_last_fragment = false;
         frame_total_len = 0;
         first_byte_ts = 0;
         first_nic_frame_poll_cycle = 0;
         last_byte_ts = 0;
         latest_nic_frame_poll_cycle = 0;
         latest_raw_frame_poll_cycle = 0;
-        ssl_read_cycle = 0;
+        first_ssl_read_cycle = 0;
+        last_ssl_read_cycle = 0;
+        ssl_read_ct = 0;
+        nic_packet_ct = 0;
         ws_parse_cycle = 0;
     }
 };
@@ -455,7 +475,7 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         remote_port = 0;
         std::memset(local_mac, 0, 6);
         std::memset(remote_mac, 0, 6);
-        peer_mss = TCP_MSS;  // From pipeline_config.hpp (NIC_MTU - 40)
+        peer_mss = PIPELINE_TCP_MSS;  // From pipeline_config.hpp (NIC_MTU - 40)
         last_ack_cycle = 0;
         srtt_us = 100000;   // Initial 100ms
         rttvar_us = 50000;  // Initial 50ms
@@ -779,7 +799,23 @@ struct IPCRingConsumer {
     size_t process_manually(F&& handler, size_t max_events = SIZE_MAX) {
         auto* published = region_.producer_published();
         int64_t avail = published->load(std::memory_order_acquire);
-        int64_t next = sequence_ + 1;
+
+        // FIX: When commit_up_to() cannot advance sequence_ (e.g., OOO buffer holds
+        // frame references), last_processed_ is preserved but sequence_ stays unchanged.
+        // Without this fix, next iteration would reprocess the same frames because
+        // next = sequence_ + 1 ignores what was already processed.
+        //
+        // Example scenario (TCP OOO handling):
+        //   - Frame 23 is OOO segment, stored in OOO buffer with ext_id=23
+        //   - safe_commit_rx() calls commit_up_to(22) since min_ext_id-1 = 22
+        //   - sequence_ stays at 22, but last_processed_ = 23
+        //   - Without fix: next = 23, reprocesses frame 23 indefinitely
+        //   - With fix: next = 24, skips already-processed frame 23
+        //
+        // See: issues/001_ipc_ring_reprocess_bug.md for detailed analysis
+        int64_t next = (last_processed_ > sequence_)
+                       ? last_processed_ + 1
+                       : sequence_ + 1;
 
         if (avail < next) {
             return 0;  // No events available
@@ -840,6 +876,24 @@ struct IPCRingConsumer {
             region_.consumer_sequence(consumer_index_)->store(sequence_, std::memory_order_release);
         }
         last_processed_ = -1;  // Reset for next batch
+    }
+
+    /**
+     * Commit up to a specific sequence (for safe commit with OOO segments)
+     * Use this when OOO buffer holds references to frames that shouldn't be released yet.
+     * @param target_seq Maximum sequence to commit to (inclusive)
+     *
+     * NOTE: Does NOT reset last_processed_ - frames past safe point still tracked.
+     */
+    void commit_up_to(int64_t target_seq) {
+        if (target_seq > sequence_) {
+            int64_t commit_seq = std::min(target_seq, last_processed_);
+            if (commit_seq > sequence_) {
+                sequence_ = commit_seq;
+                region_.consumer_sequence(consumer_index_)->store(sequence_, std::memory_order_release);
+            }
+        }
+        // NOTE: Don't reset last_processed_ - still tracking frames past safe point
     }
 
     /**

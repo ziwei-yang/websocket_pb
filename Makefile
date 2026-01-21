@@ -241,6 +241,7 @@ TEST_STACK_CHECKSUM_SRC := $(TEST_DIR)/test_stack_checksum.cpp
 TEST_TCP_STATE_SRC := $(TEST_DIR)/test_tcp_state.cpp
 TEST_RETRANSMIT_QUEUE_SRC := $(TEST_DIR)/test_retransmit_queue.cpp
 TEST_SSL_POLICY_SRC := $(TEST_DIR)/test_ssl_policy.cpp
+TEST_WS_PARSER_SRC := $(TEST_DIR)/test_ws_parser.cpp
 
 # Integration test source files
 TEST_BINANCE_SRC := $(INTEGRATION_DIR)/binance.cpp
@@ -275,8 +276,9 @@ TEST_STACK_CHECKSUM_BIN := $(BUILD_DIR)/test_stack_checksum
 TEST_TCP_STATE_BIN := $(BUILD_DIR)/test_tcp_state
 TEST_RETRANSMIT_QUEUE_BIN := $(BUILD_DIR)/test_retransmit_queue
 TEST_SSL_POLICY_BIN := $(BUILD_DIR)/test_ssl_policy
+TEST_WS_PARSER_BIN := $(BUILD_DIR)/test_ws_parser
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-hftshm bpf check-ktls release debug epoll build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss
 
 all: $(EXAMPLE_BIN)
 
@@ -517,6 +519,17 @@ test-ssl-policy: $(TEST_SSL_POLICY_BIN)
 	@echo "🧪 Running SSL policy unit tests..."
 	./$(TEST_SSL_POLICY_BIN)
 
+# Build WS parser tests
+$(TEST_WS_PARSER_BIN): $(TEST_WS_PARSER_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling WS parser unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run WS parser tests
+test-ws-parser: $(TEST_WS_PARSER_BIN)
+	@echo "🧪 Running WS parser unit tests..."
+	./$(TEST_WS_PARSER_BIN)
+
 # ============================================================================
 # Pipeline Integration Tests (Multi-Process AF_XDP WebSocket)
 # ============================================================================
@@ -530,36 +543,10 @@ PIPELINE_HEADERS := \
     src/pipeline/pipeline_config.hpp \
     src/pipeline/msg_inbox.hpp \
     src/pipeline/ws_parser.hpp \
-    src/pipeline/pipeline.hpp \
     src/pipeline/websocket_process.hpp \
-    src/pipeline/app_client.hpp \
-    src/pipeline/handshake_manager.hpp \
     src/stack/userspace_stack.hpp \
     src/policy/ssl.hpp \
     src/core/timing.hpp
-
-# Pipeline source and binary
-PIPELINE_BINANCE_SRC := $(INTEGRATION_DIR)/binance_pipeline.cpp
-PIPELINE_BINANCE_BIN := $(BUILD_DIR)/binance_pipeline
-
-# Build pipeline Binance integration test
-$(PIPELINE_BINANCE_BIN): $(PIPELINE_BINANCE_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
-	@echo "🔨 Compiling Pipeline Binance integration test..."
-ifdef USE_XDP
-	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
-	@echo "✅ Pipeline build complete: $@"
-else
-	@echo "❌ Error: Pipeline requires USE_XDP=1"
-	@exit 1
-endif
-
-# Build-only target for pipeline
-build-pipeline-binance: $(PIPELINE_BINANCE_BIN)
-
-# Run pipeline Binance test (with full XDP preparation)
-test-pipeline-binance: $(PIPELINE_BINANCE_BIN)
-	@echo "🧪 Running Pipeline integration test via script..."
-	sudo ./scripts/xdp_pipeline_integration.sh $(XDP_INTERFACE) 45
 
 # ============================================================================
 # XDP Poll Segregated Test (Wire Loopback)
@@ -779,6 +766,64 @@ test-pipeline-transport-https-libressl: $(PIPELINE_TRANSPORT_HTTPS_LIBRESSL_BIN)
 	./scripts/test_xdp.sh 14_transport_https_libressl.cpp
 
 # ============================================================================
+# Transport WSS Test (WebSocket Secure with WolfSSL against Binance)
+# Tests WSS streaming against stream.binance.com:443
+# ============================================================================
+
+PIPELINE_TRANSPORT_WSS_SRC := test/pipeline/15_transport_wss.cpp
+PIPELINE_TRANSPORT_WSS_BIN := $(BUILD_DIR)/test_pipeline_transport_wss
+
+$(PIPELINE_TRANSPORT_WSS_BIN): $(PIPELINE_TRANSPORT_WSS_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+	@echo "🔨 Compiling Transport WSS test..."
+ifdef USE_XDP
+ifdef USE_WOLFSSL
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Transport WSS test build complete: $@"
+else
+	@echo "❌ Error: Transport WSS test requires USE_WOLFSSL=1"
+	@exit 1
+endif
+else
+	@echo "❌ Error: Transport WSS test requires USE_XDP=1"
+	@exit 1
+endif
+
+build-test-pipeline-transport_wss: $(PIPELINE_TRANSPORT_WSS_BIN)
+
+test-pipeline-transport-wss: $(PIPELINE_TRANSPORT_WSS_BIN) bpf
+	@echo "🧪 Running Transport WSS test via script..."
+	./scripts/test_xdp.sh 15_transport_wss.cpp
+
+# ============================================================================
+# WebSocket Binance Test (WebSocketProcess with Binance WSS stream)
+# Tests full pipeline: XDP Poll + Transport + WebSocket processes
+# ============================================================================
+
+PIPELINE_WEBSOCKET_BINANCE_SRC := test/pipeline/20_websocket_binance.cpp
+PIPELINE_WEBSOCKET_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_websocket_binance
+
+$(PIPELINE_WEBSOCKET_BINANCE_BIN): $(PIPELINE_WEBSOCKET_BINANCE_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+	@echo "🔨 Compiling WebSocket Binance test..."
+ifdef USE_XDP
+ifdef USE_WOLFSSL
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ WebSocket Binance test build complete: $@"
+else
+	@echo "❌ Error: WebSocket Binance test requires USE_WOLFSSL=1"
+	@exit 1
+endif
+else
+	@echo "❌ Error: WebSocket Binance test requires USE_XDP=1"
+	@exit 1
+endif
+
+build-test-pipeline-websocket_binance: $(PIPELINE_WEBSOCKET_BINANCE_BIN)
+
+test-pipeline-websocket-binance: $(PIPELINE_WEBSOCKET_BINANCE_BIN) bpf
+	@echo "🧪 Running WebSocket Binance test via script..."
+	USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp
+
+# ============================================================================
 # HftShm RingBuffer Tests (requires hft-shm CLI)
 # ============================================================================
 
@@ -862,7 +907,7 @@ test-simulator: $(SIMULATOR_BIN)
 # Unified Test Target - Run All Unit Tests
 # ============================================================================
 
-test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy
+test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser
 	@echo ""
 	@echo "╔════════════════════════════════════════════════════════════════════╗"
 	@echo "║                    ALL UNIT TESTS COMPLETED                        ║"
@@ -965,12 +1010,12 @@ help:
 	@echo "  make test-stack-checksum - Test TCP/IP checksum calculations"
 	@echo "  make test-tcp-state     - Test TCP state machine"
 	@echo "  make test-ssl-policy    - Test SSL policy zero-copy API"
+	@echo "  make test-ws-parser     - Test WebSocket frame parser"
 	@echo "  make test-hftshm        - Test HftShmRingBuffer (requires hft-shm CLI)"
 	@echo ""
 	@echo "Integration Tests:"
 	@echo "  make test-binance       - BSD socket test with Binance (20 msgs)"
 	@echo "  make test-xdp-binance   - XDP zero-copy test with Binance (requires sudo)"
-	@echo "  make test-pipeline-binance - Multi-process pipeline test (requires sudo)"
 	@echo "  make test-pipeline-xdp-poll - XDP Poll segregated test (wire loopback, sudo)"
 	@echo "  make test-pipeline-transport-http - Plain HTTP test against ipinfo.io:80"
 	@echo ""

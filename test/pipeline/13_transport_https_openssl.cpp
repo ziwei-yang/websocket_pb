@@ -720,6 +720,10 @@ public:
             total_response_bytes += meta.decrypted_len;
             received_chunks++;
 
+            // Log new nic_packet_ct field
+            printf("[META] chunk=%d offset=%u len=%u nic_packet_ct=%u\n",
+                   received_chunks, meta.msg_inbox_offset, meta.decrypted_len, meta.nic_packet_ct);
+
             const char* data = reinterpret_cast<const char*>(msg_inbox_->data_at(meta.msg_inbox_offset));
             uint32_t chunk_start = meta.msg_inbox_offset;
             uint32_t chunk_end = chunk_start + meta.decrypted_len;

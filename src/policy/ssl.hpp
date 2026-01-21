@@ -43,7 +43,7 @@
 #include <cstring>
 #include <unistd.h>  // usleep() for DPDK handshake polling
 
-#include "../pipeline/pipeline_config.hpp"  // NIC_MTU, TCP_MSS, MAX_TLS_RECORD_PAYLOAD
+#include "../pipeline/pipeline_config.hpp"  // NIC_MTU, PIPELINE_TCP_MSS, MAX_TLS_RECORD_PAYLOAD
 
 // ============================================================================
 // Library Detection and Headers
@@ -177,7 +177,7 @@ struct OpenSSLPolicy {
         SSL_CTX_set_options(ctx_, SSL_OP_NO_TICKET);
 
         // Limit TLS record size to fit in single TCP segment (Hybrid Approach for MTU)
-        // MAX_TLS_RECORD_PAYLOAD = TCP_MSS - TLS13_OVERHEAD (from pipeline_config.hpp)
+        // MAX_TLS_RECORD_PAYLOAD = PIPELINE_TCP_MSS - TLS13_OVERHEAD (from pipeline_config.hpp)
         // This is derived from NIC_MTU which is a compile-time argument
         SSL_CTX_set_max_send_fragment(ctx_, pipeline::MAX_TLS_RECORD_PAYLOAD);
 
@@ -870,7 +870,7 @@ struct LibreSSLPolicy {
         SSL_CTX_set_options(ctx_, SSL_OP_NO_TICKET);
 
         // Limit TLS record size to fit in single TCP segment (Hybrid Approach for MTU)
-        // MAX_TLS_RECORD_PAYLOAD = TCP_MSS - TLS13_OVERHEAD (from pipeline_config.hpp)
+        // MAX_TLS_RECORD_PAYLOAD = PIPELINE_TCP_MSS - TLS13_OVERHEAD (from pipeline_config.hpp)
         // This is derived from NIC_MTU which is a compile-time argument
         SSL_CTX_set_max_send_fragment(ctx_, pipeline::MAX_TLS_RECORD_PAYLOAD);
 

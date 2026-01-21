@@ -344,6 +344,11 @@ struct XDPPollProcess {
             tx_desc->options = 0;
             tx_count++;
 
+            // Debug: Print UMEM frame ID on TX
+            uint32_t umem_frame_id = static_cast<uint32_t>(desc.umem_addr / FrameSize);
+            fprintf(stderr, "[XDP-TX] umem_id=%u addr=0x%lx len=%u type=%u\n",
+                    umem_frame_id, (unsigned long)desc.umem_addr, desc.frame_len, desc.frame_type);
+
 #if DEBUG
             fprintf(stderr, "[XDP-TX] Collected frame: addr=0x%lx len=%u\n",
                     (unsigned long)desc.umem_addr, desc.frame_len);
@@ -483,6 +488,11 @@ struct XDPPollProcess {
                 first_rx_timestamp_ns_ = desc.nic_timestamp_ns;  // First packet's timestamp for profiling
                 first_rx_poll_cycle_ = poll_cycle;               // First packet's poll cycle for profiling
             }
+
+            // Debug: Print UMEM frame ID on RX
+            uint32_t umem_frame_id = static_cast<uint32_t>(rx_desc->addr / FrameSize);
+            fprintf(stderr, "[XDP-RX] umem_id=%u addr=0x%lx len=%u slot=%ld\n",
+                    umem_frame_id, (unsigned long)rx_desc->addr, rx_desc->len, slot);
 
             // Record NIC latency sample (when profiling enabled)
             if constexpr (Profiling) {

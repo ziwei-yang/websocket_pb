@@ -91,7 +91,9 @@ inline constexpr size_t MSG_INBOX_SIZE = 64 * 1024 * 1024;
 // TCP/TLS Configuration
 // ============================================================================
 
-inline constexpr size_t TCP_MSS = NIC_MTU - 40;  // MTU - IP(20) - TCP(20)
+// Note: Named PIPELINE_TCP_MSS to avoid conflict with system header
+// /usr/include/netinet/tcp.h which defines #define TCP_MSS 512
+inline constexpr size_t PIPELINE_TCP_MSS = NIC_MTU - 40;  // MTU - IP(20) - TCP(20)
 
 // TLS overhead for record size calculation
 inline constexpr size_t TLS_RECORD_HEADER = 5;    // Content type(1) + version(2) + length(2)
@@ -99,7 +101,7 @@ inline constexpr size_t TLS_MAC_SIZE = 16;        // AES-GCM tag
 inline constexpr size_t TLS13_OVERHEAD = TLS_RECORD_HEADER + TLS_MAC_SIZE;  // 5 + 16 = 21
 
 // Max TLS record payload to fit in single TCP segment
-inline constexpr size_t MAX_TLS_RECORD_PAYLOAD = TCP_MSS - TLS13_OVERHEAD;
+inline constexpr size_t MAX_TLS_RECORD_PAYLOAD = PIPELINE_TCP_MSS - TLS13_OVERHEAD;
 
 // ============================================================================
 // Batch Sizes
@@ -122,6 +124,11 @@ inline constexpr uint64_t INITIAL_RTO_US = 200000;       // 200ms initial RTO
 
 // Retransmit check interval (skip check when busy, check every N loops when idle)
 inline constexpr uint32_t RETRANSMIT_CHECK_INTERVAL = 1024;
+
+// Periodic duplicate ACK interval for OOO recovery (~400us @ 200ns/loop)
+// TCP fast retransmit requires 3+ duplicate ACKs. When OOO buffer has segments
+// but no new frames arrive, we send duplicate ACKs at this interval.
+inline constexpr uint32_t DUP_ACK_LOOP_INTERVAL = 2048;
 
 // Trickle interval for igc driver workaround
 inline constexpr uint32_t TRICKLE_INTERVAL_ITERATIONS = 8;

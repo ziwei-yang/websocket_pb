@@ -669,6 +669,10 @@ public:
         auto process_response_chunk = [&](const MsgMetadata& meta) {
             if (meta.decrypted_len == 0) return;
 
+            // Log new nic_packet_ct field
+            printf("[META] offset=%u len=%u nic_packet_ct=%u\n",
+                   meta.msg_inbox_offset, meta.decrypted_len, meta.nic_packet_ct);
+
             total_response_bytes += meta.decrypted_len;
             received_chunks++;
 

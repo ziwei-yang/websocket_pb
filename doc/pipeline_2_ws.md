@@ -21,7 +21,7 @@ WebSocket Process handles **HTTP+WS handshake** and **WebSocket frame parsing/di
 2. Consume MSG_METADATA_INBOX events via `event_processor.run()` (auto-consumer)
 3. Read decrypted data from MSG_INBOX at offsets specified in metadata
 4. Parse WebSocket frames using `parse_websocket_frame()` from core/http.hpp
-5. Handle control frames (PING → build complete PONG frame, CLOSE → signal Transport)
+5. Handle control frames (PING → defer PONG to idle, CLOSE → signal Transport)
 6. Publish WSFrameInfo with full timestamp chain for data frames
 
 ---
@@ -187,6 +187,11 @@ bool WebSocketProcess::recv_http_upgrade_response() {
 }
 ```
 
+**Note**: `commit_manually()` is called inside the loop, committing after each poll
+iteration. This is acceptable for the blocking handshake phase. If an error occurs
+mid-response, partial consumption cannot be rolled back, but handshake failure
+triggers process abort anyway.
+
 ### Subscription Message Sending
 
 ```cpp
@@ -236,21 +241,19 @@ struct HandshakeConfig {
 ## Type Definitions
 
 ```cpp
-// IPC Producer wrapper - combines sequencer + ring buffer for single-producer access
+// From pipeline_data.hpp - wraps disruptor::ipc::shared_region
 // DESIGN DECISION: Always use try_claim(), abort on full buffer (indicates misconfiguration)
-template<typename T, size_t SIZE>
-struct IPCProducer {
-    disruptor::sequencer<
-        disruptor::sequence_policies::local_atomic_sequence,
-        disruptor::memory_ordering_policies::acquire_release,
-        disruptor::claim_policies::single_producer_claim_policy>& sequencer;
-    disruptor::ring_buffer<T, SIZE, disruptor::storage_policies::external_storage>& ring;
+template<typename T>
+struct IPCRingProducer {
+    disruptor::ipc::shared_region& region_;
+    size_t element_count_;
+    size_t element_mask_;
 
-    int64_t try_claim() {
-        return sequencer.has_available_capacity(1) ? sequencer.claim() : -1;
-    }
-    T& operator[](int64_t seq) { return ring[seq]; }
-    void publish(int64_t seq) { sequencer.publish(seq); }
+    explicit IPCRingProducer(disruptor::ipc::shared_region& r);
+
+    int64_t try_claim();
+    T& operator[](int64_t seq);
+    void publish(int64_t seq);
 };
 
 // NOTE: Callers must check try_claim() return value and abort if < 0:
@@ -258,9 +261,52 @@ struct IPCProducer {
 //   if (seq < 0) std::abort();  // Buffer full = consumer too slow or buffer misconfigured
 
 // Concrete producer types used by WebSocketProcess
-using WSFrameInfoProducer = IPCProducer<WSFrameInfo, WS_FRAME_INFO_SIZE>;
-using PongsProducer = IPCProducer<PongFrameAligned, PONGS_SIZE>;
-using MsgOutboxProducer = IPCProducer<MsgOutboxEvent, MSG_OUTBOX_SIZE>;
+using WSFrameInfoProducer = IPCRingProducer<WSFrameInfo>;
+using PongsProducer = IPCRingProducer<PongFrameAligned>;
+using MsgOutboxProducer = IPCRingProducer<MsgOutboxEvent>;
+
+// WSFrameInfo structure (from pipeline_data.hpp, 128 bytes cache-aligned)
+//
+// NOTE: Each WS fragment generates a separate WSFrameInfo event immediately.
+// This allows AppClient to process fragments incrementally for lower latency.
+//
+// Fragment/partial handling:
+//   - is_fragmented=false: Complete single-frame message
+//   - is_fragmented=true, is_last_fragment=false: Partial frame or intermediate fragment
+//   - is_fragmented=true, is_last_fragment=true: Final fragment (message complete)
+//
+// Partial frame behavior:
+//   - If WS header is complete but payload is incomplete, WSFrameInfo is published immediately
+//   - is_fragmented=true indicates partial data, is_last_fragment=false indicates more coming
+//   - If WS header is incomplete (< 14 bytes), DEFER until header is complete
+//
+// All fields are valid per-fragment (msg_inbox_offset points to THIS fragment's payload).
+struct WSFrameInfo {
+    uint32_t msg_inbox_offset;        // Payload offset in MSG_INBOX (valid for this fragment)
+    uint32_t payload_len;             // This fragment's payload length
+    uint8_t  opcode;                  // WS opcode (TEXT=1, BINARY=2, PING=9, etc.)
+    bool     is_fin;                  // FIN bit from WS header
+    bool     is_fragmented;           // True if partial frame OR fragmented WS message
+    bool     is_last_fragment;        // True if this is the final fragment/part
+    uint32_t frame_total_len;         // Total WS frame length(s) including headers
+
+    // Full timestamp chain
+    uint64_t first_byte_ts;           // NIC timestamp when first byte arrived
+    uint64_t first_nic_frame_poll_cycle;
+    uint64_t last_byte_ts;            // NIC timestamp when frame completed
+    uint64_t latest_nic_frame_poll_cycle;
+    uint64_t latest_raw_frame_poll_cycle;
+
+    // SSL_read timing (replaces single ssl_read_cycle)
+    uint64_t first_ssl_read_cycle;    // TSC cycle of first SSL_read for this frame
+    uint64_t last_ssl_read_cycle;     // TSC cycle of last SSL_read for this frame
+    uint32_t ssl_read_ct;             // Number of SSL_read calls for this frame
+
+    // Packet counting
+    uint32_t nic_packet_ct;           // Number of NIC packets for this frame
+
+    uint64_t ws_parse_cycle;          // WS frame parse completion cycle
+};
 ```
 
 ---
@@ -268,7 +314,9 @@ using MsgOutboxProducer = IPCProducer<MsgOutboxEvent, MSG_OUTBOX_SIZE>;
 ## Class Definition
 
 ```cpp
-class WebSocketProcess : public disruptor::event_handler<MsgMetadata> {
+// Satisfies disruptor::event_handler_concept<WebSocketProcess, MsgMetadata>
+// Can be used with disruptor::event_processor for automatic event consumption
+class WebSocketProcess {
 private:
     MsgInbox& msg_inbox_;
     WSFrameInfoProducer& ws_frame_producer_;
@@ -296,15 +344,21 @@ private:
     PartialWebSocketFrame pending_frame_;
     bool has_pending_frame_ = false;
 
+    // Wrap-around buffer for WS headers spanning MSG_INBOX wrap point
+    // Max WS header = 14 bytes (2 base + 8 extended length + 4 mask)
+    // 64 bytes provides margin for safety
+    uint8_t ws_header_wrap_buffer_[64];
+
     // Current message metadata (from MSG_METADATA_INBOX)
     MsgMetadata current_metadata_;
 
-    // === DEFERRED COMMIT MODE ===
+    // === PARTIAL FRAME ACCUMULATION MODE ===
     // When a WS frame spans multiple SSL_reads, we accumulate data until the frame
     // is complete (same pattern as src/websocket.hpp lines 585-1312).
     //
     // Key insight: MSG_INBOX already contains the accumulated data from all SSL_reads.
-    // We just need to track:
+    // Ring buffer consumption happens immediately via event_processor; only WS frame
+    // parsing state is preserved across events. We track:
     //   1. Where the current partial frame starts (data_start_offset_)
     //   2. How much data we've accumulated (data_accumulated_)
     //   3. Timestamps from the FIRST packet (accumulated_metadata_)
@@ -312,7 +366,7 @@ private:
     // On each on_event():
     //   - If partial frame: data_accumulated_ += meta.decrypted_len, continue parsing
     //   - If frame complete: publish WSFrameInfo, reset state
-    //   - If still partial: defer (don't advance consumption), wait for next event
+    //   - If still partial: preserve parser state, wait for next event
     //
     uint32_t data_start_offset_ = 0;           // MSG_INBOX offset where current batch starts
     uint32_t data_accumulated_ = 0;            // Total bytes accumulated for current partial frame
@@ -327,6 +381,11 @@ private:
     // in hot path. 64 entries is generous - typical WS frame spans 1-4 SSL_reads.
     // If a WS frame requires more than 64 SSL_reads (>1MB at 16KB TLS records),
     // we fall back to using only the first metadata's timestamps.
+    //
+    // Value 64 is a practical optimization (reduced from 256):
+    //   - Reduces cache footprint by 12 KB (MsgMetadata is 64 bytes each)
+    //   - Still handles any realistic WebSocket frame (64 SSL_reads per frame is extreme)
+    //   - Better cache locality = lower latency variance
     static constexpr size_t MAX_ACCUMULATED_METADATA = 64;
     int64_t partial_frame_start_seq_ = -1;     // Sequence of first metadata for this frame
     std::array<MsgMetadata, MAX_ACCUMULATED_METADATA> accumulated_metadata_;  // Fixed-size, no allocation
@@ -355,6 +414,29 @@ private:
     //   - This matches how we track partial frames spanning multiple SSL_reads
     MsgMetadata fragment_first_metadata_;       // Timestamps from first fragment (TEXT/BINARY with FIN=0)
 
+    // === DEFERRED PONG STATE ===
+    // PONG frame building is deferred to idle time to reduce hot-path work.
+    // When PING is received, we store the payload info; PONG is built when idle.
+    struct PendingPing {
+        uint32_t payload_offset;   // MSG_INBOX offset of PING payload
+        uint16_t payload_len;      // PING payload length
+    };
+    PendingPing pending_ping_;
+    bool has_pending_ping_ = false;
+
+    // Constructor receives shared memory pointers from parent process (set before fork)
+    WebSocketProcess(
+        MsgInbox& msg_inbox,                    // Shared memory: decrypted TLS data
+        WSFrameInfoProducer& ws_frame_producer,
+        PongsProducer& pongs_producer,
+        MsgOutboxProducer& msg_outbox_producer,
+        // ... ring buffer references
+        HandshakeConfig* handshake_config,      // Shared memory: handshake parameters
+        std::atomic<bool>* tls_ready,           // Input signal from Transport
+        std::atomic<bool>* ws_ready,            // Output signal to AppClient
+        std::atomic<bool>* running              // Shutdown flag
+    );
+
 public:
     // === HANDSHAKE METHODS (Phase 1: called before run()) ===
     bool init_with_handshake();  // Main entry: performs full HTTP+WS handshake
@@ -375,6 +457,9 @@ private:
     void handle_complete_frame(const uint8_t* frame_start, const WebSocketFrame& frame, size_t consumed);
     void publish_ws_frame_info(const uint8_t* frame_start, const WebSocketFrame& frame,
                                size_t consumed, uint64_t ws_parse_cycle);
+
+    // Deferred PONG helpers
+    void flush_pending_pong();  // Build and send PONG for pending PING (called on idle/shutdown)
 };
 ```
 
@@ -389,8 +474,9 @@ private:
 void WebSocketProcess::on_event(MsgMetadata& meta, int64_t sequence, bool end_of_batch) {
     current_metadata_ = meta;
 
-    // === DEFERRED COMMIT MODE (same pattern as src/websocket.hpp) ===
+    // === PARTIAL FRAME ACCUMULATION MODE (same pattern as src/websocket.hpp) ===
     // Accumulate data across SSL_reads until WS frame is complete.
+    // Ring buffer consumption happens immediately; only WS frame parsing state is preserved.
     //
     // Key insight: MSG_INBOX already contains contiguous data from Transport.
     // Each on_event() adds more data; we parse from where we left off.
@@ -424,22 +510,108 @@ void WebSocketProcess::on_event(MsgMetadata& meta, int64_t sequence, bool end_of
         // Handle MSG_INBOX wrap-around (linear available bytes)
         size_t linear_avail = std::min(available, (size_t)(MSG_INBOX_SIZE - offset));
 
+        // Handle header spanning wrap point - copy to contiguous buffer
+        if (linear_avail < available && linear_avail < sizeof(ws_header_wrap_buffer_)) {
+            // Header may span wrap point - copy to contiguous buffer
+            size_t first_part = MSG_INBOX_SIZE - offset;
+            size_t second_part = std::min(available - first_part, sizeof(ws_header_wrap_buffer_) - first_part);
+            memcpy(ws_header_wrap_buffer_, data, first_part);
+            memcpy(ws_header_wrap_buffer_ + first_part, msg_inbox_.data_at(0), second_part);
+            data = ws_header_wrap_buffer_;
+            linear_avail = first_part + second_part;
+        }
+
         // Resume parsing with pending frame state if we have one
         PartialWebSocketFrame& pframe = pending_frame_;
         if (has_pending_frame_) {
             // Continue parsing with previously saved state
             if (!continue_partial_frame(data, linear_avail, pframe)) {
-                // Still incomplete - defer commit, wait for next on_event()
-                // has_pending_frame_ stays true, data_accumulated_ preserved
-                return;  // DEFER: Don't process more until we have enough data
+                // Still incomplete - check if header is complete for partial WSFrameInfo
+                if (!pframe.header_complete) {
+                    // Header incomplete - DEFER, don't publish WSFrameInfo
+                    // has_pending_frame_ stays true, data_accumulated_ preserved
+                    return;
+                }
+
+                // Header complete but payload incomplete - publish partial WSFrameInfo
+                int64_t seq = ws_frame_producer_.try_claim();
+                if (seq < 0) std::abort();
+
+                auto& info = ws_frame_producer_[seq];
+                // Calculate payload offset (frame start + header length)
+                info.msg_inbox_offset = (data_start_offset_ + pframe.header_len) % MSG_INBOX_SIZE;
+                info.payload_len = data_accumulated_ - pframe.header_len;  // Payload bytes so far
+                info.frame_total_len = data_accumulated_;
+                info.opcode = pframe.opcode;  // Header is complete, opcode is known
+                info.is_fin = pframe.fin;
+                info.is_fragmented = true;      // Partial frame (payload incomplete)
+                info.is_last_fragment = false;  // More data needed
+
+                // Timestamps from accumulated metadata
+                info.first_byte_ts = accumulated_metadata_[0].first_nic_timestamp_ns;
+                info.first_nic_frame_poll_cycle = accumulated_metadata_[0].first_nic_frame_poll_cycle;
+                info.last_byte_ts = meta.latest_nic_timestamp_ns;
+                info.latest_nic_frame_poll_cycle = meta.latest_nic_frame_poll_cycle;
+                info.latest_raw_frame_poll_cycle = meta.latest_raw_frame_poll_cycle;
+                info.first_ssl_read_cycle = accumulated_metadata_[0].ssl_read_cycle;
+                info.last_ssl_read_cycle = meta.ssl_read_cycle;
+                info.ssl_read_ct = static_cast<uint32_t>(accumulated_metadata_count_);
+                // Sum packet counts from all accumulated metadata
+                info.nic_packet_ct = 0;
+                for (size_t i = 0; i < accumulated_metadata_count_; ++i) {
+                    info.nic_packet_ct += accumulated_metadata_[i].nic_packet_ct;
+                }
+                info.ws_parse_cycle = rdtscp();
+
+                ws_frame_producer_.publish(seq);
+
+                // Still preserve state for continuation
+                has_pending_frame_ = true;
+                return;
             }
         } else {
             // Start parsing new frame
             pframe.reset();
             if (!start_parse_frame(data, linear_avail, pframe)) {
-                // Partial frame - state saved in pframe
+                // Partial frame - check if header is complete
+                if (!pframe.header_complete) {
+                    // Header incomplete - DEFER, don't publish WSFrameInfo
+                    has_pending_frame_ = true;
+                    return;
+                }
+
+                // Header complete but payload incomplete - publish partial WSFrameInfo
+                int64_t seq = ws_frame_producer_.try_claim();
+                if (seq < 0) std::abort();
+
+                auto& info = ws_frame_producer_[seq];
+                // Calculate payload offset (frame start + header length)
+                info.msg_inbox_offset = (data_start_offset_ + pframe.header_len) % MSG_INBOX_SIZE;
+                info.payload_len = data_accumulated_ - pframe.header_len;  // Payload bytes so far
+                info.frame_total_len = data_accumulated_;
+                info.opcode = pframe.opcode;
+                info.is_fin = pframe.fin;
+                info.is_fragmented = true;
+                info.is_last_fragment = false;
+
+                // Timestamps from accumulated metadata
+                info.first_byte_ts = accumulated_metadata_[0].first_nic_timestamp_ns;
+                info.first_nic_frame_poll_cycle = accumulated_metadata_[0].first_nic_frame_poll_cycle;
+                info.last_byte_ts = meta.latest_nic_timestamp_ns;
+                info.latest_nic_frame_poll_cycle = meta.latest_nic_frame_poll_cycle;
+                info.latest_raw_frame_poll_cycle = meta.latest_raw_frame_poll_cycle;
+                info.first_ssl_read_cycle = accumulated_metadata_[0].ssl_read_cycle;
+                info.last_ssl_read_cycle = meta.ssl_read_cycle;
+                info.ssl_read_ct = static_cast<uint32_t>(accumulated_metadata_count_);
+                info.nic_packet_ct = 0;
+                for (size_t i = 0; i < accumulated_metadata_count_; ++i) {
+                    info.nic_packet_ct += accumulated_metadata_[i].nic_packet_ct;
+                }
+                info.ws_parse_cycle = rdtscp();
+
+                ws_frame_producer_.publish(seq);
+
                 has_pending_frame_ = true;
-                // DEFER: Wait for next on_event() to provide more data
                 return;
             }
         }
@@ -514,6 +686,147 @@ void WebSocketProcess::shutdown() {
 
 ---
 
+## Deferred PONG Response
+
+To reduce hot-path work, PONG frame building is deferred to idle time rather than being done immediately when a PING is received.
+
+### Design Rationale
+
+1. **Hot path optimization**: PONG frame building (header construction, mask application) is moved out of the frame parsing path
+2. **Simple state**: Single pending PING tracked with boolean flag
+3. **Immediate on new PING**: If server sends another PING while one is pending, the old PONG is flushed immediately
+
+### Data Structures
+
+```cpp
+// Pending PING info (PONG built later when flushing, not on hot path)
+struct PendingPing {
+    uint32_t payload_offset;   // MSG_INBOX offset of PING payload
+    uint16_t payload_len;      // PING payload length
+};
+
+// Member variables
+PendingPing pending_ping_;
+bool has_pending_ping_ = false;
+```
+
+### Flow
+
+```
+on_event(MsgMetadata):
+    parse frames...
+    if PING found:
+        publish WSFrameInfo (unchanged)
+        if has_pending_ping_:
+            flush_pending_pong()     // New PING while pending → flush old first
+        store pending_ping_          // Don't build PONG yet
+        has_pending_ping_ = true
+
+run() main loop:
+    processed = process_manually(...)
+    commit if processed > 0
+
+    if has_pending_ping_ && processed == 0:   // IDLE
+        flush_pending_pong()
+
+    pause if idle
+
+shutdown:
+    flush_pending_pong()             // Flush any remaining PONG
+```
+
+### Implementation
+
+```cpp
+void flush_pending_pong() {
+    if (!has_pending_ping_) return;
+
+    int64_t pong_seq = pongs_prod_->try_claim();
+    if (pong_seq < 0) {
+        fprintf(stderr, "[WS-PROCESS] FATAL: PONGS full\n");
+        std::abort();
+    }
+
+    auto& pong = (*pongs_prod_)[pong_seq];
+    pong.clear();
+
+    // Build PONG frame now (deferred from PING receipt)
+    const uint8_t* ping_payload = msg_inbox_->data_at(pending_ping_.payload_offset);
+    uint8_t mask_key[4] = {0, 0, 0, 0};
+
+    size_t safe_payload_len = pending_ping_.payload_len;
+    if (safe_payload_len > 119) {
+        safe_payload_len = 119;
+    }
+
+    pong.data_len = static_cast<uint8_t>(websocket::http::build_pong_frame(
+        ping_payload, safe_payload_len, pong.data, mask_key));
+
+    pongs_prod_->publish(pong_seq);
+    has_pending_ping_ = false;
+}
+
+void handle_ping(uint64_t payload_len, uint32_t frame_total_len, uint64_t parse_cycle) {
+    // Publish WSFrameInfo for PING (unchanged - allows client to see PING timing)
+    // ... WSFrameInfo publishing code ...
+
+    // If we already have a pending PING, flush it first (new PING arrived)
+    if (has_pending_ping_) {
+        flush_pending_pong();
+    }
+
+    // Store pending PING (don't build PONG yet - deferred to idle)
+    pending_ping_.payload_offset = current_payload_offset_;
+    pending_ping_.payload_len = static_cast<uint16_t>(payload_len);
+    has_pending_ping_ = true;
+}
+```
+
+### Main Loop with Deferred PONG
+
+```cpp
+void run() {
+    conn_state_->set_ready(PROC_WEBSOCKET);
+
+    while (conn_state_->is_running(PROC_WEBSOCKET)) {
+        size_t processed = msg_metadata_cons_->process_manually(
+            [this](MsgMetadata& meta, int64_t seq, bool end_of_batch) {
+                on_event(meta, seq, end_of_batch);
+                return true;
+            },
+            MAX_ACCUMULATED_METADATA
+        );
+
+        if (processed > 0) {
+            msg_metadata_cons_->commit_manually();
+        }
+
+        // Flush PONG on IDLE (no frames processed this round)
+        if (has_pending_ping_ && processed == 0) {
+            flush_pending_pong();
+        }
+
+        if (processed == 0) {
+            __builtin_ia32_pause();
+        }
+    }
+
+    // Flush any remaining PONG on shutdown
+    flush_pending_pong();
+}
+```
+
+### Benefits
+
+| Aspect | Before | After |
+|--------|--------|-------|
+| PING handling | Build PONG immediately in hot path | Store offset/len only |
+| PONG building | During frame parsing | Deferred to idle |
+| New PING while pending | N/A (immediate send) | Flush old, store new |
+| Shutdown | N/A | Flush pending PONG |
+
+---
+
 ## Frame Handler
 
 ```cpp
@@ -524,22 +837,48 @@ void WebSocketProcess::handle_complete_frame(const uint8_t* frame_start,
 
     // WebSocketOpcode enum from core/http.hpp
     if (frame.opcode == static_cast<uint8_t>(WebSocketOpcode::PING)) {
-        // Build complete PONG frame and queue - FATAL if ring full
-        // NOTE: PONGS_SIZE exhaustion triggers abort. This is intentional for HFT:
-        //   1. If Transport is not processing PONGs fast enough, it indicates system overload
-        //   2. Graceful degradation would hide latency problems
-        //   3. PONGs are processed during idle time - if we're never idle, we're overloaded
-        int64_t seq = pongs_producer_.try_claim();
-        if (seq < 0) std::abort();  // PONGS ring full - Transport overloaded
+        // Publish WSFrameInfo for PING (allows client to see PING timing)
+        int64_t ws_seq = ws_frame_producer_.try_claim();
+        if (ws_seq < 0) std::abort();
 
-        auto& pong = pongs_producer_[seq];
-        // Build complete WS PONG frame using build_pong_frame() from core/http.hpp
-        // Zero mask for no-op XOR (client frames must be masked per RFC 6455)
-        uint8_t mask[4] = {0, 0, 0, 0};
-        // Limit payload to 119 bytes to fit complete frame in 125 bytes (6-byte header + payload)
-        size_t payload_len = std::min(frame.payload_len, (uint64_t)119);
-        pong.frame_len = build_pong_frame(frame.payload, payload_len, pong.frame, mask);
-        pongs_producer_.publish(seq);
+        auto& info = ws_frame_producer_[ws_seq];
+        size_t payload_offset_in_data = frame.payload - frame_start;
+        info.msg_inbox_offset = (consumed + payload_offset_in_data) % MSG_INBOX_SIZE;
+        info.payload_len = static_cast<uint32_t>(frame.payload_len);
+        info.frame_total_len = static_cast<uint32_t>(frame.header_len + frame.payload_len);
+        info.opcode = 0x09;  // PING opcode
+        info.is_fin = true;
+        info.is_fragmented = false;
+        info.is_last_fragment = false;
+
+        // Timestamps from accumulated metadata
+        info.first_byte_ts = first_packet_metadata_.first_nic_timestamp_ns;
+        info.first_nic_frame_poll_cycle = first_packet_metadata_.first_nic_frame_poll_cycle;
+        info.last_byte_ts = current_metadata_.latest_nic_timestamp_ns;
+        info.latest_nic_frame_poll_cycle = current_metadata_.latest_nic_frame_poll_cycle;
+        info.latest_raw_frame_poll_cycle = current_metadata_.latest_raw_frame_poll_cycle;
+        info.first_ssl_read_cycle = first_packet_metadata_.ssl_read_cycle;
+        info.last_ssl_read_cycle = current_metadata_.ssl_read_cycle;
+        info.ssl_read_ct = static_cast<uint32_t>(accumulated_metadata_count_);
+        // Sum packet counts from all accumulated metadata
+        info.nic_packet_ct = 0;
+        for (size_t i = 0; i < accumulated_metadata_count_; ++i) {
+            info.nic_packet_ct += accumulated_metadata_[i].nic_packet_ct;
+        }
+        info.ws_parse_cycle = ws_parse_cycle;
+
+        ws_frame_producer_.publish(ws_seq);
+
+        // DEFERRED PONG: Store pending PING info, don't build PONG on hot path
+        // If we already have a pending PING, flush it first (new PING arrived)
+        if (has_pending_ping_) {
+            flush_pending_pong();
+        }
+
+        // Store pending PING (PONG built later on idle)
+        pending_ping_.payload_offset = (consumed + payload_offset_in_data) % MSG_INBOX_SIZE;
+        pending_ping_.payload_len = static_cast<uint16_t>(frame.payload_len);
+        has_pending_ping_ = true;
 
     } else if (frame.opcode == static_cast<uint8_t>(WebSocketOpcode::CLOSE)) {
         // Signal close to Transport - FATAL if ring full
@@ -578,6 +917,36 @@ void WebSocketProcess::handle_complete_frame(const uint8_t* frame_start,
             // If the first TEXT/BINARY frame spans multiple SSL_reads, first_packet_metadata_
             // correctly reflects the true first packet of the entire fragmented message.
             fragment_first_metadata_ = first_packet_metadata_;
+
+            // Publish WSFrameInfo for first fragment immediately (allows client to start processing)
+            int64_t seq = ws_frame_producer_.try_claim();
+            if (seq < 0) std::abort();  // WS_FRAME_INFO ring full
+
+            auto& info = ws_frame_producer_[seq];
+            info.msg_inbox_offset = fragment_start_offset_;  // Valid for this fragment only
+            info.payload_len = static_cast<uint32_t>(frame.payload_len);  // This fragment's payload
+            info.frame_total_len = static_cast<uint32_t>(frame.header_len + frame.payload_len);
+            info.opcode = frame.opcode;  // TEXT or BINARY
+            info.is_fin = false;
+            info.is_fragmented = true;        // Part of fragmented message
+            info.is_last_fragment = false;    // More fragments to come
+
+            info.first_byte_ts = first_packet_metadata_.first_nic_timestamp_ns;
+            info.first_nic_frame_poll_cycle = first_packet_metadata_.first_nic_frame_poll_cycle;
+            info.last_byte_ts = current_metadata_.latest_nic_timestamp_ns;
+            info.latest_nic_frame_poll_cycle = current_metadata_.latest_nic_frame_poll_cycle;
+            info.latest_raw_frame_poll_cycle = current_metadata_.latest_raw_frame_poll_cycle;
+            info.first_ssl_read_cycle = first_packet_metadata_.ssl_read_cycle;
+            info.last_ssl_read_cycle = current_metadata_.ssl_read_cycle;
+            info.ssl_read_ct = static_cast<uint32_t>(accumulated_metadata_count_);
+            // Sum packet counts from all accumulated metadata
+            info.nic_packet_ct = 0;
+            for (size_t i = 0; i < accumulated_metadata_count_; ++i) {
+                info.nic_packet_ct += accumulated_metadata_[i].nic_packet_ct;
+            }
+            info.ws_parse_cycle = ws_parse_cycle;
+
+            ws_frame_producer_.publish(seq);
             return;  // Wait for continuation frames
         }
 
@@ -603,54 +972,85 @@ void WebSocketProcess::handle_complete_frame(const uint8_t* frame_start,
         fragment_total_len_ += static_cast<uint32_t>(frame.payload_len);
         fragment_total_frame_len_ += static_cast<uint32_t>(frame.header_len + frame.payload_len);
 
-        if (frame.fin) {
-            // Final fragment - publish complete reassembled message
+        // Calculate this fragment's payload offset in MSG_INBOX
+        size_t payload_offset_in_data = frame.payload - frame_start;
+        uint32_t this_fragment_offset = (consumed + payload_offset_in_data) % MSG_INBOX_SIZE;
+
+        if (!frame.fin) {
+            // Intermediate CONTINUATION fragment - publish immediately for faster client processing
+            int64_t seq = ws_frame_producer_.try_claim();
+            if (seq < 0) std::abort();  // WS_FRAME_INFO ring full
+
+            auto& info = ws_frame_producer_[seq];
+            info.msg_inbox_offset = this_fragment_offset;  // Valid for this fragment only
+            info.payload_len = static_cast<uint32_t>(frame.payload_len);  // This fragment's payload
+            info.frame_total_len = static_cast<uint32_t>(frame.header_len + frame.payload_len);
+            info.opcode = fragment_opcode_;  // Original opcode (TEXT or BINARY)
+            info.is_fin = false;
+            info.is_fragmented = true;        // Part of fragmented message
+            info.is_last_fragment = false;    // More fragments to come
+
+            // Timestamps for this fragment
+            info.first_byte_ts = first_packet_metadata_.first_nic_timestamp_ns;
+            info.first_nic_frame_poll_cycle = first_packet_metadata_.first_nic_frame_poll_cycle;
+            info.last_byte_ts = current_metadata_.latest_nic_timestamp_ns;
+            info.latest_nic_frame_poll_cycle = current_metadata_.latest_nic_frame_poll_cycle;
+            info.latest_raw_frame_poll_cycle = current_metadata_.latest_raw_frame_poll_cycle;
+            info.first_ssl_read_cycle = first_packet_metadata_.ssl_read_cycle;
+            info.last_ssl_read_cycle = current_metadata_.ssl_read_cycle;
+            info.ssl_read_ct = static_cast<uint32_t>(accumulated_metadata_count_);
+            info.nic_packet_ct = 0;
+            for (size_t i = 0; i < accumulated_metadata_count_; ++i) {
+                info.nic_packet_ct += accumulated_metadata_[i].nic_packet_ct;
+            }
+            info.ws_parse_cycle = ws_parse_cycle;
+
+            ws_frame_producer_.publish(seq);
+            return;  // Continue accumulating
+        }
+
+        // Final fragment (FIN=1) - publish with is_last_fragment=true
+            // Final fragment - publish and signal message complete
             //
-            // IMPORTANT: Fragment payloads are NOT contiguous in MSG_INBOX!
-            // Each fragment arrives in a separate SSL_read with its own WS header.
-            // The AppClient MUST copy fragment payloads into a contiguous buffer.
+            // WSFrameInfo publishing strategy for fragmented messages:
+            //   - Each fragment (first, intermediate, final) is published immediately
+            //   - AppClient receives fragments in order and can process incrementally
+            //   - is_last_fragment=true signals the complete message boundary
             //
-            // We publish with:
-            //   - msg_inbox_offset = 0 (NOT USABLE for fragmented messages!)
-            //   - payload_len = total accumulated payload length (informational only)
-            //   - is_fragmented = true (signals AppClient MUST use FragmentAssemblingClient)
+            // Fragment field semantics:
+            //   - msg_inbox_offset: Valid for THIS fragment's payload location
+            //   - payload_len: THIS fragment's payload length (not total)
+            //   - is_fragmented=true: Part of a multi-frame message
+            //   - is_last_fragment: false=more coming, true=message complete
             //
-            // WARNING: For fragmented messages, msg_inbox_offset is set to 0 because:
-            //   1. Fragment payloads are scattered throughout MSG_INBOX with headers between them
-            //   2. Providing first fragment offset would be misleading - only first fragment is there
-            //   3. AppClient MUST use FragmentAssemblingClient pattern which copies each fragment
-            //      as it arrives (during on_event processing, not post-hoc)
-            //
-            // AppClient implementation for fragmented messages:
-            //   - When is_fragmented=true, IGNORE msg_inbox_offset (it's not usable)
-            //   - Use FragmentAssemblingClient pattern to copy fragments during parsing
-            //   - See pipeline_3_app.md for FragmentAssemblingClient implementation
-            //
-            // For HFT: Prefer servers that send single-frame messages (no fragmentation)
+            // AppClient must accumulate fragments if it needs the complete message,
+            // or can process each fragment incrementally for lower latency.
             //
             int64_t seq = ws_frame_producer_.try_claim();
             if (seq < 0) std::abort();  // WS_FRAME_INFO ring full
 
             auto& info = ws_frame_producer_[seq];
-            // CRITICAL: msg_inbox_offset = 0 is a SENTINEL VALUE for fragmented messages.
-            // AppClient MUST check is_fragmented BEFORE using msg_inbox_offset!
-            // If is_fragmented == true, msg_inbox_offset is INVALID and must be ignored.
-            info.msg_inbox_offset = 0;  // SENTINEL - not usable for fragmented messages
-            info.payload_len = fragment_total_len_;          // Total payload across all fragments
-            info.frame_total_len = fragment_total_frame_len_;  // Sum of all fragment frames (headers + payloads)
+            info.msg_inbox_offset = this_fragment_offset;  // Valid for this fragment
+            info.payload_len = static_cast<uint32_t>(frame.payload_len);  // This fragment's payload
+            info.frame_total_len = static_cast<uint32_t>(frame.header_len + frame.payload_len);
             info.opcode = fragment_opcode_;  // Original opcode (TEXT or BINARY)
-            info.is_final = true;
-            info.is_fragmented = true;  // Signal: AppClient MUST use FragmentAssemblingClient pattern
+            info.is_fin = true;
+            info.is_fragmented = true;        // Part of fragmented message
+            info.is_last_fragment = true;     // This is the final fragment
 
-            // Timestamps: "first" from fragment_first_metadata_ (first fragment),
-            //             "latest" from current_metadata_ (this final fragment)
-            info.first_byte_ts = fragment_first_metadata_.first_nic_timestamp_ns;
-            info.first_nic_frame_poll_cycle = fragment_first_metadata_.first_nic_frame_poll_cycle;
-            info.first_raw_frame_poll_cycle = fragment_first_metadata_.first_raw_frame_poll_cycle;
+            // Timestamps for this final fragment
+            info.first_byte_ts = first_packet_metadata_.first_nic_timestamp_ns;
+            info.first_nic_frame_poll_cycle = first_packet_metadata_.first_nic_frame_poll_cycle;
             info.last_byte_ts = current_metadata_.latest_nic_timestamp_ns;
             info.latest_nic_frame_poll_cycle = current_metadata_.latest_nic_frame_poll_cycle;
             info.latest_raw_frame_poll_cycle = current_metadata_.latest_raw_frame_poll_cycle;
-            info.ssl_read_cycle = current_metadata_.ssl_read_cycle;
+            info.first_ssl_read_cycle = first_packet_metadata_.ssl_read_cycle;
+            info.last_ssl_read_cycle = current_metadata_.ssl_read_cycle;
+            info.ssl_read_ct = static_cast<uint32_t>(accumulated_metadata_count_);
+            info.nic_packet_ct = 0;
+            for (size_t i = 0; i < accumulated_metadata_count_; ++i) {
+                info.nic_packet_ct += accumulated_metadata_[i].nic_packet_ct;
+            }
             info.ws_parse_cycle = ws_parse_cycle;
 
             ws_frame_producer_.publish(seq);
@@ -660,8 +1060,6 @@ void WebSocketProcess::handle_complete_frame(const uint8_t* frame_start,
             fragment_opcode_ = 0;
             fragment_total_len_ = 0;
             fragment_total_frame_len_ = 0;
-        }
-        // If not FIN, continue accumulating (state already updated)
 
     } else if (frame.opcode == 0x0A) {  // PONG frame (opcode 10)
         // Ignore incoming PONG frames gracefully
@@ -691,17 +1089,24 @@ void WebSocketProcess::publish_ws_frame_info(const uint8_t* frame_start,
     info.payload_len = static_cast<uint32_t>(frame.payload_len);
     info.frame_total_len = static_cast<uint32_t>(frame.header_len + frame.payload_len);
     info.opcode = frame.opcode;
-    info.is_final = frame.fin;
-    info.is_fragmented = false;  // Single-frame message, not fragmented
+    info.is_fin = frame.fin;
+    info.is_fragmented = false;       // Single-frame message, not fragmented
+    info.is_last_fragment = false;    // Not applicable for non-fragmented messages
 
     // Full timestamp chain
     info.first_byte_ts = first_packet_metadata_.first_nic_timestamp_ns;
     info.first_nic_frame_poll_cycle = first_packet_metadata_.first_nic_frame_poll_cycle;
-    info.first_raw_frame_poll_cycle = first_packet_metadata_.first_raw_frame_poll_cycle;
     info.last_byte_ts = current_metadata_.latest_nic_timestamp_ns;
     info.latest_nic_frame_poll_cycle = current_metadata_.latest_nic_frame_poll_cycle;
     info.latest_raw_frame_poll_cycle = current_metadata_.latest_raw_frame_poll_cycle;
-    info.ssl_read_cycle = current_metadata_.ssl_read_cycle;
+    info.first_ssl_read_cycle = first_packet_metadata_.ssl_read_cycle;
+    info.last_ssl_read_cycle = current_metadata_.ssl_read_cycle;
+    info.ssl_read_ct = static_cast<uint32_t>(accumulated_metadata_count_);
+    // Sum packet counts from all accumulated metadata
+    info.nic_packet_ct = 0;
+    for (size_t i = 0; i < accumulated_metadata_count_; ++i) {
+        info.nic_packet_ct += accumulated_metadata_[i].nic_packet_ct;
+    }
     info.ws_parse_cycle = ws_parse_cycle;
 
     ws_frame_producer_.publish(seq);
@@ -712,14 +1117,16 @@ void WebSocketProcess::publish_ws_frame_info(const uint8_t* frame_start,
 
 ## Partial Frame Handling and Timestamp Recovery
 
-### Deferred Commit Mode
+### Partial Frame Accumulation Mode
 
-WebSocket Process uses **deferred commit mode** (same pattern as `src/websocket.hpp` lines 585-1312) to handle WS frames that span multiple SSL_reads:
+WebSocket Process uses **partial frame accumulation mode** (same pattern as `src/websocket.hpp` lines 585-1312) to handle WS frames that span multiple SSL_reads:
 
 1. **Accumulate data**: Each `on_event()` adds `meta.decrypted_len` to `data_accumulated_`
 2. **Parse incrementally**: Resume parsing from `parse_offset_` within accumulated data
-3. **Defer on partial**: If frame incomplete, return early (don't reset state)
-4. **Commit on complete**: When all frames parsed, reset accumulators
+3. **Preserve on partial**: If frame incomplete, return early (preserve parser state)
+4. **Reset on complete**: When all frames parsed, reset accumulators
+
+**Note**: Ring buffer consumption happens immediately via `event_processor`; only the WS frame parsing state is preserved across events. This is distinct from deferring ring buffer consumption.
 
 **Why This Works**:
 - MSG_INBOX already contains all accumulated data from Transport
@@ -753,8 +1160,16 @@ See `pipeline_1_trans.md` `ssl_read_to_msg_inbox()` for the linear space check l
 | `parse_offset_` | How far we've parsed within accumulated data |
 | `has_pending_frame_` | True if we're in the middle of parsing a frame |
 | `pending_frame_` | Saved parser state (header bytes, expected lengths) |
-| `accumulated_metadata_` | Vector of ALL MsgMetadata events for timestamp recovery |
+| `accumulated_metadata_` | Array of ALL MsgMetadata events for timestamp/packet count recovery |
+| `accumulated_metadata_count_` | Number of MsgMetadata events accumulated |
 | `first_packet_metadata_` | Recovered timestamps from first SSL_read |
+| `pending_ping_` | Stores pending PING info (offset, len) for deferred PONG |
+| `has_pending_ping_` | Whether we have a pending PING awaiting PONG response |
+
+**MsgMetadata fields used**:
+- `first_nic_timestamp_ns`, `first_nic_frame_poll_cycle` - timestamps from first packet
+- `ssl_read_cycle` - used for `first_ssl_read_cycle` and `last_ssl_read_cycle`
+- `nic_packet_ct` - summed across all accumulated metadata for WSFrameInfo.nic_packet_ct
 
 ---
 
@@ -786,10 +1201,74 @@ SSL_read #3 (frame completes):
 WSFrameInfo timestamps:
   first_nic_timestamp_ns = meta1.first_nic_timestamp_ns       ← From SSL_read #1
   first_nic_frame_poll_cycle = meta1.first_nic_frame_poll_cycle
+  first_ssl_read_cycle = meta1.ssl_read_cycle                 ← From SSL_read #1
   latest_nic_timestamp_ns = meta3.latest_nic_timestamp_ns     ← From SSL_read #3
+  last_ssl_read_cycle = meta3.ssl_read_cycle                  ← From SSL_read #3
+  ssl_read_ct = 3                                             ← Number of SSL_reads
+  nic_packet_ct = meta1.nic_packet_ct + meta2.nic_packet_ct + meta3.nic_packet_ct
 ```
 
 This ensures accurate latency measurement even for large WebSocket frames spanning multiple SSL_reads.
+
+---
+
+### WSFrameInfo Generation Table
+
+| Condition | `opcode` | `is_fragmented` | `is_last_fragment` | `is_fin` |
+|-----------|----------|-----------------|---------------------|----------|
+| Single-frame complete | TEXT/BINARY | `false` | `false` | `true` |
+| Partial frame (header complete, payload incomplete) | from header | `true` | `false` | from header |
+| WS fragment first | TEXT/BINARY | `true` | `false` | `false` |
+| WS fragment middle | TEXT/BINARY | `true` | `false` | `false` |
+| WS fragment final | TEXT/BINARY | `true` | `true` | `true` |
+| PING | 0x09 | `false` | `false` | `true` |
+| Header incomplete | — | NO WSFrameInfo generated (DEFER) | — | — |
+
+### Partial Frame Flow Diagram
+
+```
+on_event(MsgMetadata)
+        │
+        ▼
+   Accumulate data + metadata
+        │
+        ▼
+   Parse WS frame header
+        │
+   ┌────┴─────────────────┐
+   │                      │
+HEADER INCOMPLETE      HEADER COMPLETE
+   │                      │
+   ▼                      ▼
+ DEFER              Check payload
+(no publish)              │
+                    ┌─────┴─────┐
+                    │           │
+              PAYLOAD       PAYLOAD
+              INCOMPLETE    COMPLETE
+                    │           │
+                    ▼           ▼
+              WSFrameInfo   WSFrameInfo
+              is_frag=true  is_frag=false
+              (partial)     (complete)
+                    │           │
+                    └─────┬─────┘
+                          ▼
+                    Continue loop
+```
+
+---
+
+### Timestamp Granularity Limitation
+
+When multiple WebSocket frames exist within a single TLS record (SSL_read), all frames
+share the same `first_byte_ts` from that TLS record. Per-frame timestamps within a
+single TLS record are not available because:
+1. TLS decryption operates on entire records
+2. NIC timestamps are captured at packet level, not application frame level
+
+For HFT applications where sub-TLS-record timing matters, prefer servers that send
+one WebSocket frame per TLS record.
 
 ---
 

@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <climits>
 
 namespace userspace_stack {
 
@@ -38,12 +39,14 @@ struct ZeroCopyOOOSegment {
     uint16_t len = 0;           // Payload length in bytes
     bool valid = false;         // Is this slot in use?
     PayloadPtr data{};          // Pointer to payload data (zero-copy)
+    int64_t ext_id = -1;        // External ID (e.g., UMEM ring position for safe commit)
 
     void clear() {
         seq = 0;
         len = 0;
         valid = false;
         data = PayloadPtr{};
+        ext_id = -1;
     }
 };
 
@@ -65,9 +68,10 @@ public:
      * @param seq TCP sequence number
      * @param len Payload length
      * @param data Pointer to payload (must remain valid until delivered)
+     * @param ext_id External ID (e.g., UMEM ring position) for tracking, -1 if unused
      * @return true if buffered, false if buffer full
      */
-    bool buffer_segment(uint32_t seq, uint16_t len, PayloadPtr data) {
+    bool buffer_segment(uint32_t seq, uint16_t len, PayloadPtr data, int64_t ext_id = -1) {
         if (count_ >= MaxSegments) {
             return false;  // Buffer full
         }
@@ -78,8 +82,13 @@ public:
                 segments_[i].seq = seq;
                 segments_[i].len = len;
                 segments_[i].data = data;
+                segments_[i].ext_id = ext_id;
                 segments_[i].valid = true;
                 count_++;
+                // Track minimum ext_id for safe commit
+                if (ext_id >= 0 && ext_id < min_ext_id_) {
+                    min_ext_id_ = ext_id;
+                }
                 return true;
             }
         }
@@ -122,6 +131,7 @@ public:
     template<typename DeliverCallback>
     size_t try_deliver(uint32_t& rcv_nxt, DeliverCallback&& callback) {
         size_t delivered = 0;
+        bool need_recompute_min = false;
 
         while (count_ > 0) {
             bool found = false;
@@ -139,7 +149,11 @@ public:
                         return delivered;  // Callback failed, stop delivery
                     }
                     rcv_nxt += segments_[i].len;
-                    segments_[i].valid = false;
+                    // Track if we need to recompute min_ext_id
+                    if (segments_[i].ext_id >= 0 && segments_[i].ext_id == min_ext_id_) {
+                        need_recompute_min = true;
+                    }
+                    segments_[i].clear();
                     count_--;
                     delivered++;
                     found = true;
@@ -154,7 +168,11 @@ public:
                         return delivered;  // Callback failed, stop delivery
                     }
                     rcv_nxt += useful_len;
-                    segments_[i].valid = false;
+                    // Track if we need to recompute min_ext_id
+                    if (segments_[i].ext_id >= 0 && segments_[i].ext_id == min_ext_id_) {
+                        need_recompute_min = true;
+                    }
+                    segments_[i].clear();
                     count_--;
                     delivered++;
                     found = true;
@@ -162,7 +180,11 @@ public:
 
                 } else if (diff < 0) {
                     // Fully duplicate: segment entirely before rcv_nxt
-                    segments_[i].valid = false;
+                    // Track if we need to recompute min_ext_id
+                    if (segments_[i].ext_id >= 0 && segments_[i].ext_id == min_ext_id_) {
+                        need_recompute_min = true;
+                    }
+                    segments_[i].clear();
                     count_--;
                     found = true;
                     break;
@@ -171,6 +193,11 @@ public:
             }
 
             if (!found) break;  // No more deliverable segments
+        }
+
+        // Recompute min_ext_id if we removed the segment with minimum ext_id
+        if (need_recompute_min) {
+            recompute_min_ext_id();
         }
 
         return delivered;
@@ -185,6 +212,7 @@ public:
             segments_[i].clear();
         }
         count_ = 0;
+        min_ext_id_ = INT64_MAX;
     }
 
     size_t count() const { return count_; }
@@ -193,9 +221,28 @@ public:
 
     static constexpr size_t max_segments() { return MaxSegments; }
 
+    // Minimum ext_id among all buffered segments (for safe commit)
+    // Returns INT64_MAX if no segments have ext_id set
+    int64_t min_ext_id() const { return min_ext_id_; }
+
+    // Returns true if any segment has a valid ext_id (not INT64_MAX)
+    bool has_ext_id_segments() const { return min_ext_id_ != INT64_MAX; }
+
 private:
+    // Recompute min_ext_id by scanning all valid segments
+    void recompute_min_ext_id() {
+        min_ext_id_ = INT64_MAX;
+        for (size_t i = 0; i < MaxSegments; i++) {
+            if (segments_[i].valid && segments_[i].ext_id >= 0 &&
+                segments_[i].ext_id < min_ext_id_) {
+                min_ext_id_ = segments_[i].ext_id;
+            }
+        }
+    }
+
     Segment segments_[MaxSegments];
     size_t count_ = 0;
+    int64_t min_ext_id_ = INT64_MAX;  // Minimum ext_id for safe commit tracking
 };
 
 }  // namespace userspace_stack

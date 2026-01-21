@@ -479,6 +479,27 @@ struct TransportProcess {
                 profiling_data_->commit();
             }
 
+            // Periodic duplicate ACK for OOO recovery (IDLE only, ~400us interval)
+            // TCP fast retransmit requires 3+ duplicate ACKs.
+            // When OOO buffer has segments but no new frames arrive, we must
+            // periodically send duplicate ACKs to trigger server retransmit.
+            if (!data_moved && ooo_buffer_.has_ext_id_segments()) {
+                loops_since_dup_ack_++;
+                if (loops_since_dup_ack_ >= DUP_ACK_LOOP_INTERVAL) {
+                    // Print every 1000th DUP ACK to avoid log spam
+                    static uint32_t dup_ack_count = 0;
+                    dup_ack_count++;
+                    if (dup_ack_count % 1000 == 1) {
+                        fprintf(stderr, "[TRANSPORT] DUP_ACK #%u: ooo_count=%zu min_ext_id=%ld rcv_nxt=%u\n",
+                                dup_ack_count, ooo_buffer_.count(), ooo_buffer_.min_ext_id(), conn_state_->rcv_nxt);
+                    }
+                    send_ack();
+                    loops_since_dup_ack_ = 0;
+                }
+            } else if (data_moved) {
+                loops_since_dup_ack_ = 0;  // Reset on activity
+            }
+
             loop_id++;
         }
 
@@ -496,7 +517,7 @@ struct TransportProcess {
         // Use process_manually() with lambda for batched processing
         // This is the disruptor pattern: process batch, then commit_manually()
         raw_inbox_cons_->process_manually(
-            [&](UMEMFrameDescriptor& desc, int64_t) -> bool {
+            [&](UMEMFrameDescriptor& desc, int64_t seq) -> bool {
                 rx_count++;
                 // Capture Transport timestamp immediately
                 uint64_t raw_poll_cycle = rdtscp();
@@ -538,8 +559,34 @@ struct TransportProcess {
                     ntohl(conn_state_->remote_ip),
                     conn_state_->remote_port);
 
+                // Debug: Print UMEM frame ID on Transport RX
+                uint32_t umem_frame_id = static_cast<uint32_t>(desc.umem_addr / frame_size_);
+                fprintf(stderr, "[TRANSPORT-RX] umem_id=%u seq=%u len=%zu slot=%ld\n",
+                        umem_frame_id, parsed.valid ? parsed.seq : 0, parsed.payload_len, seq);
+
                 if (!parsed.valid) {
                     return true;
+                }
+
+                // DEBUG: Print TCP flags for debugging stuck connection
+                if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
+                    fprintf(stderr, "[TRANSPORT] TCP FIN received from server! seq=%u ack=%u\n",
+                            parsed.seq, parsed.ack);
+                }
+                if (parsed.flags & userspace_stack::TCP_FLAG_RST) {
+                    fprintf(stderr, "[TRANSPORT] TCP RST received from server! seq=%u\n", parsed.seq);
+                }
+
+                // DEBUG: Track TCP sequence gaps
+                if (parsed.payload_len > 0) {
+                    int32_t seq_diff = static_cast<int32_t>(parsed.seq - conn_state_->rcv_nxt);
+                    if (seq_diff > 0) {
+                        fprintf(stderr, "[TRANSPORT] TCP GAP! expected_seq=%u got_seq=%u gap=%d bytes\n",
+                                conn_state_->rcv_nxt, parsed.seq, seq_diff);
+                    } else if (seq_diff < 0) {
+                        fprintf(stderr, "[TRANSPORT] TCP OVERLAP/RETRANSMIT seq=%u expected=%u overlap=%d\n",
+                                parsed.seq, conn_state_->rcv_nxt, -seq_diff);
+                    }
                 }
 
                 // Update TCP state from ACK
@@ -560,10 +607,19 @@ struct TransportProcess {
                         }
 
                         // Buffer UMEM pointer (zero-copy - frame NOT committed, UMEM stays valid)
+                        // Pass ring sequence as ext_id so safe_commit_rx() knows which frames are held
                         if (!ooo_buffer_.is_buffered(parsed.seq)) {
-                            ooo_buffer_.buffer_segment(parsed.seq,
+                            bool buffered = ooo_buffer_.buffer_segment(parsed.seq,
                                                        static_cast<uint16_t>(parsed.payload_len),
-                                                       reinterpret_cast<const uint8_t*>(parsed.payload));
+                                                       reinterpret_cast<const uint8_t*>(parsed.payload),
+                                                       seq);  // ext_id = ring sequence for safe commit
+                            if (!buffered) {
+                                fprintf(stderr, "[TRANSPORT] OOO BUFFER FULL! Dropping segment seq=%u len=%zu (buffer has %zu/%zu)\n",
+                                        parsed.seq, parsed.payload_len, ooo_buffer_.count(), ooo_buffer_.max_segments());
+                            } else {
+                                fprintf(stderr, "[TRANSPORT] OOO BUFFERED: seq=%u len=%zu ext_id=%ld ooo_count=%zu/%zu\n",
+                                        parsed.seq, parsed.payload_len, seq, ooo_buffer_.count(), ooo_buffer_.max_segments());
+                            }
                         }
                         out_of_order = true;
                         desc.acked = 1;  // Mark frame so we don't send another ACK on reprocess
@@ -574,9 +630,13 @@ struct TransportProcess {
                         // Duplicate or overlapping segment
                         int32_t overlap = -seq_diff;
                         if (static_cast<size_t>(overlap) >= parsed.payload_len) {
+                            fprintf(stderr, "[TRANSPORT] TCP FULL DUP seq=%u len=%zu (rcv_nxt=%u) - skipping\n",
+                                    parsed.seq, parsed.payload_len, conn_state_->rcv_nxt);
                             return true;  // Entire segment is duplicate, skip
                         }
                         // Partial overlap - adjust payload
+                        fprintf(stderr, "[TRANSPORT] TCP PARTIAL OVERLAP seq=%u overlap=%d new_len=%zu rcv_nxt=%u\n",
+                                parsed.seq, overlap, parsed.payload_len - overlap, conn_state_->rcv_nxt);
                         parsed.payload += overlap;
                         parsed.payload_len -= overlap;
                         parsed.seq = conn_state_->rcv_nxt;
@@ -584,7 +644,10 @@ struct TransportProcess {
                 }
 
                 // Update rcv_nxt using actual payload length for in-order data
+                uint32_t old_rcv_nxt = conn_state_->rcv_nxt;
                 conn_state_->rcv_nxt += parsed.payload_len;
+                fprintf(stderr, "[TRANSPORT] TCP IN-ORDER seq=%u len=%zu rcv_nxt: %u -> %u\n",
+                        parsed.seq, parsed.payload_len, old_rcv_nxt, conn_state_->rcv_nxt);
 
                 // Append encrypted view to ring buffer for SSL decryption (zero-copy: points to UMEM)
                 if (parsed.payload_len > 0) {
@@ -595,16 +658,23 @@ struct TransportProcess {
                     }
                     payload_frames++;  // Track frames with payload for commit logic
                     packets_since_ack_++;  // Only count payload packets for ACK threshold
+                    pending_packet_ct_++;  // Track packets for MsgMetadata.nic_packet_ct
 
                     // Check OOO buffer for now-in-order segments
-                    ooo_buffer_.try_deliver(conn_state_->rcv_nxt,
+                    uint32_t rcv_nxt_before_ooo = conn_state_->rcv_nxt;
+                    size_t delivered = ooo_buffer_.try_deliver(conn_state_->rcv_nxt,
                         [this](const uint8_t* data, uint16_t offset, uint16_t len) {
+                            fprintf(stderr, "[TRANSPORT] OOO DELIVER: offset=%u len=%u\n", offset, len);
                             if (ssl_policy_.append_encrypted_view(data + offset, len) != 0) {
                                 fprintf(stderr, "[FATAL] SSL view ring buffer overflow (OOO) - aborting\n");
                                 std::abort();
                             }
                             return true;
                         });
+                    if (delivered > 0) {
+                        fprintf(stderr, "[TRANSPORT] OOO delivered %zu segments, rcv_nxt: %u -> %u\n",
+                                delivered, rcv_nxt_before_ooo, conn_state_->rcv_nxt);
+                    }
                 }
 
                 // Note: packets_since_ack_ only incremented for payload packets (above)
@@ -620,15 +690,17 @@ struct TransportProcess {
         // Views point to UMEM frame data. After commit, XDP Poll may reclaim frames.
         // This prevents use-after-free when XDP Poll returns frames to fill ring.
         if (rx_count > 0) {
+            fprintf(stderr, "[TRANSPORT] RX: %d frames, payload_frames=%d\n", rx_count, payload_frames);
             ssl_read_to_msg_inbox();
         }
 
         // Commit frames - for SSL, frames should only be released after SSL has consumed
         // For NoSSLPolicy, read() immediately consumes all data, safe to commit
         // For real SSL (TLS), we defer commit until SSL has no partial data pending
+        // CRITICAL: Use safe_commit_rx() to prevent releasing frames held by OOO buffer
         if constexpr (std::is_same_v<SSLPolicy, ssl::NoSSLPolicy>) {
             // NoSSL: immediate commit (no decryption delay)
-            raw_inbox_cons_->commit_manually();
+            safe_commit_rx();
         } else {
             // Real SSL: defer commit until SSL has consumed all data from frames
             rx_frames_pending_ += payload_frames;
@@ -637,7 +709,7 @@ struct TransportProcess {
             // FIX: Commit pure ACK frames only when no payload is pending
             // They have no payload, so no SSL decryption needed
             if (rx_frames_pending_ == 0 && rx_count > 0 && payload_frames == 0) {
-                raw_inbox_cons_->commit_manually();
+                safe_commit_rx();
             }
         }
 
@@ -647,6 +719,27 @@ struct TransportProcess {
         }
 
         return rx_count;
+    }
+
+    // Helper: Safe commit that respects OOO buffer references
+    // Prevents use-after-free by not releasing frames still held in OOO buffer
+    void safe_commit_rx() {
+        if (ooo_buffer_.has_ext_id_segments()) {
+            // OOO buffer holds frame references - only commit up to min_ext_id - 1
+            int64_t safe_commit = ooo_buffer_.min_ext_id() - 1;
+            int64_t current_seq = raw_inbox_cons_->sequence();
+            int64_t last_proc = raw_inbox_cons_->last_processed();
+            fprintf(stderr, "[TRANSPORT] safe_commit_rx: min_ext_id=%ld safe_commit=%ld current_seq=%ld last_proc=%ld ooo_count=%zu\n",
+                    ooo_buffer_.min_ext_id(), safe_commit, current_seq, last_proc, ooo_buffer_.count());
+            if (safe_commit < current_seq) {
+                fprintf(stderr, "[TRANSPORT] safe_commit_rx: BLOCKED - nothing safe to commit\n");
+                return;  // Nothing safe to commit
+            }
+            raw_inbox_cons_->commit_up_to(safe_commit);
+        } else {
+            // No OOO segments - safe to commit all processed frames
+            raw_inbox_cons_->commit_manually();
+        }
     }
 
     // Helper: Commit RX frames after SSL has fully consumed from view ring
@@ -662,7 +755,7 @@ struct TransportProcess {
         // For NoSSLPolicy: read() immediately consumes all data, has_partial_view() = false
         // For real SSL: has_partial_view() = true if mid-TLS-record (needs more data)
         if (!ssl_policy_.has_partial_view()) {
-            raw_inbox_cons_->commit_manually();
+            safe_commit_rx();
             rx_frames_pending_ = 0;
         }
     }
@@ -703,6 +796,7 @@ struct TransportProcess {
             ret = ssl_policy_.read(msg_inbox_->write_ptr(), linear);
             if (ret <= 0) break;
 
+            fprintf(stderr, "[TRANSPORT] SSL_read: %zd bytes\n", ret);
             uint64_t ssl_read_cycle = rdtsc();
             msg_inbox_->advance_write(static_cast<uint32_t>(ret));
 
@@ -722,6 +816,7 @@ struct TransportProcess {
             meta.ssl_read_cycle = ssl_read_cycle;
             meta.msg_inbox_offset = write_offset;
             meta.decrypted_len = static_cast<uint32_t>(ret);
+            meta.nic_packet_ct = pending_packet_ct_;
             msg_metadata_prod_->publish(meta_seq);
 
             // Reset timestamps for next batch
@@ -730,7 +825,10 @@ struct TransportProcess {
 
         // ret < 0 with errno == EAGAIN means need more data (normal for pipeline)
         if (ret < 0 && errno != EAGAIN) {
-            fprintf(stderr, "[TRANSPORT] SSL read error: %s\n", strerror(errno));
+            fprintf(stderr, "[TRANSPORT] SSL read error: %s (errno=%d)\n", strerror(errno), errno);
+        } else if (ret < 0) {
+            // EAGAIN - DEBUG: track how many bytes are pending in the view ring
+            fprintf(stderr, "[TRANSPORT] SSL_read EAGAIN (need more data to complete TLS record)\n");
         }
 
         // Note: Ring buffer auto-cycles, no need to clear_encrypted_view() here
@@ -1045,6 +1143,8 @@ struct TransportProcess {
         desc.nic_frame_poll_cycle = 0;
         desc.consumed = 0;
         ack_outbox_prod_->publish(seq);
+        fprintf(stderr, "[TRANSPORT-TX] ACK umem_id=%u rcv_nxt=%u (ACK_OUTBOX seq=%ld)\n",
+                frame_idx, params.rcv_nxt, seq);
 
         packets_since_ack_ = 0;
         last_ack_cycle_ = rdtsc();
@@ -1515,7 +1615,7 @@ private:
         }
 
         // Calculate MSS for segmentation (MTU - IP(20) - TCP(20) = 1460 for MTU 1500)
-        constexpr size_t MSS = TCP_MSS;
+        constexpr size_t MSS = PIPELINE_TCP_MSS;
 
         // If data fits in single segment, use fast path
         if (pending <= MSS) {
@@ -1749,6 +1849,7 @@ private:
         latest_nic_timestamp_ns_ = 0;
         latest_nic_frame_poll_cycle_ = 0;
         latest_raw_frame_poll_cycle_ = 0;
+        pending_packet_ct_ = 0;
     }
 
     // Accessors
@@ -1792,6 +1893,7 @@ private:
     uint64_t latest_nic_timestamp_ns_ = 0;
     uint64_t latest_nic_frame_poll_cycle_ = 0;  // XDP Poll rdtscp of latest packet
     uint64_t latest_raw_frame_poll_cycle_ = 0;  // Transport rdtscp of latest packet
+    uint32_t pending_packet_ct_ = 0;           // Packets since last SSL_read
 
     // Profiling: track oldest event in batch (smallest nic_frame_poll_cycle)
     uint64_t oldest_poll_cycle_ = UINT64_MAX;       // Reset each iteration, track min nic_frame_poll_cycle
@@ -1801,6 +1903,7 @@ private:
     // ACK state
     uint32_t packets_since_ack_ = 0;
     uint64_t last_ack_cycle_ = 0;
+    uint32_t loops_since_dup_ack_ = 0;  // Loop counter for periodic OOO duplicate ACK
 
     // Retransmit state - separate queues for MSG and PONG frames
     ZeroCopyRetransmitQueue msg_retransmit_queue_;       // MSG frames
@@ -1819,7 +1922,8 @@ private:
     // Out-of-order (OOO) buffer for TCP segment reordering
     // Zero-copy: stores UMEM pointers, frames stay valid until batch commit
     // process_manually() returns true for all frames -> UMEMs valid until commit_manually()
-    using OOOBuffer = userspace_stack::ZeroCopyTCPReorderBuffer<const uint8_t*>;
+    // 64 slots to handle high packet reordering on WAN connections
+    using OOOBuffer = userspace_stack::ZeroCopyTCPReorderBuffer<const uint8_t*, 64>;
     OOOBuffer ooo_buffer_;
 
     // RX frame lifecycle - track frames pending SSL consumption in main loop

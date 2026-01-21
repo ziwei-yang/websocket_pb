@@ -775,9 +775,9 @@ build_test() {
 
     # Determine SSL library flags based on test name
     local SSL_FLAGS=""
-    if [[ "$MAKE_TARGET" == *"wolfssl"* ]]; then
+    if [[ "$MAKE_TARGET" == *"wolfssl"* ]] || [[ "$MAKE_TARGET" == *"wss"* ]]; then
         SSL_FLAGS="USE_WOLFSSL=1"
-        log_info "Detected WolfSSL test, adding USE_WOLFSSL=1"
+        log_info "Detected WolfSSL/WSS test, adding USE_WOLFSSL=1"
     elif [[ "$MAKE_TARGET" == *"libressl"* ]]; then
         SSL_FLAGS="USE_LIBRESSL=1"
         log_info "Detected LibreSSL test, adding USE_LIBRESSL=1"
