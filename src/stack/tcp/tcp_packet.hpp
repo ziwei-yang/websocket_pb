@@ -101,9 +101,16 @@ struct TCPPacket {
         }
 
         // Calculate TCP header length
+        // Timestamps enabled if ts_val is set (caller controls this)
+        bool include_timestamp = (params.ts_val != 0);
         size_t tcp_header_len = TCP_HEADER_MIN_LEN;
         if (flags & TCP_FLAG_SYN) {
-            tcp_header_len = 24;  // 20 + 4 bytes MSS option
+            // SYN: MSS(4) + SACK_OK(2) + NOP(2) = 8 bytes options
+            // With timestamps: + NOP(1) + NOP(1) + TS(10) = 12 more bytes
+            tcp_header_len = include_timestamp ? 40 : 28;
+        } else if (include_timestamp) {
+            // Non-SYN with timestamps: 20 + 12 (NOP+NOP+TS)
+            tcp_header_len = 32;
         }
 
         size_t total_len = ETH_HEADER_LEN + IP_HEADER_LEN + tcp_header_len + data_len;
@@ -125,13 +132,46 @@ struct TCPPacket {
         tcp->ack_seq = (flags & TCP_FLAG_ACK) ? htonl(params.rcv_nxt) : 0;
 
         if (flags & TCP_FLAG_SYN) {
-            tcp->doff_reserved = 0x60;  // 6 << 4 (24 bytes header)
-            // Add MSS option
+            // SYN header: 28 bytes (no TS) or 40 bytes (with TS)
+            tcp->doff_reserved = static_cast<uint8_t>((tcp_header_len / 4) << 4);
             uint8_t* options = buffer + tcp_offset + TCP_HEADER_MIN_LEN;
+            // MSS option (4 bytes)
             options[0] = TCP_OPT_MSS;
             options[1] = 4;
             options[2] = (USERSPACE_TCP_MSS >> 8) & 0xFF;
             options[3] = USERSPACE_TCP_MSS & 0xFF;
+            // SACK Permitted (2 bytes)
+            options[4] = TCP_OPT_SACK_OK;  // SACK Permitted (RFC 2018)
+            options[5] = 2;                // Length = 2
+            // NOP padding (2 bytes)
+            options[6] = TCP_OPT_NOP;
+            options[7] = TCP_OPT_NOP;
+            if (include_timestamp) {
+                // Timestamp option (12 bytes: NOP + NOP + TS)
+                options[8] = TCP_OPT_NOP;
+                options[9] = TCP_OPT_NOP;
+                options[10] = TCP_OPT_TIMESTAMP;
+                options[11] = TCP_TIMESTAMP_OPT_LEN;  // 10 bytes
+                // TSval (network byte order)
+                uint32_t ts_val_n = htonl(params.ts_val);
+                std::memcpy(&options[12], &ts_val_n, 4);
+                // TSecr (0 for SYN, or echoed value)
+                uint32_t ts_ecr_n = htonl(params.ts_ecr);
+                std::memcpy(&options[16], &ts_ecr_n, 4);
+            }
+        } else if (include_timestamp) {
+            // Non-SYN with timestamps: 32 bytes header
+            tcp->doff_reserved = 0x80;  // 8 << 4 (32 bytes header)
+            uint8_t* options = buffer + tcp_offset + TCP_HEADER_MIN_LEN;
+            // Timestamp option (12 bytes: NOP + NOP + TS)
+            options[0] = TCP_OPT_NOP;
+            options[1] = TCP_OPT_NOP;
+            options[2] = TCP_OPT_TIMESTAMP;
+            options[3] = TCP_TIMESTAMP_OPT_LEN;  // 10 bytes
+            uint32_t ts_val_n = htonl(params.ts_val);
+            std::memcpy(&options[4], &ts_val_n, 4);
+            uint32_t ts_ecr_n = htonl(params.ts_ecr);
+            std::memcpy(&options[8], &ts_ecr_n, 4);
         } else {
             tcp->doff_reserved = 0x50;  // 5 << 4 (20 bytes header)
         }
@@ -176,15 +216,158 @@ struct TCPPacket {
     }
 
     /**
+     * Build a TCP ACK segment with SACK blocks
+     *
+     * Layout: [Ethernet 14B][IP 20B][TCP 20-56B][No Data]
+     *
+     * Header sizes by block count:
+     *   0 blocks: 20 bytes (use regular build() instead)
+     *   1 block:  32 bytes (20 + 10 option + 2 padding)
+     *   2 blocks: 40 bytes (20 + 18 option + 2 padding)
+     *   3 blocks: 48 bytes (20 + 26 option + 2 padding)
+     *   4 blocks: 56 bytes (20 + 34 option + 2 padding)
+     *
+     * @param buffer Output buffer
+     * @param capacity Buffer capacity
+     * @param params TCP connection parameters
+     * @param sack_blocks SACK blocks to include
+     * @param local_mac Source MAC address
+     * @param gateway_mac Destination MAC address
+     * @param ip_id IP identification field
+     * @return Total frame length, or 0 on error
+     */
+    static size_t build_ack_with_sack(
+        uint8_t* buffer,
+        size_t capacity,
+        const TCPParams& params,
+        const SACKBlockArray& sack_blocks,
+        const uint8_t* local_mac,
+        const uint8_t* gateway_mac,
+        uint16_t ip_id
+    ) {
+        if (!buffer || !local_mac || !gateway_mac) {
+            return 0;
+        }
+
+        // If no SACK blocks, caller should use regular build()
+        if (sack_blocks.count == 0) {
+            return 0;
+        }
+
+        // Check if timestamps enabled
+        bool include_timestamp = (params.ts_val != 0);
+
+        // Cap SACK blocks: 4 without TS, 3 with TS (per RFC 7323)
+        uint8_t max_blocks = include_timestamp ? SACK_MAX_BLOCKS_WITH_TS : SACK_MAX_BLOCKS;
+        uint8_t block_count = (sack_blocks.count > max_blocks) ? max_blocks : sack_blocks.count;
+
+        // Calculate TCP header length
+        // With TS: NOP(1) + NOP(1) + TS(10) + SACK header(2) + blocks(8*n) + padding
+        // Without TS: SACK header(2) + blocks(8*n) + padding
+        size_t ts_opt_len = include_timestamp ? TCP_TIMESTAMP_PADDED_LEN : 0;
+        size_t sack_opt_len = 2 + (block_count * SACK_BLOCK_SIZE);
+        size_t options_len = ts_opt_len + sack_opt_len;
+        // Padding to 4-byte alignment
+        size_t padding = (4 - (options_len % 4)) % 4;
+        size_t tcp_header_len = TCP_HEADER_MIN_LEN + options_len + padding;
+
+        size_t total_len = ETH_HEADER_LEN + IP_HEADER_LEN + tcp_header_len;
+        if (total_len > capacity) {
+            return 0;
+        }
+
+        // Offsets
+        constexpr size_t eth_offset = 0;
+        constexpr size_t ip_offset = ETH_HEADER_LEN;
+        constexpr size_t tcp_offset = ETH_HEADER_LEN + IP_HEADER_LEN;
+
+        // === Build TCP header ===
+        TCPHeader* tcp = reinterpret_cast<TCPHeader*>(buffer + tcp_offset);
+        tcp->source = htons(params.local_port);
+        tcp->dest = htons(params.remote_port);
+        tcp->seq = htonl(params.snd_nxt);
+        tcp->ack_seq = htonl(params.rcv_nxt);
+        tcp->doff_reserved = static_cast<uint8_t>((tcp_header_len / 4) << 4);
+        tcp->flags = TCP_FLAG_ACK;
+        tcp->window = htons(static_cast<uint16_t>(params.rcv_wnd));
+        tcp->check = 0;
+        tcp->urg_ptr = 0;
+
+        uint8_t* opt = buffer + tcp_offset + TCP_HEADER_MIN_LEN;
+
+        // Write timestamp option first (if enabled)
+        if (include_timestamp) {
+            *opt++ = TCP_OPT_NOP;
+            *opt++ = TCP_OPT_NOP;
+            *opt++ = TCP_OPT_TIMESTAMP;
+            *opt++ = TCP_TIMESTAMP_OPT_LEN;  // 10 bytes
+            uint32_t ts_val_n = htonl(params.ts_val);
+            std::memcpy(opt, &ts_val_n, 4);
+            opt += 4;
+            uint32_t ts_ecr_n = htonl(params.ts_ecr);
+            std::memcpy(opt, &ts_ecr_n, 4);
+            opt += 4;
+        }
+
+        // Write SACK option: [kind=5, length, blocks...]
+        *opt++ = TCP_OPT_SACK;                           // kind = 5
+        *opt++ = static_cast<uint8_t>(2 + block_count * SACK_BLOCK_SIZE);  // length
+
+        for (uint8_t i = 0; i < block_count; i++) {
+            uint32_t left = htonl(sack_blocks.blocks[i].left_edge);
+            uint32_t right = htonl(sack_blocks.blocks[i].right_edge);
+            std::memcpy(opt, &left, 4);
+            opt += 4;
+            std::memcpy(opt, &right, 4);
+            opt += 4;
+        }
+
+        // NOP padding to 4-byte boundary
+        while ((opt - (buffer + tcp_offset)) % 4 != 0) {
+            *opt++ = TCP_OPT_NOP;
+        }
+
+        // Calculate TCP checksum (no payload)
+        tcp->check = htons(tcp_checksum(params.local_ip, params.remote_ip,
+                                        tcp, tcp_header_len, nullptr, 0));
+
+        // === Build IP header ===
+        IPv4Header* ip_hdr = reinterpret_cast<IPv4Header*>(buffer + ip_offset);
+        ip_hdr->version_ihl = 0x45;
+        ip_hdr->tos = 0;
+        ip_hdr->tot_len = htons(static_cast<uint16_t>(IP_HEADER_LEN + tcp_header_len));
+        ip_hdr->id = htons(ip_id);
+        ip_hdr->frag_off = htons(0x4000);  // Don't fragment
+        ip_hdr->ttl = IP_DEFAULT_TTL;
+        ip_hdr->protocol = IP_PROTO_TCP;
+        ip_hdr->check = 0;
+        ip_hdr->saddr = htonl(params.local_ip);
+        ip_hdr->daddr = htonl(params.remote_ip);
+        ip_hdr->check = htons(ip_checksum(ip_hdr));
+
+        // === Build Ethernet header ===
+        EthernetHeader* eth = reinterpret_cast<EthernetHeader*>(buffer + eth_offset);
+        std::memcpy(eth->dst_mac, gateway_mac, ETH_ADDR_LEN);
+        std::memcpy(eth->src_mac, local_mac, ETH_ADDR_LEN);
+        eth->ethertype = htons(ETH_TYPE_IP);
+
+        return total_len;
+    }
+
+    /**
      * Build ETH/IP/TCP headers in-place, assuming payload is already at data_offset.
      * ZERO-COPY: Does NOT copy or touch payload data.
      *
-     * Use this when payload is already written to the frame at offset 54 (ETH+IP+TCP).
-     * This function only builds the headers in front of the existing payload.
+     * Data offset depends on timestamp configuration:
+     *   - Without timestamps: offset 54 (ETH 14 + IP 20 + TCP 20)
+     *   - With timestamps:    offset 66 (ETH 14 + IP 20 + TCP 32)
+     *
+     * Timestamps are included if params.ts_val != 0. Caller must write payload
+     * at the correct offset based on this.
      *
      * @param buffer      Destination buffer (UMEM frame)
      * @param capacity    Buffer capacity
-     * @param params      TCP parameters (IPs, ports, seq/ack numbers)
+     * @param params      TCP parameters (IPs, ports, seq/ack numbers, timestamps)
      * @param flags       TCP flags (ACK, PSH, etc.)
      * @param payload_len Length of payload already at data_offset (for checksums)
      * @param local_mac   Local MAC address
@@ -206,9 +389,12 @@ struct TCPPacket {
             return 0;
         }
 
-        // TCP header is always 20 bytes (no options for data packets)
-        constexpr size_t tcp_header_len = TCP_HEADER_MIN_LEN;
-        constexpr size_t data_offset = ETH_HEADER_LEN + IP_HEADER_LEN + tcp_header_len;
+        // TCP header size depends on timestamp option
+        bool include_timestamp = (params.ts_val != 0);
+        size_t tcp_header_len = include_timestamp
+            ? (TCP_HEADER_MIN_LEN + TCP_TIMESTAMP_PADDED_LEN)  // 32 bytes
+            : TCP_HEADER_MIN_LEN;                              // 20 bytes
+        size_t data_offset = ETH_HEADER_LEN + IP_HEADER_LEN + tcp_header_len;
 
         size_t total_len = data_offset + payload_len;
         if (total_len > capacity) {
@@ -226,11 +412,24 @@ struct TCPPacket {
         tcp->dest = htons(params.remote_port);
         tcp->seq = htonl(params.snd_nxt);
         tcp->ack_seq = (flags & TCP_FLAG_ACK) ? htonl(params.rcv_nxt) : 0;
-        tcp->doff_reserved = 0x50;  // 5 << 4 (20 bytes header, no options)
+        tcp->doff_reserved = static_cast<uint8_t>((tcp_header_len / 4) << 4);
         tcp->flags = flags;
         tcp->window = htons(static_cast<uint16_t>(params.rcv_wnd));
         tcp->check = 0;
         tcp->urg_ptr = 0;
+
+        // Write timestamp option if enabled
+        if (include_timestamp) {
+            uint8_t* opt = buffer + tcp_offset + TCP_HEADER_MIN_LEN;
+            opt[0] = TCP_OPT_NOP;
+            opt[1] = TCP_OPT_NOP;
+            opt[2] = TCP_OPT_TIMESTAMP;
+            opt[3] = TCP_TIMESTAMP_OPT_LEN;  // 10 bytes
+            uint32_t ts_val_n = htonl(params.ts_val);
+            std::memcpy(&opt[4], &ts_val_n, 4);
+            uint32_t ts_ecr_n = htonl(params.ts_ecr);
+            std::memcpy(&opt[8], &ts_ecr_n, 4);
+        }
 
         // Calculate TCP checksum (payload is already in place at data_offset)
         const uint8_t* tcp_data = (payload_len > 0) ? (buffer + data_offset) : nullptr;

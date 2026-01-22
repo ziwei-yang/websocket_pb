@@ -125,11 +125,6 @@ inline constexpr uint64_t INITIAL_RTO_US = 200000;       // 200ms initial RTO
 // Retransmit check interval (skip check when busy, check every N loops when idle)
 inline constexpr uint32_t RETRANSMIT_CHECK_INTERVAL = 1024;
 
-// Periodic duplicate ACK interval for OOO recovery (~400us @ 200ns/loop)
-// TCP fast retransmit requires 3+ duplicate ACKs. When OOO buffer has segments
-// but no new frames arrive, we send duplicate ACKs at this interval.
-inline constexpr uint32_t DUP_ACK_LOOP_INTERVAL = 2048;
-
 // Trickle interval for igc driver workaround
 inline constexpr uint32_t TRICKLE_INTERVAL_ITERATIONS = 8;
 

@@ -58,7 +58,32 @@ constexpr uint8_t TCP_OPT_NOP = 1;       // No operation
 constexpr uint8_t TCP_OPT_MSS = 2;       // Maximum segment size
 constexpr uint8_t TCP_OPT_WSCALE = 3;    // Window scale
 constexpr uint8_t TCP_OPT_SACK_OK = 4;   // SACK permitted
+constexpr uint8_t TCP_OPT_SACK = 5;      // SACK option type (RFC 2018)
 constexpr uint8_t TCP_OPT_TIMESTAMP = 8; // Timestamp
+
+// SACK constants (RFC 2018)
+constexpr size_t SACK_MAX_BLOCKS = 4;    // Max blocks per ACK
+constexpr size_t SACK_BLOCK_SIZE = 8;    // 4-byte left + 4-byte right
+
+// TCP Timestamp constants (RFC 7323)
+constexpr size_t TCP_TIMESTAMP_OPT_LEN = 10;      // Kind(1) + Len(1) + TSval(4) + TSecr(4)
+constexpr size_t TCP_TIMESTAMP_PADDED_LEN = 12;  // NOP + NOP + timestamp option
+constexpr size_t SACK_MAX_BLOCKS_WITH_TS = 3;    // Max SACK blocks when timestamps enabled
+
+// SACK block structure (RFC 2018)
+struct SACKBlock {
+    uint32_t left_edge;   // First seq in block (inclusive)
+    uint32_t right_edge;  // Seq after last byte (exclusive)
+};
+
+// Array of SACK blocks for ACK packets
+struct SACKBlockArray {
+    SACKBlock blocks[SACK_MAX_BLOCKS];
+    uint8_t count = 0;
+
+    void clear() { count = 0; }
+    bool is_empty() const { return count == 0; }
+};
 
 // TCP header structure (20 bytes minimum)
 struct __attribute__((packed)) TCPHeader {
@@ -93,6 +118,10 @@ struct TCPParams {
     // IPs (host byte order)
     uint32_t local_ip = 0;
     uint32_t remote_ip = 0;
+
+    // TCP Timestamps (RFC 7323)
+    uint32_t ts_val = 0;     // Our timestamp value (TSval)
+    uint32_t ts_ecr = 0;     // Echoed timestamp (TSecr) from peer
 };
 
 // TCP timers (in milliseconds)

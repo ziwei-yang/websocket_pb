@@ -207,6 +207,8 @@ private:
  *   MsgOutboxCons   - IPCRingConsumer<MsgOutboxEvent>
  *   MsgMetadataProd - IPCRingProducer<MsgMetadata>
  *   PongsCons       - IPCRingConsumer<PongFrameAligned>
+ *   Profiling       - Enable cycle profiling (default false)
+ *   TCPTimestampEnabled - Enable TCP Timestamps RFC 7323 (default true, like Linux kernel)
  */
 template<typename SSLPolicy,
          typename RawInboxCons,
@@ -216,9 +218,11 @@ template<typename SSLPolicy,
          typename MsgOutboxCons,
          typename MsgMetadataProd,
          typename PongsCons,
-         bool Profiling = false>
+         bool Profiling = false,
+         bool TCPTimestampEnabled = true>  // RFC 7323 TCP Timestamps (default enabled like kernel)
 struct TransportProcess {
     static constexpr bool kProfiling = Profiling;
+    static constexpr bool kTimestampEnabled = TCPTimestampEnabled;
 
     // Profiling helper: wraps function, measures cycles, stores result and cycles
     // Uses pointer to shared memory slot (no stack allocation)
@@ -308,6 +312,7 @@ struct TransportProcess {
         uint64_t tsc_freq = conn_state_->tsc_freq_hz;
         rto_cycles_ = (ZeroCopyRetransmitQueue::DEFAULT_RTO_US * tsc_freq) / 1000000;
         ack_timeout_cycles_ = (ACK_TIMEOUT_US * tsc_freq) / 1000000;
+        dup_ack_interval_cycles_ = (INITIAL_RTO_US * tsc_freq) / 1000000;  // 200ms RTO
 
         // Initialize userspace TCP stack with local network info from shared state
         {
@@ -404,6 +409,7 @@ struct TransportProcess {
         uint64_t tsc_freq = conn_state_->tsc_freq_hz;
         rto_cycles_ = (ZeroCopyRetransmitQueue::DEFAULT_RTO_US * tsc_freq) / 1000000;
         ack_timeout_cycles_ = (ACK_TIMEOUT_US * tsc_freq) / 1000000;
+        dup_ack_interval_cycles_ = (INITIAL_RTO_US * tsc_freq) / 1000000;  // 200ms RTO
 
         return true;
     }
@@ -440,8 +446,16 @@ struct TransportProcess {
 
             bool data_moved = (msg_count > 0) || (rx_count > 0);
 
-            // 2. ACK (always runs - has internal early-exit if no packets pending)
-            profile_op([this]{ return check_and_send_ack(); }, slot, 2);
+            // 2. Deferred ACK (idle only) - send ACK/SACK if we saw DUP or OOO packets
+            profile_op([this]{
+                if (seen_dup_packet_ || seen_ooo_packet_) {
+                    send_ack(true);  // Include SACK for OOO/DUP recovery
+                    seen_dup_packet_ = false;
+                    seen_ooo_packet_ = false;
+                    return true;
+                }
+                return check_and_send_ack();  // Normal delayed ACK
+            }, slot, 2, !data_moved);
 
             // 3. PONG (idle only)
             profile_op(
@@ -479,25 +493,17 @@ struct TransportProcess {
                 profiling_data_->commit();
             }
 
-            // Periodic duplicate ACK for OOO recovery (IDLE only, ~400us interval)
-            // TCP fast retransmit requires 3+ duplicate ACKs.
-            // When OOO buffer has segments but no new frames arrive, we must
-            // periodically send duplicate ACKs to trigger server retransmit.
+            // RTO DUP_ACK for OOO recovery: periodic SACK while OOO gap persists (no cap - match kernel)
+            // Send SACK every RTO interval to help server retransmit missing segments
             if (!data_moved && ooo_buffer_.has_ext_id_segments()) {
-                loops_since_dup_ack_++;
-                if (loops_since_dup_ack_ >= DUP_ACK_LOOP_INTERVAL) {
-                    // Print every 1000th DUP ACK to avoid log spam
-                    static uint32_t dup_ack_count = 0;
-                    dup_ack_count++;
-                    if (dup_ack_count % 1000 == 1) {
-                        fprintf(stderr, "[TRANSPORT] DUP_ACK #%u: ooo_count=%zu min_ext_id=%ld rcv_nxt=%u\n",
-                                dup_ack_count, ooo_buffer_.count(), ooo_buffer_.min_ext_id(), conn_state_->rcv_nxt);
-                    }
-                    send_ack();
-                    loops_since_dup_ack_ = 0;
+                uint64_t now = rdtsc();
+                if (now - last_dup_ack_cycle_ >= dup_ack_interval_cycles_) {
+                    ooo_dup_ack_count_++;
+                    fprintf(stderr, "[TRANSPORT] RTO DUP_ACK #%u: ooo_count=%zu min_ext_id=%ld rcv_nxt=%u\n",
+                            ooo_dup_ack_count_, ooo_buffer_.count(), ooo_buffer_.min_ext_id(), conn_state_->rcv_nxt);
+                    send_ack(true);  // Include SACK for OOO recovery
+                    last_dup_ack_cycle_ = now;
                 }
-            } else if (data_moved) {
-                loops_since_dup_ack_ = 0;  // Reset on activity
             }
 
             loop_id++;
@@ -561,12 +567,15 @@ struct TransportProcess {
 
                 // Debug: Print UMEM frame ID on Transport RX
                 uint32_t umem_frame_id = static_cast<uint32_t>(desc.umem_addr / frame_size_);
-                fprintf(stderr, "[TRANSPORT-RX] umem_id=%u seq=%u len=%zu slot=%ld\n",
-                        umem_frame_id, parsed.valid ? parsed.seq : 0, parsed.payload_len, seq);
-
                 if (!parsed.valid) {
+                    fprintf(stderr, "[TRANSPORT-RX] umem_id=%u INVALID slot=%ld\n",
+                            umem_frame_id, seq);
                     return true;
                 }
+
+                // Log received packet with seq, ack, flags, len for timeline reconstruction
+                fprintf(stderr, "[TRANSPORT-RX] umem_id=%u seq=%u ack=%u flags=0x%02x len=%zu slot=%ld\n",
+                        umem_frame_id, parsed.seq, parsed.ack, parsed.flags, parsed.payload_len, seq);
 
                 // DEBUG: Print TCP flags for debugging stuck connection
                 if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
@@ -630,8 +639,9 @@ struct TransportProcess {
                         // Duplicate or overlapping segment
                         int32_t overlap = -seq_diff;
                         if (static_cast<size_t>(overlap) >= parsed.payload_len) {
-                            fprintf(stderr, "[TRANSPORT] TCP FULL DUP seq=%u len=%zu (rcv_nxt=%u) - skipping\n",
+                            fprintf(stderr, "[TRANSPORT] TCP FULL DUP seq=%u len=%zu (rcv_nxt=%u) - will ACK in IDLE\n",
                                     parsed.seq, parsed.payload_len, conn_state_->rcv_nxt);
+                            seen_dup_packet_ = true;  // Deferred ACK in IDLE
                             return true;  // Entire segment is duplicate, skip
                         }
                         // Partial overlap - adjust payload
@@ -646,6 +656,18 @@ struct TransportProcess {
                 // Update rcv_nxt using actual payload length for in-order data
                 uint32_t old_rcv_nxt = conn_state_->rcv_nxt;
                 conn_state_->rcv_nxt += parsed.payload_len;
+
+                // Update peer_ts_val for in-order packets only (RFC 7323 §4.1 RTTM)
+                if constexpr (kTimestampEnabled) {
+                    if (conn_state_->timestamp_enabled) {
+                        uint8_t* frame = umem_area_ + desc.umem_addr;
+                        auto ts_result = parse_timestamp_option(frame, desc.frame_len);
+                        if (ts_result.found) {
+                            conn_state_->peer_ts_val = ts_result.ts_val;
+                        }
+                    }
+                }
+
                 fprintf(stderr, "[TRANSPORT] TCP IN-ORDER seq=%u len=%zu rcv_nxt: %u -> %u\n",
                         parsed.seq, parsed.payload_len, old_rcv_nxt, conn_state_->rcv_nxt);
 
@@ -674,6 +696,8 @@ struct TransportProcess {
                     if (delivered > 0) {
                         fprintf(stderr, "[TRANSPORT] OOO delivered %zu segments, rcv_nxt: %u -> %u\n",
                                 delivered, rcv_nxt_before_ooo, conn_state_->rcv_nxt);
+                        // Reset DUP ACK counter when OOO gap is filled (fast retransmit worked)
+                        ooo_dup_ack_count_ = 0;
                     }
                 }
 
@@ -713,9 +737,13 @@ struct TransportProcess {
             }
         }
 
-        // Out of order - send duplicate ACK for fast retransmit
+        // Out of order - set flag for deferred SACK in IDLE loop
         if (out_of_order) {
-            send_ack();
+            fprintf(stderr, "[TRANSPORT] OOO detected: rcv_nxt=%u ooo_count=%zu (SACK in IDLE)\n",
+                    conn_state_->rcv_nxt, ooo_buffer_.count());
+            ooo_dup_ack_count_ = 1;
+            last_dup_ack_cycle_ = rdtsc();  // Start RTO timer for subsequent DUP ACKs
+            seen_ooo_packet_ = true;  // Deferred SACK in IDLE
         }
 
         return rx_count;
@@ -916,9 +944,13 @@ struct TransportProcess {
                 }
 
                 // Set output buffer to UMEM payload area BEFORE SSL_write
+                // TCP header: 20 bytes without timestamps, 32 bytes with timestamps
+                constexpr size_t TCP_HDR_LEN = kTimestampEnabled
+                    ? (userspace_stack::TCP_HEADER_MIN_LEN + userspace_stack::TCP_TIMESTAMP_PADDED_LEN)
+                    : userspace_stack::TCP_HEADER_MIN_LEN;
                 constexpr size_t HEADER_LEN = userspace_stack::ETH_HEADER_LEN +
                                               userspace_stack::IP_HEADER_LEN +
-                                              userspace_stack::TCP_HEADER_MIN_LEN;
+                                              TCP_HDR_LEN;
                 uint64_t umem_addr = frame_idx_to_addr(alloc_result.frame_idx, frame_size_);
                 uint8_t* frame = umem_area_ + umem_addr;
                 uint8_t* payload_ptr = frame + HEADER_LEN;
@@ -954,6 +986,11 @@ struct TransportProcess {
                 // Build headers + add to retransmit queue
                 auto [umem_addr_ret, frame_len] = prepare_encrypted_packet(
                     alloc_result.frame_idx, encrypted_len, alloc_result.alloc_pos, rtx_queue);
+
+                // Log data packet TX with sequence info for timeline reconstruction
+                fprintf(stderr, "[TRANSPORT-TX] %s DATA umem_id=%u seq=%u len=%zu\n",
+                        type_name, alloc_result.frame_idx, conn_state_->snd_nxt - static_cast<uint32_t>(encrypted_len),
+                        encrypted_len);
 
                 // Write descriptor to output ring (different descriptor types)
                 int64_t out_seq = batch_start + slot_idx;
@@ -1109,7 +1146,7 @@ struct TransportProcess {
         return false;
     }
 
-    void send_ack() {
+    void send_ack(bool include_sack = false) {
         uint32_t frame_idx = allocate_ack_frame();
         if (frame_idx == UINT32_MAX) {
             fprintf(stderr, "[TRANSPORT] FATAL: ACK frame pool exhausted\n");
@@ -1120,12 +1157,63 @@ struct TransportProcess {
         uint8_t* frame = umem_area_ + umem_addr;
 
         auto params = build_tcp_params();
-        size_t frame_len = userspace_stack::TCPPacket::build(
-            frame, frame_size_, params,
-            userspace_stack::TCP_FLAG_ACK,
-            nullptr, 0,
-            conn_state_->local_mac, conn_state_->remote_mac,
-            ip_id_++);
+        size_t frame_len = 0;
+
+        // Only include SACK when explicitly requested (OOO/DUP events)
+        if (include_sack && conn_state_->sack_enabled && !ooo_buffer_.is_empty()) {
+            userspace_stack::SACKBlockArray sack_blocks;
+            ooo_buffer_.extract_sack_blocks(conn_state_->rcv_nxt, sack_blocks);
+
+            if (sack_blocks.count > 0) {
+                frame_len = userspace_stack::TCPPacket::build_ack_with_sack(
+                    frame, frame_size_, params, sack_blocks,
+                    conn_state_->local_mac, conn_state_->remote_mac,
+                    ip_id_++);
+
+                // Calculate actual blocks written (capped to 3 with timestamps, 4 without)
+                // Use params.ts_val which was set by build_tcp_params() based on timestamp_enabled
+                bool ts_in_packet = (params.ts_val != 0);
+                uint8_t max_blocks = ts_in_packet
+                    ? userspace_stack::SACK_MAX_BLOCKS_WITH_TS
+                    : userspace_stack::SACK_MAX_BLOCKS;
+                uint8_t actual_blocks = (sack_blocks.count > max_blocks) ? max_blocks : sack_blocks.count;
+                // DEBUG: show timestamp state
+                fprintf(stderr, "[DEBUG-SACK] ts_val=%u ts_enabled=%d peer_ts=%u raw_blocks=%u actual=%u\n",
+                        params.ts_val, conn_state_->timestamp_enabled, conn_state_->peer_ts_val,
+                        sack_blocks.count, actual_blocks);
+
+                // Dump OOO buffer FIRST so formatter sees it before SACK line
+                ooo_buffer_.debug_dump("[OOO-BUFFER]");
+                fprintf(stderr, "[TRANSPORT-TX] SACK ACK umem_id=%u rcv_nxt=%u blocks=%u",
+                        frame_idx, params.rcv_nxt, actual_blocks);
+                for (uint8_t i = 0; i < actual_blocks; i++) {
+                    fprintf(stderr, " [%u-%u]", sack_blocks.blocks[i].left_edge,
+                            sack_blocks.blocks[i].right_edge);
+                }
+                fprintf(stderr, "\n");
+                // Hex dump TCP options (SACK area) - starts at offset 54 (ETH+IP+TCP_MIN)
+                if (frame_len > 54) {
+                    fprintf(stderr, "[SACK-HEX] TCP opts: ");
+                    for (size_t i = 54; i < frame_len && i < 54 + 40; i++) {
+                        fprintf(stderr, "%02x ", frame[i]);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+
+        // Fallback to regular ACK (no SACK or empty blocks)
+        if (frame_len == 0) {
+            frame_len = userspace_stack::TCPPacket::build(
+                frame, frame_size_, params,
+                userspace_stack::TCP_FLAG_ACK,
+                nullptr, 0,
+                conn_state_->local_mac, conn_state_->remote_mac,
+                ip_id_++);
+            fprintf(stderr, "[TRANSPORT-TX] ACK umem_id=%u rcv_nxt=%u\n",
+                    frame_idx, params.rcv_nxt);
+        }
+
         if (frame_len == 0) {
             fprintf(stderr, "[TRANSPORT] FATAL: TCPPacket::build() failed for ACK\n");
             std::abort();
@@ -1143,8 +1231,6 @@ struct TransportProcess {
         desc.nic_frame_poll_cycle = 0;
         desc.consumed = 0;
         ack_outbox_prod_->publish(seq);
-        fprintf(stderr, "[TRANSPORT-TX] ACK umem_id=%u rcv_nxt=%u (ACK_OUTBOX seq=%ld)\n",
-                frame_idx, params.rcv_nxt, seq);
 
         packets_since_ack_ = 0;
         last_ack_cycle_ = rdtsc();
@@ -1213,6 +1299,11 @@ struct TransportProcess {
                 // Rebuild TCP header with current ACK number
                 rebuild_tcp_header_for_retransmit(&seg);
 
+                // Log retransmit with sequence info
+                fprintf(stderr, "[TRANSPORT-TX] RETRANSMIT %s umem_id=%u seq=%u-%u len=%u attempt=%u\n",
+                        name, seg.frame_idx, seg.seq_start, seg.seq_end,
+                        seg.seq_end - seg.seq_start, seg.retransmit_count + 1);
+
                 // Write descriptor to pre-claimed slot
                 int64_t out_seq = batch_start + slot_idx;
                 UMEMFrameDescriptor& desc = (*raw_outbox_prod_)[out_seq];
@@ -1256,10 +1347,12 @@ struct TransportProcess {
         // Get pointers to headers
         constexpr size_t ETH_LEN = userspace_stack::ETH_HEADER_LEN;
         constexpr size_t IP_LEN = userspace_stack::IP_HEADER_LEN;
-        constexpr size_t TCP_LEN = userspace_stack::TCP_HEADER_MIN_LEN;
 
         auto* ip_hdr = reinterpret_cast<userspace_stack::IPv4Header*>(frame + ETH_LEN);
         auto* tcp_hdr = reinterpret_cast<userspace_stack::TCPHeader*>(frame + ETH_LEN + IP_LEN);
+
+        // Get actual TCP header length from doff field (handles timestamps)
+        size_t tcp_hdr_len = ((tcp_hdr->doff_reserved >> 4) & 0x0F) * 4;
 
         // Calculate payload length from segment sequence range
         size_t payload_len = seg->seq_end - seg->seq_start;
@@ -1267,15 +1360,31 @@ struct TransportProcess {
         // Update TCP ACK number to current rcv_nxt
         tcp_hdr->ack_seq = htonl(params.rcv_nxt);
 
+        // Update TCP timestamp if present (update ts_val for retransmit)
+        if constexpr (kTimestampEnabled) {
+            if (tcp_hdr_len >= userspace_stack::TCP_HEADER_MIN_LEN + userspace_stack::TCP_TIMESTAMP_PADDED_LEN) {
+                // Timestamp option at offset 20 (after base header): NOP NOP TS len TSval TSecr
+                uint8_t* opt = frame + ETH_LEN + IP_LEN + userspace_stack::TCP_HEADER_MIN_LEN;
+                if (opt[2] == userspace_stack::TCP_OPT_TIMESTAMP) {
+                    // Update TSval with fresh timestamp
+                    uint32_t ts_val_n = htonl(generate_ts_val());
+                    std::memcpy(&opt[4], &ts_val_n, 4);
+                    // Update TSecr with latest peer timestamp
+                    uint32_t ts_ecr_n = htonl(conn_state_->peer_ts_val);
+                    std::memcpy(&opt[8], &ts_ecr_n, 4);
+                }
+            }
+        }
+
         // Update IP ID (use fresh ID to avoid middlebox issues)
         ip_hdr->id = htons(ip_id_++);
 
-        // Recalculate TCP checksum (ACK number changed)
+        // Recalculate TCP checksum (ACK number and possibly timestamp changed)
         tcp_hdr->check = 0;
-        const uint8_t* payload_ptr = frame + ETH_LEN + IP_LEN + TCP_LEN;
+        const uint8_t* payload_ptr = frame + ETH_LEN + IP_LEN + tcp_hdr_len;
         tcp_hdr->check = htons(userspace_stack::tcp_checksum(
             params.local_ip, params.remote_ip,
-            tcp_hdr, TCP_LEN, payload_ptr, payload_len));
+            tcp_hdr, tcp_hdr_len, payload_ptr, payload_len));
 
         // Recalculate IP checksum (IP ID changed)
         ip_hdr->check = 0;
@@ -1324,6 +1433,19 @@ struct TransportProcess {
     }
 
     // ========================================================================
+    // TCP Timestamp Helper (RFC 7323)
+    // ========================================================================
+
+    /**
+     * Generate timestamp value for TCP Timestamps option
+     * Uses TSC >> 21 for ~1ms granularity (RFC 7323 recommends ~1ms)
+     * 2.4GHz TSC >> 21 ≈ 1.14ms per tick
+     */
+    static uint32_t generate_ts_val() {
+        return static_cast<uint32_t>(rdtsc() >> 21);
+    }
+
+    // ========================================================================
     // TCP Params Helper (builds TCPParams from shared state)
     // ========================================================================
 
@@ -1337,6 +1459,14 @@ struct TransportProcess {
         params.snd_nxt = conn_state_->snd_nxt;
         params.rcv_nxt = conn_state_->rcv_nxt;
         params.rcv_wnd = 65535;  // Advertise full window
+
+        // Populate timestamps if enabled at compile-time AND runtime
+        if constexpr (kTimestampEnabled) {
+            if (conn_state_->timestamp_enabled) {
+                params.ts_val = generate_ts_val();
+                params.ts_ecr = conn_state_->peer_ts_val;
+            }
+        }
         return params;
     }
 
@@ -1386,6 +1516,12 @@ private:
         uint64_t syn_addr = frame_idx_to_addr(syn_alloc.frame_idx, frame_size_);
         uint8_t* syn_buffer = umem_area_ + syn_addr;
 
+        // Set timestamp for SYN (ts_ecr = 0 for initial SYN per RFC 7323)
+        if constexpr (kTimestampEnabled) {
+            tcp_params_.ts_val = generate_ts_val();
+            tcp_params_.ts_ecr = 0;
+        }
+
         // Build SYN packet
         size_t syn_len = stack_.build_syn(syn_buffer, frame_size_, tcp_params_);
         if (syn_len == 0) {
@@ -1404,6 +1540,14 @@ private:
         syn_desc.nic_frame_poll_cycle = rdtsc();
         syn_desc.consumed = 0;
         raw_outbox_prod_->publish(syn_seq);
+
+        if constexpr (kTimestampEnabled) {
+            fprintf(stderr, "[TRANSPORT-TX] SYN umem_id=%u seq=%u ts_val=%u ts_ecr=0\n",
+                    syn_alloc.frame_idx, tcp_params_.snd_nxt, tcp_params_.ts_val);
+        } else {
+            fprintf(stderr, "[TRANSPORT-TX] SYN umem_id=%u seq=%u\n",
+                    syn_alloc.frame_idx, tcp_params_.snd_nxt);
+        }
         tcp_params_.snd_nxt++;  // SYN consumes 1 seq
 
         // Wait for SYN-ACK via RAW_INBOX using process_manually()
@@ -1434,6 +1578,29 @@ private:
                         conn_state_->snd_una = tcp_params_.snd_una;
                         conn_state_->snd_nxt = tcp_params_.snd_nxt;
                         conn_state_->peer_recv_window = parsed.window;
+
+                        // Parse TCP options for SACK_OK - MUST check before using SACK (RFC 2018)
+                        conn_state_->sack_enabled = parse_sack_ok_option(frame, rx_desc.frame_len);
+
+                        // Parse TCP options for Timestamps (RFC 7323)
+                        if constexpr (kTimestampEnabled) {
+                            auto ts_result = parse_timestamp_option(frame, rx_desc.frame_len);
+                            conn_state_->timestamp_enabled = ts_result.found;
+                            if (ts_result.found) {
+                                conn_state_->peer_ts_val = ts_result.ts_val;
+                            }
+                            fprintf(stderr, "[TRANSPORT-RX] SYN-ACK seq=%u ack=%u flags=0x%02x, SACK %s, TS %s peer_ts_val=%u\n",
+                                    parsed.seq, parsed.ack, parsed.flags,
+                                    conn_state_->sack_enabled ? "ENABLED" : "DISABLED",
+                                    conn_state_->timestamp_enabled ? "ENABLED" : "DISABLED",
+                                    conn_state_->peer_ts_val);
+                        } else {
+                            conn_state_->timestamp_enabled = false;
+                            fprintf(stderr, "[TRANSPORT-RX] SYN-ACK seq=%u ack=%u flags=0x%02x, SACK %s\n",
+                                    parsed.seq, parsed.ack, parsed.flags,
+                                    conn_state_->sack_enabled ? "ENABLED" : "DISABLED");
+                        }
+
                         got_synack = true;
                     }
                     return true;  // Continue processing, commit this frame
@@ -1455,6 +1622,14 @@ private:
         uint64_t ack_addr = frame_idx_to_addr(ack_frame_idx, frame_size_);
         uint8_t* ack_buffer = umem_area_ + ack_addr;
 
+        // Set timestamps for ACK (echo peer's ts_val from SYN-ACK)
+        if constexpr (kTimestampEnabled) {
+            if (conn_state_->timestamp_enabled) {
+                tcp_params_.ts_val = generate_ts_val();
+                tcp_params_.ts_ecr = conn_state_->peer_ts_val;
+            }
+        }
+
         size_t ack_len = stack_.build_ack(ack_buffer, frame_size_, tcp_params_);
         if (ack_len == 0) {
             return false;
@@ -1472,6 +1647,19 @@ private:
         ack_desc.nic_frame_poll_cycle = 0;
         ack_desc.consumed = 0;
         ack_outbox_prod_->publish(ack_seq);
+
+        if constexpr (kTimestampEnabled) {
+            if (conn_state_->timestamp_enabled) {
+                fprintf(stderr, "[TRANSPORT-TX] TCP-HANDSHAKE ACK umem_id=%u rcv_nxt=%u ts_val=%u ts_ecr=%u\n",
+                        ack_frame_idx, tcp_params_.rcv_nxt, tcp_params_.ts_val, tcp_params_.ts_ecr);
+            } else {
+                fprintf(stderr, "[TRANSPORT-TX] TCP-HANDSHAKE ACK umem_id=%u rcv_nxt=%u (peer has no TS)\n",
+                        ack_frame_idx, tcp_params_.rcv_nxt);
+            }
+        } else {
+            fprintf(stderr, "[TRANSPORT-TX] TCP-HANDSHAKE ACK umem_id=%u rcv_nxt=%u\n",
+                    ack_frame_idx, tcp_params_.rcv_nxt);
+        }
 
         return true;
     }
@@ -1648,6 +1836,9 @@ private:
             desc.consumed = 0;
             raw_outbox_prod_->publish(seq);
 
+            fprintf(stderr, "[TRANSPORT-TX] TLS-HANDSHAKE DATA umem_id=%u seq=%u len=%zu\n",
+                    alloc.frame_idx, tcp_params_.snd_nxt, pending);
+
             tcp_params_.snd_nxt += pending;
             conn_state_->snd_nxt = tcp_params_.snd_nxt;
 
@@ -1699,6 +1890,9 @@ private:
             desc.nic_frame_poll_cycle = rdtsc();
             desc.consumed = 0;
             raw_outbox_prod_->publish(seq);
+
+            fprintf(stderr, "[TRANSPORT-TX] TLS-HANDSHAKE DATA (seg) umem_id=%u seq=%u len=%zu (sent=%zu/%zu)\n",
+                    alloc.frame_idx, tcp_params_.snd_nxt, seg_len, sent + seg_len, pending);
 
             // Update tcp_params_ for next segment (sequence number advances)
             tcp_params_.snd_nxt += seg_len;
@@ -1835,11 +2029,163 @@ private:
         desc.nic_frame_poll_cycle = 0;
         desc.consumed = 0;
         ack_outbox_prod_->publish(seq);
+
+        fprintf(stderr, "[TRANSPORT-TX] HANDSHAKE ACK umem_id=%u rcv_nxt=%u\n",
+                frame_idx, tcp_params_.rcv_nxt);
     }
 
     // ========================================================================
     // General Helpers
     // ========================================================================
+
+    /**
+     * Parse TCP options in SYN-ACK to check for SACK_OK (RFC 2018)
+     * Must be called on SYN-ACK frames during handshake.
+     *
+     * @param frame Raw Ethernet frame
+     * @param frame_len Frame length
+     * @return true if SACK_OK option found, false otherwise
+     */
+    static bool parse_sack_ok_option(const uint8_t* frame, size_t frame_len) {
+        constexpr size_t ETH_LEN = userspace_stack::ETH_HEADER_LEN;
+        constexpr size_t IP_LEN = userspace_stack::IP_HEADER_LEN;
+        constexpr size_t TCP_MIN = userspace_stack::TCP_HEADER_MIN_LEN;
+
+        // Minimum size check
+        if (frame_len < ETH_LEN + IP_LEN + TCP_MIN) {
+            return false;
+        }
+
+        const auto* tcp = reinterpret_cast<const userspace_stack::TCPHeader*>(
+            frame + ETH_LEN + IP_LEN);
+
+        // Get TCP header length from data offset field
+        size_t tcp_header_len = ((tcp->doff_reserved >> 4) & 0x0F) * 4;
+        if (tcp_header_len <= TCP_MIN) {
+            return false;  // No options
+        }
+
+        // Validate frame has full TCP header
+        if (frame_len < ETH_LEN + IP_LEN + tcp_header_len) {
+            return false;
+        }
+
+        // Parse TCP options
+        const uint8_t* options = frame + ETH_LEN + IP_LEN + TCP_MIN;
+        size_t options_len = tcp_header_len - TCP_MIN;
+        size_t pos = 0;
+
+        while (pos < options_len) {
+            uint8_t kind = options[pos];
+
+            if (kind == userspace_stack::TCP_OPT_EOL) {
+                break;  // End of options list
+            }
+            if (kind == userspace_stack::TCP_OPT_NOP) {
+                pos++;
+                continue;
+            }
+
+            // All other options have length byte
+            if (pos + 1 >= options_len) {
+                break;  // Malformed
+            }
+            uint8_t len = options[pos + 1];
+            if (len < 2 || pos + len > options_len) {
+                break;  // Malformed
+            }
+
+            // Check for SACK_OK (kind=4, length=2)
+            if (kind == userspace_stack::TCP_OPT_SACK_OK && len == 2) {
+                return true;  // Found SACK_OK!
+            }
+
+            pos += len;
+        }
+
+        return false;
+    }
+
+    /**
+     * Parse TCP options to extract timestamp values (RFC 7323)
+     *
+     * @param frame Raw Ethernet frame
+     * @param frame_len Frame length
+     * @return {found, ts_val, ts_ecr} - ts_val and ts_ecr from peer
+     */
+    struct TimestampParseResult {
+        bool found = false;
+        uint32_t ts_val = 0;  // Peer's timestamp value
+        uint32_t ts_ecr = 0;  // Peer's echoed timestamp (our previous ts_val)
+    };
+
+    static TimestampParseResult parse_timestamp_option(const uint8_t* frame, size_t frame_len) {
+        TimestampParseResult result;
+        constexpr size_t ETH_LEN = userspace_stack::ETH_HEADER_LEN;
+        constexpr size_t IP_LEN = userspace_stack::IP_HEADER_LEN;
+        constexpr size_t TCP_MIN = userspace_stack::TCP_HEADER_MIN_LEN;
+
+        // Minimum size check
+        if (frame_len < ETH_LEN + IP_LEN + TCP_MIN) {
+            return result;
+        }
+
+        const auto* tcp = reinterpret_cast<const userspace_stack::TCPHeader*>(
+            frame + ETH_LEN + IP_LEN);
+
+        // Get TCP header length from data offset field
+        size_t tcp_header_len = ((tcp->doff_reserved >> 4) & 0x0F) * 4;
+        if (tcp_header_len <= TCP_MIN) {
+            return result;  // No options
+        }
+
+        // Validate frame has full TCP header
+        if (frame_len < ETH_LEN + IP_LEN + tcp_header_len) {
+            return result;
+        }
+
+        // Parse TCP options
+        const uint8_t* options = frame + ETH_LEN + IP_LEN + TCP_MIN;
+        size_t options_len = tcp_header_len - TCP_MIN;
+        size_t pos = 0;
+
+        while (pos < options_len) {
+            uint8_t kind = options[pos];
+
+            if (kind == userspace_stack::TCP_OPT_EOL) {
+                break;  // End of options list
+            }
+            if (kind == userspace_stack::TCP_OPT_NOP) {
+                pos++;
+                continue;
+            }
+
+            // All other options have length byte
+            if (pos + 1 >= options_len) {
+                break;  // Malformed
+            }
+            uint8_t len = options[pos + 1];
+            if (len < 2 || pos + len > options_len) {
+                break;  // Malformed
+            }
+
+            // Check for Timestamp (kind=8, length=10)
+            if (kind == userspace_stack::TCP_OPT_TIMESTAMP && len == 10) {
+                // TSval at offset +2, TSecr at offset +6
+                uint32_t ts_val_n, ts_ecr_n;
+                std::memcpy(&ts_val_n, &options[pos + 2], 4);
+                std::memcpy(&ts_ecr_n, &options[pos + 6], 4);
+                result.found = true;
+                result.ts_val = ntohl(ts_val_n);
+                result.ts_ecr = ntohl(ts_ecr_n);
+                return result;
+            }
+
+            pos += len;
+        }
+
+        return result;
+    }
 
     void reset_timestamps() {
         has_pending_timestamps_ = false;
@@ -1903,7 +2249,13 @@ private:
     // ACK state
     uint32_t packets_since_ack_ = 0;
     uint64_t last_ack_cycle_ = 0;
-    uint32_t loops_since_dup_ack_ = 0;  // Loop counter for periodic OOO duplicate ACK
+    // Deferred ACK flags for IDLE processing
+    bool seen_dup_packet_ = false;   // Set when FULL DUP received, triggers ACK in IDLE
+    bool seen_ooo_packet_ = false;   // Set when OOO packet received, triggers SACK in IDLE
+    // OOO recovery: duplicate ACKs for fast retransmit (no cap - match kernel behavior)
+    uint32_t ooo_dup_ack_count_ = 0;    // DUP ACKs sent for current OOO gap
+    uint64_t last_dup_ack_cycle_ = 0;   // Last time we sent a DUP ACK (for RTO-based throttle)
+    uint64_t dup_ack_interval_cycles_ = 0;  // RTO timeout in cycles (200ms)
 
     // Retransmit state - separate queues for MSG and PONG frames
     ZeroCopyRetransmitQueue msg_retransmit_queue_;       // MSG frames

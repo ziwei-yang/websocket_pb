@@ -194,7 +194,21 @@ struct XDPPollProcess {
         ret = xsk_socket__create(&xsk_, interface_, kQueueId,
                                  umem_, &rx_ring_, &tx_ring_, &xsk_cfg);
         if (ret) {
-            fprintf(stderr, "[XDP-POLL] Failed to create XSK socket: %s\n", strerror(-ret));
+            if (-ret == EBUSY) {
+                fprintf(stderr, "\n");
+                fprintf(stderr, "╔══════════════════════════════════════════════════════════════════╗\n");
+                fprintf(stderr, "║  FATAL: XDP interface %s is already in use!                 ║\n", interface_);
+                fprintf(stderr, "╠══════════════════════════════════════════════════════════════════╣\n");
+                fprintf(stderr, "║  Another process has an XSK socket bound to this interface.     ║\n");
+                fprintf(stderr, "║                                                                  ║\n");
+                fprintf(stderr, "║  To fix, run:                                                    ║\n");
+                fprintf(stderr, "║    pkill -9 -f test_pipeline_websocket_binance                   ║\n");
+                fprintf(stderr, "║    sudo ip link set %s xdp off                              ║\n", interface_);
+                fprintf(stderr, "╚══════════════════════════════════════════════════════════════════╝\n");
+                fprintf(stderr, "\n");
+            } else {
+                fprintf(stderr, "[XDP-POLL] Failed to create XSK socket: %s\n", strerror(-ret));
+            }
             xsk_umem__delete(umem_);
             if (bpf_loader_) bpf_loader_->detach();
             return false;

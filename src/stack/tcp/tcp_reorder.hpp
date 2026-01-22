@@ -27,6 +27,8 @@
 #include <cstddef>
 #include <climits>
 
+#include "tcp_state.hpp"  // For SACKBlock, SACKBlockArray, SACK_MAX_BLOCKS
+
 namespace userspace_stack {
 
 // ----------------------------------------------------------------------------
@@ -221,12 +223,112 @@ public:
 
     static constexpr size_t max_segments() { return MaxSegments; }
 
+    // Debug: dump OOO buffer contents to stderr
+    void debug_dump(const char* prefix = "[OOO-DUMP]") const {
+        fprintf(stderr, "%s count=%zu segments:", prefix, count_);
+        for (size_t i = 0; i < MaxSegments; i++) {
+            if (segments_[i].valid) {
+                fprintf(stderr, " [seq=%u len=%u ext=%ld]",
+                        segments_[i].seq, segments_[i].len, segments_[i].ext_id);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+
     // Minimum ext_id among all buffered segments (for safe commit)
     // Returns INT64_MAX if no segments have ext_id set
     int64_t min_ext_id() const { return min_ext_id_; }
 
     // Returns true if any segment has a valid ext_id (not INT64_MAX)
     bool has_ext_id_segments() const { return min_ext_id_ != INT64_MAX; }
+
+    // ------------------------------------------------------------------------
+    // SACK Block Extraction (RFC 2018)
+    // ------------------------------------------------------------------------
+
+    /**
+     * Extract SACK blocks from buffered OOO segments
+     *
+     * Collects all segments beyond rcv_nxt, sorts by sequence number,
+     * merges adjacent/overlapping ranges, and returns up to SACK_MAX_BLOCKS.
+     *
+     * @param rcv_nxt Current receive next sequence number
+     * @param out Output array to store SACK blocks
+     * @return Number of blocks extracted (0 to SACK_MAX_BLOCKS)
+     */
+    uint8_t extract_sack_blocks(uint32_t rcv_nxt, SACKBlockArray& out) const {
+        out.clear();
+        if (count_ == 0) return 0;
+
+        // Collect valid segments beyond rcv_nxt into temporary array
+        struct SegRange {
+            uint32_t left;
+            uint32_t right;
+        };
+        SegRange ranges[MaxSegments];
+        size_t range_count = 0;
+
+        for (size_t i = 0; i < MaxSegments; i++) {
+            if (!segments_[i].valid) continue;
+
+            uint32_t seg_seq = segments_[i].seq;
+            uint32_t seg_end = seg_seq + segments_[i].len;
+
+            // Only include segments that start after rcv_nxt (truly OOO)
+            int32_t diff = static_cast<int32_t>(seg_seq - rcv_nxt);
+            if (diff > 0) {
+                ranges[range_count].left = seg_seq;
+                ranges[range_count].right = seg_end;
+                range_count++;
+            }
+        }
+
+        if (range_count == 0) return 0;
+
+        // Simple insertion sort by left edge (small array, O(n^2) is fine)
+        for (size_t i = 1; i < range_count; i++) {
+            SegRange key = ranges[i];
+            size_t j = i;
+            while (j > 0 && static_cast<int32_t>(ranges[j-1].left - key.left) > 0) {
+                ranges[j] = ranges[j-1];
+                j--;
+            }
+            ranges[j] = key;
+        }
+
+        // Merge overlapping/adjacent ranges
+        SACKBlock merged[MaxSegments];
+        size_t merged_count = 0;
+
+        merged[0].left_edge = ranges[0].left;
+        merged[0].right_edge = ranges[0].right;
+        merged_count = 1;
+
+        for (size_t i = 1; i < range_count; i++) {
+            SACKBlock& last = merged[merged_count - 1];
+            // Check if ranges overlap or are adjacent (right_edge >= next left)
+            int32_t gap = static_cast<int32_t>(ranges[i].left - last.right_edge);
+            if (gap <= 0) {
+                // Merge: extend right edge if needed
+                if (static_cast<int32_t>(ranges[i].right - last.right_edge) > 0) {
+                    last.right_edge = ranges[i].right;
+                }
+            } else {
+                // New block
+                merged[merged_count].left_edge = ranges[i].left;
+                merged[merged_count].right_edge = ranges[i].right;
+                merged_count++;
+            }
+        }
+
+        // Copy up to SACK_MAX_BLOCKS to output
+        out.count = static_cast<uint8_t>(merged_count > SACK_MAX_BLOCKS ? SACK_MAX_BLOCKS : merged_count);
+        for (uint8_t i = 0; i < out.count; i++) {
+            out.blocks[i] = merged[i];
+        }
+
+        return out.count;
+    }
 
 private:
     // Recompute min_ext_id by scanning all valid segments

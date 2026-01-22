@@ -314,7 +314,13 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
 
     // MSS from SYN-ACK
     uint16_t peer_mss;
-    uint8_t  _pad_tcp2[6];
+
+    // SACK support (RFC 2018)
+    bool sack_enabled;         // True if peer advertised SACK_OK in SYN-ACK
+
+    // TCP Timestamps support (RFC 7323)
+    bool timestamp_enabled;    // True if peer advertised TS in SYN-ACK
+    uint32_t peer_ts_val;      // Latest peer timestamp (for TSecr echo)
 
     // RTT tracking (Transport only)
     uint64_t last_ack_cycle;                  // TSC when last ACK sent
@@ -476,6 +482,9 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         std::memset(local_mac, 0, 6);
         std::memset(remote_mac, 0, 6);
         peer_mss = PIPELINE_TCP_MSS;  // From pipeline_config.hpp (NIC_MTU - 40)
+        sack_enabled = false;         // Will be set true if peer sends SACK_OK in SYN-ACK
+        timestamp_enabled = false;    // Will be set true if peer sends TS in SYN-ACK
+        peer_ts_val = 0;              // Latest peer timestamp (for TSecr echo)
         last_ack_cycle = 0;
         srtt_us = 100000;   // Initial 100ms
         rttvar_us = 50000;  // Initial 50ms

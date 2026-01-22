@@ -172,6 +172,41 @@ set_nic_queue() {
     fi
 }
 
+# Set RX/TX ring buffers to maximum (prevents packet drops under load)
+set_ring_buffers_max() {
+    echo "Setting RX/TX ring buffers to maximum..."
+
+    # Get maximum and current RX ring size
+    local rx_max=$(ethtool -g "$IFACE" 2>/dev/null | grep -A 5 "Pre-set maximums:" | grep "^RX:" | awk '{print $2}')
+    local rx_cur=$(ethtool -g "$IFACE" 2>/dev/null | grep -A 5 "Current hardware settings:" | grep "^RX:" | awk '{print $2}')
+
+    # Get maximum and current TX ring size
+    local tx_max=$(ethtool -g "$IFACE" 2>/dev/null | grep -A 5 "Pre-set maximums:" | grep "^TX:" | awk '{print $2}')
+    local tx_cur=$(ethtool -g "$IFACE" 2>/dev/null | grep -A 5 "Current hardware settings:" | grep "^TX:" | awk '{print $2}')
+
+    # Set RX ring to maximum
+    if [[ -n "$rx_max" && "$rx_cur" != "$rx_max" ]]; then
+        if sudo ethtool -G "$IFACE" rx "$rx_max" 2>/dev/null; then
+            print_status "RX ring: $rx_cur → $rx_max (max)"
+        else
+            print_warning "Could not set RX ring to $rx_max"
+        fi
+    else
+        print_status "RX ring already at max ($rx_cur)"
+    fi
+
+    # Set TX ring to maximum
+    if [[ -n "$tx_max" && "$tx_cur" != "$tx_max" ]]; then
+        if sudo ethtool -G "$IFACE" tx "$tx_max" 2>/dev/null; then
+            print_status "TX ring: $tx_cur → $tx_max (max)"
+        else
+            print_warning "Could not set TX ring to $tx_max"
+        fi
+    else
+        print_status "TX ring already at max ($tx_cur)"
+    fi
+}
+
 # Disable GRO/LRO for lowest latency (prevents packet batching)
 disable_gro_lro() {
     echo "Disabling GRO/LRO for lowest latency..."
@@ -406,6 +441,7 @@ update_domain_hosts
 reload_nic_driver
 check_xdp_support
 set_nic_queue
+set_ring_buffers_max
 disable_gro_lro
 disable_coalescing
 enable_hw_timestamp

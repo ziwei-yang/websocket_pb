@@ -53,11 +53,13 @@ resolve_dns() {
     host "$domain" 2>/dev/null | grep "has address" | awk '{print $NF}' | sort -u
 }
 
-# Check if an IP route exists
-route_exists() {
+# Check if an IP route is effective (actually routes via the interface)
+# VPN policy routing can override main table routes, so we use "ip route get"
+route_effective() {
     local ip="$1"
     local iface="$2"
-    ip route show "$ip" dev "$iface" &>/dev/null
+    # Check if the effective route actually goes via our interface
+    ip route get "$ip" 2>/dev/null | grep -q "dev $iface"
 }
 
 # Check if iptables RST rule exists
@@ -97,34 +99,66 @@ remove_rst_block() {
     fi
 }
 
-# Add route for IP via interface
+# Add route for IP via interface (bypasses VPN policy routing)
 add_route() {
     local ip="$1"
     local gateway="$2"
     local iface="$3"
 
-    if route_exists "$ip" "$iface"; then
-        print_info "Route already exists for $ip via $iface"
+    # Check if route is already effective via our interface
+    if route_effective "$ip" "$iface"; then
+        print_info "Route already effective for $ip via $iface"
         return 0
     fi
 
-    if sudo ip route add "$ip" via "$gateway" dev "$iface" metric 50 2>/dev/null; then
-        echo "$ip" >> "$ROUTES_FILE"
+    # VPN uses policy-based routing with high-priority rules
+    # We need to add an ip rule with even higher priority (lower number)
+    # Priority 100 is typically before VPN rules (which are often 32000+)
+    local rule_priority=100
+
+    # Remove any existing rule for this IP (in case of stale state)
+    sudo ip rule del to "$ip" priority "$rule_priority" 2>/dev/null || true
+
+    # Add route to main table
+    sudo ip route del "$ip" 2>/dev/null || true
+    if sudo ip route add "$ip" via "$gateway" dev "$iface" 2>/dev/null; then
         print_status "Added route: $ip via $gateway dev $iface"
+    else
+        print_warning "Could not add route for $ip to main table"
+    fi
+
+    # Add ip rule to ensure this IP uses main table before VPN table
+    if sudo ip rule add to "$ip" lookup main priority "$rule_priority" 2>/dev/null; then
+        echo "$ip:$rule_priority" >> "$ROUTES_FILE"
+        print_status "Added ip rule: to $ip lookup main priority $rule_priority"
+    else
+        print_warning "Could not add ip rule for $ip"
+    fi
+
+    # Verify the route is now effective
+    if route_effective "$ip" "$iface"; then
+        print_status "Route verified effective for $ip via $iface"
         return 0
     else
-        print_warning "Could not add route for $ip (may conflict with existing route)"
+        print_warning "Route for $ip may not be effective (VPN still routing)"
         return 1
     fi
 }
 
-# Remove route for IP
+# Remove route for IP (including ip rule)
 remove_route() {
     local ip="$1"
     local iface="$2"
 
-    if sudo ip route del "$ip" dev "$iface" 2>/dev/null; then
-        print_status "Removed route: $ip dev $iface"
+    # Remove ip rule (check for stored priority or use default)
+    local rule_priority=100
+    if sudo ip rule del to "$ip" priority "$rule_priority" 2>/dev/null; then
+        print_status "Removed ip rule: to $ip priority $rule_priority"
+    fi
+
+    # Remove route from main table
+    if sudo ip route del "$ip" 2>/dev/null; then
+        print_status "Removed route: $ip"
     fi
 }
 
@@ -250,11 +284,13 @@ reset_filter() {
     echo "========================================"
     echo ""
 
-    # Remove routes
+    # Remove routes (format: "ip" or "ip:priority")
     if [[ -f "$ROUTES_FILE" ]]; then
         echo "Removing route bypasses..."
-        while IFS= read -r ip; do
-            if [[ -n "$ip" ]]; then
+        while IFS= read -r entry; do
+            if [[ -n "$entry" ]]; then
+                # Extract IP (before colon if present)
+                local ip="${entry%%:*}"
                 remove_route "$ip" "$iface"
             fi
         done < "$ROUTES_FILE"
