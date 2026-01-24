@@ -53,6 +53,26 @@ resolve_dns() {
     host "$domain" 2>/dev/null | grep "has address" | awk '{print $NF}' | sort -u
 }
 
+# Get the fastest IP using latency probe
+get_fastest_ip() {
+    local domain="$1"
+    local port="${2:-443}"
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local probe_script="$script_dir/../tools/fastest_ip_probe.py"
+
+    if [[ -x "$probe_script" ]]; then
+        print_info "Running latency probe to find fastest IP..." >&2
+        local fastest_ip
+        fastest_ip=$("$probe_script" --host "$domain" --port "$port" --samples 5 --quiet)
+        if [[ -n "$fastest_ip" && "$fastest_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$fastest_ip"
+            return 0
+        fi
+    fi
+    # Fallback: return empty (caller will use first DNS result)
+    return 1
+}
+
 # Check if an IP route is effective (actually routes via the interface)
 # VPN policy routing can override main table routes, so we use "ip route get"
 route_effective() {
@@ -229,8 +249,15 @@ setup_filter() {
     local ip_count=$(echo "$ips" | wc -l)
     print_status "Resolved $ip_count IP(s) for $domain"
 
-    # Pick the first IP for /etc/hosts (connection will use this)
-    local primary_ip=$(echo "$ips" | head -1)
+    # Find the fastest IP using latency probe (or fallback to first)
+    local primary_ip
+    primary_ip=$(get_fastest_ip "$domain")
+    if [[ -z "$primary_ip" ]]; then
+        print_warning "Latency probe unavailable, using first DNS result"
+        primary_ip=$(echo "$ips" | head -1)
+    else
+        print_status "Fastest IP: $primary_ip"
+    fi
 
     # Update /etc/hosts
     update_hosts "$domain" "$primary_ip"

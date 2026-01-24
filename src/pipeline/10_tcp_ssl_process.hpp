@@ -1996,6 +1996,9 @@ private:
                         // Parse TCP options for SACK_OK - MUST check before using SACK (RFC 2018)
                         conn_state_->sack_enabled = parse_sack_ok_option(frame, rx_desc.frame_len);
 
+                        // Parse TCP options for Window Scale (RFC 7323)
+                        conn_state_->window_scale = parse_window_scale_option(frame, rx_desc.frame_len);
+
                         // Parse TCP options for Timestamps (RFC 7323)
                         if constexpr (kTimestampEnabled) {
                             auto ts_result = parse_timestamp_option(frame, rx_desc.frame_len);
@@ -2003,16 +2006,17 @@ private:
                             if (ts_result.found) {
                                 conn_state_->peer_ts_val = ts_result.ts_val;
                             }
-                            fprintf(stderr, "[TRANSPORT-RX] SYN-ACK seq=%u ack=%u flags=0x%02x, SACK %s, TS %s peer_ts_val=%u\n",
+                            fprintf(stderr, "[TRANSPORT-RX] SYN-ACK seq=%u ack=%u flags=0x%02x, SACK %s, TS %s, WS=%u\n",
                                     parsed.seq, parsed.ack, parsed.flags,
                                     conn_state_->sack_enabled ? "ENABLED" : "DISABLED",
                                     conn_state_->timestamp_enabled ? "ENABLED" : "DISABLED",
-                                    conn_state_->peer_ts_val);
+                                    conn_state_->window_scale);
                         } else {
                             conn_state_->timestamp_enabled = false;
-                            fprintf(stderr, "[TRANSPORT-RX] SYN-ACK seq=%u ack=%u flags=0x%02x, SACK %s\n",
+                            fprintf(stderr, "[TRANSPORT-RX] SYN-ACK seq=%u ack=%u flags=0x%02x, SACK %s, WS=%u\n",
                                     parsed.seq, parsed.ack, parsed.flags,
-                                    conn_state_->sack_enabled ? "ENABLED" : "DISABLED");
+                                    conn_state_->sack_enabled ? "ENABLED" : "DISABLED",
+                                    conn_state_->window_scale);
                         }
 
                         got_synack = true;
@@ -2519,6 +2523,75 @@ private:
         }
 
         return false;
+    }
+
+    /**
+     * Parse TCP options to extract Window Scale value (RFC 7323)
+     *
+     * @param frame Raw Ethernet frame
+     * @param frame_len Frame length
+     * @return Window scale shift value (0-14), or 0 if not found
+     */
+    static uint8_t parse_window_scale_option(const uint8_t* frame, size_t frame_len) {
+        constexpr size_t ETH_LEN = userspace_stack::ETH_HEADER_LEN;
+        constexpr size_t IP_LEN = userspace_stack::IP_HEADER_LEN;
+        constexpr size_t TCP_MIN = userspace_stack::TCP_HEADER_MIN_LEN;
+
+        // Minimum size check
+        if (frame_len < ETH_LEN + IP_LEN + TCP_MIN) {
+            return 0;
+        }
+
+        const auto* tcp = reinterpret_cast<const userspace_stack::TCPHeader*>(
+            frame + ETH_LEN + IP_LEN);
+
+        // Get TCP header length from data offset field
+        size_t tcp_header_len = ((tcp->doff_reserved >> 4) & 0x0F) * 4;
+        if (tcp_header_len <= TCP_MIN) {
+            return 0;  // No options
+        }
+
+        // Validate frame has full TCP header
+        if (frame_len < ETH_LEN + IP_LEN + tcp_header_len) {
+            return 0;
+        }
+
+        // Parse TCP options
+        const uint8_t* options = frame + ETH_LEN + IP_LEN + TCP_MIN;
+        size_t options_len = tcp_header_len - TCP_MIN;
+        size_t pos = 0;
+
+        while (pos < options_len) {
+            uint8_t kind = options[pos];
+
+            if (kind == userspace_stack::TCP_OPT_EOL) {
+                break;  // End of options list
+            }
+            if (kind == userspace_stack::TCP_OPT_NOP) {
+                pos++;
+                continue;
+            }
+
+            // All other options have length byte
+            if (pos + 1 >= options_len) {
+                break;  // Malformed
+            }
+            uint8_t len = options[pos + 1];
+            if (len < 2 || pos + len > options_len) {
+                break;  // Malformed
+            }
+
+            // Check for Window Scale (kind=3, length=3)
+            if (kind == userspace_stack::TCP_OPT_WSCALE && len == userspace_stack::TCP_OPT_WSCALE_LEN) {
+                uint8_t shift = options[pos + 2];
+                // RFC 7323: max shift is 14
+                return (shift > 14) ? 14 : shift;
+            }
+
+            pos += len;
+        }
+
+        return 0;  // Not found
     }
 
     /**

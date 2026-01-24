@@ -70,6 +70,11 @@ constexpr size_t TCP_TIMESTAMP_OPT_LEN = 10;      // Kind(1) + Len(1) + TSval(4)
 constexpr size_t TCP_TIMESTAMP_PADDED_LEN = 12;  // NOP + NOP + timestamp option
 constexpr size_t SACK_MAX_BLOCKS_WITH_TS = 3;    // Max SACK blocks when timestamps enabled
 
+// Window Scale constants (RFC 7323)
+constexpr uint8_t TCP_WSCALE_CLIENT = 12;         // Client→Server (receive large market data, 2^12 = 4096x)
+constexpr uint8_t TCP_WSCALE_SERVER_DEFAULT = 8;  // Default if server doesn't send WS (2^8 = 256x)
+constexpr uint8_t TCP_OPT_WSCALE_LEN = 3;         // Kind(1) + Len(1) + Shift(1)
+
 // SACK block structure (RFC 2018)
 struct SACKBlock {
     uint32_t left_edge;   // First seq in block (inclusive)
