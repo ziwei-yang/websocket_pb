@@ -115,10 +115,6 @@ inline constexpr uint32_t COMP_BATCH = 32;
 // Timing Configuration
 // ============================================================================
 
-// Adaptive ACK thresholds
-inline constexpr uint32_t ACK_PACKET_THRESHOLD = 8;      // Send ACK after N packets
-inline constexpr uint64_t ACK_TIMEOUT_US = 100;          // Send ACK after N microseconds
-
 // Retransmit timeout (initial RTO)
 inline constexpr uint64_t INITIAL_RTO_US = 200000;       // 200ms initial RTO
 

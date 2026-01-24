@@ -3,6 +3,7 @@
 
 #include "../../src/stack/tcp/tcp_state.hpp"
 #include "../../src/stack/tcp/tcp_retransmit.hpp"
+#include "../../src/stack/tcp/tcp_reorder.hpp"
 #include <iostream>
 #include <cassert>
 
@@ -208,6 +209,215 @@ void test_retransmit_queue_overflow() {
     END_TEST
 }
 
+// ============================================================================
+// SACK Block Extraction Tests (RFC 2018)
+// ============================================================================
+
+// Test empty OOO buffer returns no SACK blocks
+void test_sack_empty_buffer() {
+    TEST("SACK: empty buffer returns no blocks")
+        ZeroCopyTCPReorderBuffer<const uint8_t*> buffer;
+        SACKBlockArray out;
+
+        uint8_t count = buffer.extract_sack_blocks(1000, out);
+        ASSERT(count == 0, "No blocks from empty buffer");
+        ASSERT(out.count == 0, "Output count is 0");
+    END_TEST
+}
+
+// Test single OOO segment generates one SACK block
+void test_sack_single_block() {
+    TEST("SACK: single OOO segment")
+        ZeroCopyTCPReorderBuffer<const uint8_t*> buffer;
+        SACKBlockArray out;
+
+        // Buffer one OOO segment: seq=2000, len=500 (gap from rcv_nxt=1000)
+        uint8_t dummy_data[10] = {0};
+        buffer.buffer_segment(2000, 500, dummy_data);
+
+        uint8_t count = buffer.extract_sack_blocks(1000, out);
+        ASSERT(count == 1, "One SACK block");
+        ASSERT(out.blocks[0].left_edge == 2000, "Left edge = 2000");
+        ASSERT(out.blocks[0].right_edge == 2500, "Right edge = 2500");
+    END_TEST
+}
+
+// Test multiple non-contiguous segments generate multiple blocks
+void test_sack_multiple_blocks() {
+    TEST("SACK: multiple non-contiguous segments")
+        ZeroCopyTCPReorderBuffer<const uint8_t*> buffer;
+        SACKBlockArray out;
+        uint8_t dummy_data[10] = {0};
+
+        // Buffer 3 non-contiguous segments in arrival order
+        buffer.buffer_segment(2000, 500, dummy_data);   // arrival_id=0
+        buffer.buffer_segment(4000, 500, dummy_data);   // arrival_id=1
+        buffer.buffer_segment(6000, 500, dummy_data);   // arrival_id=2 (most recent)
+
+        uint8_t count = buffer.extract_sack_blocks(1000, out);
+        ASSERT(count == 3, "Three SACK blocks");
+
+        // RFC 2018 Section 4: Most recent first
+        ASSERT(out.blocks[0].left_edge == 6000, "First block is most recent (seq=6000)");
+        ASSERT(out.blocks[0].right_edge == 6500, "First block right edge");
+        ASSERT(out.blocks[1].left_edge == 4000, "Second block is second most recent");
+        ASSERT(out.blocks[2].left_edge == 2000, "Third block is oldest");
+    END_TEST
+}
+
+// Test RFC 2018 Section 4: most recently arrived segment's block comes first
+void test_sack_arrival_order() {
+    TEST("SACK: RFC 2018 Section 4 - most recent first")
+        ZeroCopyTCPReorderBuffer<const uint8_t*> buffer;
+        SACKBlockArray out;
+        uint8_t dummy_data[10] = {0};
+
+        // Buffer segments in non-sequential order (simulating network reordering)
+        // Arrival order: seq=4000, then seq=2000, then seq=6000
+        buffer.buffer_segment(4000, 500, dummy_data);   // arrival_id=0
+        buffer.buffer_segment(2000, 500, dummy_data);   // arrival_id=1
+        buffer.buffer_segment(6000, 500, dummy_data);   // arrival_id=2 (most recent)
+
+        uint8_t count = buffer.extract_sack_blocks(1000, out);
+        ASSERT(count == 3, "Three SACK blocks");
+
+        // Most recent (6000) should be first, then 2000 (arrival_id=1), then 4000 (arrival_id=0)
+        ASSERT(out.blocks[0].left_edge == 6000, "First = most recent arrival (seq=6000)");
+        ASSERT(out.blocks[1].left_edge == 2000, "Second = second most recent (seq=2000)");
+        ASSERT(out.blocks[2].left_edge == 4000, "Third = oldest arrival (seq=4000)");
+    END_TEST
+}
+
+// Test adjacent segments are merged into single block
+void test_sack_merge_adjacent() {
+    TEST("SACK: merge adjacent segments")
+        ZeroCopyTCPReorderBuffer<const uint8_t*> buffer;
+        SACKBlockArray out;
+        uint8_t dummy_data[10] = {0};
+
+        // Two adjacent segments: [2000-2500) and [2500-3000)
+        buffer.buffer_segment(2000, 500, dummy_data);   // arrival_id=0
+        buffer.buffer_segment(2500, 500, dummy_data);   // arrival_id=1 (most recent)
+
+        uint8_t count = buffer.extract_sack_blocks(1000, out);
+        ASSERT(count == 1, "Merged into one SACK block");
+        ASSERT(out.blocks[0].left_edge == 2000, "Merged left edge");
+        ASSERT(out.blocks[0].right_edge == 3000, "Merged right edge");
+    END_TEST
+}
+
+// Test overlapping segments are merged
+void test_sack_merge_overlapping() {
+    TEST("SACK: merge overlapping segments")
+        ZeroCopyTCPReorderBuffer<const uint8_t*> buffer;
+        SACKBlockArray out;
+        uint8_t dummy_data[10] = {0};
+
+        // Overlapping segments: [2000-2600) and [2400-3000)
+        buffer.buffer_segment(2000, 600, dummy_data);
+        buffer.buffer_segment(2400, 600, dummy_data);
+
+        uint8_t count = buffer.extract_sack_blocks(1000, out);
+        ASSERT(count == 1, "Merged into one SACK block");
+        ASSERT(out.blocks[0].left_edge == 2000, "Merged left edge");
+        ASSERT(out.blocks[0].right_edge == 3000, "Merged right edge");
+    END_TEST
+}
+
+// Test max_blocks parameter limits output
+void test_sack_max_blocks_limit() {
+    TEST("SACK: max_blocks parameter limits output")
+        ZeroCopyTCPReorderBuffer<const uint8_t*> buffer;
+        SACKBlockArray out;
+        uint8_t dummy_data[10] = {0};
+
+        // Buffer 5 non-contiguous segments
+        buffer.buffer_segment(2000, 500, dummy_data);   // arrival_id=0
+        buffer.buffer_segment(4000, 500, dummy_data);   // arrival_id=1
+        buffer.buffer_segment(6000, 500, dummy_data);   // arrival_id=2
+        buffer.buffer_segment(8000, 500, dummy_data);   // arrival_id=3
+        buffer.buffer_segment(10000, 500, dummy_data);  // arrival_id=4 (most recent)
+
+        // Request only 3 blocks (simulating timestamps enabled)
+        uint8_t count = buffer.extract_sack_blocks(1000, out, 3);
+        ASSERT(count == 3, "Limited to 3 blocks");
+
+        // Should be the 3 most recent
+        ASSERT(out.blocks[0].left_edge == 10000, "First = most recent (seq=10000)");
+        ASSERT(out.blocks[1].left_edge == 8000, "Second = seq=8000");
+        ASSERT(out.blocks[2].left_edge == 6000, "Third = seq=6000");
+    END_TEST
+}
+
+// Test segments below rcv_nxt are excluded
+void test_sack_exclude_below_rcv_nxt() {
+    TEST("SACK: exclude segments at or below rcv_nxt")
+        ZeroCopyTCPReorderBuffer<const uint8_t*> buffer;
+        SACKBlockArray out;
+        uint8_t dummy_data[10] = {0};
+
+        // Buffer segments: one below rcv_nxt, one at rcv_nxt, one above
+        buffer.buffer_segment(500, 200, dummy_data);    // Below rcv_nxt=1000
+        buffer.buffer_segment(1000, 200, dummy_data);   // At rcv_nxt (should be excluded)
+        buffer.buffer_segment(2000, 200, dummy_data);   // Above rcv_nxt
+
+        uint8_t count = buffer.extract_sack_blocks(1000, out);
+        ASSERT(count == 1, "Only one block above rcv_nxt");
+        ASSERT(out.blocks[0].left_edge == 2000, "Block is the one above rcv_nxt");
+    END_TEST
+}
+
+// Test merged block inherits max arrival_id (for recency ordering)
+void test_sack_merged_block_recency() {
+    TEST("SACK: merged block uses max arrival_id for ordering")
+        ZeroCopyTCPReorderBuffer<const uint8_t*> buffer;
+        SACKBlockArray out;
+        uint8_t dummy_data[10] = {0};
+
+        // First: isolated block at 6000 (arrival_id=0)
+        buffer.buffer_segment(6000, 500, dummy_data);
+
+        // Then: two segments that merge into [2000-3000)
+        buffer.buffer_segment(2000, 500, dummy_data);   // arrival_id=1
+        buffer.buffer_segment(2500, 500, dummy_data);   // arrival_id=2 (most recent in merged block)
+
+        uint8_t count = buffer.extract_sack_blocks(1000, out);
+        ASSERT(count == 2, "Two blocks (one merged)");
+
+        // Merged block [2000-3000) has higher max arrival_id (2) than [6000-6500) (0)
+        ASSERT(out.blocks[0].left_edge == 2000, "Merged block first (most recent arrival)");
+        ASSERT(out.blocks[0].right_edge == 3000, "Merged block right edge");
+        ASSERT(out.blocks[1].left_edge == 6000, "Isolated block second");
+    END_TEST
+}
+
+// Test realistic scenario from user bug report
+void test_sack_realistic_scenario() {
+    TEST("SACK: realistic OOO scenario (user bug report)")
+        ZeroCopyTCPReorderBuffer<const uint8_t*> buffer;
+        SACKBlockArray out;
+        uint8_t dummy_data[10] = {0};
+
+        // Simulating: PKT 8 arrives, then PKT 10, then PKT 12
+        // Each is a separate non-contiguous block
+        uint32_t base_seq = 402459397;  // From user's log
+
+        buffer.buffer_segment(base_seq, 942, dummy_data);          // PKT 8, arrival_id=0
+        buffer.buffer_segment(base_seq + 1448, 942, dummy_data);   // PKT 10, arrival_id=1
+        buffer.buffer_segment(base_seq + 2896, 942, dummy_data);   // PKT 12, arrival_id=2
+
+        uint32_t rcv_nxt = 402458891;  // From user's log
+
+        uint8_t count = buffer.extract_sack_blocks(rcv_nxt, out, 3);
+        ASSERT(count == 3, "Three SACK blocks");
+
+        // Expected order: PKT 12 first (most recent), then PKT 10, then PKT 8
+        ASSERT(out.blocks[0].left_edge == base_seq + 2896, "First = PKT 12 (most recent)");
+        ASSERT(out.blocks[1].left_edge == base_seq + 1448, "Second = PKT 10");
+        ASSERT(out.blocks[2].left_edge == base_seq, "Third = PKT 8 (oldest)");
+    END_TEST
+}
+
 int main() {
     std::cout << "╔════════════════════════════════════════════════╗" << std::endl;
     std::cout << "║   Userspace Stack: TCP State Unit Tests       ║" << std::endl;
@@ -223,6 +433,18 @@ int main() {
     test_receive_buffer();
     test_receive_buffer_partial();
     test_retransmit_queue_overflow();
+
+    // SACK block extraction tests (RFC 2018)
+    test_sack_empty_buffer();
+    test_sack_single_block();
+    test_sack_multiple_blocks();
+    test_sack_arrival_order();
+    test_sack_merge_adjacent();
+    test_sack_merge_overlapping();
+    test_sack_max_blocks_limit();
+    test_sack_exclude_below_rcv_nxt();
+    test_sack_merged_block_recency();
+    test_sack_realistic_scenario();
 
     // Summary
     std::cout << std::endl;

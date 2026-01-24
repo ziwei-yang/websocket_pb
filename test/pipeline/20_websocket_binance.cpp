@@ -47,11 +47,10 @@
 // pipeline_data.hpp must be included FIRST as it includes disruptor headers
 // before pipeline_config.hpp to avoid CACHE_LINE_SIZE macro conflict
 #include "../../src/pipeline/pipeline_data.hpp"
-#include "../../src/pipeline/xdp_poll_process.hpp"
-#include "../../src/pipeline/transport_process.hpp"
-#include "../../src/pipeline/websocket_process.hpp"
+#include "../../src/pipeline/00_xdp_poll_process.hpp"
+#include "../../src/pipeline/10_tcp_ssl_process.hpp"
+#include "../../src/pipeline/20_ws_process.hpp"
 #include "../../src/pipeline/msg_inbox.hpp"
-#include "../../src/pipeline/ws_parser.hpp"
 #include "../../src/core/http.hpp"
 #include "../../src/policy/ssl.hpp"  // WolfSSLPolicy
 
@@ -84,11 +83,17 @@ static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade";
 // Test configuration
 std::string g_local_ip;  // Detected from interface
 
-// Global shutdown flag
+// Global shutdown flag and connection state pointer for signal handler
 std::atomic<bool> g_shutdown{false};
+ConnStateShm* g_conn_state = nullptr;  // Set after setup, used by signal handler
 
-void signal_handler(int) {
+void signal_handler(int sig) {
     g_shutdown.store(true, std::memory_order_release);
+    // Notify all processes to stop immediately
+    if (g_conn_state) {
+        g_conn_state->shutdown_all();
+    }
+    fprintf(stderr, "\n[SIGNAL] Received signal %d, initiating graceful shutdown...\n", sig);
 }
 
 // Pin current process to specified CPU core with SCHED_FIFO priority
@@ -405,15 +410,20 @@ bool get_default_gateway(const char* interface, std::string& gateway_out) {
 // Type Aliases
 // ============================================================================
 
-// Enable profiling
+// Enable debug modes
 static constexpr bool PROFILING_ENABLED = true;
+static constexpr bool DEBUG_TCP_ENABLED = true;  // TCP debug mode for retransmit detection
+static constexpr bool DEBUG_XDP_ENABLED = true;  // XDP debug mode for fill-ring monitoring
 
-// XDP Poll Process types (with profiling enabled)
+// XDP Poll Process types (with profiling and debug enabled)
 using XDPPollType = XDPPollProcess<
     IPCRingProducer<UMEMFrameDescriptor>,
     IPCRingConsumer<UMEMFrameDescriptor>,
     true,                                   // TrickleEnabled
-    PROFILING_ENABLED>;                     // Profiling
+    PROFILING_ENABLED,                      // Profiling
+    256,                                    // FrameHeadroom (default)
+    2048,                                   // FrameSize (default)
+    DEBUG_XDP_ENABLED>;                     // DebugXDP - fill-ring monitoring
 
 // Transport Process types (with WolfSSL and profiling enabled)
 using TransportType = TransportProcess<
@@ -425,7 +435,12 @@ using TransportType = TransportProcess<
     IPCRingConsumer<MsgOutboxEvent>,       // MsgOutboxCons
     IPCRingProducer<MsgMetadata>,          // MsgMetadataProd
     IPCRingConsumer<PongFrameAligned>,     // PongsCons
-    PROFILING_ENABLED>;                    // Profiling
+    PROFILING_ENABLED,                     // Profiling
+    true,                                  // TCPTimestampEnabled (RFC 7323)
+    DEBUG_TCP_ENABLED,                     // DebugTCP - retransmit detection
+    2,                                     // TcpDelackNum (ACK after N packets)
+    40,                                    // TcpDelackMinMs (min delay before ACK)
+    200>;                                  // TcpDelackMaxMs (max delay, forced ACK)
 
 // WebSocket Process types
 using WebSocketType = WebSocketProcess<
@@ -758,8 +773,6 @@ public:
 
         auto start_time = std::chrono::steady_clock::now();
         auto stream_end = start_time + std::chrono::milliseconds(g_timeout_ms);
-        auto last_status_time = start_time;
-        constexpr int STATUS_INTERVAL_MS = 1000;  // Print status every 1 second
 
         printf("[WSS] Starting stream reception...\n");
 
@@ -841,56 +854,7 @@ public:
                 }
             }
 
-            // Periodic status in forever mode
-            if (run_forever) {
-                auto now = std::chrono::steady_clock::now();
-                auto since_last_status = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - last_status_time).count();
-                if (since_last_status >= STATUS_INTERVAL_MS) {
-                    auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
-                        now - start_time).count();
-
-                    // Check ring buffer status
-                    int64_t pongs_prod = pongs_region_->producer_published()->load(std::memory_order_acquire);
-                    int64_t pongs_cons = pongs_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-                    int64_t meta_prod = msg_metadata_region_->producer_published()->load(std::memory_order_acquire);
-                    int64_t meta_cons = msg_metadata_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-                    int64_t outbox_prod = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
-                    int64_t outbox_cons = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-                    int64_t raw_outbox_prod = raw_outbox_region_->producer_published()->load(std::memory_order_acquire);
-                    int64_t raw_outbox_cons = raw_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-                    int64_t pong_outbox_prod = pong_outbox_region_->producer_published()->load(std::memory_order_acquire);
-                    int64_t pong_outbox_cons = pong_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-
-                    printf("\n[STATUS @%lds] trades=%lu pings=%lu\n",
-                           elapsed_s, valid_trades, ping_frames);
-                    // Also check RAW_INBOX and ACK_OUTBOX status
-                    int64_t raw_inbox_prod = raw_inbox_region_->producer_published()->load(std::memory_order_acquire);
-                    int64_t raw_inbox_cons = raw_inbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-                    int64_t ack_outbox_prod = ack_outbox_region_->producer_published()->load(std::memory_order_acquire);
-                    int64_t ack_outbox_cons = ack_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-
-                    printf("  PONGS(prod=%ld,cons=%ld) META(prod=%ld,cons=%ld) MSG_OUTBOX(prod=%ld,cons=%ld)\n",
-                           pongs_prod, pongs_cons,
-                           meta_prod, meta_cons,
-                           outbox_prod, outbox_cons);
-                    printf("  RAW_INBOX(prod=%ld,cons=%ld) ACK_OUTBOX(prod=%ld,cons=%ld)\n",
-                           raw_inbox_prod, raw_inbox_cons,
-                           ack_outbox_prod, ack_outbox_cons);
-                    printf("  RAW_OUTBOX(prod=%ld,cons=%ld) PONG_OUTBOX(prod=%ld,cons=%ld)\n",
-                           raw_outbox_prod, raw_outbox_cons,
-                           pong_outbox_prod, pong_outbox_cons);
-
-                    // Check process status
-                    printf("  Processes: XDP=%s TRANSPORT=%s WEBSOCKET=%s\n",
-                           conn_state_->is_running(PROC_XDP_POLL) ? "OK" : "DEAD",
-                           conn_state_->is_running(PROC_TRANSPORT) ? "OK" : "DEAD",
-                           conn_state_->is_running(PROC_WEBSOCKET) ? "OK" : "DEAD");
-                    fflush(stdout);
-
-                    last_status_time = now;
-                }
-            }
+            // Status logging consolidated in TRANSPORT process (see transport_process.hpp)
 
             __builtin_ia32_pause();
         }
@@ -932,6 +896,16 @@ public:
         printf("  BINARY frames:   %lu\n", binary_frames);
         printf("  PING frames:     %lu\n", ping_frames);
         printf("  PONG frames:     %lu\n", pong_frames);
+        // PONG deficit check: compare PINGs received with PONGs queued
+        {
+            int64_t pongs_queued = pongs_region_->producer_published()->load(std::memory_order_acquire) + 1;  // +1 for 0-based
+            int64_t deficit = static_cast<int64_t>(ping_frames) - pongs_queued;
+            if (deficit > 0) {
+                printf("  PONG DEFICIT:    %ld (PINGs received but PONGs not queued - INVESTIGATE!)\n", deficit);
+            } else {
+                printf("  PONG balance:    OK (all PINGs have corresponding PONGs queued)\n");
+            }
+        }
         printf("  CLOSE frames:    %lu\n", close_frames);
         printf("  Valid trades:    %lu\n", valid_trades);
         printf("  Sequence errors: %s\n", sequence_error ? "YES" : "none");
@@ -1092,6 +1066,9 @@ public:
                    filename, count, buf.total_count);
         }
     }
+
+    // Getter for connection state (used by signal handler)
+    ConnStateShm* get_conn_state() const { return conn_state_; }
 
 private:
     // XDP Poll child process
@@ -1331,6 +1308,9 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "\nFATAL: Setup failed\n");
         return 1;
     }
+
+    // Set global conn_state for signal handler to use
+    g_conn_state = test.get_conn_state();
 
     // Fork processes
     if (!test.fork_processes()) {

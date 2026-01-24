@@ -323,7 +323,7 @@ build_test() {
 
     # Determine SSL library flags based on test name or USE_WOLFSSL env var
     local SSL_FLAGS=""
-    if [[ -n "$USE_WOLFSSL" ]] || [[ "$MAKE_TARGET" == *"wolfssl"* ]] || [[ "$MAKE_TARGET" == *"wss"* ]] || [[ "$MAKE_TARGET" == *"binance"* ]]; then
+    if [[ -n "$USE_WOLFSSL" ]] || [[ "$MAKE_TARGET" == *"wolfssl"* ]] || [[ "$MAKE_TARGET" == *"wss"* ]] || [[ "$MAKE_TARGET" == *"binance"* ]] || [[ "$MAKE_TARGET" == *"okx"* ]]; then
         SSL_FLAGS="USE_WOLFSSL=1"
         log_info "Using WolfSSL (USE_WOLFSSL=1)"
     elif [[ "$MAKE_TARGET" == *"libressl"* ]]; then

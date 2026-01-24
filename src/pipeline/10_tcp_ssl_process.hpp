@@ -1,4 +1,4 @@
-// pipeline/transport_process.hpp
+// pipeline/10_tcp_ssl_process.hpp
 // Transport Process - SSL/TCP layer with zero-copy I/O
 // Handles encryption, retransmission, and adaptive ACK
 // C++20, policy-based design, single-thread HFT focus
@@ -21,7 +21,6 @@
 #include "pipeline_config.hpp"
 #include "pipeline_data.hpp"
 #include "msg_inbox.hpp"
-#include "ws_parser.hpp"
 #include "../core/timing.hpp"
 #include "../stack/userspace_stack.hpp"
 #include "../stack/tcp/tcp_reorder.hpp"
@@ -46,6 +45,23 @@ struct alignas(64) RetransmitSegmentRef {
     uint8_t  reserved[32];     // [32:63] Padding to cache line
 };
 static_assert(sizeof(RetransmitSegmentRef) == 64, "RetransmitSegmentRef must be 64 bytes");
+
+// Track last PONG packet for ACK confirmation logging
+struct LastPongInfo {
+    uint32_t seq_start = 0;      // TCP sequence number at PONG start
+    uint32_t seq_end = 0;        // TCP sequence number at PONG end (need ACK >= this)
+    uint64_t send_tsc = 0;       // TSC when PONG was sent
+    uint32_t frame_idx = 0;      // UMEM frame index
+    uint16_t plaintext_len = 0;  // Original plaintext length
+    bool pending = false;        // True if waiting for ACK
+
+    void clear() {
+        seq_start = seq_end = frame_idx = 0;
+        send_tsc = 0;
+        plaintext_len = 0;
+        pending = false;
+    }
+};
 
 // ============================================================================
 // ZeroCopyRetransmitQueue - Circular queue of unacked segments
@@ -179,6 +195,54 @@ private:
 };
 
 // ============================================================================
+// DebugPacketHistory - Ring buffer for retransmit detection via timestamp
+// Only has storage when Enabled=true - zero memory overhead when disabled
+// ============================================================================
+
+template<bool Enabled>
+struct DebugPacketHistory {
+    // Empty when disabled - takes no space
+    void record([[maybe_unused]] uint32_t seq, [[maybe_unused]] uint32_t tsval) {}
+    bool is_retransmit([[maybe_unused]] uint32_t new_seq, [[maybe_unused]] uint32_t new_tsval) const { return false; }
+};
+
+template<>
+struct DebugPacketHistory<true> {
+    struct PacketRecord {
+        uint32_t seq = 0;
+        uint32_t tsval = 0;
+        bool valid = false;
+    };
+    static constexpr size_t kSize = 16;
+    PacketRecord history[kSize] = {};
+    size_t idx = 0;
+
+    void record(uint32_t seq, uint32_t tsval) {
+        auto& slot = history[idx];
+        slot.seq = seq;
+        slot.tsval = tsval;
+        slot.valid = true;
+        idx = (idx + 1) % kSize;
+    }
+
+    // Check if incoming packet is a retransmit based on timestamp comparison
+    // Logic: if saved_packet.seq >= new_packet.seq && saved_packet.tsval < new_packet.tsval
+    // This detects when:
+    // - A packet covers sequence numbers we've seen before (saved.seq >= new.seq)
+    // - But has a newer timestamp (saved.tsval < new.tsval)
+    // - Meaning: the sender retransmitted this segment
+    bool is_retransmit(uint32_t new_seq, uint32_t new_tsval) const {
+        for (size_t i = 0; i < kSize; ++i) {
+            if (!history[i].valid) continue;
+            if (history[i].seq >= new_seq && history[i].tsval < new_tsval) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+// ============================================================================
 // TransportProcess - SSL/TCP handler with zero-copy packet I/O
 //
 // Responsibilities:
@@ -219,10 +283,26 @@ template<typename SSLPolicy,
          typename MsgMetadataProd,
          typename PongsCons,
          bool Profiling = false,
-         bool TCPTimestampEnabled = true>  // RFC 7323 TCP Timestamps (default enabled like kernel)
+         bool TCPTimestampEnabled = true,  // RFC 7323 TCP Timestamps (default enabled like kernel)
+         bool DebugTCP = false,            // Debug mode for retransmit detection via timestamps
+         uint32_t TcpDelackNum = 2,        // ACK after N packets received
+         uint32_t TcpDelackMinMs = 40,     // Minimum delay before ACK (ms)
+         uint32_t TcpDelackMaxMs = 200>    // Maximum delay before forced ACK (ms)
 struct TransportProcess {
     static constexpr bool kProfiling = Profiling;
     static constexpr bool kTimestampEnabled = TCPTimestampEnabled;
+    static constexpr bool kDebugTCP = DebugTCP;
+    static constexpr uint32_t kTcpDelackNum = TcpDelackNum;
+    static constexpr uint32_t kTcpDelackMinMs = TcpDelackMinMs;
+    static constexpr uint32_t kTcpDelackMaxMs = TcpDelackMaxMs;
+
+    // Debug printf - only prints when DebugTCP is enabled (zero overhead otherwise)
+    template<typename... Args>
+    static void debug_printf([[maybe_unused]] const char* fmt, [[maybe_unused]] Args&&... args) {
+        if constexpr (kDebugTCP) {
+            fprintf(stderr, fmt, std::forward<Args>(args)...);
+        }
+    }
 
     // Profiling helper: wraps function, measures cycles, stores result and cycles
     // Uses pointer to shared memory slot (no stack allocation)
@@ -306,13 +386,17 @@ struct TransportProcess {
         // Initialize retransmit queues and pre-calculate cycle thresholds
         msg_retransmit_queue_.clear();
         pong_retransmit_queue_.clear();
+        last_pong_.clear();
         // Handshake buffer and RX frame tracking reset
         handshake_rx_len_ = 0;
         handshake_rx_appended_ = 0;
         uint64_t tsc_freq = conn_state_->tsc_freq_hz;
         rto_cycles_ = (ZeroCopyRetransmitQueue::DEFAULT_RTO_US * tsc_freq) / 1000000;
-        ack_timeout_cycles_ = (ACK_TIMEOUT_US * tsc_freq) / 1000000;
-        dup_ack_interval_cycles_ = (INITIAL_RTO_US * tsc_freq) / 1000000;  // 200ms RTO
+        // Convert delayed ACK timeouts to CPU cycles
+        delack_min_cycles_ = (static_cast<uint64_t>(kTcpDelackMinMs) * tsc_freq) / 1000;
+        delack_max_cycles_ = (static_cast<uint64_t>(kTcpDelackMaxMs) * tsc_freq) / 1000;
+        health_interval_cycles_ = tsc_freq;  // 1 second in cycles
+        health_last_cycle_ = rdtsc();
 
         // Initialize userspace TCP stack with local network info from shared state
         {
@@ -408,8 +492,11 @@ struct TransportProcess {
         // Calculate cycle thresholds: timeout_us * (TSC_freq_hz / 1,000,000)
         uint64_t tsc_freq = conn_state_->tsc_freq_hz;
         rto_cycles_ = (ZeroCopyRetransmitQueue::DEFAULT_RTO_US * tsc_freq) / 1000000;
-        ack_timeout_cycles_ = (ACK_TIMEOUT_US * tsc_freq) / 1000000;
-        dup_ack_interval_cycles_ = (INITIAL_RTO_US * tsc_freq) / 1000000;  // 200ms RTO
+        // Convert delayed ACK timeouts to CPU cycles
+        delack_min_cycles_ = (static_cast<uint64_t>(kTcpDelackMinMs) * tsc_freq) / 1000;
+        delack_max_cycles_ = (static_cast<uint64_t>(kTcpDelackMaxMs) * tsc_freq) / 1000;
+        health_interval_cycles_ = tsc_freq;  // 1 second in cycles
+        health_last_cycle_ = rdtsc();
 
         return true;
     }
@@ -421,6 +508,9 @@ struct TransportProcess {
     void run() {
         // Mark ourselves as ready so XDP Poll can start processing
         conn_state_->set_ready(PROC_TRANSPORT);
+
+        // Record connection start time for duration tracking in on_finished()
+        connection_start_cycle_ = rdtsc();
 
         uint64_t loop_id = 0;
         uint32_t loops_since_retransmit_check = 0;
@@ -448,13 +538,37 @@ struct TransportProcess {
 
             // 2. Deferred ACK (idle only) - send ACK/SACK if we saw DUP or OOO packets
             profile_op([this]{
+                // OOO/DUP: immediate ACK (RFC requirement)
                 if (seen_dup_packet_ || seen_ooo_packet_) {
-                    send_ack(true);  // Include SACK for OOO/DUP recovery
+                    send_ack();  // Includes SACK automatically when OOO exists (RFC 5681)
                     seen_dup_packet_ = false;
                     seen_ooo_packet_ = false;
+                    has_unacked_packets_ = false;
                     return true;
                 }
-                return check_and_send_ack();  // Normal delayed ACK
+                // Normal path: delayed ACK with packet count and min/max timeout
+                if (has_unacked_packets_) {
+                    // Check timeout every 1024 iterations (avoid rdtsc() overhead)
+                    if ((++idle_loop_counter_ & 0x3FF) == 0) {
+                        uint64_t now = rdtsc();
+                        uint64_t elapsed = now - first_unacked_cycle_;
+
+                        // Force ACK after max timeout (regardless of packet count)
+                        if (elapsed >= delack_max_cycles_) {
+                            send_ack();
+                            has_unacked_packets_ = false;
+                            return true;
+                        }
+
+                        // ACK after N packets AND min timeout elapsed
+                        if (packets_since_ack_ >= kTcpDelackNum && elapsed >= delack_min_cycles_) {
+                            send_ack();
+                            has_unacked_packets_ = false;
+                            return true;
+                        }
+                    }
+                }
+                return false;
             }, slot, 2, !data_moved);
 
             // 3. PONG (idle only)
@@ -493,22 +607,107 @@ struct TransportProcess {
                 profiling_data_->commit();
             }
 
-            // RTO DUP_ACK for OOO recovery: periodic SACK while OOO gap persists (no cap - match kernel)
-            // Send SACK every RTO interval to help server retransmit missing segments
-            if (!data_moved && ooo_buffer_.has_ext_id_segments()) {
+            // Periodic connection health summary (every 1 second)
+            {
                 uint64_t now = rdtsc();
-                if (now - last_dup_ack_cycle_ >= dup_ack_interval_cycles_) {
-                    ooo_dup_ack_count_++;
-                    fprintf(stderr, "[TRANSPORT] RTO DUP_ACK #%u: ooo_count=%zu min_ext_id=%ld rcv_nxt=%u\n",
-                            ooo_dup_ack_count_, ooo_buffer_.count(), ooo_buffer_.min_ext_id(), conn_state_->rcv_nxt);
-                    send_ack(true);  // Include SACK for OOO recovery
-                    last_dup_ack_cycle_ = now;
+                if (now - health_last_cycle_ >= health_interval_cycles_) {
+                    // Calculate elapsed seconds since connection start
+                    uint64_t elapsed_cycles = now - connection_start_cycle_;
+                    int64_t elapsed_s = static_cast<int64_t>(elapsed_cycles / conn_state_->tsc_freq_hz);
+
+                    // Get current state from rings
+                    int64_t meta_prod = msg_metadata_prod_->published_sequence();
+                    int64_t pongs_prod = pongs_cons_->published_sequence();  // pings received
+                    int64_t pongs_cons = pongs_cons_->sequence();            // pongs sent
+                    int64_t raw_inbox_prod = raw_inbox_cons_->published_sequence();
+                    int64_t ack_prod = ack_outbox_prod_->published_sequence();
+                    int64_t pong_outbox_prod = pong_outbox_prod_->published_sequence();
+
+                    // Change detection - only print if something interesting changed
+                    bool changed = (meta_prod != last_health_.meta_prod ||
+                                    pongs_prod != last_health_.pongs_prod ||
+                                    pongs_cons != last_health_.pongs_cons ||
+                                    health_rx_frames_ != last_health_.rx_frames ||
+                                    health_tx_frames_ != last_health_.tx_frames ||
+                                    health_ooo_packets_ != last_health_.ooo_packets ||
+                                    health_dup_packets_ != last_health_.dup_packets ||
+                                    health_retransmits_ != last_health_.retransmits ||
+                                    conn_state_->rcv_nxt != last_health_.rcv_nxt ||
+                                    conn_state_->snd_nxt != last_health_.snd_nxt ||
+                                    conn_state_->snd_una != last_health_.snd_una ||
+                                    ooo_buffer_.count() != last_health_.ooo_count ||
+                                    msg_retransmit_queue_.size() != last_health_.msg_rtx_size ||
+                                    pong_retransmit_queue_.size() != last_health_.pong_rtx_size ||
+                                    raw_inbox_prod != last_health_.raw_inbox_prod ||
+                                    ack_prod != last_health_.ack_prod ||
+                                    pong_outbox_prod != last_health_.pong_outbox_prod);
+
+                    if (changed) {
+                        // Calculate derived values
+                        int64_t trades = meta_prod + 1;       // 0-based seq, so +1 for count
+                        int64_t pings = pongs_prod + 1;       // pings received (producer to PONG ring)
+                        int64_t pong_deficit = pings - (pongs_cons + 1);  // pings - pongs sent
+
+                        // Print consolidated status in table format
+                        fprintf(stderr, "\n[TRANSPORT] Status @%lds\n", elapsed_s);
+                        fprintf(stderr, "┌─────────────────────────────────────────────────────────────┐\n");
+                        fprintf(stderr, "│ trades=%-12ld pings=%-12ld pong_deficit=%-5ld%s│\n",
+                                trades, pings, pong_deficit,
+                                pong_deficit > 0 ? "!" : " ");
+                        fprintf(stderr, "│ rcv_nxt=%-10u snd_nxt=%-10u snd_una=%-10u │\n",
+                                conn_state_->rcv_nxt, conn_state_->snd_nxt, conn_state_->snd_una);
+                        fprintf(stderr, "├──────────┬──────────┬──────────┬──────────┬─────────────────┤\n");
+                        fprintf(stderr, "│ RX=%-5lu │ TX=%-5lu │ OOO=%-4lu │ DUP=%-4lu │ RTX=%-10lu │\n",
+                                health_rx_frames_, health_tx_frames_,
+                                health_ooo_packets_, health_dup_packets_, health_retransmits_);
+                        fprintf(stderr, "├──────────┴──────────┴──────────┴──────────┴─────────────────┤\n");
+                        fprintf(stderr, "│ ooo_buf=%zu/%-9zu rtx_queue: MSG=%-4zu PONG=%-4zu          │\n",
+                                ooo_buffer_.count(), ooo_buffer_.max_segments(),
+                                msg_retransmit_queue_.size(), pong_retransmit_queue_.size());
+                        fprintf(stderr, "├─────────────────────────────────────────────────────────────┤\n");
+                        fprintf(stderr, "│ RAW_IN(%ld/%ld)  ACK(%ld/%ld)  PONG(%ld/%ld)  META(%ld/%ld) │\n",
+                                raw_inbox_cons_->sequence(), raw_inbox_prod,
+                                ack_outbox_prod_->consumer_sequence(), ack_prod,
+                                pongs_cons, pongs_prod,
+                                msg_metadata_prod_->consumer_sequence(), meta_prod);
+                        fprintf(stderr, "└─────────────────────────────────────────────────────────────┘\n");
+
+                        // Update last state
+                        last_health_.meta_prod = meta_prod;
+                        last_health_.pongs_prod = pongs_prod;
+                        last_health_.pongs_cons = pongs_cons;
+                        last_health_.rx_frames = health_rx_frames_;
+                        last_health_.tx_frames = health_tx_frames_;
+                        last_health_.ooo_packets = health_ooo_packets_;
+                        last_health_.dup_packets = health_dup_packets_;
+                        last_health_.retransmits = health_retransmits_;
+                        last_health_.rcv_nxt = conn_state_->rcv_nxt;
+                        last_health_.snd_nxt = conn_state_->snd_nxt;
+                        last_health_.snd_una = conn_state_->snd_una;
+                        last_health_.ooo_count = ooo_buffer_.count();
+                        last_health_.msg_rtx_size = msg_retransmit_queue_.size();
+                        last_health_.pong_rtx_size = pong_retransmit_queue_.size();
+                        last_health_.raw_inbox_prod = raw_inbox_prod;
+                        last_health_.ack_prod = ack_prod;
+                        last_health_.pong_outbox_prod = pong_outbox_prod;
+                    }
+
+                    // Reset interval counters
+                    health_rx_frames_ = 0;
+                    health_tx_frames_ = 0;
+                    health_ooo_packets_ = 0;
+                    health_dup_packets_ = 0;
+                    health_retransmits_ = 0;
+                    health_last_cycle_ = now;
                 }
             }
 
             loop_id++;
         }
 
+        // Loop exited - running flag was set to false (e.g., WS CLOSE, external shutdown)
+        // Call on_finished() to perform graceful teardown
+        on_finished(true);
     }
 
     // ========================================================================
@@ -577,13 +776,72 @@ struct TransportProcess {
                 fprintf(stderr, "[TRANSPORT-RX] umem_id=%u seq=%u ack=%u flags=0x%02x len=%zu slot=%ld\n",
                         umem_frame_id, parsed.seq, parsed.ack, parsed.flags, parsed.payload_len, seq);
 
+                // Hex dump first 32 bytes of payload for debugging
+                if (parsed.payload_len > 0) {
+                    const uint8_t* payload = reinterpret_cast<const uint8_t*>(parsed.payload);
+                    size_t dump_len = std::min(parsed.payload_len, static_cast<size_t>(32));
+                    fprintf(stderr, "[TRANSPORT-RX] payload[0:%zu]: ", dump_len);
+                    for (size_t i = 0; i < dump_len; ++i) {
+                        fprintf(stderr, "%02x ", payload[i]);
+                    }
+                    if (parsed.payload_len > 32) {
+                        fprintf(stderr, "...");
+                    }
+                    fprintf(stderr, "\n");
+                }
+
+                // DEBUG: Retransmit detection via TCP timestamp comparison (RFC 7323 PAWS)
+                // Only enabled when DebugTCP=true - zero overhead otherwise
+                if constexpr (kDebugTCP) {
+                    if (conn_state_->timestamp_enabled && parsed.payload_len > 0) {
+                        uint8_t* frame = umem_area_ + desc.umem_addr;
+                        auto ts_result = parse_timestamp_option(frame, desc.frame_len);
+                        if (ts_result.found) {
+                            // Check BEFORE recording (compare against previous packets)
+                            bool is_retransmit = debug_packet_history_.is_retransmit(parsed.seq, ts_result.ts_val);
+
+                            if (is_retransmit) {
+                                debug_printf("[TRANSPORT] TCP RETRANSMIT-DETECTED seq=%u len=%zu tsval=%u\n",
+                                             parsed.seq, parsed.payload_len, ts_result.ts_val);
+                            }
+
+                            // Record AFTER check (to compare against previous packets only)
+                            debug_packet_history_.record(parsed.seq, ts_result.ts_val);
+                        }
+                    }
+                }
+
                 // DEBUG: Print TCP flags for debugging stuck connection
                 if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
-                    fprintf(stderr, "[TRANSPORT] TCP FIN received from server! seq=%u ack=%u\n",
-                            parsed.seq, parsed.ack);
+                    // Enhanced FIN logging with OOO context
+                    fprintf(stderr, "\n");
+                    fprintf(stderr, "╔══════════════════════════════════════════════════════════════════╗\n");
+                    fprintf(stderr, "║  [TRANSPORT] TCP FIN RECEIVED                                    ║\n");
+                    fprintf(stderr, "╠══════════════════════════════════════════════════════════════════╣\n");
+                    fprintf(stderr, "║  FIN seq=%u ack=%u len=%zu                        \n",
+                            parsed.seq, parsed.ack, parsed.payload_len);
+                    fprintf(stderr, "║  rcv_nxt=%u gap=%d bytes                          \n",
+                            conn_state_->rcv_nxt,
+                            static_cast<int32_t>(parsed.seq - conn_state_->rcv_nxt));
+                    fprintf(stderr, "║  OOO buffer: count=%zu/%zu has_ext_id=%s           \n",
+                            ooo_buffer_.count(), ooo_buffer_.max_segments(),
+                            ooo_buffer_.has_ext_id_segments() ? "yes" : "no");
+                    if (ooo_buffer_.count() > 0) {
+                        fprintf(stderr, "║  OOO min_ext_id=%ld (packets held in OOO buffer)    \n",
+                                ooo_buffer_.min_ext_id());
+                    }
+                    fprintf(stderr, "║  NOTE: If gap > 0, FIN arrived out-of-order!                     ║\n");
+                    fprintf(stderr, "║        Missing data between rcv_nxt and FIN may contain          ║\n");
+                    fprintf(stderr, "║        WebSocket CLOSE frame with actual close reason.           ║\n");
+                    fprintf(stderr, "╚══════════════════════════════════════════════════════════════════╝\n");
+
+                    // Trigger graceful shutdown, send our FIN back
+                    on_finished(true);
                 }
                 if (parsed.flags & userspace_stack::TCP_FLAG_RST) {
                     fprintf(stderr, "[TRANSPORT] TCP RST received from server! seq=%u\n", parsed.seq);
+                    // RST = abrupt termination, no FIN handshake needed
+                    on_finished(false);
                 }
 
                 // DEBUG: Track TCP sequence gaps
@@ -631,6 +889,7 @@ struct TransportProcess {
                             }
                         }
                         out_of_order = true;
+                        health_ooo_packets_++;  // Track for health summary
                         desc.acked = 1;  // Mark frame so we don't send another ACK on reprocess
                         // Continue processing - UMEMs stay valid until commit_manually()
                         // Don't add to SSL view yet (stored in OOO buffer above)
@@ -642,6 +901,10 @@ struct TransportProcess {
                             fprintf(stderr, "[TRANSPORT] TCP FULL DUP seq=%u len=%zu (rcv_nxt=%u) - will ACK in IDLE\n",
                                     parsed.seq, parsed.payload_len, conn_state_->rcv_nxt);
                             seen_dup_packet_ = true;  // Deferred ACK in IDLE
+                            // Capture DSACK info (RFC 2883)
+                            dup_seq_ = parsed.seq;
+                            dup_len_ = static_cast<uint16_t>(parsed.payload_len);
+                            health_dup_packets_++;    // Track for health summary
                             return true;  // Entire segment is duplicate, skip
                         }
                         // Partial overlap - adjust payload
@@ -679,8 +942,17 @@ struct TransportProcess {
                         std::abort();
                     }
                     payload_frames++;  // Track frames with payload for commit logic
-                    packets_since_ack_++;  // Only count payload packets for ACK threshold
+                    // Only count full MSS-sized packets for delayed ACK threshold (per RFC 1122)
+                    if (parsed.payload_len >= PIPELINE_TCP_MSS) {
+                        packets_since_ack_++;
+                    }
                     pending_packet_ct_++;  // Track packets for MsgMetadata.nic_packet_ct
+
+                    // Track first unacked packet time for delayed ACK timeout
+                    if (!has_unacked_packets_) {
+                        first_unacked_cycle_ = rdtsc();
+                        has_unacked_packets_ = true;
+                    }
 
                     // Check OOO buffer for now-in-order segments
                     uint32_t rcv_nxt_before_ooo = conn_state_->rcv_nxt;
@@ -696,8 +968,6 @@ struct TransportProcess {
                     if (delivered > 0) {
                         fprintf(stderr, "[TRANSPORT] OOO delivered %zu segments, rcv_nxt: %u -> %u\n",
                                 delivered, rcv_nxt_before_ooo, conn_state_->rcv_nxt);
-                        // Reset DUP ACK counter when OOO gap is filled (fast retransmit worked)
-                        ooo_dup_ack_count_ = 0;
                     }
                 }
 
@@ -715,6 +985,7 @@ struct TransportProcess {
         // This prevents use-after-free when XDP Poll returns frames to fill ring.
         if (rx_count > 0) {
             fprintf(stderr, "[TRANSPORT] RX: %d frames, payload_frames=%d\n", rx_count, payload_frames);
+            health_rx_frames_ += rx_count;  // Track for health summary
             ssl_read_to_msg_inbox();
         }
 
@@ -741,8 +1012,6 @@ struct TransportProcess {
         if (out_of_order) {
             fprintf(stderr, "[TRANSPORT] OOO detected: rcv_nxt=%u ooo_count=%zu (SACK in IDLE)\n",
                     conn_state_->rcv_nxt, ooo_buffer_.count());
-            ooo_dup_ack_count_ = 1;
-            last_dup_ack_cycle_ = rdtsc();  // Start RTO timer for subsequent DUP ACKs
             seen_ooo_packet_ = true;  // Deferred SACK in IDLE
         }
 
@@ -849,6 +1118,20 @@ struct TransportProcess {
 
             // Reset timestamps for next batch
             reset_timestamps();
+        }
+
+        // ret == 0 means SSL shutdown (clean close_notify received)
+        if (ret == 0) {
+            fprintf(stderr, "\n");
+            fprintf(stderr, "╔══════════════════════════════════════════════════════════════════╗\n");
+            fprintf(stderr, "║  [TRANSPORT] SSL SHUTDOWN DETECTED (SSL_read returned 0)         ║\n");
+            fprintf(stderr, "╠══════════════════════════════════════════════════════════════════╣\n");
+            fprintf(stderr, "║  Server sent TLS close_notify alert (clean shutdown)             ║\n");
+            fprintf(stderr, "║  This typically follows a WebSocket CLOSE frame.                 ║\n");
+            fprintf(stderr, "╚══════════════════════════════════════════════════════════════════╝\n");
+
+            // Trigger graceful shutdown (FIN may already be sent if TCP FIN triggered first)
+            on_finished(true);
         }
 
         // ret < 0 with errno == EAGAIN means need more data (normal for pipeline)
@@ -988,9 +1271,24 @@ struct TransportProcess {
                     alloc_result.frame_idx, encrypted_len, alloc_result.alloc_pos, rtx_queue);
 
                 // Log data packet TX with sequence info for timeline reconstruction
+                uint64_t tx_cycle = rdtsc();
                 fprintf(stderr, "[TRANSPORT-TX] %s DATA umem_id=%u seq=%u len=%zu\n",
                         type_name, alloc_result.frame_idx, conn_state_->snd_nxt - static_cast<uint32_t>(encrypted_len),
                         encrypted_len);
+
+                // Track and log PONG for ACK confirmation
+                if constexpr (Type == TxType::PONG) {
+                    last_pong_.seq_start = conn_state_->snd_nxt - static_cast<uint32_t>(encrypted_len);
+                    last_pong_.seq_end = conn_state_->snd_nxt;
+                    last_pong_.send_tsc = tx_cycle;
+                    last_pong_.frame_idx = alloc_result.frame_idx;
+                    last_pong_.plaintext_len = data_len;
+                    last_pong_.pending = true;
+
+                    fprintf(stderr, "[PONG-TX] seq=%u-%u len=%zu umem=%u plaintext=%u (awaiting ACK >= %u)\n",
+                            last_pong_.seq_start, last_pong_.seq_end, encrypted_len,
+                            alloc_result.frame_idx, data_len, last_pong_.seq_end);
+                }
 
                 // Write descriptor to output ring (different descriptor types)
                 int64_t out_seq = batch_start + slot_idx;
@@ -1026,6 +1324,11 @@ struct TransportProcess {
         // Publish any remaining packets
         if (slot_idx > 0 && slot_idx % TX_BATCH_SIZE != 0) {
             producer.publish_batch(publish_lo, batch_start + slot_idx - 1);
+        }
+
+        // Track TX frames for health summary
+        if (slot_idx > 0) {
+            health_tx_frames_ += slot_idx;
         }
 
         return slot_idx;
@@ -1121,6 +1424,16 @@ struct TransportProcess {
             if (pong_acked_pos > 0) {
                 // Update pong_acked_pos so XDP Poll can release frames (atomic - cross-process)
                 conn_state_->tx_frame.pong_acked_pos.store(pong_acked_pos, std::memory_order_release);
+
+                // Log PONG ACK confirmation if this ACK covers our last PONG
+                if (last_pong_.pending && static_cast<int32_t>(ack_num - last_pong_.seq_end) >= 0) {
+                    uint64_t now_tsc = rdtsc();
+                    uint64_t rtt_cycles = now_tsc - last_pong_.send_tsc;
+                    double rtt_us = static_cast<double>(rtt_cycles) * 1000000.0 / conn_state_->tsc_freq_hz;
+                    fprintf(stderr, "[PONG-ACK] seq=%u-%u CONFIRMED by ack=%u rtt=%.1fus\n",
+                            last_pong_.seq_start, last_pong_.seq_end, ack_num, rtt_us);
+                    last_pong_.pending = false;
+                }
             }
         }
 
@@ -1128,25 +1441,7 @@ struct TransportProcess {
         conn_state_->peer_recv_window = static_cast<uint32_t>(window) << conn_state_->window_scale;
     }
 
-    bool check_and_send_ack() {
-        if (packets_since_ack_ == 0) return false;
-
-        // Check packet threshold
-        if (packets_since_ack_ >= ACK_PACKET_THRESHOLD) {
-            send_ack();
-            return true;
-        }
-
-        // Check timeout (pre-calculated ack_timeout_cycles_)
-        uint64_t now = rdtsc();
-        if (now - last_ack_cycle_ >= ack_timeout_cycles_) {
-            send_ack();
-            return true;
-        }
-        return false;
-    }
-
-    void send_ack(bool include_sack = false) {
+    void send_ack() {
         uint32_t frame_idx = allocate_ack_frame();
         if (frame_idx == UINT32_MAX) {
             fprintf(stderr, "[TRANSPORT] FATAL: ACK frame pool exhausted\n");
@@ -1159,46 +1454,73 @@ struct TransportProcess {
         auto params = build_tcp_params();
         size_t frame_len = 0;
 
-        // Only include SACK when explicitly requested (OOO/DUP events)
-        if (include_sack && conn_state_->sack_enabled && !ooo_buffer_.is_empty()) {
-            userspace_stack::SACKBlockArray sack_blocks;
-            ooo_buffer_.extract_sack_blocks(conn_state_->rcv_nxt, sack_blocks);
+        // Build combined SACK block array: DSACK first (RFC 2883), then OOO blocks
+        userspace_stack::SACKBlockArray sack_blocks;
+        sack_blocks.count = 0;
 
-            if (sack_blocks.count > 0) {
-                frame_len = userspace_stack::TCPPacket::build_ack_with_sack(
-                    frame, frame_size_, params, sack_blocks,
-                    conn_state_->local_mac, conn_state_->remote_mac,
-                    ip_id_++);
+        // Calculate max SACK blocks based on timestamp setting (compile-time + runtime)
+        // params.ts_val is set by build_tcp_params() based on timestamp_enabled
+        const bool ts_in_packet = (params.ts_val != 0);
+        const uint8_t max_sack_blocks = ts_in_packet
+            ? userspace_stack::SACK_MAX_BLOCKS_WITH_TS
+            : userspace_stack::SACK_MAX_BLOCKS;
 
-                // Calculate actual blocks written (capped to 3 with timestamps, 4 without)
-                // Use params.ts_val which was set by build_tcp_params() based on timestamp_enabled
-                bool ts_in_packet = (params.ts_val != 0);
-                uint8_t max_blocks = ts_in_packet
-                    ? userspace_stack::SACK_MAX_BLOCKS_WITH_TS
-                    : userspace_stack::SACK_MAX_BLOCKS;
-                uint8_t actual_blocks = (sack_blocks.count > max_blocks) ? max_blocks : sack_blocks.count;
-                // DEBUG: show timestamp state
-                fprintf(stderr, "[DEBUG-SACK] ts_val=%u ts_enabled=%d peer_ts=%u raw_blocks=%u actual=%u\n",
-                        params.ts_val, conn_state_->timestamp_enabled, conn_state_->peer_ts_val,
-                        sack_blocks.count, actual_blocks);
+        // DSACK block (RFC 2883) - first block reports duplicate segment
+        if (dup_len_ > 0) {
+            sack_blocks.blocks[0].left_edge = dup_seq_;
+            sack_blocks.blocks[0].right_edge = dup_seq_ + dup_len_;
+            sack_blocks.count = 1;
+            fprintf(stderr, "[TRANSPORT-TX] DSACK block [%u-%u] (dup below rcv_nxt=%u)\n",
+                    dup_seq_, dup_seq_ + dup_len_, conn_state_->rcv_nxt);
+            // Clear after use
+            dup_len_ = 0;
+        }
 
-                // Dump OOO buffer FIRST so formatter sees it before SACK line
+        // Regular SACK blocks from OOO buffer (RFC 2018)
+        if (conn_state_->sack_enabled && !ooo_buffer_.is_empty()) {
+            // Calculate remaining blocks available after DSACK
+            const uint8_t remaining_blocks = max_sack_blocks - sack_blocks.count;
+            userspace_stack::SACKBlockArray ooo_blocks;
+            ooo_buffer_.extract_sack_blocks(conn_state_->rcv_nxt, ooo_blocks, remaining_blocks);
+
+            // Append OOO blocks after DSACK (RFC 2018 Section 4: most recent first)
+            for (uint8_t i = 0; i < ooo_blocks.count && sack_blocks.count < max_sack_blocks; i++) {
+                sack_blocks.blocks[sack_blocks.count++] = ooo_blocks.blocks[i];
+            }
+        }
+
+        // Build ACK with SACK/DSACK if we have blocks
+        if (sack_blocks.count > 0) {
+            frame_len = userspace_stack::TCPPacket::build_ack_with_sack(
+                frame, frame_size_, params, sack_blocks,
+                conn_state_->local_mac, conn_state_->remote_mac,
+                ip_id_++);
+
+            // sack_blocks.count is already limited to max_sack_blocks (calculated earlier)
+            uint8_t actual_blocks = sack_blocks.count;
+            // DEBUG: show timestamp state
+            fprintf(stderr, "[DEBUG-SACK] ts_val=%u ts_enabled=%d peer_ts=%u max_blocks=%u actual=%u\n",
+                    params.ts_val, conn_state_->timestamp_enabled, conn_state_->peer_ts_val,
+                    max_sack_blocks, actual_blocks);
+
+            // Dump OOO buffer FIRST so formatter sees it before SACK line
+            if (!ooo_buffer_.is_empty()) {
                 ooo_buffer_.debug_dump("[OOO-BUFFER]");
-                fprintf(stderr, "[TRANSPORT-TX] SACK ACK umem_id=%u rcv_nxt=%u blocks=%u",
-                        frame_idx, params.rcv_nxt, actual_blocks);
-                for (uint8_t i = 0; i < actual_blocks; i++) {
-                    fprintf(stderr, " [%u-%u]", sack_blocks.blocks[i].left_edge,
-                            sack_blocks.blocks[i].right_edge);
+            }
+            fprintf(stderr, "[TRANSPORT-TX] SACK ACK umem_id=%u rcv_nxt=%u blocks=%u",
+                    frame_idx, params.rcv_nxt, actual_blocks);
+            for (uint8_t i = 0; i < actual_blocks; i++) {
+                fprintf(stderr, " [%u-%u]", sack_blocks.blocks[i].left_edge,
+                        sack_blocks.blocks[i].right_edge);
+            }
+            fprintf(stderr, "\n");
+            // Hex dump TCP options (SACK area) - starts at offset 54 (ETH+IP+TCP_MIN)
+            if (frame_len > 54) {
+                fprintf(stderr, "[SACK-HEX] TCP opts: ");
+                for (size_t i = 54; i < frame_len && i < 54 + 40; i++) {
+                    fprintf(stderr, "%02x ", frame[i]);
                 }
                 fprintf(stderr, "\n");
-                // Hex dump TCP options (SACK area) - starts at offset 54 (ETH+IP+TCP_MIN)
-                if (frame_len > 54) {
-                    fprintf(stderr, "[SACK-HEX] TCP opts: ");
-                    for (size_t i = 54; i < frame_len && i < 54 + 40; i++) {
-                        fprintf(stderr, "%02x ", frame[i]);
-                    }
-                    fprintf(stderr, "\n");
-                }
             }
         }
 
@@ -1237,6 +1559,96 @@ struct TransportProcess {
     }
 
     // ========================================================================
+    // Connection Teardown
+    // ========================================================================
+
+    /**
+     * Send TCP FIN+ACK packet to complete the 4-way handshake.
+     * Uses ACK frame pool and ACK_OUTBOX (same path as regular ACKs).
+     * FIN consumes 1 sequence number.
+     */
+    void send_tcp_fin() {
+        uint32_t frame_idx = allocate_ack_frame();
+        if (frame_idx == UINT32_MAX) {
+            fprintf(stderr, "[TRANSPORT] WARNING: Cannot send FIN - ACK frame pool exhausted\n");
+            return;
+        }
+
+        uint64_t umem_addr = frame_idx_to_addr(frame_idx, frame_size_);
+        uint8_t* frame = umem_area_ + umem_addr;
+
+        auto params = build_tcp_params();
+
+        // Build FIN+ACK packet
+        size_t frame_len = userspace_stack::TCPPacket::build(
+            frame, frame_size_, params,
+            userspace_stack::TCP_FLAG_FIN | userspace_stack::TCP_FLAG_ACK,
+            nullptr, 0,
+            conn_state_->local_mac, conn_state_->remote_mac,
+            ip_id_++);
+
+        if (frame_len == 0) {
+            fprintf(stderr, "[TRANSPORT] WARNING: TCPPacket::build() failed for FIN\n");
+            return;
+        }
+
+        // FIN consumes 1 sequence number
+        conn_state_->snd_nxt++;
+
+        // Publish to ACK_OUTBOX
+        int64_t seq = ack_outbox_prod_->try_claim();
+        if (seq < 0) {
+            fprintf(stderr, "[TRANSPORT] WARNING: Cannot send FIN - ACK_OUTBOX full\n");
+            return;
+        }
+
+        auto& desc = (*ack_outbox_prod_)[seq];
+        desc.umem_addr = umem_addr;
+        desc.frame_len = static_cast<uint16_t>(frame_len);
+        desc.frame_type = FRAME_TYPE_ACK;
+        desc.nic_timestamp_ns = 0;
+        desc.nic_frame_poll_cycle = 0;
+        desc.consumed = 0;
+        ack_outbox_prod_->publish(seq);
+
+        fprintf(stderr, "[TRANSPORT-TX] FIN+ACK umem_id=%u seq=%u ack=%u\n",
+                frame_idx, params.snd_nxt, params.rcv_nxt);
+    }
+
+    /**
+     * Handle graceful connection teardown.
+     * Called when server sends TCP FIN or TLS close_notify.
+     * Logs connection duration, optionally sends FIN, and signals all processes to stop.
+     *
+     * @param send_fin If true, send TCP FIN to complete 4-way handshake
+     */
+    void on_finished(bool send_fin = false) {
+        // Prevent double-invocation (FIN and close_notify often arrive together)
+        if (finished_called_) return;
+        finished_called_ = true;
+
+        // Calculate connection duration
+        uint64_t now_cycle = rdtsc();
+        uint64_t duration_cycles = now_cycle - connection_start_cycle_;
+        double duration_sec = static_cast<double>(duration_cycles) / conn_state_->tsc_freq_hz;
+
+        fprintf(stderr, "\n");
+        fprintf(stderr, "╔══════════════════════════════════════════════════════════════════╗\n");
+        fprintf(stderr, "║  [TRANSPORT] on_finished() - Connection teardown initiated       ║\n");
+        fprintf(stderr, "╠══════════════════════════════════════════════════════════════════╣\n");
+        fprintf(stderr, "║  Connection duration: %.3f seconds                              \n", duration_sec);
+        fprintf(stderr, "╚══════════════════════════════════════════════════════════════════╝\n");
+
+        // Send TCP FIN to complete 4-way handshake if requested
+        if (send_fin) {
+            send_tcp_fin();
+        }
+
+        // Signal all processes to stop
+        conn_state_->shutdown_all();
+    }
+
+    // ========================================================================
     // Retransmit
     // ========================================================================
 
@@ -1269,7 +1681,8 @@ struct TransportProcess {
             });
 
         if (has_fatal) {
-            conn_state_->running[PROC_TRANSPORT].flag.store(0, std::memory_order_release);
+            // Max retransmits exceeded - connection is dead, trigger shutdown
+            on_finished(false);  // No FIN needed, connection unresponsive
             return;
         }
 
@@ -1303,6 +1716,7 @@ struct TransportProcess {
                 fprintf(stderr, "[TRANSPORT-TX] RETRANSMIT %s umem_id=%u seq=%u-%u len=%u attempt=%u\n",
                         name, seg.frame_idx, seg.seq_start, seg.seq_end,
                         seg.seq_end - seg.seq_start, seg.retransmit_count + 1);
+                health_retransmits_++;  // Track for health summary
 
                 // Write descriptor to pre-claimed slot
                 int64_t out_seq = batch_start + slot_idx;
@@ -1977,9 +2391,10 @@ private:
                             }
                             memcpy(handshake_rx_buf_ + handshake_rx_len_, data + offset, len);
                             handshake_rx_len_ += len;
-                            conn_state_->rcv_nxt = tcp_params_.rcv_nxt;
                             return true;
                         });
+                    // Sync after try_deliver updates tcp_params_.rcv_nxt
+                    conn_state_->rcv_nxt = tcp_params_.rcv_nxt;
 
                     // Only send ACK when we received payload data (don't ACK pure ACKs)
                     send_ack_during_handshake();
@@ -2252,16 +2667,56 @@ private:
     // Deferred ACK flags for IDLE processing
     bool seen_dup_packet_ = false;   // Set when FULL DUP received, triggers ACK in IDLE
     bool seen_ooo_packet_ = false;   // Set when OOO packet received, triggers SACK in IDLE
-    // OOO recovery: duplicate ACKs for fast retransmit (no cap - match kernel behavior)
-    uint32_t ooo_dup_ack_count_ = 0;    // DUP ACKs sent for current OOO gap
-    uint64_t last_dup_ack_cycle_ = 0;   // Last time we sent a DUP ACK (for RTO-based throttle)
-    uint64_t dup_ack_interval_cycles_ = 0;  // RTO timeout in cycles (200ms)
+    // DSACK state (RFC 2883) - captures duplicate segment info for DSACK block
+    uint32_t dup_seq_ = 0;           // Start seq of duplicate segment
+    uint16_t dup_len_ = 0;           // Length of duplicate segment
+
+    // Connection health summary stats (reset each 1s interval)
+    uint64_t health_rx_frames_ = 0;        // RX frames this interval
+    uint64_t health_tx_frames_ = 0;        // TX frames this interval
+    uint64_t health_ooo_packets_ = 0;      // OOO packets this interval
+    uint64_t health_dup_packets_ = 0;      // Duplicate packets this interval
+    uint64_t health_retransmits_ = 0;      // Retransmits this interval
+    uint64_t health_last_cycle_ = 0;       // Last health summary timestamp
+    uint64_t health_interval_cycles_ = 0;  // 1 second in cycles (set in init)
+
+    // Track last printed state for change detection
+    struct LastHealthState {
+        int64_t meta_prod = -1;             // META ring producer seq (trades)
+        int64_t pongs_prod = -1;            // PONG ring producer seq (pings received)
+        int64_t pongs_cons = -1;            // PONG ring consumer seq (pongs sent)
+        uint64_t rx_frames = 0;             // RX frames
+        uint64_t tx_frames = 0;             // TX frames
+        uint64_t ooo_packets = 0;           // OOO packets
+        uint64_t dup_packets = 0;           // Duplicate packets
+        uint64_t retransmits = 0;           // Retransmits
+        uint32_t rcv_nxt = 0;               // TCP rcv_nxt
+        uint32_t snd_nxt = 0;               // TCP snd_nxt
+        uint32_t snd_una = 0;               // TCP snd_una
+        size_t ooo_count = 0;               // OOO buffer count
+        size_t msg_rtx_size = 0;            // MSG retransmit queue size
+        size_t pong_rtx_size = 0;           // PONG retransmit queue size
+        int64_t raw_inbox_prod = -1;        // RAW_INBOX producer seq
+        int64_t ack_prod = -1;              // ACK_OUTBOX producer seq
+        int64_t pong_outbox_prod = -1;      // PONG_OUTBOX producer seq
+    } last_health_;
+
+    // Connection lifecycle tracking
+    uint64_t connection_start_cycle_ = 0;  // TSC cycle when run() begins (post-handshake)
+    bool finished_called_ = false;         // Prevent double-invocation of on_finished()
 
     // Retransmit state - separate queues for MSG and PONG frames
     ZeroCopyRetransmitQueue msg_retransmit_queue_;       // MSG frames
     ZeroCopyRetransmitQueue pong_retransmit_queue_;  // PONG frames
+    LastPongInfo last_pong_;  // Track last PONG for explicit ACK logging
     uint64_t rto_cycles_ = 0;          // Calculated from TSC frequency in init()
-    uint64_t ack_timeout_cycles_ = 0;  // Calculated from TSC frequency in init()
+
+    // Delayed ACK state
+    uint64_t delack_min_cycles_ = 0;       // TcpDelackMinMs converted to CPU cycles
+    uint64_t delack_max_cycles_ = 0;       // TcpDelackMaxMs converted to CPU cycles
+    uint64_t first_unacked_cycle_ = 0;     // TSC when first unacked packet arrived
+    bool has_unacked_packets_ = false;     // True if packets pending ACK
+    uint32_t idle_loop_counter_ = 0;       // Counter for periodic timeout check
 
     // Handshake RX buffer - used to copy TLS data during handshake
     // This allows immediate frame commit while keeping data valid for SSL
@@ -2290,6 +2745,9 @@ private:
 
     // Profiling data (optional, set via set_profiling_data())
     CycleSampleBuffer* profiling_data_ = nullptr;
+
+    // Debug packet history for retransmit detection (zero-size when disabled)
+    [[no_unique_address]] DebugPacketHistory<kDebugTCP> debug_packet_history_;
 
 public:
     // Profiling setter

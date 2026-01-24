@@ -583,6 +583,11 @@ struct IPCRingProducer {
         return region_.consumer_sequence(0)->load(std::memory_order_acquire);
     }
 
+    // Get producer published sequence (for monitoring ring buffer fill level)
+    int64_t published_sequence() const {
+        return region_.producer_published()->load(std::memory_order_acquire);
+    }
+
     // Get data pointer for direct access (used by XDP Poll for frame reclaim)
     T* data() { return region_.template data<T>(); }
     const T* data() const { return region_.template data<T>(); }
@@ -930,6 +935,11 @@ struct IPCRingConsumer {
 
     // Get current committed sequence (for debugging/stats)
     int64_t sequence() const { return sequence_; }
+
+    // Get producer published sequence (for monitoring ring buffer fill level)
+    int64_t published_sequence() const {
+        return region_.producer_published()->load(std::memory_order_acquire);
+    }
 
     // Get last processed sequence (for deferred commit tracking)
     int64_t last_processed() const { return last_processed_; }

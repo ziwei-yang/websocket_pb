@@ -45,8 +45,8 @@
 // pipeline_data.hpp must be included FIRST as it includes disruptor headers
 // before pipeline_config.hpp to avoid CACHE_LINE_SIZE macro conflict
 #include "../../src/pipeline/pipeline_data.hpp"
-#include "../../src/pipeline/xdp_poll_process.hpp"
-#include "../../src/pipeline/transport_process.hpp"
+#include "../../src/pipeline/00_xdp_poll_process.hpp"
+#include "../../src/pipeline/10_tcp_ssl_process.hpp"
 #include "../../src/pipeline/msg_inbox.hpp"
 #include "../../src/policy/ssl.hpp"  // LibreSSLPolicy
 

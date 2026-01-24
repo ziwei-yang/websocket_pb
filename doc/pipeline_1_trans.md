@@ -5,6 +5,7 @@
 - [XDP Poll Process (Core 2)](pipeline_0_nic.md)
 - [WebSocket Process (Core 6)](pipeline_2_ws.md)
 - [AppClient Process (Core 8)](pipeline_3_app.md)
+- [TCP Stack Details](pipeline_1_trans_tcpstack.md) - TCP Timestamps (RFC 7323), SACK (RFC 2018), OOO handling
 
 ---
 
@@ -574,12 +575,12 @@ The zero-copy TX path (`process_outbound<TxType>()` and `prepare_encrypted_packe
 TCP header with no options. This allows the hardcoded offset 54 (ETH 14 + IP 20 + TCP 20) to be
 used for payload placement.
 
-- **Data packets**: Always use `TCP_FLAG_PSH | TCP_FLAG_ACK` with 20-byte TCP header
-- **SYN packets**: Use `TCPPacket::build()` (not zero-copy) which supports 24-byte header with MSS option
-- **No TCP timestamp/SACK options**: HFT systems typically disable these for latency reasons
+- **Data packets**: Use `TCP_FLAG_PSH | TCP_FLAG_ACK` with 20-byte (no timestamps) or 32-byte (with timestamps) TCP header
+- **SYN packets**: Use `TCPPacket::build()` (not zero-copy) which supports 28-byte (no TS) or 40-byte (with TS) header with MSS + SACK_OK + Timestamp options
+- **TCP Timestamps (RFC 7323)**: Enabled by default (like Linux kernel) via `TCPTimestampEnabled` template parameter. Provides accurate RTT measurement and PAWS protection.
+- **SACK (RFC 2018)**: Negotiated via SACK_OK in SYN. Enables selective acknowledgment of OOO segments for efficient retransmission.
 
-If TCP options were needed on data packets, the payload offset would vary and zero-copy would
-require dynamic offset calculation. Current design trades flexibility for simplicity and speed.
+See [Transport TCP Stack](pipeline_1_trans_tcpstack.md) for detailed TCP options implementation.
 
 **Why This Matters for HFT**:
 1. **Cache efficiency**: Data stays in L1/L2 cache, no cache pollution from copies
@@ -1364,6 +1365,8 @@ void TransportProcess::ssl_read_to_msg_inbox() {
 
 ## TCP Retransmission (Interval-Based Check)
 
+> **See Also**: [TCP Stack Details](pipeline_1_trans_tcpstack.md) for timestamp updates on retransmit and retransmit queue structure.
+
 **Scheduling**: Retransmit check runs when idle (`!data_moved`) OR every `RETRANSMIT_CHECK_INTERVAL` (1024) loops.
 This optimization saves ~50-200ns per busy loop by skipping queue iteration when network is healthy.
 
@@ -1624,6 +1627,8 @@ void TransportProcess::send_ack() {
 ---
 
 ## ACK and Control Frame Helpers
+
+> **See Also**: [TCP Stack Details](pipeline_1_trans_tcpstack.md) for SACK ACK implementation and deferred ACK pattern.
 
 ### send_ack()
 ```cpp
@@ -2238,6 +2243,8 @@ inline bool seq_leq(uint32_t a, uint32_t b) {
 ---
 
 ## Out-of-Order (OOO) TCP Segment Handling
+
+> **See Also**: [TCP Stack Details](pipeline_1_trans_tcpstack.md) for SACK support, duplicate ACK handling, and bug fixes (Issue 001/002).
 
 TCP segments can arrive out of order due to network path variations, packet loss/retransmission, or load balancing. Transport Process handles OOO segments differently in **handshake phase** vs **main loop phase**.
 

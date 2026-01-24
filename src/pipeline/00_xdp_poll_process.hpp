@@ -1,4 +1,4 @@
-// pipeline/xdp_poll_process.hpp
+// pipeline/00_xdp_poll_process.hpp
 // XDP Poll Process - Kernel interface for zero-copy packet I/O
 // Runs on dedicated CPU core, handles UMEM frame management
 // C++20, policy-based design, single-thread HFT focus
@@ -57,7 +57,8 @@ template<typename RingProducer,
          bool TrickleEnabled = true,
          bool Profiling = false,
          uint32_t FrameHeadroom = 256,
-         uint32_t FrameSize = 2048>
+         uint32_t FrameSize = 2048,
+         bool DebugXDP = false>
 struct XDPPollProcess {
     // Compile-time constants from template args
     static constexpr bool kTrickleEnabled = TrickleEnabled;
@@ -65,6 +66,15 @@ struct XDPPollProcess {
     static constexpr uint32_t kFrameHeadroom = FrameHeadroom;
     static constexpr uint32_t kFrameSize = FrameSize;
     static constexpr uint32_t kQueueId = 0;  // Always queue 0
+    static constexpr bool kDebugXDP = DebugXDP;
+
+    // Debug printf - only prints when DebugXDP enabled (zero overhead otherwise)
+    template<typename... Args>
+    static void debug_printf([[maybe_unused]] const char* fmt, [[maybe_unused]] Args&&... args) {
+        if constexpr (kDebugXDP) {
+            fprintf(stderr, fmt, std::forward<Args>(args)...);
+        }
+    }
     // Pre-reserve TX slots: min(256, TX_RING_SIZE/4) to avoid exhausting small rings
     static constexpr uint32_t TX_PRESERVE_SIZE =
         (256 < XSK_RING_PROD__DEFAULT_NUM_DESCS / 4) ? 256 : XSK_RING_PROD__DEFAULT_NUM_DESCS / 4;
@@ -265,6 +275,10 @@ struct XDPPollProcess {
             conn_state_->set_handshake_xdp_ready();
         }
 
+        // Initialize BPF stats timing (1 second interval)
+        stats_interval_cycles_ = conn_state_->tsc_freq_hz;
+        stats_last_cycle_ = rdtsc();
+
         return true;
     }
 
@@ -297,6 +311,22 @@ struct XDPPollProcess {
 
             bool data_moved = (tx_count > 0) || (rx_count > 0);
 
+            // Debug: Fill-ring starvation monitoring (non-IDLE, every loop when debug enabled)
+            if constexpr (kDebugXDP) {
+                uint32_t fill_prod = *fill_ring_.producer;
+                uint32_t fill_cons = *fill_ring_.consumer;
+                uint32_t fill_avail = fill_prod - fill_cons;  // Available slots in fill ring
+                uint32_t fill_size = fill_ring_.size;
+
+                // Warn if fill ring is getting low (< 25% capacity)
+                if (fill_avail < fill_size / 4) {
+                    debug_printf("[XDP-DEBUG] Fill-ring LOW: avail=%u/%u (%.1f%%) prod=%u cons=%u last_released=%ld\n",
+                                 fill_avail, fill_size,
+                                 (fill_avail * 100.0) / fill_size,
+                                 fill_prod, fill_cons, last_released_seq_);
+                }
+            }
+
             // 2. Trickle (every 8th iteration)
             bool trickle_triggered = ((++trickle_counter & 0x07) == 0);
             profile_op([this]{ send_trickle(); return 1; }, slot, 2, trickle_triggered);
@@ -316,6 +346,17 @@ struct XDPPollProcess {
                 slot->nic_poll_cycle = first_rx_poll_cycle_;
                 slot->transport_poll_cycle = 0;  // Not used by XDP Poll
                 profiling_data_->commit();
+            }
+
+            // Periodic BPF stats printing (every 1 second)
+            {
+                uint64_t now = rdtsc();
+                if (now - stats_last_cycle_ >= stats_interval_cycles_) {
+                    if (bpf_loader_) {
+                        bpf_loader_->print_stats();
+                    }
+                    stats_last_cycle_ = now;
+                }
             }
 
             loop_id++;
@@ -895,6 +936,10 @@ private:
     // Pre-reserved TX slots (proactive reservation in idle loop)
     uint32_t tx_preserved_count_ = 0;   // Current number of preserved slots
     uint32_t tx_preserved_idx_ = 0;     // Starting index of preserved slots
+
+    // Periodic BPF stats and debug timing
+    uint64_t stats_interval_cycles_ = 0;  // 1 second in cycles
+    uint64_t stats_last_cycle_ = 0;       // Last stats print timestamp
 
 #if DEBUG
     // For FIFO ordering verification (design doc: abort on out-of-order)

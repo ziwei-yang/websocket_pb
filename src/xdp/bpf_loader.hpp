@@ -434,25 +434,17 @@ struct BPFLoader {
         return stats;
     }
 
-    // Print statistics
+    // Print statistics (single-line, skip duplicates)
     void print_stats() const {
         BPFStats stats = get_stats();
+        if (stats.total_packets == last_printed_total_) return;  // Skip duplicate
+        last_printed_total_ = stats.total_packets;
 
-        printf("\n[BPF] Statistics:\n");
-        printf("  Total packets:     %lu\n", stats.total_packets);
-        printf("  Exchange packets:  %lu (%.1f%%)\n",
-               stats.exchange_packets,
-               stats.total_packets > 0 ? (stats.exchange_packets * 100.0 / stats.total_packets) : 0.0);
-        printf("  Kernel packets:    %lu (%.1f%%)\n",
-               stats.kernel_packets,
-               stats.total_packets > 0 ? (stats.kernel_packets * 100.0 / stats.total_packets) : 0.0);
-        printf("  IPv4 packets:      %lu\n", stats.ipv4_packets);
-        printf("  TCP packets:       %lu\n", stats.tcp_packets);
-        printf("  Non-TCP packets:   %lu\n", stats.non_tcp_packets);
-        printf("  Parse errors:      %lu\n", stats.parse_errors);
-        printf("  Dropped packets:   %lu\n", stats.dropped_packets);
-        printf("  HW timestamp OK:   %lu\n", stats.timestamp_ok);
-        printf("  HW timestamp fail: %lu\n", stats.timestamp_fail);
+        double xchg_pct = stats.ipv4_packets > 0 ? (stats.exchange_packets * 100.0 / stats.ipv4_packets) : 0.0;
+        fprintf(stderr, "[BPF] ipv4=%lu xchg=%lu(%.1f%%) kern=%lu tcp=%lu non-tcp=%lu drop=%lu hwts=%lu/%lu\n",
+                stats.ipv4_packets, stats.exchange_packets, xchg_pct, stats.kernel_packets,
+                stats.tcp_packets, stats.non_tcp_packets, stats.dropped_packets,
+                stats.timestamp_ok, stats.timestamp_fail);
     }
 
     // Get map FDs (for advanced usage)
@@ -494,6 +486,9 @@ private:
     uint32_t xdp_flags_ = 0;  // Track flags used during attach
     std::string interface_;
     std::string bpf_obj_path_;
+
+    // For duplicate stats suppression
+    mutable uint64_t last_printed_total_ = 0;
 };
 
 } // namespace websocket::xdp

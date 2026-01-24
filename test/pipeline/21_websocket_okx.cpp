@@ -1,15 +1,21 @@
-// test/pipeline/10_transport_tcp.cpp
-// Test TransportProcess<NoSSLPolicy> with XDP Poll against TCP echo server
+// test/pipeline/21_websocket_okx.cpp
+// Test WebSocketProcess with XDP Poll + Transport against OKX WSS stream
 //
-// Usage: ./test_pipeline_transport_tcp <interface> <bpf_path> <echo_ip> <echo_port>
-// (Called by scripts/test_xdp.sh 10_transport_tcp.cpp)
+// Usage: ./test_pipeline_websocket_okx <interface> <bpf_path> [ignored...] [--timeout <ms>]
+// (Called by scripts/test_xdp.sh 21_websocket_okx.cpp)
+//
+// Build: make build-test-pipeline-websocket_okx USE_XDP=1 USE_WOLFSSL=1
+//
+// Options:
+//   --timeout <ms>   Stream timeout in milliseconds (default: 5000)
+//                    If <= 0, run forever and display every message received
 //
 // This test:
-// - Forks XDP Poll process (core 2) and Transport process (core 4)
-// - Connects to TCP echo server (no TLS via NoSSLPolicy)
-// - Sends 5000 messages at 1ms intervals via MSG_OUTBOX
-// - Verifies echo responses via MSG_METADATA
-// - Timeout: 5 seconds total
+// - Forks XDP Poll (core 2), Transport (core 4), WebSocket (core 6)
+// - Connects to ws.okx.com on port 8443 (WSS with WolfSSL)
+// - WebSocketProcess handles HTTP+WS handshake, frame parsing
+// - Parent consumes WS_FRAME_INFO ring, validates JSON orderbook events
+// - Verifies ring buffer consumers caught up
 //
 // Safety: Uses dedicated test interface, never touches default route
 
@@ -20,6 +26,9 @@
 #include <atomic>
 #include <chrono>
 #include <string>
+#include <string_view>
+#include <vector>
+#include <algorithm>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -28,6 +37,7 @@
 #include <net/if.h>
 #include <arpa/inet.h>
 #include <sys/ioctl.h>
+#include <netdb.h>
 
 #ifdef USE_XDP
 
@@ -39,8 +49,10 @@
 #include "../../src/pipeline/pipeline_data.hpp"
 #include "../../src/pipeline/00_xdp_poll_process.hpp"
 #include "../../src/pipeline/10_tcp_ssl_process.hpp"
+#include "../../src/pipeline/20_ws_process.hpp"
 #include "../../src/pipeline/msg_inbox.hpp"
-#include "../../src/policy/ssl.hpp"  // NoSSLPolicy
+#include "../../src/core/http.hpp"
+#include "../../src/policy/ssl.hpp"  // WolfSSLPolicy
 
 using namespace websocket::pipeline;
 
@@ -53,23 +65,35 @@ namespace {
 // CPU core assignments for latency-critical processes
 constexpr int XDP_POLL_CPU_CORE = 2;
 constexpr int TRANSPORT_CPU_CORE = 4;
+constexpr int WEBSOCKET_CPU_CORE = 6;
 
-// Test parameters
-constexpr int MAX_MESSAGES = 5000;                         // Max messages to send
-constexpr int TIMEOUT_SECONDS = 5;                         // Total timeout
-constexpr int SEND_INTERVAL_MS = 1;                        // Send every 1ms
-constexpr uint64_t TEST_TIMEOUT_NS = 5'000'000'000ULL;     // 5 seconds in ns
+// Test parameters (defaults, can be overridden by --timeout argument)
+constexpr int DEFAULT_STREAM_DURATION_MS = 5000;   // Stream for 5 seconds
+constexpr int FINAL_DRAIN_MS = 2000;               // Wait 2s after streaming
+constexpr int MIN_EXPECTED_UPDATES = 10;           // Expect at least 10 orderbook updates in 5s for BTC-USDT-SWAP
 
-// Test configuration - set from command line
-std::string g_echo_server_ip = "139.162.79.171";
-uint16_t g_echo_server_port = 12345;
+// Runtime timeout (set by --timeout argument)
+int g_timeout_ms = DEFAULT_STREAM_DURATION_MS;     // -1 or 0 = run forever
+
+// WebSocket target
+static constexpr const char* WSS_HOST = "ws.okx.com";
+static constexpr uint16_t WSS_PORT = 8443;
+static constexpr const char* WSS_PATH = "/ws/v5/public";
+
+// Test configuration
 std::string g_local_ip;  // Detected from interface
 
-// Global shutdown flag
+// Global shutdown flag and connection state pointer for signal handler
 std::atomic<bool> g_shutdown{false};
+ConnStateShm* g_conn_state = nullptr;  // Set after setup, used by signal handler
 
-void signal_handler(int) {
+void signal_handler(int sig) {
     g_shutdown.store(true, std::memory_order_release);
+    // Notify all processes to stop immediately
+    if (g_conn_state) {
+        g_conn_state->shutdown_all();
+    }
+    fprintf(stderr, "\n[SIGNAL] Received signal %d, initiating graceful shutdown...\n", sig);
 }
 
 // Pin current process to specified CPU core with SCHED_FIFO priority
@@ -113,94 +137,35 @@ void calibrate_tsc() {
     printf("[TSC] Calibrated: %.3f GHz (%.3f cycles/ns)\n", g_tsc_freq_ghz, g_tsc_freq_ghz);
 }
 
-// Get realtime clock (for comparison with NIC PHC timestamp)
-uint64_t get_realtime_ns() {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + ts.tv_nsec;
+// Resolve hostname to IP at runtime
+std::string resolve_hostname(const char* hostname) {
+    struct addrinfo hints = {}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(hostname, nullptr, &hints, &res) != 0 || !res) {
+        fprintf(stderr, "FAIL: Cannot resolve %s\n", hostname);
+        return "";
+    }
+
+    auto* addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr);
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
+    freeaddrinfo(res);
+
+    printf("Resolved %s -> %s\n", hostname, ip_str);
+    return ip_str;
 }
 
-// ============================================================================
-// Latency Statistics
-// ============================================================================
-
-struct LatencyStats {
-    int64_t min_ns = INT64_MAX;
-    int64_t max_ns = INT64_MIN;
-    int64_t sum_ns = 0;
-    uint64_t count = 0;
-
-    // Histogram buckets (in microseconds): <4, 4-5, 5-6, 6-7, 7-8, 8-10, 10-15, 15-20, 20-50, 50+
-    static constexpr int NUM_BUCKETS = 10;
-    uint64_t histogram[NUM_BUCKETS] = {};
-
-    int get_bucket(int64_t latency_ns) const {
-        int64_t us = latency_ns / 1000;  // Convert to microseconds
-        if (us < 4) return 0;
-        if (us < 5) return 1;
-        if (us < 6) return 2;
-        if (us < 7) return 3;
-        if (us < 8) return 4;
-        if (us < 10) return 5;
-        if (us < 15) return 6;
-        if (us < 20) return 7;
-        if (us < 50) return 8;
-        return 9;
-    }
-
-    void update(int64_t latency_ns) {
-        if (latency_ns < min_ns) min_ns = latency_ns;
-        if (latency_ns > max_ns) max_ns = latency_ns;
-        sum_ns += latency_ns;
-        count++;
-        histogram[get_bucket(latency_ns)]++;
-    }
-
-    void print(const char* name) const {
-        if (count == 0) {
-            printf("\n=== %s Latency Stats ===\n", name);
-            printf("No samples - cannot compute latency\n");
-            printf("=====================================\n\n");
-            return;
-        }
-
-        int64_t avg_ns = sum_ns / static_cast<int64_t>(count);
-
-        printf("\n=== %s Latency Stats ===\n", name);
-        printf("  Samples:    %lu\n", count);
-        printf("  Min:        %ld ns (%.3f us)\n", min_ns, min_ns / 1000.0);
-        printf("  Max:        %ld ns (%.3f us)\n", max_ns, max_ns / 1000.0);
-        printf("  Avg:        %ld ns (%.3f us)\n", avg_ns, avg_ns / 1000.0);
-
-        // Print histogram
-        printf("\n  Latency Histogram:\n");
-        const char* bucket_labels[NUM_BUCKETS] = {
-            "  < 4us", "  4-5us", "  5-6us", "  6-7us", "  7-8us",
-            " 8-10us", "10-15us", "15-20us", "20-50us", "  50+us"
-        };
-
-        // Find max bucket for scaling
-        uint64_t max_bucket = 0;
-        for (int i = 0; i < NUM_BUCKETS; i++) {
-            if (histogram[i] > max_bucket) max_bucket = histogram[i];
-        }
-
-        // Print histogram bars
-        constexpr int BAR_WIDTH = 40;
-        for (int i = 0; i < NUM_BUCKETS; i++) {
-            uint64_t b = histogram[i];
-            double pct = (count > 0) ? 100.0 * b / count : 0;
-            int bar_len = (max_bucket > 0) ? static_cast<int>(BAR_WIDTH * b / max_bucket) : 0;
-
-            printf("  %s |", bucket_labels[i]);
-            for (int j = 0; j < bar_len; j++) printf("█");
-            for (int j = bar_len; j < BAR_WIDTH; j++) printf(" ");
-            printf("| %6lu (%5.1f%%)\n", b, pct);
-        }
-        printf("=====================================\n");
-        fflush(stdout);
-    }
-};
+// Validate OKX orderbook JSON
+bool is_valid_orderbook_json(const char* data, size_t len) {
+    std::string_view sv(data, len);
+    // OKX books5 events have {"arg":{"channel":"books5",...},"data":[...]}
+    if (sv.find("\"arg\"") == std::string_view::npos) return false;
+    if (sv.find("\"channel\":\"books5\"") == std::string_view::npos) return false;
+    if (sv.find("\"data\"") == std::string_view::npos) return false;
+    return true;
+}
 
 }  // namespace
 
@@ -215,7 +180,7 @@ public:
         struct tm* tm_info = localtime(&now);
         char timestamp[32];
         strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);
-        ipc_ring_dir_ = std::string("transport_tcp_test_") + timestamp;
+        ipc_ring_dir_ = std::string("websocket_okx_test_") + timestamp;
     }
 
     ~IPCRingManager() {
@@ -294,7 +259,7 @@ public:
             return false;
         }
 
-        // XDP Poll <-> Transport rings (all use UMEMFrameDescriptor for type unification)
+        // XDP Poll <-> Transport rings
         if (!create_ring("raw_inbox", RAW_INBOX_SIZE * sizeof(UMEMFrameDescriptor),
                          sizeof(UMEMFrameDescriptor), 1)) return false;
         if (!create_ring("raw_outbox", RAW_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
@@ -304,13 +269,17 @@ public:
         if (!create_ring("pong_outbox", PONG_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
                          sizeof(UMEMFrameDescriptor), 1)) return false;
 
-        // Transport <-> Test (Parent) rings
+        // Transport <-> WebSocket rings
         if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
                          sizeof(MsgOutboxEvent), 1)) return false;
         if (!create_ring("msg_metadata", MSG_METADATA_SIZE * sizeof(MsgMetadata),
                          sizeof(MsgMetadata), 1)) return false;
         if (!create_ring("pongs", PONGS_SIZE * sizeof(PongFrameAligned),
                          sizeof(PongFrameAligned), 1)) return false;
+
+        // WebSocket <-> Parent (Test) ring
+        if (!create_ring("ws_frame_info", WS_FRAME_INFO_SIZE * sizeof(WSFrameInfo),
+                         sizeof(WSFrameInfo), 1)) return false;
 
         printf("[IPC] Created all ring files in %s\n", full_dir.c_str());
         return true;
@@ -322,7 +291,7 @@ public:
         std::string base = "/dev/shm/hft/" + ipc_ring_dir_;
         const char* ring_names[] = {
             "raw_inbox", "raw_outbox", "ack_outbox", "pong_outbox",
-            "msg_outbox", "msg_metadata", "pongs"
+            "msg_outbox", "msg_metadata", "pongs", "ws_frame_info"
         };
 
         for (const char* name : ring_names) {
@@ -440,45 +409,67 @@ bool get_default_gateway(const char* interface, std::string& gateway_out) {
 // Type Aliases
 // ============================================================================
 
-// Enable profiling
+// Enable debug modes
 static constexpr bool PROFILING_ENABLED = true;
+static constexpr bool DEBUG_TCP_ENABLED = true;  // TCP debug mode for retransmit detection
+static constexpr bool DEBUG_XDP_ENABLED = true;  // XDP debug mode for fill-ring monitoring
 
-// XDP Poll Process types (with profiling enabled)
+// XDP Poll Process types (with profiling and debug enabled)
 using XDPPollType = XDPPollProcess<
     IPCRingProducer<UMEMFrameDescriptor>,
     IPCRingConsumer<UMEMFrameDescriptor>,
     true,                                   // TrickleEnabled
-    PROFILING_ENABLED>;                     // Profiling
+    PROFILING_ENABLED,                      // Profiling
+    256,                                    // FrameHeadroom (default)
+    2048,                                   // FrameSize (default)
+    DEBUG_XDP_ENABLED>;                     // DebugXDP - fill-ring monitoring
 
-// Transport Process types (with profiling enabled)
-// All outbox rings use UMEMFrameDescriptor for XDPPollProcess compatibility
+// Transport Process types (with WolfSSL and profiling enabled)
 using TransportType = TransportProcess<
-    NoSSLPolicy,
+    WolfSSLPolicy,                         // WolfSSL for WSS
     IPCRingConsumer<UMEMFrameDescriptor>,  // RawInboxCons
     IPCRingProducer<UMEMFrameDescriptor>,  // RawOutboxProd
-    IPCRingProducer<UMEMFrameDescriptor>,  // AckOutboxProd (unified type)
-    IPCRingProducer<UMEMFrameDescriptor>,  // PongOutboxProd (unified type)
+    IPCRingProducer<UMEMFrameDescriptor>,  // AckOutboxProd
+    IPCRingProducer<UMEMFrameDescriptor>,  // PongOutboxProd
     IPCRingConsumer<MsgOutboxEvent>,       // MsgOutboxCons
     IPCRingProducer<MsgMetadata>,          // MsgMetadataProd
     IPCRingConsumer<PongFrameAligned>,     // PongsCons
-    PROFILING_ENABLED>;                    // Profiling
+    PROFILING_ENABLED,                     // Profiling
+    true,                                  // TCPTimestampEnabled (RFC 7323)
+    DEBUG_TCP_ENABLED,                     // DebugTCP - retransmit detection
+    2,                                     // TcpDelackNum (ACK after N packets)
+    40,                                    // TcpDelackMinMs (min delay before ACK)
+    200>;                                  // TcpDelackMaxMs (max delay, forced ACK)
+
+// WebSocket Process types
+using WebSocketType = WebSocketProcess<
+    IPCRingConsumer<MsgMetadata>,          // MsgMetadataCons
+    IPCRingProducer<WSFrameInfo>,          // WSFrameInfoProd
+    IPCRingProducer<PongFrameAligned>,     // PongsProd
+    IPCRingProducer<MsgOutboxEvent>>;      // MsgOutboxProd
 
 // ============================================================================
 // Test Class
 // ============================================================================
 
-class TransportTCPTest {
+class WebSocketOkxTest {
 public:
-    TransportTCPTest(const char* interface, const char* bpf_path,
-                     const char* echo_ip, uint16_t echo_port)
-        : interface_(interface), bpf_path_(bpf_path),
-          echo_ip_(echo_ip), echo_port_(echo_port) {}
+    WebSocketOkxTest(const char* interface, const char* bpf_path)
+        : interface_(interface), bpf_path_(bpf_path) {}
 
     bool setup() {
-        printf("\n=== Setting up Transport TCP Test ===\n");
+        printf("\n=== Setting up WebSocket OKX Test ===\n");
         printf("Interface:   %s\n", interface_);
         printf("BPF Path:    %s\n", bpf_path_);
-        printf("Echo Server: %s:%u\n\n", echo_ip_, echo_port_);
+
+        // Resolve WSS target
+        wss_target_ip_ = resolve_hostname(WSS_HOST);
+        if (wss_target_ip_.empty()) {
+            fprintf(stderr, "FAIL: Cannot resolve %s\n", WSS_HOST);
+            return false;
+        }
+        printf("Target:      %s:%u (%s)\n", WSS_HOST, WSS_PORT, wss_target_ip_.c_str());
+        printf("Path:        %s\n\n", WSS_PATH);
 
         calibrate_tsc();
 
@@ -518,6 +509,8 @@ public:
         printf("Gateway MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
                gateway_mac_[0], gateway_mac_[1], gateway_mac_[2],
                gateway_mac_[3], gateway_mac_[4], gateway_mac_[5]);
+
+        printf("WSS Target IP: %s (route must be set by test script)\n", wss_target_ip_.c_str());
 
         // Create IPC rings
         if (!ipc_manager_.create_all_rings()) {
@@ -569,11 +562,17 @@ public:
         }
         conn_state_->init();
 
-        // Set target and network config in shared state
-        strncpy(conn_state_->target_host, echo_ip_, sizeof(conn_state_->target_host) - 1);
-        conn_state_->target_port = echo_port_;
+        // Set target and network config in shared state (use resolved IP)
+        strncpy(conn_state_->target_host, WSS_HOST, sizeof(conn_state_->target_host) - 1);
+        conn_state_->target_port = WSS_PORT;
+        strncpy(conn_state_->target_path, WSS_PATH, sizeof(conn_state_->target_path) - 1);
         strncpy(conn_state_->bpf_path, bpf_path_, sizeof(conn_state_->bpf_path) - 1);
         strncpy(conn_state_->interface_name, interface_, sizeof(conn_state_->interface_name) - 1);
+
+        // Set subscription JSON for OKX books5 channel
+        strncpy(conn_state_->subscription_json,
+                R"({"op":"subscribe","args":[{"channel":"books5","instId":"BTC-USDT-SWAP"}]})",
+                sizeof(conn_state_->subscription_json) - 1);
 
         // Set local IP in network byte order
         struct in_addr addr;
@@ -613,6 +612,7 @@ public:
             msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
             msg_metadata_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata"));
             pongs_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pongs"));
+            ws_frame_info_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("ws_frame_info"));
         } catch (const std::exception& e) {
             fprintf(stderr, "FAIL: Cannot open shared regions: %s\n", e.what());
             return false;
@@ -637,6 +637,10 @@ public:
             kill(transport_pid_, SIGTERM);
             waitpid(transport_pid_, nullptr, 0);
         }
+        if (websocket_pid_ > 0) {
+            kill(websocket_pid_, SIGTERM);
+            waitpid(websocket_pid_, nullptr, 0);
+        }
 
         // Cleanup shared regions
         delete raw_inbox_region_;
@@ -646,6 +650,7 @@ public:
         delete msg_outbox_region_;
         delete msg_metadata_region_;
         delete pongs_region_;
+        delete ws_frame_info_region_;
 
         if (conn_state_ && conn_state_ != MAP_FAILED) {
             munmap(conn_state_, sizeof(ConnStateShm));
@@ -702,217 +707,296 @@ public:
 
         printf("[PARENT] Forked Transport process (PID %d)\n", transport_pid_);
 
-        // Wait for TCP handshake to complete (TLS skipped for NoSSLPolicy)
-        printf("[PARENT] Waiting for TCP handshake...\n");
+        // Wait for TLS handshake to complete (WolfSSL requires actual TLS handshake)
+        printf("[PARENT] Waiting for TLS handshake (WolfSSL)...\n");
         auto start = std::chrono::steady_clock::now();
         while (!conn_state_->is_handshake_tls_ready()) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count();
-            if (elapsed > 10000) {
-                fprintf(stderr, "FAIL: Timeout waiting for TCP handshake\n");
+            if (elapsed > 15000) {  // 15s timeout for TLS handshake
+                fprintf(stderr, "FAIL: Timeout waiting for TLS handshake\n");
                 return false;
             }
             if (!conn_state_->is_running(PROC_TRANSPORT)) {
-                fprintf(stderr, "FAIL: Transport process exited during handshake\n");
+                fprintf(stderr, "FAIL: Transport process exited during TLS handshake\n");
                 return false;
             }
             usleep(1000);
         }
-        printf("[PARENT] TCP handshake complete (TLS skipped for NoSSLPolicy)\n");
+        printf("[PARENT] TLS handshake complete (WolfSSL)\n");
+
+        // Fork WebSocket process
+        websocket_pid_ = fork();
+        if (websocket_pid_ < 0) {
+            fprintf(stderr, "FAIL: fork() for WebSocket failed\n");
+            return false;
+        }
+
+        if (websocket_pid_ == 0) {
+            // Child: WebSocket process
+            run_websocket_process();
+            _exit(0);
+        }
+
+        printf("[PARENT] Forked WebSocket process (PID %d)\n", websocket_pid_);
+
+        // Wait for WebSocket handshake to complete
+        printf("[PARENT] Waiting for WebSocket handshake...\n");
+        if (!conn_state_->wait_for_handshake_ws_ready(30000000)) {
+            fprintf(stderr, "FAIL: Timeout waiting for WebSocket handshake\n");
+            return false;
+        }
+        printf("[PARENT] WebSocket handshake complete\n");
 
         return true;
     }
 
-    bool run_roundtrip_test() {
-        printf("\n--- Roundtrip Echo Test (max %d msgs, timeout %ds, interval %dms) ---\n",
-               MAX_MESSAGES, TIMEOUT_SECONDS, SEND_INTERVAL_MS);
+    bool run_stream_test() {
+        bool run_forever = (g_timeout_ms <= 0);
 
-        // Create producer/consumer for parent
-        IPCRingProducer<MsgOutboxEvent> msg_outbox_prod(*msg_outbox_region_);
-        IPCRingConsumer<MsgMetadata> msg_metadata_cons(*msg_metadata_region_);
+        if (run_forever) {
+            printf("\n--- WSS Stream Test (FOREVER MODE - Ctrl+C to stop) ---\n");
+        } else {
+            printf("\n--- WSS Stream Test (%dms, expect %d+ orderbook updates) ---\n",
+                   g_timeout_ms, MIN_EXPECTED_UPDATES);
+        }
 
-        int sent = 0;
-        int received = 0;
-        int metadata_count = 0;
-        size_t received_bytes = 0;
+        // Create consumer for WS_FRAME_INFO ring
+        IPCRingConsumer<WSFrameInfo> ws_frame_cons(*ws_frame_info_region_);
+
+        // Tracking metrics
+        uint64_t total_frames = 0;
+        uint64_t text_frames = 0;
+        uint64_t binary_frames = 0;
+        uint64_t ping_frames = 0;
+        uint64_t pong_frames = 0;
+        uint64_t close_frames = 0;
+        uint64_t valid_updates = 0;
+        int64_t last_sequence = -1;
+        bool sequence_error = false;
+
         auto start_time = std::chrono::steady_clock::now();
-        auto last_send_time = start_time;
+        auto stream_end = start_time + std::chrono::milliseconds(g_timeout_ms);
 
-        // Latency tracking
-        LatencyStats nic_to_xdp_latency;      // NIC PHC -> XDP Poll
-        LatencyStats xdp_to_transport_latency; // XDP Poll -> Transport
-        LatencyStats transport_to_ssl_latency; // Transport -> SSL read
-        LatencyStats total_latency;            // NIC PHC -> SSL read
+        printf("[WSS] Starting stream reception...\n");
 
-        // Helper to process metadata and compute latencies
-        auto process_metadata = [&](const MsgMetadata& meta) {
-            if (meta.decrypted_len == 0) return;
-
-            metadata_count++;
-            received_bytes += meta.decrypted_len;
-
-            // Parse concatenated messages: count "TEST_MSG_" occurrences
-            const char* data = reinterpret_cast<const char*>(msg_inbox_) + meta.msg_inbox_offset;
-            for (uint32_t i = 0; i + 9 <= meta.decrypted_len; i++) {
-                if (memcmp(data + i, "TEST_MSG_", 9) == 0) {
-                    received++;
-                }
-            }
-
-            // Compute latencies from timestamp chain
-            // All latencies use "latest" packet timestamps for consistency (same packet through pipeline)
-            // NIC PHC -> XDP Poll: convert XDP poll cycle to realtime and compare with NIC timestamp
-            if (meta.latest_nic_timestamp_ns != 0 && meta.latest_nic_frame_poll_cycle != 0) {
-                uint64_t now_tsc = rdtsc();
-                uint64_t now_realtime_ns = get_realtime_ns();
-                uint64_t elapsed_cycles = now_tsc - meta.latest_nic_frame_poll_cycle;
-                uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_cycles / g_tsc_freq_ghz);
-                uint64_t xdp_poll_realtime_ns = now_realtime_ns - elapsed_ns;
-
-                int64_t nic_to_xdp_ns = static_cast<int64_t>(xdp_poll_realtime_ns) -
-                                       static_cast<int64_t>(meta.latest_nic_timestamp_ns);
-                if (nic_to_xdp_ns > 0 && nic_to_xdp_ns < 1'000'000'000) {  // Sanity check < 1s
-                    nic_to_xdp_latency.update(nic_to_xdp_ns);
-                }
-            }
-
-            // XDP Poll -> Transport: cycle difference (same packet)
-            // XDP Poll -> Transport: use latest packet timestamps (same packet)
-            if (meta.latest_nic_frame_poll_cycle != 0 && meta.latest_raw_frame_poll_cycle != 0) {
-                uint64_t cycles = meta.latest_raw_frame_poll_cycle - meta.latest_nic_frame_poll_cycle;
-                int64_t ns = static_cast<int64_t>(cycles / g_tsc_freq_ghz);
-                if (ns > 0 && ns < 1'000'000'000) {
-                    xdp_to_transport_latency.update(ns);
-                }
-            }
-
-            // Transport -> SSL read: cycle difference
-            if (meta.latest_raw_frame_poll_cycle != 0 && meta.ssl_read_cycle != 0) {
-                uint64_t cycles = meta.ssl_read_cycle - meta.latest_raw_frame_poll_cycle;
-                int64_t ns = static_cast<int64_t>(cycles / g_tsc_freq_ghz);
-                if (ns > 0 && ns < 1'000'000'000) {
-                    transport_to_ssl_latency.update(ns);
-                }
-            }
-
-            // Total: NIC PHC -> SSL read (using latest packet for consistency)
-            if (meta.latest_nic_timestamp_ns != 0 && meta.ssl_read_cycle != 0) {
-                uint64_t now_tsc = rdtsc();
-                uint64_t now_realtime_ns = get_realtime_ns();
-                uint64_t elapsed_cycles = now_tsc - meta.ssl_read_cycle;
-                uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_cycles / g_tsc_freq_ghz);
-                uint64_t ssl_read_realtime_ns = now_realtime_ns - elapsed_ns;
-
-                int64_t total_ns = static_cast<int64_t>(ssl_read_realtime_ns) -
-                                  static_cast<int64_t>(meta.latest_nic_timestamp_ns);
-                if (total_ns > 0 && total_ns < 1'000'000'000) {
-                    total_latency.update(total_ns);
-                }
-            }
-        };
-
-        // Main test loop
-        while (sent < MAX_MESSAGES) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-            if (elapsed_s >= TIMEOUT_SECONDS) {
-                printf("[TEST] Timeout reached after %ld seconds\n", elapsed_s);
+        // Main streaming loop
+        while (run_forever || std::chrono::steady_clock::now() < stream_end) {
+            if (g_shutdown.load(std::memory_order_acquire)) {
+                printf("[WSS] Shutdown signal received\n");
                 break;
             }
 
-            // Check if Transport is still running
-            if (!conn_state_->is_running(PROC_TRANSPORT)) {
-                fprintf(stderr, "[TEST] Transport process exited\n");
+            if (!conn_state_->is_running(PROC_WEBSOCKET)) {
+                fprintf(stderr, "[WSS] WebSocket process exited during streaming\n");
                 break;
             }
 
-            // Send next message if 1ms has passed
-            auto since_last = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_send_time).count();
-            if (since_last >= SEND_INTERVAL_MS) {
-                // Prepare test message
-                char msg[64];
-                snprintf(msg, sizeof(msg), "TEST_MSG_%04d", sent);
-                size_t msg_len = strlen(msg);
+            // Process WS_FRAME_INFO events
+            WSFrameInfo frame;
+            bool end_of_batch;
+            while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
+                total_frames++;
 
-                // Send via MSG_OUTBOX: try_claim() + fill + publish()
-                int64_t slot = msg_outbox_prod.try_claim();
-                if (slot >= 0) {
-                    auto& event = msg_outbox_prod[slot];
-                    event.data_len = static_cast<uint16_t>(msg_len);
-                    event.msg_type = MSG_TYPE_DATA;
-                    memcpy(event.data, msg, msg_len);
-                    msg_outbox_prod.publish(slot);
-                    sent++;
-                    last_send_time = now;
+                // Verify sequence ordering
+                int64_t current_seq = ws_frame_cons.sequence();
+                if (last_sequence != -1 && current_seq != last_sequence + 1) {
+                    fprintf(stderr, "WARN: Out-of-order frame! Expected %ld, got %ld\n",
+                            last_sequence + 1, current_seq);
+                    sequence_error = true;
+                }
+                last_sequence = current_seq;
 
-                    if (sent % 500 == 0) {
-                        printf("[PROGRESS] Sent: %d, Received: %d\n", sent, received);
+                // Count by opcode
+                switch (frame.opcode) {
+                    case 0x01:  // TEXT
+                        text_frames++;
+                        // Validate JSON orderbook data
+                        if (frame.payload_len > 0) {
+                            const uint8_t* payload = msg_inbox_->data_at(frame.msg_inbox_offset);
+                            if (is_valid_orderbook_json(reinterpret_cast<const char*>(payload), frame.payload_len)) {
+                                valid_updates++;
+                                // In forever mode, display every message; otherwise only first 3
+                                if (run_forever || valid_updates <= 3) {
+                                    printf("[ORDERBOOK #%lu] %.*s\n",
+                                           valid_updates,
+                                           (int)std::min(static_cast<uint32_t>(500), frame.payload_len),
+                                           reinterpret_cast<const char*>(payload));
+                                }
+                            }
+                        }
+                        break;
+
+                    case 0x02:  // BINARY
+                        binary_frames++;
+                        break;
+
+                    case 0x09:  // PING
+                        ping_frames++;
+                        {
+                            auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now() - start_time).count();
+                            int64_t pongs_prod = pongs_region_->producer_published()->load(std::memory_order_acquire);
+                            int64_t pongs_cons = pongs_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+                            printf("[PING @%lds] Received PING (payload_len=%u) - PONGS ring: prod=%ld, cons=%ld\n",
+                                   elapsed_s, frame.payload_len, pongs_prod, pongs_cons);
+                            fflush(stdout);
+                        }
+                        break;
+
+                    case 0x0A:  // PONG
+                        pong_frames++;
+                        break;
+
+                    case 0x08:  // CLOSE
+                        close_frames++;
+                        printf("[CLOSE] Received CLOSE frame\n");
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+
+            // Status logging consolidated in TRANSPORT process (see transport_process.hpp)
+
+            __builtin_ia32_pause();
+        }
+
+        // Final drain (skip in forever mode since we're exiting on signal)
+        if (!run_forever) {
+            printf("[WSS] Final %dms drain...\n", FINAL_DRAIN_MS);
+            auto drain_start = std::chrono::steady_clock::now();
+
+            while (true) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - drain_start).count();
+                if (elapsed_ms >= FINAL_DRAIN_MS) break;
+
+                WSFrameInfo frame;
+                while (ws_frame_cons.try_consume(frame)) {
+                    total_frames++;
+                    if (frame.opcode == 0x01) {
+                        text_frames++;
+                        if (frame.payload_len > 0) {
+                            const uint8_t* payload = msg_inbox_->data_at(frame.msg_inbox_offset);
+                            if (is_valid_orderbook_json(reinterpret_cast<const char*>(payload), frame.payload_len)) {
+                                valid_updates++;
+                            }
+                        }
                     }
                 }
-            }
-
-            // Check for echo responses via MSG_METADATA
-            MsgMetadata meta;
-            if (msg_metadata_cons.try_consume(meta)) {
-                process_metadata(meta);
+                usleep(1000);
             }
         }
 
-        // Wait 10ms for pipeline to drain
-        usleep(10000);
-
-        // Check for any remaining responses
-        MsgMetadata meta;
-        while (msg_metadata_cons.try_consume(meta)) {
-            process_metadata(meta);
-        }
-
-        auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        auto actual_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start_time).count();
 
-        // Calculate expected bytes (each message is "TEST_MSG_XXXX" = 13 bytes)
-        size_t sent_bytes = sent * 13;
-
         printf("\n=== Test Results ===\n");
-        printf("  Duration:     %ld ms\n", total_time);
-        printf("  Sent:         %d messages (%zu bytes)\n", sent, sent_bytes);
-        printf("  Received:     %d messages in %d metadata entries (%zu bytes)\n",
-               received, metadata_count, received_bytes);
-        printf("  Message success: %.1f%%\n", sent > 0 ? 100.0 * received / sent : 0);
-        printf("  Byte success:    %.1f%%\n", sent_bytes > 0 ? 100.0 * received_bytes / sent_bytes : 0);
+        printf("  Duration:        %ld ms\n", actual_duration);
+        printf("  Total frames:    %lu\n", total_frames);
+        printf("  TEXT frames:     %lu\n", text_frames);
+        printf("  BINARY frames:   %lu\n", binary_frames);
+        printf("  PING frames:     %lu\n", ping_frames);
+        printf("  PONG frames:     %lu\n", pong_frames);
+        // PONG deficit check: compare PINGs received with PONGs queued
+        {
+            int64_t pongs_queued = pongs_region_->producer_published()->load(std::memory_order_acquire) + 1;  // +1 for 0-based
+            int64_t deficit = static_cast<int64_t>(ping_frames) - pongs_queued;
+            if (deficit > 0) {
+                printf("  PONG DEFICIT:    %ld (PINGs received but PONGs not queued - INVESTIGATE!)\n", deficit);
+            } else {
+                printf("  PONG balance:    OK (all PINGs have corresponding PONGs queued)\n");
+            }
+        }
+        printf("  CLOSE frames:    %lu\n", close_frames);
+        printf("  Valid updates:   %lu\n", valid_updates);
+        printf("  Sequence errors: %s\n", sequence_error ? "YES" : "none");
 
         // Verify ring buffer status
         printf("\n--- Ring Buffer Status ---\n");
-        int64_t msg_metadata_cons_seq = msg_metadata_cons.sequence();
-        printf("  MSG_METADATA consumer seq:  %ld\n", msg_metadata_cons_seq);
-        printf("  Consumer caught up: %s\n", (metadata_count > 0 && msg_metadata_cons_seq >= 0) ? "yes" : "no");
+
+        // WS_FRAME_INFO
+        int64_t ws_frame_prod = ws_frame_info_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t ws_frame_cons_seq = ws_frame_cons.sequence();
+        bool ws_frame_caught_up = ws_frame_cons_seq >= ws_frame_prod;
+        printf("  WS_FRAME_INFO producer: %ld, consumer: %ld\n", ws_frame_prod, ws_frame_cons_seq);
+        printf("  Consumer caught up: %s\n", ws_frame_caught_up ? "yes" : "NO - FAIL");
+
+        // MSG_METADATA
+        int64_t meta_prod = msg_metadata_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t meta_cons = msg_metadata_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+        bool meta_caught_up = meta_cons >= meta_prod - 1;  // Allow 1 pending
+        printf("  MSG_METADATA producer: %ld, consumer: %ld\n", meta_prod, meta_cons);
+        printf("  Consumer caught up: %s\n", meta_caught_up ? "yes" : "NO - FAIL");
+
+        // MSG_OUTBOX
+        int64_t outbox_prod = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t outbox_cons = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+        bool outbox_caught_up = outbox_cons >= outbox_prod;
+        printf("  MSG_OUTBOX producer: %ld, consumer: %ld\n", outbox_prod, outbox_cons);
+        printf("  Consumer caught up: %s\n", outbox_caught_up ? "yes" : "NO - FAIL");
+
+        // PONGS
+        int64_t pongs_prod = pongs_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t pongs_cons = pongs_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+        bool pongs_caught_up = pongs_cons >= pongs_prod;
+        printf("  PONGS producer: %ld, consumer: %ld\n", pongs_prod, pongs_cons);
+        printf("  Consumer caught up: %s\n", pongs_caught_up ? "yes" : "NO - FAIL");
 
         printf("====================\n");
         fflush(stdout);
 
-        // Signal children to stop and wait for them before printing latency stats
-        // This prevents child stderr from interleaving with latency output
+        // Signal children to stop and wait
         conn_state_->shutdown_all();
         if (xdp_pid_ > 0) waitpid(xdp_pid_, nullptr, 0);
         if (transport_pid_ > 0) waitpid(transport_pid_, nullptr, 0);
+        if (websocket_pid_ > 0) waitpid(websocket_pid_, nullptr, 0);
         xdp_pid_ = 0;
         transport_pid_ = 0;
+        websocket_pid_ = 0;
 
-        // Print latency statistics
-        nic_to_xdp_latency.print("NIC-to-XDP_Poll");
-        xdp_to_transport_latency.print("XDP_Poll-to-Transport");
-        transport_to_ssl_latency.print("Transport-to-SSL_Read");
-        total_latency.print("Total (NIC-to-SSL_Read)");
+        // Save profiling data
+        save_profiling_data();
 
-        if (received == 0) {
-            printf("\nFAIL: No echo responses received\n");
+        // === FAILURE CONDITIONS ===
+
+        // In forever mode, always pass if we got frames (was killed by timeout command or Ctrl+C)
+        if (run_forever) {
+            printf("\nFOREVER MODE: Received %lu orderbook updates over %ld ms\n",
+                   valid_updates, actual_duration);
+            printf("PASS: Forever mode completed (terminated by signal)\n");
+            return true;
+        }
+
+        // 1. Check we received WebSocket frames
+        if (total_frames == 0) {
+            printf("\nFAIL: No WebSocket frames received\n");
             return false;
         }
 
-        // Save profiling data to /tmp
-        save_profiling_data();
+        // 2. Check we received orderbook data
+        if (valid_updates < static_cast<uint64_t>(MIN_EXPECTED_UPDATES)) {
+            printf("\nFAIL: Only %lu orderbook updates received (expected %d+)\n",
+                   valid_updates, MIN_EXPECTED_UPDATES);
+            return false;
+        }
 
-        printf("\nPASS: Received %d/%d echo responses\n", received, sent);
+        // 3. Check ringbuffer consumer caught up
+        if (!ws_frame_caught_up) {
+            printf("\nFAIL: WS_FRAME_INFO consumer did not catch up with producer\n");
+            return false;
+        }
+
+        // 4. Check for sequence errors
+        if (sequence_error) {
+            printf("\nFAIL: Out-of-order frame delivery detected\n");
+            return false;
+        }
+
+        printf("\nPASS: WebSocket process working, received %lu orderbook updates in %ld ms\n",
+               valid_updates, actual_duration);
         return true;
     }
 
@@ -987,6 +1071,9 @@ public:
         }
     }
 
+    // Getter for connection state (used by signal handler)
+    ConnStateShm* get_conn_state() const { return conn_state_; }
+
 private:
     // XDP Poll child process
     void run_xdp_poll_process() {
@@ -1020,12 +1107,16 @@ private:
             return;
         }
 
-        // Configure BPF maps for echo server traffic
+        // Configure BPF maps for WSS target traffic
         auto* bpf = xdp_poll.get_bpf_loader();
         if (bpf) {
+            fprintf(stderr, "[XDP-POLL] Configuring BPF maps: local_ip=%s, exchange_ip=%s, port=%u\n",
+                    g_local_ip.c_str(), wss_target_ip_.c_str(), WSS_PORT);
             bpf->set_local_ip(g_local_ip.c_str());
-            bpf->add_exchange_ip(echo_ip_);
-            bpf->add_exchange_port(echo_port_);
+            bpf->add_exchange_ip(wss_target_ip_.c_str());
+            bpf->add_exchange_port(WSS_PORT);
+        } else {
+            fprintf(stderr, "[XDP-POLL] WARNING: BPF loader is NULL!\n");
         }
         xdp_poll.run();
         xdp_poll.cleanup();
@@ -1035,7 +1126,7 @@ private:
     void run_transport_process() {
         pin_to_cpu(TRANSPORT_CPU_CORE);
 
-        // Create ring adapters in child process (all use UMEMFrameDescriptor)
+        // Create ring adapters in child process
         IPCRingConsumer<UMEMFrameDescriptor> raw_inbox_cons(*raw_inbox_region_);
         IPCRingProducer<UMEMFrameDescriptor> raw_outbox_prod(*raw_outbox_region_);
         IPCRingProducer<UMEMFrameDescriptor> ack_outbox_prod(*ack_outbox_region_);
@@ -1051,9 +1142,10 @@ private:
             transport.set_profiling_data(&profiling_->transport);
         }
 
+        // Pass the hostname (not IP) for SNI
         bool ok = transport.init_with_handshake(
             umem_area_, FRAME_SIZE,
-            echo_ip_, echo_port_,
+            WSS_HOST, WSS_PORT,
             &raw_inbox_cons,
             &raw_outbox_prod,
             &ack_outbox_prod,
@@ -1070,13 +1162,43 @@ private:
             return;
         }
 
+        fprintf(stderr, "[TRANSPORT] TLS handshake complete, running main loop\n");
         transport.run();
+    }
+
+    // WebSocket child process
+    void run_websocket_process() {
+        pin_to_cpu(WEBSOCKET_CPU_CORE);
+
+        // Create ring adapters in child process
+        IPCRingConsumer<MsgMetadata> msg_metadata_cons(*msg_metadata_region_);
+        IPCRingProducer<WSFrameInfo> ws_frame_info_prod(*ws_frame_info_region_);
+        IPCRingProducer<MsgOutboxEvent> msg_outbox_prod(*msg_outbox_region_);
+        IPCRingProducer<PongFrameAligned> pongs_prod(*pongs_region_);
+
+        WebSocketType ws_process;
+
+        bool ok = ws_process.init(
+            msg_inbox_,
+            &msg_metadata_cons,
+            &ws_frame_info_prod,
+            &pongs_prod,
+            &msg_outbox_prod,
+            conn_state_);
+
+        if (!ok) {
+            fprintf(stderr, "[WS-PROCESS] init() failed\n");
+            conn_state_->shutdown_all();
+            return;
+        }
+
+        // Run with handshake (performs HTTP upgrade, subscription, then main loop)
+        ws_process.run_with_handshake();
     }
 
     const char* interface_;
     const char* bpf_path_;
-    const char* echo_ip_;
-    uint16_t echo_port_;
+    std::string wss_target_ip_;  // Resolved IP of WSS_HOST
 
     IPCRingManager ipc_manager_;
 
@@ -1098,35 +1220,56 @@ private:
     disruptor::ipc::shared_region* msg_outbox_region_ = nullptr;
     disruptor::ipc::shared_region* msg_metadata_region_ = nullptr;
     disruptor::ipc::shared_region* pongs_region_ = nullptr;
+    disruptor::ipc::shared_region* ws_frame_info_region_ = nullptr;
 
     pid_t xdp_pid_ = 0;
     pid_t transport_pid_ = 0;
+    pid_t websocket_pid_ = 0;
 };
 
 // ============================================================================
 // Main
 // ============================================================================
 
+// Parse --timeout argument from argv
+void parse_args(int argc, char* argv[]) {
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
+            g_timeout_ms = atoi(argv[i + 1]);
+            printf("[ARGS] Timeout set to %d ms%s\n",
+                   g_timeout_ms, g_timeout_ms <= 0 ? " (FOREVER MODE)" : "");
+            break;
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
-    if (argc < 5) {
-        fprintf(stderr, "Usage: %s <interface> <bpf_path> <echo_ip> <echo_port>\n", argv[0]);
-        fprintf(stderr, "NOTE: Do NOT run directly. Use: ./scripts/test_xdp.sh 10_transport_tcp.cpp\n");
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <interface> <bpf_path> [ignored...] [--timeout <ms>]\n", argv[0]);
+        fprintf(stderr, "NOTE: Do NOT run directly. Use: USE_WOLFSSL=1 ./scripts/test_xdp.sh 21_websocket_okx.cpp\n");
+        fprintf(stderr, "\nOptions:\n");
+        fprintf(stderr, "  --timeout <ms>   Stream timeout in milliseconds (default: %d)\n", DEFAULT_STREAM_DURATION_MS);
+        fprintf(stderr, "                   If <= 0, run forever (display all messages, Ctrl+C to stop)\n");
         fprintf(stderr, "\nThis test:\n");
-        fprintf(stderr, "  - Forks XDP Poll (core 2) and Transport<NoSSLPolicy> (core 4)\n");
-        fprintf(stderr, "  - Connects to TCP echo server (no TLS)\n");
-        fprintf(stderr, "  - Sends up to %d messages at %dms intervals\n", MAX_MESSAGES, SEND_INTERVAL_MS);
-        fprintf(stderr, "  - Timeout: %d seconds\n", TIMEOUT_SECONDS);
+        fprintf(stderr, "  - Forks XDP Poll (core 2), Transport<WolfSSL> (core 4), WebSocket (core 6)\n");
+        fprintf(stderr, "  - Connects to %s:%u (WSS with WolfSSL)\n", WSS_HOST, WSS_PORT);
+        fprintf(stderr, "  - WebSocketProcess handles HTTP+WS handshake\n");
+        fprintf(stderr, "  - Streams BTC-USDT-SWAP books5 orderbook updates for the specified timeout\n");
+        fprintf(stderr, "  - Parent consumes WS_FRAME_INFO, validates JSON orderbook data\n");
+        fprintf(stderr, "  - Expects at least %d orderbook updates (BTC-USDT-SWAP is very liquid)\n", MIN_EXPECTED_UPDATES);
+        fprintf(stderr, "  - Waits %dms, then verifies ringbuffer consumers caught up\n", FINAL_DRAIN_MS);
+        fprintf(stderr, "\nExamples:\n");
+        fprintf(stderr, "  USE_WOLFSSL=1 ./scripts/test_xdp.sh 21_websocket_okx.cpp                # Default 5s\n");
+        fprintf(stderr, "  USE_WOLFSSL=1 ./scripts/test_xdp.sh 21_websocket_okx.cpp --timeout 10000  # 10s\n");
+        fprintf(stderr, "  USE_WOLFSSL=1 ./scripts/test_xdp.sh 21_websocket_okx.cpp --timeout -1     # Forever\n");
         return 1;
     }
 
     const char* interface = argv[1];
     const char* bpf_path = argv[2];
-    const char* echo_ip = argv[3];
-    uint16_t echo_port = static_cast<uint16_t>(atoi(argv[4]));
 
-    // Store in globals
-    g_echo_server_ip = echo_ip;
-    g_echo_server_port = echo_port;
+    // Parse optional arguments
+    parse_args(argc, argv);
 
     // PREVENT ROOT USER FROM RUNNING
     if (geteuid() == 0) {
@@ -1134,7 +1277,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "ERROR: Do NOT run as root!\n");
         fprintf(stderr, "========================================\n");
         fprintf(stderr, "\nRun via the wrapper script which sets capabilities properly:\n");
-        fprintf(stderr, "  ./scripts/test_xdp.sh 10_transport_tcp.cpp\n");
+        fprintf(stderr, "  USE_WOLFSSL=1 ./scripts/test_xdp.sh 21_websocket_okx.cpp\n");
         return 1;
     }
 
@@ -1143,21 +1286,35 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, signal_handler);
 
     printf("==============================================\n");
-    printf("  Transport TCP Test (NoSSLPolicy)            \n");
+    printf("  WebSocket OKX Test                          \n");
     printf("==============================================\n");
-    printf("  Interface: %s\n", interface);
-    printf("  Target:    %s:%u\n", echo_ip, echo_port);
-    printf("  Messages:  up to %d (every %dms)\n", MAX_MESSAGES, SEND_INTERVAL_MS);
-    printf("  Timeout:   %d seconds\n", TIMEOUT_SECONDS);
+    printf("  Interface:  %s\n", interface);
+    printf("  Target:     %s:%u (WSS)\n", WSS_HOST, WSS_PORT);
+    printf("  Path:       %s\n", WSS_PATH);
+    printf("  SSL:        WolfSSL\n");
+    printf("  Processes:  XDP Poll (core %d)\n", XDP_POLL_CPU_CORE);
+    printf("              Transport (core %d)\n", TRANSPORT_CPU_CORE);
+    printf("              WebSocket (core %d)\n", WEBSOCKET_CPU_CORE);
+    if (g_timeout_ms <= 0) {
+        printf("  Timeout:    FOREVER (Ctrl+C to stop)\n");
+        printf("  Mode:       Display all messages\n");
+    } else {
+        printf("  Timeout:    %d ms\n", g_timeout_ms);
+        printf("  Expected:   %d+ orderbook updates\n", MIN_EXPECTED_UPDATES);
+        printf("  Drain:      %dms then check ringbuffers\n", FINAL_DRAIN_MS);
+    }
     printf("==============================================\n\n");
 
-    TransportTCPTest test(interface, bpf_path, echo_ip, echo_port);
+    WebSocketOkxTest test(interface, bpf_path);
 
     // Setup
     if (!test.setup()) {
         fprintf(stderr, "\nFATAL: Setup failed\n");
         return 1;
     }
+
+    // Set global conn_state for signal handler to use
+    g_conn_state = test.get_conn_state();
 
     // Fork processes
     if (!test.fork_processes()) {
@@ -1169,9 +1326,9 @@ int main(int argc, char* argv[]) {
     // Give processes time to stabilize
     usleep(500000);  // 500ms
 
-    // Run test
+    // Run streaming test
     int result = 0;
-    if (!test.run_roundtrip_test()) {
+    if (!test.run_stream_test()) {
         result = 1;
     }
 
@@ -1193,8 +1350,8 @@ int main(int argc, char* argv[]) {
 #else  // !USE_XDP
 
 int main() {
-    fprintf(stderr, "Error: Build with USE_XDP=1\n");
-    fprintf(stderr, "Example: make build-test-pipeline-transport-tcp USE_XDP=1\n");
+    fprintf(stderr, "Error: Build with USE_XDP=1 USE_WOLFSSL=1\n");
+    fprintf(stderr, "Example: make build-test-pipeline-websocket_okx USE_XDP=1 USE_WOLFSSL=1\n");
     return 1;
 }
 

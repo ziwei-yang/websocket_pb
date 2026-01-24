@@ -537,13 +537,12 @@ test-ws-parser: $(TEST_WS_PARSER_BIN)
 # Common pipeline headers - all pipeline tests depend on these
 # When any header changes, affected tests will be rebuilt
 PIPELINE_HEADERS := \
-    src/pipeline/transport_process.hpp \
-    src/pipeline/xdp_poll_process.hpp \
+    src/pipeline/00_xdp_poll_process.hpp \
+    src/pipeline/10_tcp_ssl_process.hpp \
+    src/pipeline/20_ws_process.hpp \
     src/pipeline/pipeline_data.hpp \
     src/pipeline/pipeline_config.hpp \
     src/pipeline/msg_inbox.hpp \
-    src/pipeline/ws_parser.hpp \
-    src/pipeline/websocket_process.hpp \
     src/stack/userspace_stack.hpp \
     src/policy/ssl.hpp \
     src/core/timing.hpp
@@ -822,6 +821,35 @@ build-test-pipeline-websocket_binance: $(PIPELINE_WEBSOCKET_BINANCE_BIN)
 test-pipeline-websocket-binance: $(PIPELINE_WEBSOCKET_BINANCE_BIN) bpf
 	@echo "🧪 Running WebSocket Binance test via script..."
 	USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp
+
+# ============================================================================
+# WebSocket OKX Test (WebSocketProcess with OKX WSS stream)
+# Tests full pipeline: XDP Poll + Transport + WebSocket processes
+# ============================================================================
+
+PIPELINE_WEBSOCKET_OKX_SRC := test/pipeline/21_websocket_okx.cpp
+PIPELINE_WEBSOCKET_OKX_BIN := $(BUILD_DIR)/test_pipeline_websocket_okx
+
+$(PIPELINE_WEBSOCKET_OKX_BIN): $(PIPELINE_WEBSOCKET_OKX_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+	@echo "🔨 Compiling WebSocket OKX test..."
+ifdef USE_XDP
+ifdef USE_WOLFSSL
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ WebSocket OKX test build complete: $@"
+else
+	@echo "❌ Error: WebSocket OKX test requires USE_WOLFSSL=1"
+	@exit 1
+endif
+else
+	@echo "❌ Error: WebSocket OKX test requires USE_XDP=1"
+	@exit 1
+endif
+
+build-test-pipeline-websocket_okx: $(PIPELINE_WEBSOCKET_OKX_BIN)
+
+test-pipeline-websocket-okx: $(PIPELINE_WEBSOCKET_OKX_BIN) bpf
+	@echo "🧪 Running WebSocket OKX test via script..."
+	USE_WOLFSSL=1 ./scripts/test_xdp.sh 21_websocket_okx.cpp
 
 # ============================================================================
 # HftShm RingBuffer Tests (requires hft-shm CLI)

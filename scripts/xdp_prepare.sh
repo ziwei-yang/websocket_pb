@@ -288,13 +288,113 @@ enable_hw_timestamp() {
 }
 
 # Detach any existing XDP program
+# IMPORTANT: Must kill owning process first to avoid kernel crash!
+# Device-bound XDP programs (BPF_F_XDP_DEV_BOUND_ONLY) can cause kernel hang
+# if forcibly detached while AF_XDP socket is still active.
 detach_xdp() {
-    echo "Detaching any existing XDP program..."
+    echo "Checking for existing XDP program on $IFACE..."
 
-    # Always try both xdp and xdpdrv off to ensure complete cleanup
-    # (stale programs from previous runs may not be detected by ip link show)
-    sudo ip link set "$IFACE" xdp off 2>/dev/null || true
-    sudo ip link set "$IFACE" xdpdrv off 2>/dev/null || true
+    # Check if XDP is currently attached
+    local xdp_info=$(ip link show "$IFACE" | grep -o "xdp[^ ]*" || true)
+
+    if [[ -n "$xdp_info" ]]; then
+        print_warning "XDP program detected: $xdp_info"
+
+        # Find processes using AF_XDP sockets on this interface
+        # Method 1: Find test_pipeline_* processes with this interface argument
+        local xdp_pids=$(pgrep -f "test_pipeline_.*$IFACE" 2>/dev/null || true)
+
+        # Method 2: Find any test_pipeline_* process (may not have interface in cmdline)
+        if [[ -z "$xdp_pids" ]]; then
+            xdp_pids=$(pgrep -f "test_pipeline_" 2>/dev/null || true)
+        fi
+
+        # Method 3: Use bpftool to find XDP program and trace to owning process
+        if [[ -z "$xdp_pids" ]]; then
+            local prog_id=$(sudo bpftool net show dev "$IFACE" 2>/dev/null | grep -oP 'xdp.*prog_id \K[0-9]+' || true)
+            if [[ -n "$prog_id" ]]; then
+                # Find process holding this BPF program fd
+                xdp_pids=$(sudo bpftool prog show id "$prog_id" 2>/dev/null | grep -oP 'pids \K[^\]]+' | tr -d '[]' | cut -d'/' -f1 || true)
+            fi
+        fi
+
+        # Method 4: Find processes with xsk (AF_XDP socket) in their fd links
+        if [[ -z "$xdp_pids" ]]; then
+            xdp_pids=$(sudo sh -c 'for pid in /proc/[0-9]*/fd/*; do readlink "$pid" 2>/dev/null | grep -q "xsk:" && echo "$pid"; done' | grep -oP '/proc/\K[0-9]+' | sort -u || true)
+        fi
+
+        if [[ -n "$xdp_pids" ]]; then
+            echo "Found process(es) using XDP: $xdp_pids"
+
+            # Send SIGTERM first for graceful cleanup
+            for pid in $xdp_pids; do
+                if [[ -d "/proc/$pid" ]]; then
+                    local proc_name=$(cat /proc/$pid/comm 2>/dev/null || echo "unknown")
+                    echo "Sending SIGTERM to PID $pid ($proc_name)..."
+                    sudo kill -TERM "$pid" 2>/dev/null || true
+                fi
+            done
+
+            # Wait for graceful shutdown (BPFLoader destructor calls detach())
+            echo "Waiting for graceful XDP cleanup..."
+            local wait_count=0
+            while [[ $wait_count -lt 10 ]]; do
+                sleep 1
+                ((wait_count++))
+
+                # Check if XDP is still attached
+                xdp_info=$(ip link show "$IFACE" | grep -o "xdp[^ ]*" || true)
+                if [[ -z "$xdp_info" ]]; then
+                    print_status "XDP program gracefully detached after ${wait_count}s"
+                    break
+                fi
+
+                # Check if processes are still running
+                local still_running=0
+                for pid in $xdp_pids; do
+                    if [[ -d "/proc/$pid" ]]; then
+                        still_running=1
+                        break
+                    fi
+                done
+
+                if [[ $still_running -eq 0 ]]; then
+                    # Processes died but XDP still attached - wait a bit more
+                    sleep 2
+                    break
+                fi
+
+                echo "  Still waiting... (${wait_count}s)"
+            done
+
+            # If still running after 10s, send SIGKILL
+            for pid in $xdp_pids; do
+                if [[ -d "/proc/$pid" ]]; then
+                    local proc_name=$(cat /proc/$pid/comm 2>/dev/null || echo "unknown")
+                    print_warning "Process $pid ($proc_name) didn't exit, sending SIGKILL..."
+                    sudo kill -KILL "$pid" 2>/dev/null || true
+                fi
+            done
+
+            # Wait for SIGKILL to take effect
+            sleep 2
+        else
+            # No owning process found - XDP program is orphaned
+            # This is safe to detach since AF_XDP socket died with the process
+            print_warning "XDP program is orphaned (no owning process found)"
+            print_status "Safe to force-detach orphaned program"
+        fi
+    fi
+
+    # Now safe to detach any remaining XDP program
+    # (should already be detached if process exited cleanly)
+    xdp_info=$(ip link show "$IFACE" | grep -o "xdp[^ ]*" || true)
+    if [[ -n "$xdp_info" ]]; then
+        echo "Force-detaching remaining XDP program..."
+        sudo ip link set "$IFACE" xdp off 2>/dev/null || true
+        sudo ip link set "$IFACE" xdpdrv off 2>/dev/null || true
+        sleep 1
+    fi
 
     # Clean up any pinned BPF programs from previous test runs
     # These are created by bpftool when loading device-bound XDP programs
@@ -306,13 +406,14 @@ detach_xdp() {
     done
 
     # Verify cleanup
-    local xdp_info=$(ip link show "$IFACE" | grep -o "xdp[^ ]*" || true)
+    xdp_info=$(ip link show "$IFACE" | grep -o "xdp[^ ]*" || true)
 
     if [[ -n "$xdp_info" ]]; then
         print_error "Failed to detach XDP program: $xdp_info"
+        print_error "Manual intervention required. Try: sudo ip link set $IFACE xdp off"
         exit 1
     else
-        print_status "XDP programs detached (xdp off + xdpdrv off)"
+        print_status "XDP cleanup complete"
     fi
 }
 

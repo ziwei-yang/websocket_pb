@@ -1,7 +1,7 @@
 // test/unittest/test_ws_parser.cpp
 // Unit tests for pipeline/ws_parser.hpp - WebSocket frame partial parsing
 
-#include "../../src/pipeline/ws_parser.hpp"
+#include "../../src/pipeline/20_ws_process.hpp"
 #include <cassert>
 #include <cstdio>
 #include <cstring>
