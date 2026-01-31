@@ -21,6 +21,7 @@
 #
 # Examples:
 #   ./scripts/build_xdp.sh 20_websocket_binance.cpp
+#   ./scripts/build_xdp.sh xdp_binance.cpp
 #   ./scripts/build_xdp.sh -i enp108s0 00_xdp_poll.cpp
 #
 # After running this script, you can run the test manually:
@@ -104,6 +105,7 @@ Options:
 
 Examples:
   $0 20_websocket_binance.cpp
+  $0 xdp_binance.cpp
   $0 -i enp108s0 00_xdp_poll.cpp
 
 After running this script, you can run the test manually:
@@ -290,6 +292,14 @@ map_test_source() {
             TEST_BIN="build/test_pipeline_xdp_poll_tcp"
             MAKE_TARGET="build-test-pipeline-xdp-poll-tcp"
             ;;
+        02_xdp_packetio_tcp)
+            TEST_BIN="build/test_pipeline_02_xdp_packetio_tcp"
+            MAKE_TARGET="build-test-pipeline-02_xdp_packetio_tcp"
+            ;;
+        03_disruptor_packetio_tcp)
+            TEST_BIN="build/test_pipeline_03_disruptor_packetio_tcp"
+            MAKE_TARGET="build-test-pipeline-03_disruptor_packetio_tcp"
+            ;;
         00_xdp_poll_ping)
             TEST_BIN="build/test_pipeline_xdp_poll_ping"
             MAKE_TARGET="build-test-pipeline-xdp-poll-ping"
@@ -301,6 +311,26 @@ map_test_source() {
         11_transport_http)
             TEST_BIN="build/test_pipeline_transport_http"
             MAKE_TARGET="build-test-pipeline-transport-http"
+            ;;
+        xdp_binance)
+            TEST_BIN="build/test_xdp_binance_integration"
+            MAKE_TARGET="build/test_xdp_binance_integration"
+            ;;
+        xdp_okx)
+            TEST_BIN="build/test_xdp_okx_integration"
+            MAKE_TARGET="build/test_xdp_okx_integration"
+            ;;
+        99_websocket_binance)
+            TEST_BIN="build/test_pipeline_99_websocket_binance"
+            MAKE_TARGET="build-test-pipeline-unified_binance"
+            ;;
+        98_websocket_binance)
+            TEST_BIN="build/test_pipeline_98_websocket_binance"
+            MAKE_TARGET="build-test-pipeline-98_websocket_binance"
+            ;;
+        96_websocket_binance)
+            TEST_BIN="build/test_pipeline_96_websocket_binance"
+            MAKE_TARGET="build-test-pipeline-96_websocket_binance"
             ;;
         *)
             # Generic pattern: NN_name.cpp -> test_pipeline_name
@@ -323,15 +353,15 @@ build_test() {
 
     # Determine SSL library flags based on test name or USE_WOLFSSL env var
     local SSL_FLAGS=""
-    if [[ -n "$USE_WOLFSSL" ]] || [[ "$MAKE_TARGET" == *"wolfssl"* ]] || [[ "$MAKE_TARGET" == *"wss"* ]] || [[ "$MAKE_TARGET" == *"binance"* ]] || [[ "$MAKE_TARGET" == *"okx"* ]]; then
+    if [[ -n "$USE_WOLFSSL" ]] || [[ "$MAKE_TARGET" == *"wolfssl"* ]]; then
         SSL_FLAGS="USE_WOLFSSL=1"
         log_info "Using WolfSSL (USE_WOLFSSL=1)"
     elif [[ "$MAKE_TARGET" == *"libressl"* ]]; then
         SSL_FLAGS="USE_LIBRESSL=1"
         log_info "Detected LibreSSL test, adding USE_LIBRESSL=1"
-    elif [[ "$MAKE_TARGET" == *"openssl"* ]]; then
+    elif [[ -n "$USE_OPENSSL" ]] || [[ "$MAKE_TARGET" == *"wss"* ]] || [[ "$MAKE_TARGET" == *"binance"* ]] || [[ "$MAKE_TARGET" == *"okx"* ]] || [[ "$MAKE_TARGET" == *"openssl"* ]]; then
         SSL_FLAGS="USE_OPENSSL=1"
-        log_info "Detected OpenSSL test, adding USE_OPENSSL=1"
+        log_info "Using OpenSSL (USE_OPENSSL=1)"
     fi
 
     # Build BPF first if needed

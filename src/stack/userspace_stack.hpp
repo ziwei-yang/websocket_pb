@@ -251,8 +251,8 @@ private:
     uint32_t netmask_ = 0;       // Host byte order
     uint8_t local_mac_[6] = {};
 
-    // IP identification counter
-    uint16_t ip_id_ = 0;
+    // IP identification counter (random start like Python/kernel)
+    uint16_t ip_id_ = static_cast<uint16_t>(std::time(nullptr) ^ (std::time(nullptr) >> 16));
 
     bool initialized_ = false;
 };

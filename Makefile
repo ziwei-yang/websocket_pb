@@ -41,14 +41,14 @@ ifeq ($(UNAME_S),Linux)
         ifeq ($(wildcard $(CUSTOM_WOLFSSL_DIR)/include/wolfssl),)
             $(error WolfSSL not found at $(CUSTOM_WOLFSSL_DIR). Please build and install WolfSSL to ~/Proj/wolfssl/install/)
         endif
-        CXXFLAGS += -DHAVE_WOLFSSL -I$(CUSTOM_WOLFSSL_DIR)/include
+        CXXFLAGS += -DUSE_WOLFSSL -DHAVE_WOLFSSL -I$(CUSTOM_WOLFSSL_DIR)/include
         LDFLAGS += -L$(CUSTOM_WOLFSSL_DIR)/lib -Wl,-rpath,$(CUSTOM_WOLFSSL_DIR)/lib -lwolfssl
         SSL_INFO := WolfSSL ($(CUSTOM_WOLFSSL_DIR))
     else ifdef USE_OPENSSL
         ifeq ($(wildcard $(CUSTOM_OPENSSL_DIR)/include/openssl),)
             $(error OpenSSL not found at $(CUSTOM_OPENSSL_DIR). Please build and install OpenSSL to ~/Proj/openssl/install/)
         endif
-        CXXFLAGS += -I$(CUSTOM_OPENSSL_DIR)/include
+        CXXFLAGS += -DUSE_OPENSSL -I$(CUSTOM_OPENSSL_DIR)/include
         LDFLAGS += -L$(CUSTOM_OPENSSL_DIR)/lib64 -Wl,-rpath,$(CUSTOM_OPENSSL_DIR)/lib64 -lssl -lcrypto
         SSL_INFO := OpenSSL ($(CUSTOM_OPENSSL_DIR))
     else
@@ -540,10 +540,13 @@ PIPELINE_HEADERS := \
     src/pipeline/00_xdp_poll_process.hpp \
     src/pipeline/10_tcp_ssl_process.hpp \
     src/pipeline/20_ws_process.hpp \
+    src/pipeline/98_xdp_tcp_ssl_process.hpp \
+    src/pipeline/99_xdp_tcp_ssl_ws_process.hpp \
     src/pipeline/pipeline_data.hpp \
     src/pipeline/pipeline_config.hpp \
     src/pipeline/msg_inbox.hpp \
     src/stack/userspace_stack.hpp \
+    src/xdp/xdp_packet_io.hpp \
     src/policy/ssl.hpp \
     src/core/timing.hpp
 
@@ -623,6 +626,52 @@ build-test-pipeline-xdp-poll-tcp: $(PIPELINE_XDP_POLL_TCP_BIN)
 test-pipeline-xdp-poll-tcp: $(PIPELINE_XDP_POLL_TCP_BIN) bpf
 	@echo "🧪 Running XDP Poll TCP test via script..."
 	./scripts/test_pipeline_xdp_poll.sh $(XDP_INTERFACE) 01_xdp_poll_tcp.cpp
+
+# ============================================================================
+# XDPPacketIO TCP Test (Single-Process: PacketTransport<XDPPacketIO>)
+# Tests single-process AF_XDP path with plain TCP echo server
+# ============================================================================
+
+PIPELINE_XDP_PACKETIO_TCP_SRC := test/pipeline/02_xdp_packetio_tcp.cpp
+PIPELINE_XDP_PACKETIO_TCP_BIN := $(BUILD_DIR)/test_pipeline_02_xdp_packetio_tcp
+
+# Build XDPPacketIO TCP test
+$(PIPELINE_XDP_PACKETIO_TCP_BIN): $(PIPELINE_XDP_PACKETIO_TCP_SRC) $(PIPELINE_HEADERS) src/xdp/xdp_packet_io.hpp src/policy/transport.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling XDPPacketIO TCP test..."
+ifdef USE_XDP
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ XDPPacketIO TCP test build complete: $@"
+else
+	@echo "❌ Error: XDPPacketIO TCP test requires USE_XDP=1"
+	@exit 1
+endif
+
+# Build-only target for XDPPacketIO TCP test
+build-test-pipeline-02_xdp_packetio_tcp: $(PIPELINE_XDP_PACKETIO_TCP_BIN)
+
+# Run XDPPacketIO TCP test (requires echo server)
+# NOTE: Script uses sudo internally, do not invoke with sudo
+test-pipeline-02-xdp-packetio-tcp: $(PIPELINE_XDP_PACKETIO_TCP_BIN) bpf
+	@echo "🧪 Running XDPPacketIO TCP test via script..."
+	./scripts/build_xdp.sh 02_xdp_packetio_tcp.cpp
+
+# ============================================================================
+# DisruptorPacketIO TCP Test (2-Process: XDP Poll + PacketTransport<DisruptorPacketIO>)
+# ============================================================================
+
+PIPELINE_DISRUPTOR_PACKETIO_TCP_SRC := test/pipeline/03_disruptor_packetio_tcp.cpp
+PIPELINE_DISRUPTOR_PACKETIO_TCP_BIN := $(BUILD_DIR)/test_pipeline_03_disruptor_packetio_tcp
+
+$(PIPELINE_DISRUPTOR_PACKETIO_TCP_BIN): $(PIPELINE_DISRUPTOR_PACKETIO_TCP_SRC) $(PIPELINE_HEADERS) \
+    src/pipeline/disruptor_packet_io.hpp src/pipeline/00_xdp_poll_process.hpp src/policy/transport.hpp | $(BUILD_DIR)
+ifdef USE_XDP
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+endif
+
+build-test-pipeline-03_disruptor_packetio_tcp: $(PIPELINE_DISRUPTOR_PACKETIO_TCP_BIN)
+
+test-pipeline-03-disruptor-packetio-tcp: $(PIPELINE_DISRUPTOR_PACKETIO_TCP_BIN) bpf
+	./scripts/build_xdp.sh 03_disruptor_packetio_tcp.cpp
 
 # ============================================================================
 # Transport TCP Test (NoSSLPolicy with forked XDP Poll + Transport)
@@ -804,11 +853,11 @@ PIPELINE_WEBSOCKET_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_websocket_binance
 $(PIPELINE_WEBSOCKET_BINANCE_BIN): $(PIPELINE_WEBSOCKET_BINANCE_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
 	@echo "🔨 Compiling WebSocket Binance test..."
 ifdef USE_XDP
-ifdef USE_WOLFSSL
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 	@echo "✅ WebSocket Binance test build complete: $@"
 else
-	@echo "❌ Error: WebSocket Binance test requires USE_WOLFSSL=1"
+	@echo "❌ Error: WebSocket Binance test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
 	@exit 1
 endif
 else
@@ -820,7 +869,7 @@ build-test-pipeline-websocket_binance: $(PIPELINE_WEBSOCKET_BINANCE_BIN)
 
 test-pipeline-websocket-binance: $(PIPELINE_WEBSOCKET_BINANCE_BIN) bpf
 	@echo "🧪 Running WebSocket Binance test via script..."
-	USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp
+	./scripts/test_xdp.sh 20_websocket_binance.cpp
 
 # ============================================================================
 # WebSocket OKX Test (WebSocketProcess with OKX WSS stream)
@@ -833,11 +882,11 @@ PIPELINE_WEBSOCKET_OKX_BIN := $(BUILD_DIR)/test_pipeline_websocket_okx
 $(PIPELINE_WEBSOCKET_OKX_BIN): $(PIPELINE_WEBSOCKET_OKX_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
 	@echo "🔨 Compiling WebSocket OKX test..."
 ifdef USE_XDP
-ifdef USE_WOLFSSL
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 	@echo "✅ WebSocket OKX test build complete: $@"
 else
-	@echo "❌ Error: WebSocket OKX test requires USE_WOLFSSL=1"
+	@echo "❌ Error: WebSocket OKX test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
 	@exit 1
 endif
 else
@@ -849,7 +898,94 @@ build-test-pipeline-websocket_okx: $(PIPELINE_WEBSOCKET_OKX_BIN)
 
 test-pipeline-websocket-okx: $(PIPELINE_WEBSOCKET_OKX_BIN) bpf
 	@echo "🧪 Running WebSocket OKX test via script..."
-	USE_WOLFSSL=1 ./scripts/test_xdp.sh 21_websocket_okx.cpp
+	./scripts/test_xdp.sh 21_websocket_okx.cpp
+
+# ============================================================================
+# Unified XDP+TCP+SSL+WS Pipeline Test (Single-Process)
+# Tests unified pipeline: all layers in one process, outputs to IPC rings
+# ============================================================================
+
+PIPELINE_UNIFIED_BINANCE_SRC := test/pipeline/99_websocket_binance.cpp
+PIPELINE_UNIFIED_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_99_websocket_binance
+
+$(PIPELINE_UNIFIED_BINANCE_BIN): $(PIPELINE_UNIFIED_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/99_xdp_tcp_ssl_ws_process.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling Unified XDP+TCP+SSL+WS Pipeline test..."
+ifdef USE_XDP
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Unified Pipeline test build complete: $@"
+else
+	@echo "❌ Error: Unified Pipeline test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
+	@exit 1
+endif
+else
+	@echo "❌ Error: Unified Pipeline test requires USE_XDP=1"
+	@exit 1
+endif
+
+build-test-pipeline-unified_binance: $(PIPELINE_UNIFIED_BINANCE_BIN)
+
+test-pipeline-unified-binance: $(PIPELINE_UNIFIED_BINANCE_BIN) bpf
+	@echo "🧪 Running Unified Pipeline Binance test via script..."
+	./scripts/test_xdp.sh 99_websocket_binance.cpp
+
+# ============================================================================
+# UnifiedSSL + WebSocket Pipeline Test (98_*)
+# Two processes: UnifiedSSL (XDP+TCP+SSL) + WebSocket (frame parsing)
+# ============================================================================
+
+PIPELINE_98_BINANCE_SRC := test/pipeline/98_websocket_binance.cpp
+PIPELINE_98_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_98_websocket_binance
+
+$(PIPELINE_98_BINANCE_BIN): $(PIPELINE_98_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/98_xdp_tcp_ssl_process.hpp src/pipeline/20_ws_process.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling UnifiedSSL + WebSocket Pipeline test (98_*)..."
+ifdef USE_XDP
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ UnifiedSSL + WebSocket Pipeline test build complete: $@"
+else
+	@echo "❌ Error: 98_* test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
+	@exit 1
+endif
+else
+	@echo "❌ Error: 98_* test requires USE_XDP=1"
+	@exit 1
+endif
+
+build-test-pipeline-98_websocket_binance: $(PIPELINE_98_BINANCE_BIN)
+
+test-pipeline-98-binance: $(PIPELINE_98_BINANCE_BIN) bpf
+	@echo "🧪 Running UnifiedSSL + WebSocket Pipeline test via script..."
+	./scripts/test_xdp.sh 98_websocket_binance.cpp
+
+# ============================================================================
+# 96_websocket_binance - Three-Process Pipeline Test (XDP Poll + PIO Transport + WebSocket)
+# Three processes: XDP Poll + PIO Transport (TCP+SSL via DisruptorPacketIO) + WebSocket
+# ============================================================================
+
+PIPELINE_96_BINANCE_SRC := test/pipeline/96_websocket_binance.cpp
+PIPELINE_96_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_96_websocket_binance
+
+$(PIPELINE_96_BINANCE_BIN): $(PIPELINE_96_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/00_xdp_poll_process.hpp src/pipeline/96_pio_tcp_ssl_process.hpp src/pipeline/disruptor_packet_io.hpp src/pipeline/20_ws_process.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling XDP Poll + PIO Transport + WebSocket Pipeline test (96_*)..."
+ifdef USE_XDP
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ XDP Poll + PIO Transport + WebSocket Pipeline test build complete: $@"
+else
+	@echo "❌ Error: 96_* test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
+	@exit 1
+endif
+else
+	@echo "❌ Error: 96_* test requires USE_XDP=1"
+	@exit 1
+endif
+
+build-test-pipeline-96_websocket_binance: $(PIPELINE_96_BINANCE_BIN)
+
+test-pipeline-96-binance: $(PIPELINE_96_BINANCE_BIN) bpf
+	@echo "🧪 Running XDP Poll + PIO Transport + WebSocket Pipeline test via script..."
+	./scripts/test_xdp.sh 96_websocket_binance.cpp
 
 # ============================================================================
 # HftShm RingBuffer Tests (requires hft-shm CLI)

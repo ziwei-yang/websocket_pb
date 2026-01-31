@@ -548,23 +548,16 @@ void xdp_poll_thread(
     const char* bpf_path,
     disruptor::ipc::shared_region* raw_inbox_region,
     disruptor::ipc::shared_region* raw_outbox_region,
-    disruptor::ipc::shared_region* ack_outbox_region,
-    disruptor::ipc::shared_region* pong_outbox_region,
     ConnStateShm* conn_state)
 {
     pin_to_cpu(XDP_POLL_CPU_CORE);
 
     IPCRingProducer<UMEMFrameDescriptor> raw_inbox_prod(*raw_inbox_region);
     IPCRingConsumer<UMEMFrameDescriptor> raw_outbox_cons(*raw_outbox_region);
-    IPCRingConsumer<UMEMFrameDescriptor> ack_outbox_cons(*ack_outbox_region);
-    IPCRingConsumer<UMEMFrameDescriptor> pong_outbox_cons(*pong_outbox_region);
-
     bool ok = xdp_poll->init(
         umem_area, umem_size, bpf_path,
         &raw_inbox_prod,
         &raw_outbox_cons,
-        &ack_outbox_cons,
-        &pong_outbox_cons,
         conn_state);
 
     if (!ok) {
@@ -765,8 +758,6 @@ public:
             bpf_path_,
             raw_inbox_region_,
             raw_outbox_region_,
-            ack_outbox_region_,
-            pong_outbox_region_,
             conn_state_);
 
         printf("[MAIN] Waiting for XDP Poll to initialize...\n");

@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <chrono>
 #include <array>
 
 // pipeline_data.hpp must be included BEFORE pipeline_config.hpp
@@ -829,6 +831,53 @@ private:
                           uint32_t frame_total_len, uint64_t parse_cycle) {
         if (fin) {
             // Complete single-frame message
+            msg_count_++;
+            const char* opcode_str = (opcode == static_cast<uint8_t>(websocket::http::WebSocketOpcode::TEXT))
+                                     ? "TEXT" : "BINARY";
+
+            // Format message preview (truncate to 120 chars for logging)
+            const uint8_t* msg_data = msg_inbox_->data_at(current_payload_offset_);
+            char msg_preview[256] = {0};
+            size_t preview_len = std::min(payload_len, uint64_t(120));
+            if (opcode == static_cast<uint8_t>(websocket::http::WebSocketOpcode::TEXT)) {
+                // TEXT: copy as string, escape non-printable
+                size_t j = 0;
+                for (size_t i = 0; i < preview_len && j < 240; i++) {
+                    uint8_t c = msg_data[i];
+                    if (c >= 32 && c < 127) {
+                        msg_preview[j++] = static_cast<char>(c);
+                    } else if (c == '\n') {
+                        msg_preview[j++] = '\\';
+                        msg_preview[j++] = 'n';
+                    } else if (c == '\r') {
+                        msg_preview[j++] = '\\';
+                        msg_preview[j++] = 'r';
+                    } else if (c == '\t') {
+                        msg_preview[j++] = '\\';
+                        msg_preview[j++] = 't';
+                    } else {
+                        j += snprintf(msg_preview + j, 5, "\\x%02x", c);
+                    }
+                }
+                msg_preview[j] = '\0';
+            } else {
+                // BINARY: hex format
+                for (size_t i = 0; i < std::min(preview_len, size_t(40)); i++) {
+                    snprintf(msg_preview + i * 2, 3, "%02x", msg_data[i]);
+                }
+            }
+            if (payload_len > 120) {
+                strncat(msg_preview, "...", 4);
+            }
+
+            // Get current Unix time in milliseconds
+            auto now = std::chrono::system_clock::now();
+            int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()).count();
+
+            fprintf(stderr, "[WS-MSG] #%lu received: opcode=%s payload_len=%lu nic_ts=%lu ns unix_ts=%ld ms text=[%s]\n",
+                    msg_count_, opcode_str, payload_len, current_metadata_.latest_nic_timestamp_ns, unix_ms, msg_preview);
+
             publish_frame_info(opcode, payload_len, frame_total_len, parse_cycle,
                               false, false);
         } else {
@@ -861,6 +910,52 @@ private:
             publish_frame_info(fragment_opcode_, payload_len, frame_total_len, parse_cycle,
                               true, false);
         } else {
+            // Final fragment - log complete fragmented message
+            msg_count_++;
+            const char* opcode_str = (fragment_opcode_ == static_cast<uint8_t>(websocket::http::WebSocketOpcode::TEXT))
+                                     ? "TEXT" : "BINARY";
+
+            // Format message preview from first fragment (truncate to 120 chars)
+            const uint8_t* msg_data = msg_inbox_->data_at(fragment_start_offset_);
+            char msg_preview[256] = {0};
+            size_t preview_len = std::min(static_cast<size_t>(fragment_total_len_), size_t(120));
+            if (fragment_opcode_ == static_cast<uint8_t>(websocket::http::WebSocketOpcode::TEXT)) {
+                size_t j = 0;
+                for (size_t i = 0; i < preview_len && j < 240; i++) {
+                    uint8_t c = msg_data[i];
+                    if (c >= 32 && c < 127) {
+                        msg_preview[j++] = static_cast<char>(c);
+                    } else if (c == '\n') {
+                        msg_preview[j++] = '\\';
+                        msg_preview[j++] = 'n';
+                    } else if (c == '\r') {
+                        msg_preview[j++] = '\\';
+                        msg_preview[j++] = 'r';
+                    } else if (c == '\t') {
+                        msg_preview[j++] = '\\';
+                        msg_preview[j++] = 't';
+                    } else {
+                        j += snprintf(msg_preview + j, 5, "\\x%02x", c);
+                    }
+                }
+                msg_preview[j] = '\0';
+            } else {
+                for (size_t i = 0; i < std::min(preview_len, size_t(40)); i++) {
+                    snprintf(msg_preview + i * 2, 3, "%02x", msg_data[i]);
+                }
+            }
+            if (fragment_total_len_ > 120) {
+                strncat(msg_preview, "...", 4);
+            }
+
+            // Get current Unix time in milliseconds
+            auto now = std::chrono::system_clock::now();
+            int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()).count();
+
+            fprintf(stderr, "[WS-MSG] #%lu received: opcode=%s payload_len=%u nic_ts=%lu ns unix_ts=%ld ms text=[%s] (fragmented)\n",
+                    msg_count_, opcode_str, fragment_total_len_, current_metadata_.latest_nic_timestamp_ns, unix_ms, msg_preview);
+
             // Final fragment - publish with is_last_fragment=true
             publish_frame_info(fragment_opcode_, payload_len, frame_total_len, parse_cycle,
                               true, true);
@@ -904,8 +999,18 @@ private:
 
         pongs_prod_->publish(pong_seq);
 
-        fprintf(stderr, "[WS-PONG] #%lu queued: payload_len=%u queue_latency=%lu ns (ping_recv_nic_ts=%lu)\n",
-                pong_count_, pending_ping_.payload_len, queue_latency_ns, pending_ping_.recv_nic_ts_ns);
+        // Format payload as hex string for logging
+        char pong_payload_hex[64] = {0};
+        size_t hex_len = std::min(safe_payload_len, size_t(20));  // Limit to 20 bytes
+        for (size_t i = 0; i < hex_len; i++) {
+            snprintf(pong_payload_hex + i * 2, 3, "%02x", ping_payload[i]);
+        }
+        if (safe_payload_len > 20) {
+            snprintf(pong_payload_hex + 40, 4, "...");
+        }
+
+        fprintf(stderr, "[WS-PONG] #%lu queued: payload_len=%u queue_latency=%lu ns payload=[%s]\n",
+                pong_count_, pending_ping_.payload_len, queue_latency_ns, pong_payload_hex);
 
         has_pending_ping_ = false;
     }
@@ -915,8 +1020,31 @@ private:
         uint64_t recv_cycle = rdtscp();
         uint64_t recv_nic_ts_ns = current_metadata_.latest_nic_timestamp_ns;
 
-        fprintf(stderr, "[WS-PING] #%lu received: payload_len=%lu nic_ts=%lu ns\n",
-                ping_count_, payload_len, recv_nic_ts_ns);
+        // Get current Unix time in milliseconds
+        auto now = std::chrono::system_clock::now();
+        int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+
+        // Get payload pointer
+        const uint8_t* ping_payload = msg_inbox_->data_at(current_payload_offset_);
+
+        // Parse payload as ASCII string (Binance sends timestamp as ASCII digits)
+        char payload_ascii[32] = {0};
+        size_t ascii_len = std::min(payload_len, uint64_t(31));
+        for (size_t i = 0; i < ascii_len; i++) {
+            payload_ascii[i] = static_cast<char>(ping_payload[i]);
+        }
+
+        // Parse as timestamp if 13 digits (millisecond Unix timestamp)
+        int64_t payload_ms = 0;
+        int64_t diff_ms = 0;
+        if (payload_len == 13) {
+            payload_ms = std::strtoll(payload_ascii, nullptr, 10);
+            diff_ms = unix_ms - payload_ms;
+        }
+
+        fprintf(stderr, "[WS-PING] #%lu received: payload_len=%lu nic_ts=%lu ns unix_ts=%ld ms payload=[%s] payload_ms=%ld diff_ms=%ld\n",
+                ping_count_, payload_len, recv_nic_ts_ns, unix_ms, payload_ascii, payload_ms, diff_ms);
 
         // Publish WSFrameInfo for PING
         int64_t ws_seq = ws_frame_info_prod_->try_claim();
@@ -1136,6 +1264,7 @@ private:
     bool has_pending_ping_ = false;
     uint64_t ping_count_ = 0;      // Total PINGs received
     uint64_t pong_count_ = 0;      // Total PONGs sent
+    uint64_t msg_count_ = 0;       // Total TEXT/BINARY messages received
 };
 
 }  // namespace websocket::pipeline

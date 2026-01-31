@@ -174,7 +174,89 @@ struct OpenSSLPolicy {
         SSL_CTX_set_max_proto_version(ctx_, TLS1_3_VERSION);
 
         // Disable session tickets (reduces ClientHello size slightly)
-        SSL_CTX_set_options(ctx_, SSL_OP_NO_TICKET);
+        // NOTE: Removed SSL_OP_NO_TICKET to allow empty session_ticket extension like Python
+        // SSL_CTX_set_options(ctx_, SSL_OP_NO_TICKET);
+
+        // =================================================================
+        // Match Python ClientHello exactly for Binance compatibility
+        // =================================================================
+
+        // 1. Add ClientHello padding to 512 bytes (matches Python)
+        SSL_CTX_set_options(ctx_, SSL_OP_TLSEXT_PADDING);
+
+        // 1b. Enable secure renegotiation to add SCSV cipher (0x00ff)
+        // This ensures TLS_EMPTY_RENEGOTIATION_INFO_SCSV is in cipher list
+        // Clear any options that might prevent SCSV from being added
+        SSL_CTX_clear_options(ctx_, SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
+#ifdef SSL_OP_NO_RENEGOTIATION
+        SSL_CTX_clear_options(ctx_, SSL_OP_NO_RENEGOTIATION);
+#endif
+
+        // 2. Set supported groups to match Python (10 groups)
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+        if (SSL_CTX_set1_groups_list(ctx_,
+            "X25519:P-256:X448:P-521:P-384:ffdhe2048:ffdhe3072:ffdhe4096:ffdhe6144:ffdhe8192") != 1) {
+            fprintf(stderr, "[TLS] Warning: Failed to set supported groups\n");
+        }
+#endif
+
+        // 2b. EC point formats are automatically determined by OpenSSL based on curves
+        // Python sends 3 formats (uncompressed, ansiX962_compressed_prime/char2)
+        // OpenSSL typically sends only uncompressed, which is fine for TLS 1.3
+        // TLS 1.3 mandates uncompressed format only (RFC 8446 Section 4.2.8.2)
+        // For TLS 1.2 with Python fingerprint match, this is a minor difference
+
+        // 3. Set signature algorithms to match Python exactly (20 algorithms, 40 bytes)
+        // Order from Python PCAP: ECDSA→EdDSA→RSA-PSS-PSS→RSA-PSS-RSAE→RSA-PKCS1→Legacy→DSA
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+        SSL_CTX_set1_sigalgs_list(ctx_,
+            // ECDSA with SHA-2 (04 03, 05 03, 06 03)
+            "ECDSA+SHA256:ECDSA+SHA384:ECDSA+SHA512:"
+            // EdDSA curves (08 07, 08 08)
+            "ed25519:ed448:"
+            // RSA-PSS with PSS padding (08 09, 08 0a, 08 0b)
+            "rsa_pss_pss_sha256:rsa_pss_pss_sha384:rsa_pss_pss_sha512:"
+            // RSA-PSS with RSAE padding (08 04, 08 05, 08 06)
+            "RSA-PSS+SHA256:RSA-PSS+SHA384:RSA-PSS+SHA512:"
+            // RSA PKCS#1 v1.5 (04 01, 05 01, 06 01)
+            "RSA+SHA256:RSA+SHA384:RSA+SHA512:"
+            // Legacy SHA-1 (03 03, 03 01)
+            "ECDSA+SHA1:RSA+SHA1:"
+            // DSA variants (03 02, 04 02, 05 02, 06 02)
+            "DSA+SHA1:DSA+SHA256:DSA+SHA384:DSA+SHA512");
+#endif
+
+        // 4. Set TLS 1.3 ciphersuites - Python order: AES-256 FIRST
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+        SSL_CTX_set_ciphersuites(ctx_,
+            "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256");
+#endif
+
+        // 5. Set TLS 1.2 ciphers - Python order (31 total ciphers)
+        SSL_CTX_set_cipher_list(ctx_,
+            // ECDHE + AES-GCM (highest priority)
+            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+            "DHE-RSA-AES256-GCM-SHA384:"
+            // ECDHE + ChaCha20
+            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+            "DHE-RSA-CHACHA20-POLY1305:"
+            // ECDHE + AES-128-GCM
+            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+            "DHE-RSA-AES128-GCM-SHA256:"
+            // ECDHE + AES-CBC-SHA384/SHA256
+            "ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:"
+            "DHE-RSA-AES256-SHA256:"
+            "ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:"
+            "DHE-RSA-AES128-SHA256:"
+            // ECDHE + AES-CBC-SHA (legacy)
+            "ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:"
+            "DHE-RSA-AES256-SHA:"
+            "ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA:"
+            "DHE-RSA-AES128-SHA:"
+            // RSA-only fallbacks
+            "AES256-GCM-SHA384:AES128-GCM-SHA256:"
+            "AES256-SHA256:AES128-SHA256:"
+            "AES256-SHA:AES128-SHA");
 
         // Limit TLS record size to fit in single TCP segment (Hybrid Approach for MTU)
         // MAX_TLS_RECORD_PAYLOAD = PIPELINE_TCP_MSS - TLS13_OVERHEAD (from pipeline_config.hpp)
@@ -1521,8 +1603,21 @@ struct WolfSSLPolicy {
         // Set minimum TLS version to 1.2
         wolfSSL_CTX_SetMinVersion(ctx_, WOLFSSL_TLSV1_2);
 
+        // Set cipher preference: AES-128-GCM first (fastest on Intel with AES-NI)
+        // WolfSSL uses a unified cipher list for TLS 1.2 and 1.3
+        // TLS 1.3 ciphers: TLS13-AES128-GCM-SHA256, TLS13-AES256-GCM-SHA384, TLS13-CHACHA20-POLY1305-SHA256
+        // TLS 1.2 ciphers: ECDHE-RSA-AES128-GCM-SHA256, etc.
+        int ret = wolfSSL_CTX_set_cipher_list(ctx_,
+            "TLS13-AES128-GCM-SHA256:TLS13-AES256-GCM-SHA384:TLS13-CHACHA20-POLY1305-SHA256:"
+            "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305-SHA256");
+        if (ret != WOLFSSL_SUCCESS) {
+            fprintf(stderr, "[TLS] Warning: Failed to set cipher preference\n");
+        }
+
         // Disable verification (HFT optimization - verify in production!)
         wolfSSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);
+
+        fprintf(stderr, "[TLS] WolfSSL initialized with AES-128-GCM preferred\n");
     }
 
     /**
@@ -1566,6 +1661,14 @@ struct WolfSSLPolicy {
             wolfSSL_ERR_error_string(err, err_buf);
             throw std::runtime_error(std::string("wolfSSL_connect() failed: ") + err_buf);
         }
+
+        // Log cipher details
+        const char* cipher_name = wolfSSL_get_cipher(ssl_);
+        const char* tls_version = wolfSSL_get_version(ssl_);
+
+        fprintf(stderr, "[TLS] Handshake SUCCESS (BSD socket)\n");
+        fprintf(stderr, "[TLS]   Version: %s\n", tls_version ? tls_version : "unknown");
+        fprintf(stderr, "[TLS]   Cipher:  %s\n", cipher_name ? cipher_name : "unknown");
     }
 
     /**
@@ -1626,7 +1729,15 @@ struct WolfSSLPolicy {
             int ret = wolfSSL_connect(ssl_);
 
             if (ret == SSL_SUCCESS) {
-                // Handshake successful - stop trickle thread, switch to inline trickle
+                // Handshake successful - log cipher details
+                const char* cipher_name = wolfSSL_get_cipher(ssl_);
+                const char* tls_version = wolfSSL_get_version(ssl_);
+
+                fprintf(stderr, "[TLS] Handshake SUCCESS\n");
+                fprintf(stderr, "[TLS]   Version: %s\n", tls_version ? tls_version : "unknown");
+                fprintf(stderr, "[TLS]   Cipher:  %s\n", cipher_name ? cipher_name : "unknown");
+
+                // Stop trickle thread, switch to inline trickle
                 transport->stop_rx_trickle_thread();
                 return;
             }

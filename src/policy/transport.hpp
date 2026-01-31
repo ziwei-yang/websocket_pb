@@ -3,14 +3,14 @@
 //
 // This header provides transport implementations for different network stacks:
 //   - BSDSocketTransport<EventPolicy>: BSD sockets + event loop (kernel TCP/IP stack)
-//   - XDPUserspaceTransport: AF_XDP zero-copy + userspace TCP/IP stack (complete kernel bypass)
+//   - PacketTransport<PacketIO>: Policy-based userspace TCP/IP stack (e.g., XDPPacketIO)
 //
-// Architecture (XDPUserspaceTransport):
+// Architecture (PacketTransport<XDPPacketIO>):
 //   Transport Policy (this file)
 //       │
 //       ├── Owns: TCP state, timers, retransmit queue, receive buffer
 //       ├── Owns: All control flow (connect loop, send/recv, close)
-//       ├── Owns: XDP I/O operations (xdp_transport.hpp)
+//       ├── Uses: PacketIO policy (XDPPacketIO for AF_XDP zero-copy)
 //       │
 //       └── Uses: UserspaceStack (pure packet operations)
 //                 ├── build_syn(), build_ack(), build_data(), build_fin()
@@ -482,7 +482,7 @@ private:
 
 // Include XDP headers outside namespace to avoid conflicts
 #ifdef USE_XDP
-#include "../xdp/xdp_transport.hpp"
+#include "../xdp/xdp_packet_io.hpp"
 #include "../xdp/xdp_frame.hpp"
 #include "../stack/userspace_stack.hpp"
 #include <net/if.h>
@@ -493,24 +493,57 @@ namespace websocket {
 namespace transport {
 
 #ifdef USE_XDP
+
+// NOTE: Legacy XDPUserspaceTransport has been removed.
+// Use PacketTransport<XDPPacketIO> instead (see below).
+
+// ============================================================================
+// PacketTransport<PacketIO> - Policy-based Transport Abstraction
+// ============================================================================
+//
+// This template abstracts TCP+SSL transport logic from the underlying
+// packet I/O mechanism. The same transport logic works with:
+//   - XDPPacketIO (AF_XDP zero-copy)
+//   - DPDKPacketIO (future: DPDK)
+//   - DisruptorPacketIO (future: pipeline-based)
+//
+// Architecture:
+//   Application
+//       │ send()/recv()
+//       ▼
+//   PacketTransport<PacketIO>
+//       ├── PacketIO (pio_) - Zero-copy I/O, frame management, polling
+//       ├── UserspaceStack (stack_) - Packet building/parsing
+//       └── TCP State Machine - state_, tcp_params_, retransmit queue
+//
+// PacketTransport provides a policy-based userspace transport implementation
+// with pluggable packet I/O backends (e.g., XDPPacketIO for AF_XDP).
+// ============================================================================
+
 /**
- * XDP Userspace Transport Policy
+ * PacketTransport - Policy-based userspace transport
  *
- * Uses XDP driver mode with userspace TCP/IP stack (complete kernel bypass).
+ * Template Parameters:
+ *   PacketIO - Packet I/O policy (e.g., XDPPacketIO)
  *
- * Architecture:
- *   - Stack: Pure packet building/parsing (no I/O, no control flow)
- *   - Transport: Owns all I/O and control flow (connect loops, retransmits, timers)
- *
- * This class owns:
- *   - TCP state machine (state_, tcp_params_)
- *   - Retransmit queue and timers
- *   - Receive buffer
- *   - XDP I/O operations
+ * PacketIO concept requirements:
+ *   - init(config) - Initialize I/O
+ *   - close() - Cleanup
+ *   - process_rx_frames() / mark_frame_consumed() - RX path (batch API)
+ *   - claim_tx_frames() / commit_tx_frames() - TX path (batch API)
+ *   - mark_frame_acked() - ACK-based release (auto FIFO release)
+ *   - retransmit_frame() - Retransmit existing frame (TCP retransmit)
+ *   - poll_wait() - Event polling
+ *   - frame_idx_to_addr() / get_frame_ptr() / frame_ptr_to_idx() / frame_capacity() - Frame utilities
+ *   - get_mode() / get_interface() - Configuration access
+ *   - add_remote_ip() / set_local_ip() / is_bpf_enabled() - BPF filter
+ *   - print_stats() - Statistics
+ *   - stop_rx_trickle_thread() - Thread control
  */
-struct XDPUserspaceTransport {
-    XDPUserspaceTransport()
-        : xdp_()
+template<typename PacketIO>
+struct PacketTransport {
+    PacketTransport()
+        : pio_()
         , stack_()
         , state_(userspace_stack::TCPState::CLOSED)
         , connected_(false)
@@ -520,31 +553,30 @@ struct XDPUserspaceTransport {
         , hw_timestamp_byte_ct_(0)
     {}
 
-    ~XDPUserspaceTransport() {
+    ~PacketTransport() {
         close();
     }
 
     // Prevent copying
-    XDPUserspaceTransport(const XDPUserspaceTransport&) = delete;
-    XDPUserspaceTransport& operator=(const XDPUserspaceTransport&) = delete;
+    PacketTransport(const PacketTransport&) = delete;
+    PacketTransport& operator=(const PacketTransport&) = delete;
+
+    // ========================================================================
+    // Initialization
+    // ========================================================================
 
     /**
-     * Initialize XDP transport without DNS resolution (caller manages BPF filter)
-     *
-     * @param interface  Network interface name (e.g., "enp41s0")
-     * @param bpf_path   Path to BPF object file
+     * Initialize transport without DNS resolution (caller manages BPF filter)
      */
     void init(const char* interface, const char* bpf_path, bool zero_copy = true) {
-        // 1. Configure and initialize XDP
-        // Uses compile-time defaults from xdp_transport.hpp (XDP_INTERFACE, NIC_MTU, XDP_HEADROOM)
-        websocket::xdp::XDPConfig config;
-        config.interface = interface;
-        // config.frame_size uses XDP_FRAME_SIZE by default (calculated from NIC_MTU)
-        config.zero_copy = zero_copy;
+        // Configure PacketIO
+        typename std::remove_reference_t<decltype(pio_)>::config_type config;
+        // Use structured binding to set config if it's XDPPacketIOConfig-like
+        init_packet_io_config(config, interface, bpf_path, zero_copy);
 
-        xdp_.init(config, bpf_path);
+        pio_.init(config);
 
-        // 2. Get local interface configuration
+        // Get local interface configuration
         uint8_t local_mac[6];
         uint32_t local_ip, gateway_ip, netmask;
 
@@ -552,7 +584,7 @@ struct XDPUserspaceTransport {
             throw std::runtime_error("Failed to get interface configuration");
         }
 
-        // Initialize stack (pure packet ops only)
+        // Initialize stack
         char local_ip_str[16], gateway_ip_str[16], netmask_str[16];
         ip_to_string(local_ip, local_ip_str);
         ip_to_string(gateway_ip, gateway_ip_str);
@@ -564,14 +596,14 @@ struct XDPUserspaceTransport {
         tcp_params_.local_ip = local_ip;
 
         // Set local IP in BPF filter
-        if (xdp_.is_bpf_enabled()) {
-            xdp_.set_local_ip(local_ip_str);
+        if (pio_.is_bpf_enabled()) {
+            pio_.set_local_ip(local_ip_str);
         }
 
         // Set up zero-copy receive buffer callback
         recv_buffer_.set_release_callback(frame_release_callback, this);
 
-        printf("[XDP-Userspace] Initialized on %s\n", interface);
+        printf("[PacketTransport] Initialized on %s\n", interface);
         printf("  Local IP:  %s\n", local_ip_str);
         printf("  Gateway:   %s\n", gateway_ip_str);
         printf("  MAC:       %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -580,64 +612,73 @@ struct XDPUserspaceTransport {
     }
 
     /**
-     * Initialize XDP transport with DNS resolution and BPF filter setup
-     *
-     * @param interface  Network interface name (e.g., "enp41s0")
-     * @param bpf_path   Path to BPF object file
-     * @param domain     Exchange domain to filter (e.g., "stream.binance.com")
-     * @param port       Exchange port to filter (e.g., 443)
+     * Initialize transport with DNS resolution and BPF filter setup
      */
     void init(const char* interface, const char* bpf_path,
               const char* domain, uint16_t port) {
-        // 1. Configure and initialize XDP
-        // Uses compile-time defaults from xdp_transport.hpp (XDP_INTERFACE, NIC_MTU, XDP_HEADROOM)
-        websocket::xdp::XDPConfig config;
-        config.interface = interface;
-        // config.frame_size uses XDP_FRAME_SIZE by default (calculated from NIC_MTU)
+        // First init without domain
+        init(interface, bpf_path);
 
-        xdp_.init(config, bpf_path);
-
-        // 2. Get local interface configuration
-        uint8_t local_mac[6];
-        uint32_t local_ip, gateway_ip, netmask;
-
-        if (!get_interface_config(interface, local_mac, &local_ip, &gateway_ip, &netmask)) {
-            throw std::runtime_error("Failed to get interface configuration");
-        }
-
-        // Initialize stack (pure packet ops only)
-        char local_ip_str[16], gateway_ip_str[16], netmask_str[16];
-        ip_to_string(local_ip, local_ip_str);
-        ip_to_string(gateway_ip, gateway_ip_str);
-        ip_to_string(netmask, netmask_str);
-
-        stack_.init(local_ip_str, gateway_ip_str, netmask_str, local_mac);
-
-        // Initialize TCP params
-        tcp_params_.local_ip = local_ip;
-
-        // Set local IP in BPF filter
-        if (xdp_.is_bpf_enabled()) {
-            xdp_.set_local_ip(local_ip_str);
-        }
-
-        // Set up zero-copy receive buffer callback
-        recv_buffer_.set_release_callback(frame_release_callback, this);
-
-        // 3. DNS resolution for exchange domain
+        // DNS resolution for exchange domain
         auto ips = resolve_hostname(domain);
         if (ips.empty()) {
             throw std::runtime_error(std::string("Failed to resolve domain: ") + domain);
         }
 
-        // 4. Configure BPF filter for all resolved IPs and port
+        // Configure BPF filter for all resolved IPs
         for (const auto& ip : ips) {
             add_exchange_ip(ip.c_str());
         }
-        add_exchange_port(port);
 
-        printf("[XDP-Userspace] Initialized on %s for %s:%u (%zu IPs)\n",
-               interface, domain, port, ips.size());
+        printf("[PacketTransport] Configured for %s:%u (%zu IPs)\n",
+               domain, port, ips.size());
+    }
+
+    /**
+     * Initialize transport with pre-configured PacketIO config
+     * Used by DisruptorPacketIO which receives config from XDP Poll process
+     *
+     * @param config Pre-configured PacketIO config (e.g., DisruptorPacketIOConfig)
+     */
+    template<typename ConfigT>
+    void init_with_pio_config(const ConfigT& config) {
+        pio_.init(config);
+
+        // Get interface name from conn_state if available
+        const char* interface = nullptr;
+        if constexpr (requires { config.conn_state; }) {
+            if (config.conn_state && config.conn_state->interface_name[0] != '\0') {
+                interface = config.conn_state->interface_name;
+            }
+        }
+
+        if (!interface) {
+            throw std::runtime_error("No interface name in config");
+        }
+
+        // Get local interface configuration
+        uint8_t local_mac[6];
+        uint32_t local_ip, gateway_ip, netmask;
+
+        if (!get_interface_config(interface, local_mac, &local_ip, &gateway_ip, &netmask)) {
+            throw std::runtime_error("Failed to get interface configuration");
+        }
+
+        // Initialize stack
+        char local_ip_str[16], gateway_ip_str[16], netmask_str[16];
+        ip_to_string(local_ip, local_ip_str);
+        ip_to_string(gateway_ip, gateway_ip_str);
+        ip_to_string(netmask, netmask_str);
+
+        stack_.init(local_ip_str, gateway_ip_str, netmask_str, local_mac);
+
+        // Initialize TCP params
+        tcp_params_.local_ip = local_ip;
+
+        // Set up zero-copy receive buffer callback
+        recv_buffer_.set_release_callback(frame_release_callback, this);
+
+        printf("[PacketTransport] Initialized with PIO config on %s\n", interface);
         printf("  Local IP:  %s\n", local_ip_str);
         printf("  Gateway:   %s\n", gateway_ip_str);
         printf("  MAC:       %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -645,36 +686,12 @@ struct XDPUserspaceTransport {
                local_mac[3], local_mac[4], local_mac[5]);
     }
 
-    // Helper: resolve hostname to list of IP addresses
-    static std::vector<std::string> resolve_hostname(const char* hostname) {
-        std::vector<std::string> ips;
-        struct addrinfo hints = {};
-        struct addrinfo* result = nullptr;
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        int ret = getaddrinfo(hostname, nullptr, &hints, &result);
-        if (ret != 0 || !result) {
-            if (result) freeaddrinfo(result);
-            return ips;
-        }
-
-        for (struct addrinfo* p = result; p != nullptr; p = p->ai_next) {
-            if (p->ai_family == AF_INET) {
-                auto* addr = reinterpret_cast<struct sockaddr_in*>(p->ai_addr);
-                char ip_str[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
-                ips.push_back(ip_str);
-            }
-        }
-        freeaddrinfo(result);
-        return ips;
-    }
+    // ========================================================================
+    // Connection
+    // ========================================================================
 
     /**
      * Connect to remote host via userspace TCP (3-way handshake)
-     *
-     * ALL control flow is here in transport, not in stack.
      */
     void connect(const char* host, uint16_t port) {
         if (connected_) {
@@ -703,12 +720,13 @@ struct XDPUserspaceTransport {
         in_addr_tmp.s_addr = htonl(remote_ip);
         inet_ntop(AF_INET, &in_addr_tmp, remote_ip_str, sizeof(remote_ip_str));
 
-        // Ensure resolved IP is in BPF filter (DNS round-robin may return different IPs)
-        if (xdp_.is_bpf_enabled()) {
-            xdp_.add_exchange_ip(remote_ip_str);
+        // Ensure resolved IP is in BPF filter
+        if (pio_.is_bpf_enabled()) {
+            pio_.add_remote_ip(remote_ip_str);
         }
 
-        printf("[XDP-Userspace] Connecting to %s:%u (%s) via userspace TCP...\n", host, port, remote_ip_str);
+        printf("[PacketTransport] Connecting to %s:%u (%s) via userspace TCP...\n",
+               host, port, remote_ip_str);
 
         // Setup TCP parameters
         tcp_params_.remote_ip = remote_ip;
@@ -719,40 +737,39 @@ struct XDPUserspaceTransport {
         tcp_params_.snd_wnd = userspace_stack::TCP_MAX_WINDOW;
         tcp_params_.rcv_wnd = userspace_stack::TCP_MAX_WINDOW;
 
-        // Initialize retransmit queue with TSC frequency
+        // Initialize retransmit queue
         if (tsc_freq_hz_ == 0) {
             tsc_freq_hz_ = calibrate_tsc_freq();
         }
         retransmit_queue_.init(tsc_freq_hz_, timers_.rto);
 
-        // Send SYN using zero-copy TX
-        uint32_t syn_frame_idx = xdp_.alloc_tx_frame_idx();
-        if (syn_frame_idx == UINT32_MAX) {
+        // Send SYN using batch TX API
+        uint32_t syn_frame_idx;
+        size_t syn_len = 0;
+        uint32_t claimed = pio_.claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+            syn_frame_idx = pio_.frame_ptr_to_idx(desc.frame_ptr);
+            uint8_t* syn_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
+            syn_len = stack_.build_syn(syn_buffer, pio_.frame_capacity(), tcp_params_);
+            desc.frame_len = static_cast<uint16_t>(syn_len);
+        });
+
+        if (claimed == 0 || syn_len == 0) {
             throw std::runtime_error("Failed to allocate TX frame for SYN");
         }
 
-        uint64_t syn_frame_addr = xdp_.frame_idx_to_addr(syn_frame_idx);
-        uint8_t* syn_buffer = xdp_.get_frame_ptr(syn_frame_addr);
-        size_t syn_len = stack_.build_syn(syn_buffer, xdp_.frame_capacity(), tcp_params_);
-        if (syn_len == 0) {
-            throw std::runtime_error("Failed to build SYN packet");
-        }
-
-        xdp_.send_raw_frame(syn_frame_addr, syn_len);
+        pio_.commit_tx_frames(syn_frame_idx, syn_frame_idx);
         state_ = userspace_stack::TCPState::SYN_SENT;
-        fprintf(stderr, "[XDP-Userspace] SYN sent (seq=%u, frame_idx=%u, len=%zu)\n",
+        fprintf(stderr, "[PacketTransport] SYN sent (seq=%u, frame_idx=%u, len=%zu)\n",
                 tcp_params_.snd_nxt - 1, syn_frame_idx, syn_len);
 
-        // Add SYN to zero-copy retransmit queue (SYN has 0 payload, consumes 1 seq)
+        // Add SYN to retransmit queue
         retransmit_queue_.add_ref(tcp_params_.snd_nxt, userspace_stack::TCP_FLAG_SYN,
                                   syn_frame_idx, static_cast<uint16_t>(syn_len), 0);
-        tcp_params_.snd_nxt++;  // SYN consumes one sequence number
+        tcp_params_.snd_nxt++;
 
         // Wait for SYN-ACK with timeout
         auto start = std::chrono::steady_clock::now();
         constexpr uint32_t timeout_ms = 5000;
-
-        // Debug: Print BPF stats during handshake
         static int handshake_debug_count = 0;
 
         while (state_ == userspace_stack::TCPState::SYN_SENT) {
@@ -760,28 +777,20 @@ struct XDPUserspaceTransport {
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
 
             if (elapsed_ms >= timeout_ms) {
-                // Print BPF stats before timeout
-                fprintf(stderr, "[XDP-Userspace] Connection timeout - BPF stats:\n");
-                xdp_.print_bpf_stats();
+                fprintf(stderr, "[PacketTransport] Connection timeout - stats:\n");
+                pio_.print_stats();
                 state_ = userspace_stack::TCPState::CLOSED;
                 throw std::runtime_error("Connection timeout");
             }
 
-            // Debug: Print BPF stats every second during handshake
             if (handshake_debug_count < 5 && (elapsed_ms / 1000) > handshake_debug_count) {
-                fprintf(stderr, "[XDP-Userspace] Handshake %lds - BPF stats:\n", elapsed_ms / 1000);
-                xdp_.print_bpf_stats();
+                fprintf(stderr, "[PacketTransport] Handshake %lds - stats:\n", elapsed_ms / 1000);
+                pio_.print_stats();
                 handshake_debug_count++;
             }
 
-            // Trigger NAPI via poll_wait() for TX completions + RX processing
-            // Required: igc driver stall bug - TX completions only happen during NAPI
-            xdp_.poll_wait();
-
-            // Poll XDP for RX frames and process
+            pio_.poll_wait();
             poll_rx_and_process();
-
-            // Check retransmissions
             check_retransmit();
 
             std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -792,14 +801,19 @@ struct XDPUserspaceTransport {
         }
 
         connected_ = true;
-        printf("[XDP-Userspace] Connected to %s:%u\n", host, port);
+        printf("[PacketTransport] Connected to %s:%u\n", host, port);
     }
+
+    bool is_connected() const {
+        return connected_ && state_ == userspace_stack::TCPState::ESTABLISHED;
+    }
+
+    // ========================================================================
+    // Data Transfer
+    // ========================================================================
 
     /**
      * Send data via userspace TCP (zero-copy path)
-     *
-     * Uses sequential TX frame allocation for zero-copy retransmit.
-     * Frames are released based on TCP ACK, not TX completion.
      */
     ssize_t send(const void* buf, size_t len) {
         if (!connected_ || state_ != userspace_stack::TCPState::ESTABLISHED) {
@@ -814,39 +828,34 @@ struct XDPUserspaceTransport {
         const uint8_t* data = static_cast<const uint8_t*>(buf);
         size_t sent = 0;
 
-        // NOTE: Caller must poll for ACKs via wait() to advance snd_una and open send window.
-        // This function only sends data; it does not process incoming ACKs.
         while (sent < len) {
             size_t remaining = len - sent;
             size_t chunk_size = std::min(remaining, static_cast<size_t>(tcp_params_.snd_mss));
 
-            // Allocate TX frame from sequential pool
-            uint32_t frame_idx = xdp_.alloc_tx_frame_idx();
-            if (frame_idx == UINT32_MAX) {
-                // TX pool exhausted
-                if (sent > 0) break;  // Return what we've sent so far
+            uint32_t frame_idx;
+            size_t frame_len = 0;
+            uint32_t claimed = pio_.claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+                frame_idx = pio_.frame_ptr_to_idx(desc.frame_ptr);
+                uint8_t* frame_data = reinterpret_cast<uint8_t*>(desc.frame_ptr);
+                frame_len = stack_.build_data(frame_data, pio_.frame_capacity(),
+                                              tcp_params_, data + sent, chunk_size);
+                desc.frame_len = static_cast<uint16_t>(frame_len);
+            });
+
+            if (claimed == 0) {
+                if (sent > 0) break;
                 errno = ENOBUFS;
                 return -1;
             }
 
-            uint64_t frame_addr = xdp_.frame_idx_to_addr(frame_idx);
-            uint8_t* frame_data = xdp_.get_frame_ptr(frame_addr);
-
-            // Build TCP packet directly in UMEM frame
-            size_t frame_len = stack_.build_data(frame_data, xdp_.frame_capacity(),
-                                                  tcp_params_, data + sent, chunk_size);
             if (frame_len == 0) {
-                // Build failed - can't send
                 if (sent > 0) break;
                 errno = EINVAL;
                 return -1;
             }
 
-            // Submit frame to TX ring
-            xdp_.send_raw_frame(frame_addr, frame_len);
+            pio_.commit_tx_frames(frame_idx, frame_idx);
 
-            // Add to zero-copy retransmit queue (no data copy)
-            // frame_len = Ethernet frame size, chunk_size = TCP payload size
             retransmit_queue_.add_ref(tcp_params_.snd_nxt,
                                       userspace_stack::TCP_FLAG_ACK | userspace_stack::TCP_FLAG_PSH,
                                       frame_idx, static_cast<uint16_t>(frame_len),
@@ -872,29 +881,19 @@ struct XDPUserspaceTransport {
             return 0;
         }
 
-        // Use poll() to trigger SO_BUSY_POLL
-        // This is critical for TX completion processing with igc driver
-        xdp_.poll_wait();
-
-        // Poll for incoming packets
+        pio_.poll_wait();
         poll_rx_and_process();
 
-        // Read from receive buffer
         ssize_t result = recv_buffer_.read(static_cast<uint8_t*>(buf), len);
 
-        // If no data available, check TCP state to determine if connection is closed
         if (result == 0) {
-            // If connection is still established, return EAGAIN (would block)
-            // Otherwise, return 0 (connection closed by peer)
             if (state_ == userspace_stack::TCPState::ESTABLISHED) {
                 errno = EAGAIN;
                 return -1;
             }
-            // Connection closing or closed - return 0 to signal EOF
             return 0;
         }
 
-        // Aggregate per-frame stats into cumulative stats
         if (result > 0) {
             const auto& stats = recv_buffer_.get_last_read_stats();
             consumed_recv_packet_count_ += stats.packet_count;
@@ -909,36 +908,74 @@ struct XDPUserspaceTransport {
         return result;
     }
 
-    int get_fd() const { return -1; }
-    void set_nonblocking() { /* Always non-blocking */ }
+    // ========================================================================
+    // Polling
+    // ========================================================================
 
-    /**
-     * Close TCP connection
-     */
+    void set_wait_timeout(int timeout_ms) {
+        poll_interval_us_ = timeout_ms * 1000;
+        if (tsc_freq_hz_ == 0) {
+            tsc_freq_hz_ = calibrate_tsc_freq();
+        }
+        if (poll_interval_us_ > 0 && tsc_freq_hz_ > 0) {
+            timeout_cycles_ = ((uint64_t)poll_interval_us_ * tsc_freq_hz_) / 1000000ULL;
+        } else {
+            timeout_cycles_ = 0;
+        }
+    }
+
+    int wait() {
+        uint64_t start_cycle = rdtsc();
+
+        do {
+            pio_.poll_wait();
+            poll_rx_and_process();
+
+            if (recv_buffer_.available() > 0) {
+                check_retransmit();
+                return 1;
+            }
+        } while (timeout_cycles_ == 0 || (rdtsc() - start_cycle) < timeout_cycles_);
+
+        check_retransmit();
+        return 0;
+    }
+
+    void poll() {
+        pio_.poll_wait();
+        poll_rx_and_process();
+        check_retransmit();
+        // Note: FIFO release now happens automatically in mark_frame_acked()
+    }
+
+    // ========================================================================
+    // Close
+    // ========================================================================
+
     void close() {
         if (state_ == userspace_stack::TCPState::CLOSED) {
             return;
         }
 
         if (state_ == userspace_stack::TCPState::ESTABLISHED) {
-            // Send FIN using zero-copy TX
-            uint32_t fin_frame_idx = xdp_.alloc_tx_frame_idx();
-            if (fin_frame_idx != UINT32_MAX) {
-                uint64_t fin_frame_addr = xdp_.frame_idx_to_addr(fin_frame_idx);
-                uint8_t* fin_buffer = xdp_.get_frame_ptr(fin_frame_addr);
-                size_t fin_len = stack_.build_fin(fin_buffer, xdp_.frame_capacity(), tcp_params_);
-                if (fin_len > 0) {
-                    xdp_.send_raw_frame(fin_frame_addr, fin_len);
-                    // FIN has 0 payload, consumes 1 seq (like SYN)
-                    retransmit_queue_.add_ref(tcp_params_.snd_nxt,
-                                              userspace_stack::TCP_FLAG_FIN | userspace_stack::TCP_FLAG_ACK,
-                                              fin_frame_idx, static_cast<uint16_t>(fin_len), 0);
-                    tcp_params_.snd_nxt++;
-                    state_ = userspace_stack::TCPState::FIN_WAIT_1;
-                }
+            uint32_t fin_frame_idx;
+            size_t fin_len = 0;
+            uint32_t claimed = pio_.claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+                fin_frame_idx = pio_.frame_ptr_to_idx(desc.frame_ptr);
+                uint8_t* fin_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
+                fin_len = stack_.build_fin(fin_buffer, pio_.frame_capacity(), tcp_params_);
+                desc.frame_len = static_cast<uint16_t>(fin_len);
+            });
+
+            if (claimed > 0 && fin_len > 0) {
+                pio_.commit_tx_frames(fin_frame_idx, fin_frame_idx);
+                retransmit_queue_.add_ref(tcp_params_.snd_nxt,
+                                          userspace_stack::TCP_FLAG_FIN | userspace_stack::TCP_FLAG_ACK,
+                                          fin_frame_idx, static_cast<uint16_t>(fin_len), 0);
+                tcp_params_.snd_nxt++;
+                state_ = userspace_stack::TCPState::FIN_WAIT_1;
             }
 
-            // Wait briefly for FIN-ACK
             auto start = std::chrono::steady_clock::now();
             while (state_ != userspace_stack::TCPState::CLOSED &&
                    state_ != userspace_stack::TCPState::TIME_WAIT) {
@@ -948,7 +985,7 @@ struct XDPUserspaceTransport {
 
                 poll_rx_and_process();
                 check_retransmit();
-                xdp_.try_release_tx_frames();
+                // Note: FIFO release now happens automatically in mark_frame_acked()
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
         }
@@ -957,164 +994,44 @@ struct XDPUserspaceTransport {
         connected_ = false;
         retransmit_queue_.clear();
         recv_buffer_.clear();
+        pio_.close();
     }
 
-    bool is_connected() const {
-        return connected_ && state_ == userspace_stack::TCPState::ESTABLISHED;
-    }
+    // ========================================================================
+    // SSL Integration
+    // ========================================================================
 
-    /**
-     * Poll for RX and handle retransmits (call periodically)
-     *
-     * Uses poll() on AF_XDP socket to trigger SO_BUSY_POLL behavior
-     * which processes both RX and TX completions.
-     * This is critical during SSL handshake where TX completion timing affects success.
-     */
-    void poll() {
-        // Use poll() to trigger SO_BUSY_POLL for TX completions
-        xdp_.poll_wait();
-
-        poll_rx_and_process();
-        check_retransmit();
-
-        // Release contiguous acked TX frames
-        xdp_.try_release_tx_frames();
-    }
-
-    // =========================================================================
-    // Event waiting (TransportPolicy interface)
-    // =========================================================================
-
-    /**
-     * Set timeout for wait operations
-     * @param timeout_ms Timeout in milliseconds (0 = busy poll)
-     *
-     * For XDP, this controls the busy-poll loop duration.
-     * 0 = infinite busy-poll (lowest latency, highest CPU)
-     * Uses milliseconds to match BSD socket transport API.
-     *
-     * TSC calibration is done here (one-time) rather than in wait() hot path.
-     */
-    void set_wait_timeout(int timeout_ms) {
-        // Convert milliseconds to microseconds for internal use
-        // This matches the BSD socket API which uses milliseconds
-        poll_interval_us_ = timeout_ms * 1000;
-
-        // One-time TSC frequency calibration (done at setup, not in hot path)
-        if (tsc_freq_hz_ == 0) {
-            tsc_freq_hz_ = calibrate_tsc_freq();
-        }
-
-        // Pre-calculate timeout in cycles
-        if (poll_interval_us_ > 0 && tsc_freq_hz_ > 0) {
-            timeout_cycles_ = ((uint64_t)poll_interval_us_ * tsc_freq_hz_) / 1000000ULL;
-        } else {
-            timeout_cycles_ = 0;  // 0 = infinite busy-poll
-        }
-    }
-
-    /**
-     * Wait for data to be available
-     * @return 1 if data available in recv buffer, 0 otherwise
-     *
-     * Loops poll_wait() until data is available or timeout.
-     * Uses pre-calculated TSC cycles for precise timing.
-     * Only processes RX when poll_wait() indicates events ready.
-     *
-     * For HFT, use set_wait_timeout(0) for pure busy-polling (loops forever).
-     */
-    int wait() {
-        uint64_t start_cycle = rdtsc();
-
-        do {
-            // poll_wait() triggers SO_BUSY_POLL and sends inline trickle to trigger NAPI
-            // The inline trickle is critical for igc driver: SO_BUSY_POLL alone doesn't
-            // trigger NAPI for AF_XDP RX delivery and TX completions. The trickle packet
-            // ensures NAPI runs, which processes both RX and TX rings.
-            xdp_.poll_wait();
-
-            // Always process RX ring after poll_wait() - NAPI may have delivered packets
-            // even if poll() returns 0 (events ready check happens before NAPI completes)
-            poll_rx_and_process();
-
-            // Check if we have data ready
-            if (recv_buffer_.available() > 0) {
-                check_retransmit();
-                return 1;
-            }
-
-            // If timeout_cycles_ is 0, loop forever (pure busy-poll)
-            // Otherwise, check if we've exceeded timeout
-        } while (timeout_cycles_ == 0 || (rdtsc() - start_cycle) < timeout_cycles_);
-
-        check_retransmit();
-        return 0;  // Timeout, no data
-    }
-
-    /**
-     * Get ready file descriptor (not applicable for XDP)
-     * Always returns -1 as XDP doesn't use file descriptors
-     */
-    int get_ready_fd() const {
-        return -1;
-    }
-
-    // =========================================================================
-    // SSL integration (TransportPolicy interface)
-    // =========================================================================
-
-    /**
-     * Get transport pointer for userspace BIO
-     * Used by UserspaceTransportBIO to call send/recv
-     */
     void* get_transport_ptr() { return this; }
-
-    /**
-     * Check if kTLS is supported (no for XDP - no kernel socket)
-     */
     bool supports_ktls() const { return false; }
+    int get_fd() const { return -1; }
 
-    // XDP/BPF configuration
-    void add_exchange_ip(const char* ip) { xdp_.add_exchange_ip(ip); }
-    void add_exchange_port(uint16_t port) { xdp_.add_exchange_port(port); }
-    websocket::xdp::XDPTransport* get_xdp_transport() { return &xdp_; }
-    const char* get_xdp_mode() const { return xdp_.get_xdp_mode(); }
-    const char* get_interface() const { return xdp_.get_interface(); }
-    uint32_t get_queue_id() const { return xdp_.get_queue_id(); }
-    bool is_bpf_enabled() const { return xdp_.is_bpf_enabled(); }
-    void print_bpf_stats() const { xdp_.print_bpf_stats(); }
-    void stop_rx_trickle_thread() { xdp_.stop_rx_trickle_thread(); }
+    // ========================================================================
+    // BPF Configuration
+    // ========================================================================
 
-    /**
-     * Get oldest RX hardware timestamp since last reset (Stage 1)
-     * For multi-packet messages, this is the timestamp of the first packet
-     * @return Hardware timestamp in nanoseconds (CLOCK_REALTIME domain for XDP), 0 if unavailable
-     */
-    uint64_t get_oldest_rx_hw_timestamp() const { return oldest_rx_hw_timestamp_ns_; }
+    void add_exchange_ip(const char* ip) { pio_.add_remote_ip(ip); }
+    void add_exchange_port(uint16_t port) { pio_.add_remote_port(port); }
 
-    /**
-     * Get latest RX hardware timestamp since last reset (Stage 1)
-     * For multi-packet messages, this is the timestamp of the most recent packet
-     * @return Hardware timestamp in nanoseconds (CLOCK_REALTIME domain for XDP), 0 if unavailable
-     */
-    uint64_t get_latest_rx_hw_timestamp() const { return latest_rx_hw_timestamp_ns_; }
+    // ========================================================================
+    // Statistics
+    // ========================================================================
 
-    /**
-     * Get count of packets with hardware timestamps since last reset
-     * @return Number of packets timestamped (>1 indicates multi-packet message)
-     */
-    uint32_t get_hw_timestamp_count() const { return hw_timestamp_count_; }
+    void print_bpf_stats() const { pio_.print_stats(); }
 
-    /**
-     * Get count of bytes polled since last reset
-     * @return Number of bytes received via poll_rx_and_process()
-     */
-    uint64_t get_hw_timestamp_byte_count() const { return hw_timestamp_byte_ct_; }
+    // ========================================================================
+    // Hardware Timestamps
+    // ========================================================================
 
-    /**
-     * Reset hardware timestamp tracking for new message
-     * Call this after copying timestamps to timing_record_t
-     */
+    uint64_t get_recv_oldest_timestamp() const { return consumed_recv_oldest_timestamp_ns_; }
+    uint64_t get_recv_latest_timestamp() const { return consumed_recv_latest_timestamp_ns_; }
+    uint32_t get_recv_packet_count() const { return consumed_recv_packet_count_; }
+
+    void reset_recv_stats() {
+        consumed_recv_packet_count_ = 0;
+        consumed_recv_oldest_timestamp_ns_ = 0;
+        consumed_recv_latest_timestamp_ns_ = 0;
+    }
+
     void reset_hw_timestamps() {
         oldest_rx_hw_timestamp_ns_ = 0;
         latest_rx_hw_timestamp_ns_ = 0;
@@ -1122,113 +1039,86 @@ struct XDPUserspaceTransport {
         hw_timestamp_byte_ct_ = 0;
     }
 
-    // =========================================================================
-    // Cumulative recv stats (per-frame tracking across SSL buffer)
-    // These track packets actually consumed via recv(), not just packets received
-    // =========================================================================
+    // ========================================================================
+    // Accessors
+    // ========================================================================
 
-    /**
-     * Get cumulative packet count from recv() calls since last reset
-     * Tracks packets whose data was actually consumed, accounting for SSL buffering
-     */
-    uint32_t get_recv_packet_count() const { return consumed_recv_packet_count_; }
+    const char* get_xdp_mode() const { return pio_.get_mode(); }
+    const char* get_interface() const { return pio_.get_interface(); }
+    uint32_t get_queue_id() const { return pio_.get_queue_id(); }
+    bool is_bpf_enabled() const { return pio_.is_bpf_enabled(); }
+    void stop_rx_trickle_thread() { pio_.stop_rx_trickle_thread(); }
 
-    /**
-     * Get oldest hardware timestamp from recv() calls since last reset
-     */
-    uint64_t get_recv_oldest_timestamp() const { return consumed_recv_oldest_timestamp_ns_; }
+    // Hardware timestamp statistics
+    uint32_t get_hw_timestamp_count() const { return hw_timestamp_count_; }
+    uint64_t get_hw_timestamp_byte_count() const { return hw_timestamp_byte_ct_; }
 
-    /**
-     * Get latest hardware timestamp from recv() calls since last reset
-     */
-    uint64_t get_recv_latest_timestamp() const { return consumed_recv_latest_timestamp_ns_; }
-
-    /**
-     * Reset cumulative recv stats for new message batch
-     * Call this after processing a batch of messages from ssl.read()
-     */
-    void reset_recv_stats() {
-        consumed_recv_packet_count_ = 0;
-        consumed_recv_oldest_timestamp_ns_ = 0;
-        consumed_recv_latest_timestamp_ns_ = 0;
-    }
-
-    // =========================================================================
-    // XSK State Accessors (for pipeline process inheritance)
-    // =========================================================================
-    // These allow child processes to inherit the XSK socket/UMEM after fork
-
-    struct xsk_socket* get_xsk() { return xdp_.get_xsk(); }
-    struct xsk_umem* get_umem() { return xdp_.get_umem(); }
-    void* get_umem_area() { return xdp_.get_umem_area(); }
-    size_t get_umem_size() const { return xdp_.get_umem_size(); }
-    struct xsk_ring_prod* get_fill_ring() { return xdp_.get_fill_ring(); }
-    struct xsk_ring_cons* get_comp_ring() { return xdp_.get_comp_ring(); }
-    struct xsk_ring_cons* get_rx_ring() { return xdp_.get_rx_ring(); }
-    struct xsk_ring_prod* get_tx_ring() { return xdp_.get_tx_ring(); }
-    uint32_t get_frame_size() const { return xdp_.get_frame_size(); }
-    websocket::xdp::BPFLoader* get_bpf_loader() { return xdp_.get_bpf_loader(); }
-
-    // TCP parameters accessor (for populating shared memory after handshake)
+    PacketIO* get_packet_io() { return &pio_; }
     const userspace_stack::TCPParams& tcp_params() const { return tcp_params_; }
-
-    // MAC address accessors (for populating shared memory after handshake)
     const uint8_t* get_local_mac() const { return stack_.get_local_mac(); }
     const uint8_t* get_gateway_mac() const { return stack_.get_gateway_mac(); }
 
 private:
-    // =========================================================================
-    // PACKET SENDING (uses stack's pure packet building)
-    // =========================================================================
+    // ========================================================================
+    // PacketIO Config Initialization (specialization helper)
+    // ========================================================================
 
-    /**
-     * Send pure ACK (no retransmit tracking needed)
-     * Uses old alloc_tx_buffer() path - ACKs don't need zero-copy retransmit
-     */
-    void send_ack() {
-        auto [buffer, capacity] = alloc_tx_buffer();
-        if (!buffer) return;
-
-        size_t len = stack_.build_ack(buffer, capacity, tcp_params_);
-        if (len > 0) {
-            send_tx_buffer(len);
-        }
+    // Default: assume XDPPacketIOConfig-like interface
+    template<typename ConfigT>
+    void init_packet_io_config(ConfigT& config, const char* interface,
+                               const char* bpf_path, bool zero_copy) {
+        config.interface = interface;
+        config.bpf_path = bpf_path;
+        config.zero_copy = zero_copy;
     }
 
-    // =========================================================================
-    // RX PROCESSING
-    // =========================================================================
+    // ========================================================================
+    // RX Processing
+    // ========================================================================
 
     void poll_rx_and_process() {
-        // Process ALL available packets in the RX ring
-        websocket::xdp::XDPFrame* frame = xdp_.peek_rx_frame();
+        [[maybe_unused]] uint64_t poll_enter_cycle = rdtsc();
+        pio_.process_rx_frames(SIZE_MAX, [this, poll_enter_cycle](uint32_t idx, websocket::xdp::PacketFrameDescriptor& desc) {
+            uint32_t frame_idx = pio_.frame_ptr_to_idx(desc.frame_ptr);
+            uint8_t* frame_data = reinterpret_cast<uint8_t*>(desc.frame_ptr);
+            uint16_t frame_len = desc.frame_len;
+            uint64_t hw_timestamp_ns = desc.nic_timestamp_ns;
 
-        // Debug: track poll calls during handshake
-        static int poll_debug_count = 0;
-        if (poll_debug_count < 50 && state_ == userspace_stack::TCPState::SYN_SENT) {
-            if (frame) {
-                fprintf(stderr, "[XDP-Userspace] RX frame during SYN_SENT: len=%u hw_ts=%lu\n",
-                        frame->len, frame->hw_timestamp_ns);
-            }
-            poll_debug_count++;
-        }
+            dbg_rx_total_++;
 
-        while (frame) {
-            // Capture hardware timestamp from XDP metadata
-            if (frame->hw_timestamp_ns > 0) {
+            if (hw_timestamp_ns > 0) {
                 if (hw_timestamp_count_ == 0) {
-                    oldest_rx_hw_timestamp_ns_ = frame->hw_timestamp_ns;
+                    oldest_rx_hw_timestamp_ns_ = hw_timestamp_ns;
                 }
-                latest_rx_hw_timestamp_ns_ = frame->hw_timestamp_ns;
+                latest_rx_hw_timestamp_ns_ = hw_timestamp_ns;
                 hw_timestamp_count_++;
             }
 
-            auto parsed = stack_.parse_tcp(frame->data, frame->len,
+            auto parsed = stack_.parse_tcp(frame_data, frame_len,
                                            tcp_params_.local_port,
                                            tcp_params_.remote_ip,
                                            tcp_params_.remote_port);
 
             if (parsed.valid) {
+                char fs[8]; int fi = 0;
+                if (parsed.flags & 0x02) fs[fi++] = 'S';
+                if (parsed.flags & 0x10) fs[fi++] = 'A';
+                if (parsed.flags & 0x08) fs[fi++] = 'P';
+                if (parsed.flags & 0x01) fs[fi++] = 'F';
+                if (parsed.flags & 0x04) fs[fi++] = 'R';
+                fs[fi] = '\0';
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                fprintf(stderr, "[%ld.%06ld] [TRANSPORT-POLL] len=%u seq=%u ack=%u flags=%s win=%u payload=%zu\n",
+                        ts.tv_sec, ts.tv_nsec / 1000, frame_len,
+                        parsed.seq, parsed.ack, fs, parsed.window, parsed.payload_len);
+            }
+
+            bool frame_consumed = false;  // Track if frame was pushed to recv_buffer_
+
+            if (parsed.valid) {
+                dbg_rx_valid_++;
+                if (parsed.payload_len > 0) dbg_rx_has_payload_++;
                 auto result = stack_.process_tcp(state_, tcp_params_, parsed);
 
                 if (result.state_changed) {
@@ -1237,6 +1127,14 @@ private:
 
                 switch (result.action) {
                 case userspace_stack::TCPAction::SEND_ACK:
+                    dbg_rx_send_ack_++;
+                    if (parsed.flags & userspace_stack::TCP_FLAG_SYN) {
+                        dbg_rx_syn_ack_++;
+                    } else if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
+                        dbg_rx_fin_++;
+                    } else if (parsed.payload_len > 0) {
+                        dbg_rx_ooo_data_++;
+                    }
                     if (parsed.flags & userspace_stack::TCP_FLAG_SYN) {
                         tcp_params_.rcv_nxt = parsed.seq + 1;
                     } else if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
@@ -1246,19 +1144,17 @@ private:
                     break;
 
                 case userspace_stack::TCPAction::DATA_RECEIVED:
+                    dbg_rx_data_++;
                     if (result.data && result.data_len > 0) {
-                        // Track bytes polled for hw_timestamp stats
+                        dbg_rx_data_bytes_ += result.data_len;
                         hw_timestamp_byte_ct_ += result.data_len;
-                        // Save timestamp before releasing frame
-                        uint64_t frame_timestamp = frame->hw_timestamp_ns;
-                        uint64_t umem_addr = xdp_.release_rx_frame(frame, true);
-                        if (umem_addr != 0) {
-                            bool push_ok = recv_buffer_.push_frame(result.data, result.data_len, umem_addr, frame_timestamp);
-                            if (!push_ok) {
-                                // Frame was deferred-released but can't be pushed - must refill immediately
-                                xdp_.refill_frame(umem_addr);
-                            }
-                            frame = nullptr;
+                        uint64_t umem_addr = desc.frame_ptr;  // Use frame_ptr as umem_addr for compatibility
+                        bool push_ok = recv_buffer_.push_frame(result.data, result.data_len,
+                                                               frame_idx, umem_addr, hw_timestamp_ns);
+                        if (push_ok) {
+                            frame_consumed = true;  // Don't mark_frame_consumed now, recv_buffer_ will do it
+                        } else {
+                            dbg_rx_push_fail_++;
                         }
                         tcp_params_.rcv_nxt += result.data_len;
                         send_ack();
@@ -1270,80 +1166,109 @@ private:
                     break;
 
                 default:
+                    dbg_rx_other_action_++;
                     break;
                 }
 
-                // Process ACKs (update snd_una, mark frames as acked)
                 if (parsed.flags & userspace_stack::TCP_FLAG_ACK) {
+                    dbg_rx_has_ack_flag_++;
                     if (userspace_stack::seq_gt(parsed.ack, tcp_params_.snd_una)) {
-                        // Get frame indices that are now acked
-                        auto released = retransmit_queue_.remove_acked(parsed.ack);
-                        // Mark frames as acked (will be released by try_release_tx_frames())
-                        for (uint32_t frame_idx : released) {
-                            xdp_.mark_frame_acked(frame_idx);
+                        dbg_rx_ack_advance_++;
+                        uint32_t released_frames[256];
+                        size_t released_count = retransmit_queue_.remove_acked(parsed.ack,
+                                                                                released_frames, 256);
+                        for (size_t i = 0; i < released_count; i++) {
+                            pio_.mark_frame_acked(released_frames[i]);
                         }
                         tcp_params_.snd_una = parsed.ack;
                     }
                 }
 
-                // Update window
                 tcp_params_.snd_wnd = parsed.window;
+            } else {
+                dbg_rx_invalid_++;
             }
 
-            // Release frame if not already handled by zero-copy path
-            if (frame != nullptr) {
-                xdp_.release_rx_frame(frame);
+            // Mark frame consumed if not pushed to recv_buffer_ (which manages its own release)
+            if (!frame_consumed) {
+                pio_.mark_frame_consumed(frame_idx);
             }
+        });
+    }
 
-            // Try to get next packet
-            frame = xdp_.peek_rx_frame();
+    // ========================================================================
+    // TX Helpers
+    // ========================================================================
+
+    void send_ack() {
+        // Pure ACKs go through ACK_OUTBOX (separate from data path)
+        // This avoids congestion control tracking issues - ACKs don't need retransmit
+        uint32_t frame_idx = pio_.commit_ack_frame([this](websocket::xdp::PacketFrameDescriptor& desc) {
+            uint8_t* ack_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
+            desc.frame_len = static_cast<uint16_t>(
+                stack_.build_ack(ack_buffer, pio_.frame_capacity(), tcp_params_));
+        });
+
+        if (frame_idx == 0) {
+            fprintf(stderr, "[TRANSPORT] WARNING: Failed to send ACK (ACK_OUTBOX full?)\n");
         }
     }
 
-    // =========================================================================
-    // RETRANSMIT HANDLING (zero-copy: re-submit existing UMEM frames)
-    // =========================================================================
+    // ========================================================================
+    // Retransmit Handling
+    // ========================================================================
 
     void check_retransmit() {
-        auto refs = retransmit_queue_.get_retransmit_refs();
+        uint64_t now_tsc = rdtsc();
+        uint64_t rto_cycles = retransmit_queue_.get_rto_cycles();
 
-        for (auto* ref : refs) {
-            // Retransmit existing frame (no rebuild, no re-encryption)
-            ssize_t sent = xdp_.retransmit_frame(ref->frame_idx, ref->frame_len);
-            if (sent > 0) {
-                retransmit_queue_.mark_retransmitted(ref->seq);
-            }
-            // If TX ring full, retry next poll iteration
-        }
+        retransmit_queue_.for_each_expired(now_tsc, rto_cycles,
+            [this, now_tsc](userspace_stack::RetransmitSegmentRef& ref) -> bool {
+                ssize_t sent = pio_.retransmit_frame(ref.frame_idx, ref.frame_len);
+                if (sent > 0) {
+                    retransmit_queue_.mark_retransmitted(ref.seq, now_tsc);
+                }
+                return true;
+            });
 
-        // Check for failed segments
         if (retransmit_queue_.has_failed_segment()) {
+            struct timespec ts_fatal;
+            clock_gettime(CLOCK_MONOTONIC, &ts_fatal);
+            fprintf(stderr, "[%ld.%06ld] [RETX] FATAL: Segment exceeded max retransmits, closing connection\n",
+                    ts_fatal.tv_sec, ts_fatal.tv_nsec / 1000);
             state_ = userspace_stack::TCPState::CLOSED;
             connected_ = false;
         }
     }
 
-    // =========================================================================
-    // XDP I/O HELPERS
-    // =========================================================================
+    // ========================================================================
+    // Utility
+    // ========================================================================
 
-    std::pair<uint8_t*, size_t> alloc_tx_buffer() {
-        current_tx_frame_ = xdp_.get_tx_frame();
-        if (!current_tx_frame_) {
-            return {nullptr, 0};
+    static std::vector<std::string> resolve_hostname(const char* hostname) {
+        std::vector<std::string> ips;
+        struct addrinfo hints = {};
+        struct addrinfo* result = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        int ret = getaddrinfo(hostname, nullptr, &hints, &result);
+        if (ret != 0 || !result) {
+            if (result) freeaddrinfo(result);
+            return ips;
         }
-        return {current_tx_frame_->data, current_tx_frame_->capacity};
-    }
 
-    void send_tx_buffer(size_t len) {
-        if (!current_tx_frame_) return;
-        xdp_.send_frame(current_tx_frame_, len);
-        current_tx_frame_ = nullptr;
+        for (struct addrinfo* p = result; p != nullptr; p = p->ai_next) {
+            if (p->ai_family == AF_INET) {
+                auto* addr = reinterpret_cast<struct sockaddr_in*>(p->ai_addr);
+                char ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
+                ips.push_back(ip_str);
+            }
+        }
+        freeaddrinfo(result);
+        return ips;
     }
-
-    // =========================================================================
-    // UTILITY
-    // =========================================================================
 
     bool get_interface_config(const char* interface,
                              uint8_t* local_mac,
@@ -1388,47 +1313,70 @@ private:
                 ip & 0xFF);
     }
 
-    // XDP and Stack (pure packet ops)
-    websocket::xdp::XDPTransport xdp_;
+    static void frame_release_callback(uint32_t frame_idx, void* user_data) {
+        auto* self = static_cast<PacketTransport*>(user_data);
+        self->pio_.mark_frame_consumed(frame_idx);
+    }
+
+    // ========================================================================
+    // Member Variables
+    // ========================================================================
+
+    PacketIO pio_;
     userspace_stack::UserspaceStack stack_;
 
-    // TCP state (owned by transport, not stack)
     userspace_stack::TCPState state_;
     userspace_stack::TCPParams tcp_params_;
     userspace_stack::TCPTimers timers_;
-    userspace_stack::ZeroCopyRetransmitQueue retransmit_queue_;  // Zero-copy: holds UMEM frame refs
-    userspace_stack::ZeroCopyReceiveBuffer recv_buffer_;  // Zero-copy: holds UMEM frame refs
+    userspace_stack::ZeroCopyRetransmitQueue retransmit_queue_;
+    userspace_stack::ZeroCopyReceiveBuffer recv_buffer_;
 
-    // Connection state
     bool connected_;
 
-    // Stage 1: Hardware timestamps from NIC (nanoseconds, CLOCK_REALTIME domain)
-    // Track oldest/latest for multi-packet messages
-    uint64_t oldest_rx_hw_timestamp_ns_;  // First packet timestamp
-    uint64_t latest_rx_hw_timestamp_ns_;  // Most recent packet timestamp
-    uint32_t hw_timestamp_count_;         // Packets received since last reset
-    uint64_t hw_timestamp_byte_ct_;       // Bytes received since last reset
+    uint64_t oldest_rx_hw_timestamp_ns_;
+    uint64_t latest_rx_hw_timestamp_ns_;
+    uint32_t hw_timestamp_count_;
+    uint64_t hw_timestamp_byte_ct_;
 
-    // Cumulative recv stats (aggregated across multiple recv() calls)
-    // Tracks packets actually consumed via recv_buffer_.read()
     uint32_t consumed_recv_packet_count_ = 0;
     uint64_t consumed_recv_oldest_timestamp_ns_ = 0;
     uint64_t consumed_recv_latest_timestamp_ns_ = 0;
 
-    // Polling configuration
-    int poll_interval_us_ = 0;  // 0 = busy poll (default for HFT)
-    uint64_t tsc_freq_hz_ = 0;  // TSC frequency for timeout calculation
-    uint64_t timeout_cycles_ = 0;  // Pre-calculated timeout in TSC cycles
+    int poll_interval_us_ = 0;
+    uint64_t tsc_freq_hz_ = 0;
+    uint64_t timeout_cycles_ = 0;
 
-    // Current TX frame
-    websocket::xdp::XDPFrame* current_tx_frame_ = nullptr;
+    // Debug RX accounting (always active, negligible overhead)
+    uint32_t dbg_rx_total_ = 0;        // Frames delivered from RAW_INBOX
+    uint32_t dbg_rx_valid_ = 0;        // Parsed as valid TCP
+    uint32_t dbg_rx_invalid_ = 0;      // Failed TCP parse
+    uint32_t dbg_rx_has_payload_ = 0;  // Valid TCP with payload_len > 0
+    uint32_t dbg_rx_send_ack_ = 0;     // Action: SEND_ACK (SYN-ACK, FIN, OOO)
+    uint32_t dbg_rx_syn_ack_ = 0;      // SEND_ACK due to SYN-ACK
+    uint32_t dbg_rx_fin_ = 0;          // SEND_ACK due to FIN
+    uint32_t dbg_rx_ooo_data_ = 0;     // SEND_ACK due to OOO data (payload>0, no SYN/FIN, seq!=rcv_nxt)
+    uint32_t dbg_rx_data_ = 0;         // Action: DATA_RECEIVED
+    uint32_t dbg_rx_data_bytes_ = 0;   // Total data bytes received
+    uint32_t dbg_rx_push_fail_ = 0;    // recv_buffer_.push_frame() failed
+    uint32_t dbg_rx_other_action_ = 0; // Action: NONE/CLOSED/other
+    uint32_t dbg_rx_has_ack_flag_ = 0; // RX frames with ACK flag set
+    uint32_t dbg_rx_ack_advance_ = 0;  // ACK advanced snd_una
 
-    // Static callback for releasing frames from ZeroCopyReceiveBuffer
-    static void frame_release_callback(uint64_t umem_addr, void* user_data) {
-        auto* self = static_cast<XDPUserspaceTransport*>(user_data);
-        self->xdp_.refill_frame(umem_addr);
+public:
+    void print_rx_debug_stats() const {
+        fprintf(stderr, "[TRANSPORT-RX-STATS] total=%u valid=%u invalid=%u "
+                        "has_payload=%u send_ack=%u(syn=%u fin=%u ooo=%u) "
+                        "data=%u(%u bytes) push_fail=%u other=%u "
+                        "ack_flag=%u ack_advance=%u\n",
+                dbg_rx_total_, dbg_rx_valid_, dbg_rx_invalid_,
+                dbg_rx_has_payload_,
+                dbg_rx_send_ack_, dbg_rx_syn_ack_, dbg_rx_fin_, dbg_rx_ooo_data_,
+                dbg_rx_data_, dbg_rx_data_bytes_,
+                dbg_rx_push_fail_, dbg_rx_other_action_,
+                dbg_rx_has_ack_flag_, dbg_rx_ack_advance_);
     }
 };
+
 #endif  // USE_XDP
 
 } // namespace transport
@@ -1462,7 +1410,7 @@ namespace transport {
  *
  * Note: init() has different signatures for different transports:
  *   - BSDSocketTransport: init() - no arguments
- *   - XDPUserspaceTransport: init(interface, bpf_path) - two arguments
+ *   - PacketTransport<XDPPacketIO>: init(interface, bpf_path) - two arguments
  */
 template<typename T>
 concept TransportPolicyConcept = requires(T transport, const char* host, uint16_t port,
@@ -1521,10 +1469,10 @@ concept UserspaceTransportConcept = TransportPolicyConcept<T> && requires(T tran
 template<typename EventPolicy>
 concept BSDSocketTransportValid = FdBasedTransportConcept<BSDSocketTransport<EventPolicy>>;
 
-// Note: XDPUserspaceTransport validation is conditional on USE_XDP
+// Note: PacketTransport validation is conditional on USE_XDP
 #ifdef USE_XDP
-static_assert(UserspaceTransportConcept<XDPUserspaceTransport>,
-              "XDPUserspaceTransport must conform to UserspaceTransportConcept");
+static_assert(UserspaceTransportConcept<PacketTransport<websocket::xdp::XDPPacketIO>>,
+              "PacketTransport<XDPPacketIO> must conform to UserspaceTransportConcept");
 #endif
 
 } // namespace transport

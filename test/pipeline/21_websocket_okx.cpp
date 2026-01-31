@@ -52,9 +52,19 @@
 #include "../../src/pipeline/20_ws_process.hpp"
 #include "../../src/pipeline/msg_inbox.hpp"
 #include "../../src/core/http.hpp"
-#include "../../src/policy/ssl.hpp"  // WolfSSLPolicy
+#include "../../src/policy/ssl.hpp"  // OpenSSLPolicy / WolfSSLPolicy
 
 using namespace websocket::pipeline;
+using namespace websocket::ssl;
+
+// Select SSL policy based on compile-time flags
+#if defined(USE_OPENSSL)
+using SSLPolicyType = OpenSSLPolicy;
+#elif defined(USE_WOLFSSL)
+using SSLPolicyType = WolfSSLPolicy;
+#else
+#error "Must define USE_OPENSSL or USE_WOLFSSL"
+#endif
 
 // ============================================================================
 // Configuration
@@ -412,21 +422,18 @@ bool get_default_gateway(const char* interface, std::string& gateway_out) {
 // Enable debug modes
 static constexpr bool PROFILING_ENABLED = true;
 static constexpr bool DEBUG_TCP_ENABLED = true;  // TCP debug mode for retransmit detection
-static constexpr bool DEBUG_XDP_ENABLED = true;  // XDP debug mode for fill-ring monitoring
-
-// XDP Poll Process types (with profiling and debug enabled)
+// XDP Poll Process types (with profiling enabled)
 using XDPPollType = XDPPollProcess<
     IPCRingProducer<UMEMFrameDescriptor>,
     IPCRingConsumer<UMEMFrameDescriptor>,
     true,                                   // TrickleEnabled
     PROFILING_ENABLED,                      // Profiling
     256,                                    // FrameHeadroom (default)
-    2048,                                   // FrameSize (default)
-    DEBUG_XDP_ENABLED>;                     // DebugXDP - fill-ring monitoring
+    2048>;                                  // FrameSize (default)
 
-// Transport Process types (with WolfSSL and profiling enabled)
+// Transport Process types (with SSL and profiling enabled)
 using TransportType = TransportProcess<
-    WolfSSLPolicy,                         // WolfSSL for WSS
+    SSLPolicyType,                         // OpenSSL or WolfSSL for WSS
     IPCRingConsumer<UMEMFrameDescriptor>,  // RawInboxCons
     IPCRingProducer<UMEMFrameDescriptor>,  // RawOutboxProd
     IPCRingProducer<UMEMFrameDescriptor>,  // AckOutboxProd
@@ -1082,9 +1089,6 @@ private:
         // Create ring adapters in child process
         IPCRingProducer<UMEMFrameDescriptor> raw_inbox_prod(*raw_inbox_region_);
         IPCRingConsumer<UMEMFrameDescriptor> raw_outbox_cons(*raw_outbox_region_);
-        IPCRingConsumer<UMEMFrameDescriptor> ack_outbox_cons(*ack_outbox_region_);
-        IPCRingConsumer<UMEMFrameDescriptor> pong_outbox_cons(*pong_outbox_region_);
-
         XDPPollType xdp_poll(interface_);
 
         // Set profiling data buffers
@@ -1097,8 +1101,6 @@ private:
             umem_area_, umem_size_, bpf_path_,
             &raw_inbox_prod,
             &raw_outbox_cons,
-            &ack_outbox_cons,
-            &pong_outbox_cons,
             conn_state_);
 
         if (!ok) {

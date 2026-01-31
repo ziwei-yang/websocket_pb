@@ -30,6 +30,7 @@
 //   - Run ./scripts/xdp_prepare.sh <interface> before testing
 
 #include "../../src/policy/transport.hpp"
+#include "../../src/xdp/xdp_packet_io.hpp"
 #include "../../src/policy/ssl.hpp"
 #include "../../src/core/http.hpp"
 #include "../../src/core/timing.hpp"
@@ -42,6 +43,7 @@
 #include <vector>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <csignal>
 
 using namespace websocket::transport;
 using namespace websocket::ssl;
@@ -62,10 +64,28 @@ constexpr const char* BINANCE_PATH = "/stream?streams=btcusdt@trade";
 // Global test state
 std::atomic<bool> test_complete{false};
 std::atomic<int> message_count{0};
-constexpr int MAX_MESSAGES = 20;
+int g_timeout_ms = -1;  // -1 = no timeout (default)
+std::atomic<bool> g_running{true};  // Signal handler sets to false
 
 // TSC frequency for timing conversion
 uint64_t g_tsc_freq_hz = 0;
+
+/**
+ * Signal handler for graceful exit
+ */
+void signal_handler(int sig) {
+    (void)sig;
+    g_running = false;
+}
+
+/**
+ * Get current time in milliseconds
+ */
+inline uint64_t get_current_time_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 /**
  * Resolve hostname to list of IP addresses
@@ -108,8 +128,9 @@ int main(int argc, char** argv) {
     printf("Architecture: XDP (native driver) + Userspace TCP/IP + OpenSSL\n\n");
 
     // Parse command line args
-    // Usage: ./test_xdp_binance_integration [interface]
-    // Interface set via compile-time XDP_INTERFACE (required, see xdp_transport.hpp)
+    // Usage: ./test_xdp_binance_integration [interface] [--timeout <ms>]
+    // --timeout: Run duration in ms (-1 = forever, default)
+    // Press Ctrl-C or Ctrl-\ to exit gracefully
     const char* interface = XDP_INTERFACE;
 
     for (int i = 1; i < argc; i++) {
@@ -118,8 +139,16 @@ int main(int argc, char** argv) {
             strcmp(argv[i], "--user-poll") == 0 || strcmp(argv[i], "-u") == 0) {
             continue;
         }
+        if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
+            g_timeout_ms = atoi(argv[++i]);
+            continue;
+        }
         interface = argv[i];
     }
+
+    // Register signal handlers for graceful exit
+    signal(SIGINT, signal_handler);   // Ctrl-C
+    signal(SIGQUIT, signal_handler);  // Ctrl-\
 
     printf("Polling Mode: Userspace SO_BUSY_POLL\n");
     printf("Interface: %s\n\n", interface);
@@ -138,7 +167,7 @@ int main(int argc, char** argv) {
         printf("📦 Phase 1: XDP + Userspace TCP Initialization\n");
         printf("─────────────────────────────────────────────────────────────────\n");
 
-        XDPUserspaceTransport transport;
+        PacketTransport<websocket::xdp::XDPPacketIO> transport;
         transport.init(interface, "src/xdp/bpf/exchange_filter.bpf.o");
 
         // Configure BPF filter for Binance
@@ -261,7 +290,8 @@ int main(int argc, char** argv) {
         timing_record_t timing;
         memset(&timing, 0, sizeof(timing));
 
-        while (message_count < MAX_MESSAGES) {
+        uint64_t start_time_ms = get_current_time_ms();
+        while (g_running && (g_timeout_ms < 0 || (get_current_time_ms() - start_time_ms) < (uint64_t)g_timeout_ms)) {
             // Stage 2: Event loop start
             timing.event_cycle = rdtsc();
 
@@ -374,6 +404,21 @@ int main(int argc, char** argv) {
                         printf("  📨 Data: %.100s%s\n",
                                pf.frame.payload,
                                pf.frame.payload_len > 100 ? "..." : "");
+
+                        // Parse "E" (event time) field from Binance JSON
+                        // Format: {"stream":"...","data":{"e":"trade","E":1769454202248,...}}
+                        uint64_t event_time_ms = 0;
+                        const char* e_pos = strstr((const char*)pf.frame.payload, "\"E\":");
+                        if (e_pos) {
+                            event_time_ms = strtoull(e_pos + 4, nullptr, 10);
+                        }
+
+                        // Calculate exchange-to-local latency
+                        if (event_time_ms > 0) {
+                            uint64_t local_time_ms = get_current_time_ms();
+                            int64_t exchange_latency_ms = (int64_t)local_time_ms - (int64_t)event_time_ms;
+                            printf("  Exchange Latency: %ld ms (local - trade_time)\n", exchange_latency_ms);
+                        }
 
                         // Display timing breakdown
                         printf("\n  ⏱️  Latency Breakdown (6 Stages):\n");

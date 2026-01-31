@@ -11,9 +11,10 @@
 // Architecture:
 //   Application → Userspace TCP/IP Stack → XDP Transport → AF_XDP Socket → NIC
 //
-// Primary API (Zero-Copy):
-//   - peek_rx_frame() / release_rx_frame() - Zero-copy RX
-//   - get_tx_frame() / send_frame() - Zero-copy TX
+// Primary API (Batch Zero-Copy):
+//   - process_rx_frames() / mark_frame_consumed() - Batch RX with FIFO release
+//   - claim_tx_frames() / commit_tx_frames() - Batch TX with FIFO ACK release
+//   - retransmit_frame() - Zero-copy TCP retransmit
 //   - poll_wait() - Userspace busy-polling with SO_BUSY_POLL
 //
 // igc Driver TX Completion Workaround:
@@ -64,6 +65,9 @@
 #include <net/ethernet.h>
 #include "xdp_frame.hpp"
 #include "bpf_loader.hpp"
+#include "packet_frame_descriptor.hpp"
+#include "../core/timing.hpp"  // rdtsc()
+#include "../pipeline/pipeline_config.hpp"
 #endif
 
 namespace websocket {
@@ -86,27 +90,8 @@ namespace xdp {
 #error "XDP_INTERFACE must be defined. Use: make USE_XDP=1 XDP_INTERFACE=<interface>"
 #endif
 
-#ifndef XDP_HEADROOM
-#define XDP_HEADROOM 0
-#endif
-
-// NIC_MTU must be passed as a compile-time argument via -DNIC_MTU=<value>
-#ifndef NIC_MTU
-#error "NIC_MTU must be defined at compile time (e.g., -DNIC_MTU=1500)"
-#endif
-
-// Calculate frame size: MTU + Ethernet(14) + IP(20) + TCP(60 max) + margin, round up to power of 2
-// For MTU=1500: 1500 + 14 + 20 + 60 + 500 = 2094 -> 2048 (rounded)
-// For MTU=3502: 3502 + 14 + 20 + 60 + 500 = 4096
-constexpr uint32_t xdp_calculate_frame_size(uint32_t mtu) {
-    uint32_t min_size = mtu + 14 + 20 + 60 + 500;  // Headers + margin
-    // Round up to next power of 2
-    uint32_t v = min_size - 1;
-    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
-    return v + 1;
-}
-
-constexpr uint32_t XDP_FRAME_SIZE = xdp_calculate_frame_size(NIC_MTU);
+// XDP_HEADROOM and NIC_MTU are defined in pipeline_config.hpp
+// FRAME_SIZE (power-of-2, min 4096) is also from pipeline_config.hpp
 
 /**
  * XDP Transport Configuration
@@ -131,14 +116,14 @@ struct XDPConfig {
     XDPConfig()
         : interface(XDP_INTERFACE)
         , queue_id(0)
-        , frame_size(XDP_FRAME_SIZE)  // Calculated from NIC_MTU
-        , num_frames(65536)           // 16x larger for high throughput
+        , frame_size(websocket::pipeline::FRAME_SIZE)
+        , num_frames(websocket::pipeline::TOTAL_UMEM_FRAMES)
         , zero_copy(true)   // Enable zero-copy by default for HFT (igc driver supports it)
-        , batch_size(64)
-        , busy_poll_usec(1000)           // 1000us busy-poll duration (testing)
-        , busy_poll_budget(64)           // 64 packets per poll
+        , batch_size(websocket::pipeline::XDP_BATCH_SIZE)
+        , busy_poll_usec(websocket::pipeline::XDP_BUSY_POLL_USEC)
+        , busy_poll_budget(websocket::pipeline::XDP_BUSY_POLL_BUDGET)
         , rx_trickle_enabled(true)       // Enable RX trickle by default for zero-copy mode
-        , rx_trickle_interval_us(2000)   // 500 Hz (2ms interval) - optimal for igc driver
+        , rx_trickle_interval_us(websocket::pipeline::XDP_TRICKLE_INTERVAL_US)
     {}
 };
 
@@ -148,20 +133,23 @@ struct XDPConfig {
  * Provides zero-copy frame access for HFT applications using userspace
  * TCP/IP stack. All packet processing bypasses the kernel completely.
  *
- * Usage with userspace stack:
+ * Usage with userspace stack (Batch API):
  *   XDPTransport xdp;
  *   xdp.init(config, "path/to/bpf.o");  // With BPF filtering
- *   xdp.init(config);                    // Without BPF filtering
  *
- *   // TX (zero-copy):
- *   XDPFrame* tx = xdp.get_tx_frame();
- *   memcpy(tx->data, packet, len);
- *   xdp.send_frame(tx, len);
+ *   // RX (batch zero-copy):
+ *   xdp.process_rx_frames(SIZE_MAX, [](uint32_t idx, PacketFrameDescriptor& desc) {
+ *       process((uint8_t*)desc.frame_ptr, desc.frame_len);
+ *       // ... when done with frame data:
+ *       xdp.mark_frame_consumed(frame_idx);
+ *   });
  *
- *   // RX (zero-copy):
- *   XDPFrame* rx = xdp.peek_rx_frame();
- *   process(rx->data, rx->len);
- *   xdp.release_rx_frame(rx);
+ *   // TX (batch zero-copy):
+ *   xdp.claim_tx_frames(1, [&](uint32_t idx, PacketFrameDescriptor& desc) {
+ *       memcpy((uint8_t*)desc.frame_ptr, packet, len);
+ *       desc.frame_len = len;
+ *   });
+ *   xdp.commit_tx_frames(frame_idx, frame_idx);
  *
  * Frame Pool Architecture (Zero-Copy Retransmit):
  *   UMEM is split into dedicated RX and TX pools:
@@ -169,9 +157,8 @@ struct XDPConfig {
  *   - TX Pool (frames RX_POOL_SIZE - num_frames-1): Sequential allocation for TX
  *
  *   TX frames use sequential allocation with ACK-based release:
- *   - alloc_tx_frame_idx() allocates next TX frame
- *   - mark_frame_acked() flags frame as ACKed
- *   - try_release_tx_frames() releases contiguous ACKed frames
+ *   - claim_tx_frames() allocates frames from TX pool
+ *   - mark_frame_acked() flags frame as ACKed and auto-releases contiguous frames
  *   - retransmit_frame() re-submits existing frame (no rebuild)
  */
 struct XDPTransport {
@@ -193,8 +180,6 @@ struct XDPTransport {
         , connected_(false)
         , ifindex_(0)
         , next_free_frame_(0)
-        , current_rx_frame_(nullptr)
-        , current_rx_addr_(0)
         , bpf_loader_(nullptr)
         , bpf_enabled_(false)
         , rx_trickle_running_(false)
@@ -206,9 +191,14 @@ struct XDPTransport {
         , tx_pool_size_(DEFAULT_TX_POOL_SIZE)
         , tx_alloc_pos_(0)
         , tx_free_pos_(0)
+        , tx_commit_pos_(0)
+        , rx_process_pos_(0)
+        , rx_consume_pos_(0)
     {
         free_frames_.reserve(4096);  // Pre-allocate for performance
         frame_acked_.fill(false);    // Initialize ACK bitmap
+        frame_sent_.fill(false);     // Initialize sent bitmap
+        rx_consumed_.fill(false);    // Initialize RX consumed bitmap
     }
 
     ~XDPTransport() {
@@ -394,7 +384,14 @@ struct XDPTransport {
         tx_pool_size_ = config_.num_frames - rx_pool_size_;
         tx_alloc_pos_ = 0;
         tx_free_pos_ = 0;
+        tx_commit_pos_ = tx_pool_start_;  // First TX frame to commit
         frame_acked_.fill(false);
+        frame_sent_.fill(false);
+
+        // RX pool tracking for batch API
+        rx_process_pos_ = 0;
+        rx_consume_pos_ = 0;
+        rx_consumed_.fill(false);
 
         printf("[XDP] Frame pools: RX[0-%u] (%u frames), TX[%u-%u] (%u frames)\n",
                rx_pool_size_ - 1, rx_pool_size_,
@@ -430,12 +427,6 @@ struct XDPTransport {
         // RX pool uses free_frames_ for recycling (populated as frames are released)
         // TX pool uses sequential allocation (tx_alloc_pos_/tx_free_pos_)
         next_free_frame_ = frames_to_populate;  // Legacy: not used for TX anymore
-
-        // Initialize reusable frame structs (no FramePool needed)
-        rx_frame_.clear();
-        rx_frame_.capacity = config_.frame_size - HEADROOM;
-        tx_frame_.clear();
-        tx_frame_.capacity = config_.frame_size - HEADROOM;
 
         // Mark as "connected" for userspace stack usage (no TCP socket needed)
         connected_ = true;
@@ -479,243 +470,8 @@ struct XDPTransport {
     }
 
     // ========================================================================
-    // Zero-Copy API (Primary interface for HFT use case)
+    // TX Wakeup
     // ========================================================================
-
-    /**
-     * Peek at received frame without copying data
-     *
-     * Returns a reference to the next RX frame in UMEM. The frame data
-     * remains in UMEM (no memcpy). The caller can read directly from
-     * frame->data pointer.
-     *
-     * IMPORTANT: Must call release_rx_frame() when done with the frame
-     * to return it to the fill ring.
-     *
-     * @return Pointer to XDPFrame, or nullptr if no data available
-     */
-    XDPFrame* peek_rx_frame() {
-        if (!connected_ || !xsk_) {
-            errno = ENOTCONN;
-            return nullptr;
-        }
-
-        // If we already have a frame held, return it
-        if (current_rx_frame_ != nullptr) {
-            return current_rx_frame_;
-        }
-
-        // Check RX ring for received packets
-        uint32_t idx_rx;
-        uint32_t nb_pkts = xsk_ring_cons__peek(&rx_ring_, 1, &idx_rx);
-
-        if (nb_pkts == 0) {
-            // No packets available
-            errno = EAGAIN;
-            return nullptr;
-        }
-
-        // Get first packet descriptor
-        const struct xdp_desc* rx_desc = xsk_ring_cons__rx_desc(&rx_ring_, idx_rx);
-
-        // Store RX descriptor address (includes headroom) for refill
-        current_rx_addr_ = rx_desc->addr;
-
-        // Setup rx_frame_ directly from descriptor (no FramePool lookup needed)
-        uint64_t base_addr = rx_desc->addr & ~(config_.frame_size - 1);
-        rx_frame_.addr = base_addr;
-
-        // BPF program uses bpf_xdp_adjust_meta() to store timestamp before packet data
-        // Layout: [xdp_user_metadata (8 bytes)][packet data]
-        //         ^                            ^
-        //         data_meta                    data (rx_desc->addr)
-        // The timestamp is stored at rx_desc->addr - 8 (sizeof(__u64))
-        rx_frame_.data = (uint8_t*)umem_area_ + rx_desc->addr;
-        rx_frame_.len = rx_desc->len;
-
-        // Read hardware timestamp from metadata area (8 bytes before packet data)
-        // Only valid when HEADROOM >= 8 (space for bpf_xdp_adjust_meta to store timestamp)
-        if constexpr (HEADROOM >= 8) {
-            uint64_t* ts_ptr = (uint64_t*)((uint8_t*)umem_area_ + rx_desc->addr - 8);
-            rx_frame_.hw_timestamp_ns = *ts_ptr;
-        } else {
-            rx_frame_.hw_timestamp_ns = 0;  // No metadata space available
-        }
-        rx_frame_.capacity = config_.frame_size - HEADROOM;
-        rx_frame_.offset = 0;
-        rx_frame_.owned = true;
-
-        // Hold this frame until release_rx_frame() is called
-        current_rx_frame_ = &rx_frame_;
-
-        return &rx_frame_;
-    }
-
-    /**
-     * Release RX frame back to fill ring
-     *
-     * Returns the frame to the kernel for reuse. Must be called after
-     * peek_rx_frame() when done reading frame data.
-     *
-     * @param frame Frame to release (must be from peek_rx_frame())
-     * @param deferred If true, defer FILL ring refill - returns UMEM address for later refill_frame() call.
-     *                 If false (default), immediately refill FILL ring.
-     * @return When deferred=true: UMEM address to pass to refill_frame() later, or 0 on error.
-     *         When deferred=false: always returns 0.
-     */
-    uint64_t release_rx_frame(XDPFrame* frame, bool deferred = false) {
-        if (frame == nullptr || frame != current_rx_frame_) {
-            return 0;
-        }
-
-        // Save address before clearing (needed for both paths)
-        uint64_t saved_addr = current_rx_addr_;
-
-        // Release RX descriptor (this was peeked in peek_rx_frame)
-        xsk_ring_cons__release(&rx_ring_, 1);
-
-        if (!deferred) {
-            // Immediate refill: return buffer to FILL ring now
-            uint32_t idx_fq;
-            if (xsk_ring_prod__reserve(&fill_ring_, 1, &idx_fq) == 1) {
-                uint64_t base_addr = saved_addr & ~(config_.frame_size - 1);
-                *xsk_ring_prod__fill_addr(&fill_ring_, idx_fq) = base_addr;
-                xsk_ring_prod__submit(&fill_ring_, 1);
-            }
-        }
-
-        // Clear frame state
-        rx_frame_.clear();
-        current_rx_frame_ = nullptr;
-        current_rx_addr_ = 0;
-
-        return deferred ? saved_addr : 0;
-    }
-
-    /**
-     * Refill a frame to FILL ring (deferred zero-copy release)
-     *
-     * Called when SSL has finished consuming data from a frame that was
-     * released with release_rx_frame(frame, true).
-     *
-     * @param umem_addr UMEM address returned from release_rx_frame(frame, true)
-     */
-    void refill_frame(uint64_t umem_addr) {
-        if (umem_addr == 0) return;
-
-        uint32_t idx_fq;
-        if (xsk_ring_prod__reserve(&fill_ring_, 1, &idx_fq) == 1) {
-            // Get base address by masking off headroom offset
-            uint64_t base_addr = umem_addr & ~(config_.frame_size - 1);
-            *xsk_ring_prod__fill_addr(&fill_ring_, idx_fq) = base_addr;
-            xsk_ring_prod__submit(&fill_ring_, 1);
-        }
-    }
-
-    /**
-     * Get a free TX frame for writing
-     *
-     * Returns a frame reference that can be written to directly.
-     * The caller should write data to frame->data and then call
-     * send_frame() to submit for transmission.
-     *
-     * @return Pointer to XDPFrame, or nullptr if no frames available
-     */
-    XDPFrame* get_tx_frame() {
-        if (!connected_ || !xsk_) {
-            errno = ENOTCONN;
-            return nullptr;
-        }
-
-        // Reclaim completed TX frames first
-        reclaim_completed_frames();
-
-        // Get a free UMEM frame address
-        uint64_t frame_addr = get_free_frame();
-        if (frame_addr == UINT64_MAX) {
-            errno = ENOBUFS;
-            return nullptr;
-        }
-
-        // Setup tx_frame_ directly (no FramePool lookup needed)
-        tx_frame_.addr = frame_addr;
-        tx_frame_.data = (uint8_t*)umem_area_ + frame_addr + HEADROOM;
-        tx_frame_.len = 0;
-        tx_frame_.capacity = config_.frame_size - HEADROOM;
-        tx_frame_.offset = 0;
-        tx_frame_.owned = true;
-
-        return &tx_frame_;
-    }
-
-    /**
-     * Submit TX frame for transmission
-     *
-     * Submits the frame to the TX ring for transmission. The frame
-     * must have been obtained from get_tx_frame() and data must be
-     * written to frame->data with length set via frame->set_length()
-     * or frame->append().
-     *
-     * After this call, the frame is owned by the kernel until it
-     * appears in the completion ring.
-     *
-     * @param frame Frame to send
-     * @param len Data length (must be <= frame->capacity)
-     * @return Number of bytes queued, or -1 on error
-     */
-    ssize_t send_frame(XDPFrame* frame, size_t len) {
-        if (!connected_ || !xsk_) {
-            errno = ENOTCONN;
-            return -1;
-        }
-
-        if (frame == nullptr || !frame->owned) {
-            errno = EINVAL;
-            return -1;
-        }
-
-        if (len > frame->capacity) {
-            errno = EMSGSIZE;
-            return -1;
-        }
-
-        // Update frame length if not already set
-        if (frame->len != len) {
-            if (!frame->set_length(len)) {
-                errno = EMSGSIZE;
-                return -1;
-            }
-        }
-
-        // Try to reserve a TX descriptor
-        uint32_t idx;
-        if (xsk_ring_prod__reserve(&tx_ring_, 1, &idx) != 1) {
-            // TX ring is full - return frame to free pool
-            printf("[TX-ERROR] TX ring FULL! Dropping frame (addr=%lx, len=%zu)\n",
-                   (unsigned long)frame->addr, len);
-            free_frames_.push_back(frame->addr);
-            frame->clear();  // No FramePool, just clear the frame
-            errno = EAGAIN;
-            return -1;
-        }
-
-        // Set TX descriptor - use offset of frame->data from UMEM base (includes headroom)
-        struct xdp_desc* tx_desc = xsk_ring_prod__tx_desc(&tx_ring_, idx);
-        tx_desc->addr = frame->data - (uint8_t*)umem_area_;
-        tx_desc->len = frame->len;
-        tx_desc->options = 0;
-
-        // Submit the TX descriptor
-        xsk_ring_prod__submit(&tx_ring_, 1);
-
-        // Kick TX if kernel needs wakeup (required with XDP_USE_NEED_WAKEUP)
-        kick_tx();
-
-        // Mark frame as no longer owned by application
-        frame->owned = false;
-
-        return len;
-    }
 
     /**
      * Kick TX ring to notify kernel of pending transmissions
@@ -731,30 +487,132 @@ struct XDPTransport {
     }
 
     // ========================================================================
-    // End Zero-Copy API
-    // ========================================================================
-
-    // ========================================================================
-    // Zero-Copy Retransmit API (TX frame management for userspace TCP)
+    // Batch RX API
     // ========================================================================
 
     /**
-     * Allocate next TX frame index (for zero-copy retransmit)
+     * Process RX frames with lambda callback
      *
-     * Returns absolute frame index from TX pool (tx_pool_start_ to num_frames-1).
-     * Uses sequential allocation - frames are released via ACK, not completion.
+     * Replaces peek_rx_frame() and release_rx_frame().
+     * Advances RX ring consumer position by number of frames processed.
+     * Frame data remains valid until mark_frame_consumed() is called.
      *
-     * @return Frame index, or UINT32_MAX if TX pool exhausted
+     * @param max_frames Maximum frames to process (default: SIZE_MAX for all available)
+     * @param callback Lambda(uint32_t idx, PacketFrameDescriptor& desc)
+     *                 - idx: sequence index (0, 1, 2, ...) - defensive check: consecutive
+     *                 - desc: frame descriptor with frame_ptr, frame_len, nic_timestamp_ns
+     * @return Number of frames processed
      */
-    uint32_t alloc_tx_frame_idx() {
-        // Check if TX pool has available frames
-        if (tx_alloc_pos_ - tx_free_pos_ >= tx_pool_size_) {
-            return UINT32_MAX;  // TX pool exhausted
+    template<typename Func>
+    size_t process_rx_frames(size_t max_frames, Func&& callback) {
+        if (!connected_ || !xsk_) {
+            return 0;
         }
 
-        uint32_t relative_idx = tx_alloc_pos_++ % tx_pool_size_;
-        return tx_pool_start_ + relative_idx;  // Absolute frame index
+        size_t processed = 0;
+        uint32_t idx_rx;
+
+        // Peek all available packets (up to max_frames)
+        uint32_t batch_size = (max_frames < config_.batch_size) ?
+            static_cast<uint32_t>(max_frames) : config_.batch_size;
+        uint32_t nb_pkts = xsk_ring_cons__peek(&rx_ring_, batch_size, &idx_rx);
+
+        if (nb_pkts == 0) {
+            return 0;
+        }
+
+        uint64_t poll_cycle = rdtsc();
+
+        for (uint32_t i = 0; i < nb_pkts && processed < max_frames; i++) {
+            const struct xdp_desc* rx_desc = xsk_ring_cons__rx_desc(&rx_ring_, idx_rx + i);
+
+            // Setup descriptor
+            PacketFrameDescriptor desc;
+            desc.clear();
+
+            // Calculate frame index from address
+            uint64_t base_addr = rx_desc->addr & ~(config_.frame_size - 1);
+            uint32_t frame_idx = static_cast<uint32_t>(base_addr / config_.frame_size);
+
+            desc.frame_ptr = reinterpret_cast<uint64_t>(
+                static_cast<uint8_t*>(umem_area_) + rx_desc->addr);
+            desc.frame_len = rx_desc->len;
+            desc.nic_frame_poll_cycle = poll_cycle;
+            desc.frame_type = FRAME_TYPE_RX;
+
+            // Read hardware timestamp from metadata area (8 bytes before packet data)
+            if constexpr (HEADROOM >= 8) {
+                uint64_t* ts_ptr = reinterpret_cast<uint64_t*>(
+                    static_cast<uint8_t*>(umem_area_) + rx_desc->addr - 8);
+                desc.nic_timestamp_ns = *ts_ptr;
+            }
+
+            // Store frame info for later mark_frame_consumed()
+            uint32_t rel_idx = rx_process_pos_ % rx_pool_size_;
+            rx_frame_addrs_[rel_idx] = base_addr;
+            rx_process_pos_++;
+
+            // Invoke callback
+            callback(static_cast<uint32_t>(processed), desc);
+            processed++;
+        }
+
+        // Release consumed RX descriptors
+        xsk_ring_cons__release(&rx_ring_, static_cast<uint32_t>(processed));
+
+        return processed;
     }
+
+    /**
+     * Mark RX frame as consumed (data no longer needed)
+     *
+     * Internally performs FIFO refill: adds frame back to FILL ring only when
+     * all earlier frames are also consumed. Maintains frame ordering.
+     *
+     * @param frame_idx Frame index that was consumed (from process_rx_frames callback)
+     */
+    void mark_frame_consumed(uint32_t frame_idx) {
+        if (frame_idx >= rx_pool_size_) {
+            return;  // Invalid frame index
+        }
+
+        rx_consumed_[frame_idx] = true;
+
+        // FIFO refill: add to FILL ring while contiguous consumed
+        while (rx_consume_pos_ < rx_process_pos_) {
+            uint32_t consume_rel = rx_consume_pos_ % rx_pool_size_;
+            if (!rx_consumed_[consume_rel]) {
+                break;  // Can't refill - earlier frame not yet consumed
+            }
+
+            // Refill this frame
+            uint64_t addr = rx_frame_addrs_[consume_rel];
+            uint32_t idx_fq;
+            if (xsk_ring_prod__reserve(&fill_ring_, 1, &idx_fq) == 1) {
+                *xsk_ring_prod__fill_addr(&fill_ring_, idx_fq) = addr;
+                xsk_ring_prod__submit(&fill_ring_, 1);
+            }
+
+            rx_consumed_[consume_rel] = false;
+            rx_consume_pos_++;
+        }
+    }
+
+    /**
+     * Get current RX frame index for tracking
+     * Returns the next frame index that will be processed
+     */
+    uint32_t get_rx_process_pos() const {
+        return rx_process_pos_;
+    }
+
+    // ========================================================================
+    // End Batch RX API
+    // ========================================================================
+
+    // ========================================================================
+    // Frame Utilities (used by batch API and retransmit)
+    // ========================================================================
 
     /**
      * Convert frame index to UMEM address
@@ -784,13 +642,12 @@ struct XDPTransport {
     }
 
     /**
-     * Mark TX frame as ACKed (ready for release)
+     * Mark TX frame as ACKed
      *
-     * Called when TCP ACK is received for a segment. The frame will be
-     * released when try_release_tx_frames() is called and all earlier
-     * frames are also ACKed (maintains sequential release order).
+     * Internally performs FIFO release: advances tx_free_pos_ while
+     * contiguous frames are ACKed.
      *
-     * @param frame_idx Frame index (from alloc_tx_frame_idx())
+     * @param frame_idx Frame index that was ACKed
      */
     void mark_frame_acked(uint32_t frame_idx) {
         if (frame_idx < tx_pool_start_ || frame_idx >= config_.num_frames) {
@@ -798,22 +655,13 @@ struct XDPTransport {
         }
         uint32_t relative_idx = (frame_idx - tx_pool_start_) % tx_pool_size_;
         frame_acked_[relative_idx] = true;
-    }
 
-    /**
-     * Release contiguous ACKed TX frames (call in idle loop)
-     *
-     * Advances tx_free_pos_ while frames are marked as ACKed.
-     * This maintains sequential release order - a frame is only
-     * released when all frames before it are also ACKed.
-     */
-    void try_release_tx_frames() {
+        // FIFO release: advance tx_free_pos_ while contiguous ACKed
         while (tx_free_pos_ < tx_alloc_pos_) {
-            uint32_t relative_idx = tx_free_pos_ % tx_pool_size_;
-            if (!frame_acked_[relative_idx]) {
-                break;  // Can't release - earlier frame not yet ACKed
-            }
-            frame_acked_[relative_idx] = false;
+            uint32_t free_rel = tx_free_pos_ % tx_pool_size_;
+            if (!frame_acked_[free_rel]) break;
+            frame_acked_[free_rel] = false;
+            frame_sent_[free_rel] = false;
             tx_free_pos_++;
         }
     }
@@ -829,6 +677,13 @@ struct XDPTransport {
      * @return frame_len on success, -1 on error (TX ring full)
      */
     ssize_t retransmit_frame(uint32_t frame_idx, uint16_t frame_len) {
+        if (frame_idx >= tx_pool_start_ && frame_idx < tx_pool_start_ + tx_pool_size_) {
+            uint32_t relative_idx = (frame_idx - tx_pool_start_) % tx_pool_size_;
+            if (!frame_sent_[relative_idx]) {
+                return frame_len;
+            }
+        }
+
         uint64_t addr = frame_idx_to_addr(frame_idx);
 
         uint32_t idx;
@@ -842,36 +697,8 @@ struct XDPTransport {
         tx_desc->options = 0;
 
         xsk_ring_prod__submit(&tx_ring_, 1);
-        return frame_len;
-    }
-
-    /**
-     * Send raw frame at UMEM address (for zero-copy TX)
-     *
-     * Submits frame directly to TX ring. Used by userspace TCP stack
-     * to send packets built in UMEM frames.
-     *
-     * @param addr UMEM address (from frame_idx_to_addr())
-     * @param len Frame length
-     * @return len on success, -1 on error (TX ring full)
-     */
-    ssize_t send_raw_frame(uint64_t addr, size_t len) {
-        uint32_t idx;
-        if (xsk_ring_prod__reserve(&tx_ring_, 1, &idx) != 1) {
-            return -1;  // TX ring full
-        }
-
-        struct xdp_desc* tx_desc = xsk_ring_prod__tx_desc(&tx_ring_, idx);
-        tx_desc->addr = addr + HEADROOM;
-        tx_desc->len = len;
-        tx_desc->options = 0;
-
-        xsk_ring_prod__submit(&tx_ring_, 1);
-
-        // Kick TX if kernel needs wakeup (required with XDP_USE_NEED_WAKEUP)
         kick_tx();
-
-        return len;
+        return frame_len;
     }
 
     /**
@@ -881,6 +708,167 @@ struct XDPTransport {
         allocated = tx_alloc_pos_;
         pending = tx_alloc_pos_ - tx_free_pos_;
         available = tx_pool_size_ - pending;
+    }
+
+    // ========================================================================
+    // Batch TX API
+    // ========================================================================
+
+    /**
+     * Batch claim TX frames with lambda callback
+     *
+     * Claims up to 'count' frames from the TX pool and invokes the callback
+     * for each frame. The callback receives a sequence index (0, 1, 2, ...)
+     * and a PacketFrameDescriptor with frame_ptr pre-set.
+     *
+     * @param count Number of frames to claim
+     * @param callback Lambda(uint32_t idx, PacketFrameDescriptor& desc)
+     *                 - idx: sequence index (0, 1, 2, ...) - defensive check: must be consecutive
+     *                 - desc: descriptor to fill (frame_ptr set, caller sets frame_len, etc.)
+     * @return Number of frames actually claimed (may be < count if pool exhausted)
+     */
+    template<typename Func>
+    uint32_t claim_tx_frames(uint32_t count, Func&& callback) {
+        uint32_t claimed = 0;
+        uint32_t last_frame_idx = 0;
+
+        for (uint32_t i = 0; i < count; i++) {
+            // Check if TX pool has available frames
+            if (tx_alloc_pos_ - tx_free_pos_ >= tx_pool_size_) {
+                break;  // TX pool exhausted
+            }
+
+            uint32_t relative_idx = tx_alloc_pos_ % tx_pool_size_;
+            uint32_t frame_idx = tx_pool_start_ + relative_idx;
+            frame_sent_[relative_idx] = false;  // Not yet sent to NIC
+
+            // Defensive check: indices must be consecutive
+            if (claimed > 0) {
+                uint32_t expected_idx = last_frame_idx + 1;
+                if (expected_idx == tx_pool_start_ + tx_pool_size_) {
+                    expected_idx = tx_pool_start_;  // Wrap around
+                }
+                // Assert consecutive (in debug builds this would fail)
+                (void)expected_idx;  // Suppresses warning in release
+            }
+
+            // Setup descriptor
+            PacketFrameDescriptor desc;
+            desc.clear();
+            uint64_t addr = frame_idx_to_addr(frame_idx);
+            desc.frame_ptr = reinterpret_cast<uint64_t>(get_frame_ptr(addr));
+            desc.nic_frame_poll_cycle = rdtsc();
+            desc.frame_type = FRAME_TYPE_TX_DATA;
+
+            // Invoke callback with index and descriptor
+            callback(i, desc);
+
+            // Store frame metadata for later commit
+            tx_claimed_descs_[relative_idx] = desc;
+
+            tx_alloc_pos_++;
+            last_frame_idx = frame_idx;
+            claimed++;
+        }
+
+        return claimed;
+    }
+
+    /**
+     * Commit claimed TX frames to TX ring
+     *
+     * @param lowest_idx  First frame index to commit
+     * @param highest_idx Last frame index to commit (inclusive)
+     *
+     * Defensive check: lowest_idx must equal (last_committed_idx + 1)
+     * Frames are submitted to TX ring in order [lowest_idx, highest_idx]
+     */
+    void commit_tx_frames(uint32_t lowest_idx, uint32_t highest_idx) {
+        // Defensive check: must commit in order
+        // Note: tx_commit_pos_ tracks the next expected commit index
+        if (lowest_idx != tx_commit_pos_) {
+            // Allow wrap-around
+            if (!(lowest_idx == tx_pool_start_ && tx_commit_pos_ == tx_pool_start_ + tx_pool_size_)) {
+                printf("[XDP] commit_tx_frames: expected idx %u, got %u\n", tx_commit_pos_, lowest_idx);
+                return;
+            }
+        }
+
+        uint32_t count = highest_idx - lowest_idx + 1;
+
+        // Reserve TX descriptors
+        uint32_t idx;
+        if (xsk_ring_prod__reserve(&tx_ring_, count, &idx) != count) {
+            printf("[XDP] commit_tx_frames: TX ring full, wanted %u frames\n", count);
+            return;
+        }
+
+        // Submit each frame
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t frame_idx = lowest_idx + i;
+            if (frame_idx >= tx_pool_start_ + tx_pool_size_) {
+                frame_idx = tx_pool_start_ + (frame_idx - tx_pool_start_ - tx_pool_size_);
+            }
+
+            uint32_t relative_idx = (frame_idx - tx_pool_start_) % tx_pool_size_;
+            PacketFrameDescriptor& desc = tx_claimed_descs_[relative_idx];
+            frame_sent_[relative_idx] = true;  // Mark as sent to NIC
+
+            uint64_t addr = frame_idx_to_addr(frame_idx);
+            struct xdp_desc* tx_desc = xsk_ring_prod__tx_desc(&tx_ring_, idx + i);
+            tx_desc->addr = addr + HEADROOM;
+            tx_desc->len = desc.frame_len;
+            tx_desc->options = 0;
+
+            // Log TX commit with TCP details
+            const uint8_t* pkt = static_cast<const uint8_t*>(umem_area_) + addr + HEADROOM;
+            uint16_t plen = desc.frame_len;
+            if (plen >= 34) {
+                uint8_t ihl = (pkt[14] & 0x0F) * 4;
+                const uint8_t* tcp = pkt + 14 + ihl;
+                if (plen >= static_cast<uint16_t>(14 + ihl + 20)) {
+                    uint32_t tseq = (tcp[4]<<24)|(tcp[5]<<16)|(tcp[6]<<8)|tcp[7];
+                    uint32_t tack = (tcp[8]<<24)|(tcp[9]<<16)|(tcp[10]<<8)|tcp[11];
+                    uint8_t fl = tcp[13];
+                    uint8_t doff = (tcp[12] >> 4) * 4;
+                    uint16_t ip_total = (pkt[16] << 8) | pkt[17];
+                    uint16_t payload = ip_total - ihl - doff;
+                    char fs[8]; int fi = 0;
+                    if (fl & 0x02) fs[fi++] = 'S';
+                    if (fl & 0x10) fs[fi++] = 'A';
+                    if (fl & 0x08) fs[fi++] = 'P';
+                    if (fl & 0x01) fs[fi++] = 'F';
+                    if (fl & 0x04) fs[fi++] = 'R';
+                    fs[fi] = '\0';
+                    struct timespec ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    fprintf(stderr, "[%ld.%06ld] [PIO-TX-COMMIT] len=%u seq=%u ack=%u flags=%s payload=%u\n",
+                            ts.tv_sec, ts.tv_nsec / 1000, plen, tseq, tack, fs, payload);
+                }
+            }
+        }
+
+        xsk_ring_prod__submit(&tx_ring_, count);
+
+        // Update commit position
+        tx_commit_pos_ = highest_idx + 1;
+        if (tx_commit_pos_ >= tx_pool_start_ + tx_pool_size_) {
+            tx_commit_pos_ = tx_pool_start_;
+        }
+
+        // Kick TX if kernel needs wakeup
+        kick_tx();
+    }
+
+    /**
+     * Get frame index from a descriptor's frame_ptr
+     * Useful for tracking which frame was claimed in a batch
+     */
+    uint32_t frame_ptr_to_idx(uint64_t frame_ptr) const {
+        // frame_ptr = umem_area_ + (frame_idx * frame_size) + HEADROOM
+        uint64_t umem_base = reinterpret_cast<uint64_t>(umem_area_);
+        uint64_t offset = frame_ptr - umem_base - HEADROOM;
+        return static_cast<uint32_t>(offset / config_.frame_size);
     }
 
     // ========================================================================
@@ -1454,12 +1442,6 @@ private:
     std::vector<uint64_t> free_frames_;     // Pool of free UMEM frame addresses
     uint32_t next_free_frame_;              // Next unused frame index for initial allocation
 
-    // Zero-copy frame management (no FramePool - just reusable frame structs)
-    XDPFrame rx_frame_;                     // Reusable RX frame (only one held at a time)
-    XDPFrame tx_frame_;                     // Reusable TX frame (only one built at a time)
-    XDPFrame* current_rx_frame_;            // Points to rx_frame_ when holding, nullptr otherwise
-    uint64_t current_rx_addr_;              // RX descriptor address (with headroom)
-
     // BPF packet filtering (optional)
     BPFLoader* bpf_loader_;                 // BPF loader for packet filtering (nullptr if disabled)
     bool bpf_enabled_;                      // Whether BPF filtering is enabled
@@ -1483,7 +1465,16 @@ private:
     uint32_t tx_pool_size_;                 // Number of frames in TX pool
     uint32_t tx_alloc_pos_;                 // Next frame to allocate (monotonic counter)
     uint32_t tx_free_pos_;                  // Next frame available for reuse (monotonic counter)
+    uint32_t tx_commit_pos_;                // Next expected commit index (for batch TX API)
     std::array<bool, DEFAULT_TX_POOL_SIZE> frame_acked_;  // Per-TX-frame ACK status
+    std::array<bool, DEFAULT_TX_POOL_SIZE> frame_sent_;   // Per-TX-frame sent-to-NIC status
+    std::array<PacketFrameDescriptor, DEFAULT_TX_POOL_SIZE> tx_claimed_descs_;  // Descriptors for batch TX
+
+    // RX Pool Management (for batch RX API)
+    uint32_t rx_process_pos_;               // Next frame to process (monotonic counter)
+    uint32_t rx_consume_pos_;               // First unconsumed frame (monotonic counter)
+    std::array<bool, DEFAULT_RX_POOL_SIZE> rx_consumed_;  // Per-RX-frame consumed status
+    std::array<uint64_t, DEFAULT_RX_POOL_SIZE> rx_frame_addrs_;  // Frame addresses for FIFO refill
 };
 
 #else  // !USE_XDP

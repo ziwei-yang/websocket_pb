@@ -17,12 +17,25 @@ namespace websocket::pipeline {
 #error "NIC_MTU must be defined at compile time (e.g., -DNIC_MTU=1500)"
 #endif
 
-// FRAME_SIZE calculation: MTU + headers, rounded up to 1KB alignment
-// Formula: ((NIC_MTU + 94 + 1023) / 1024) * 1024
-// - 94 bytes for: Ethernet(14) + IP(20) + TCP(60 max options)
-// - 1KB alignment for cache efficiency
+// FRAME_SIZE calculation: MTU + headers, rounded up to next power of 2
+// For MTU=1500: 1500 + 14 + 20 + 60 + 500 = 2094 -> 4096 (minimum for igc driver)
+//
+// Why 4096 minimum (not 2048):
+// The igc driver (Intel I225) sets hardware RX buffer size via IGC_SRRCTL_BSIZEPKT
+// which stores size right-shifted by 10 (1KB granularity). With frame_size=2048:
+//   frame_len = 2048 - 256(headroom) - 256(XDP_PACKET_HEADROOM) = 1536
+//   hardware register: 1536 >> 10 = 1 (truncated from 1.5) -> 1024 bytes
+//   after DMA overhead -> max deliverable frame = ~1008 bytes (truncates 1514-byte frames)
+// With frame_size=4096: frame_len=3584, 3584>>10 = 3 -> 3072 bytes -> full frames OK.
+constexpr uint32_t calculate_frame_size(uint32_t mtu) {
+    uint32_t min_size = mtu + 14 + 20 + 60 + 500;  // Headers + margin
+    uint32_t v = min_size - 1;
+    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+    uint32_t result = v + 1;
+    return result < 4096 ? 4096 : result;  // min 4096 for igc driver GRO headroom
+}
 #ifndef FRAME_SIZE
-#define FRAME_SIZE (((NIC_MTU + 94 + 1023) / 1024) * 1024)
+inline constexpr uint32_t FRAME_SIZE = calculate_frame_size(NIC_MTU);
 #endif
 
 // Cache line size (configurable for different architectures)
@@ -56,6 +69,11 @@ inline constexpr size_t MSG_POOL_END  = TOTAL_UMEM_FRAMES;
 
 // TX pool combined size (for ACK tracking)
 inline constexpr size_t TX_POOL_SIZE = ACK_FRAMES + PONG_FRAMES + MSG_FRAMES;
+
+// TX throttle: max MSG packets in flight before blocking RAW_OUTBOX
+// This implements congestion control at XDP level to prevent overwhelming
+// remote servers with limited initial cwnd
+inline constexpr uint32_t MAX_PACKETS_INFLIGHT = 32;
 
 // Trickle frame (outside pools, at end of UMEM)
 // Gap N1: Trickle frame stored in reserved UMEM region, sent via XDP tx_ring
@@ -93,7 +111,9 @@ inline constexpr size_t MSG_INBOX_SIZE = 64 * 1024 * 1024;
 
 // Note: Named PIPELINE_TCP_MSS to avoid conflict with system header
 // /usr/include/netinet/tcp.h which defines #define TCP_MSS 512
-inline constexpr size_t PIPELINE_TCP_MSS = NIC_MTU - 40;  // MTU - IP(20) - TCP(20)
+// With TCP timestamps enabled (12 bytes: 10 for TS option + 2 NOP padding),
+// effective MSS = MTU - IP(20) - TCP(20) - TS(12) = MTU - 52
+inline constexpr size_t PIPELINE_TCP_MSS = NIC_MTU - 52;  // MTU - IP(20) - TCP(32 with TS)
 
 // TLS overhead for record size calculation
 inline constexpr size_t TLS_RECORD_HEADER = 5;    // Content type(1) + version(2) + length(2)
@@ -110,6 +130,30 @@ inline constexpr size_t MAX_TLS_RECORD_PAYLOAD = PIPELINE_TCP_MSS - TLS13_OVERHE
 inline constexpr uint32_t RX_BATCH = 32;
 inline constexpr uint32_t TX_BATCH_SIZE = 32;
 inline constexpr uint32_t COMP_BATCH = 32;
+
+// ============================================================================
+// XDP Socket Configuration
+// ============================================================================
+
+// XDP headroom (override via -DXDP_HEADROOM=N, default 0)
+#ifndef XDP_HEADROOM
+#define XDP_HEADROOM 0
+#endif
+inline constexpr uint32_t XDP_FRAME_HEADROOM = XDP_HEADROOM;
+
+// XSK ring sizes (must match fill/comp sizes for optimal throughput)
+inline constexpr uint32_t XDP_RX_RING_SIZE = RX_FRAMES;       // 32768
+inline constexpr uint32_t XDP_TX_RING_SIZE = TX_POOL_SIZE;     // 32768
+
+// Batch size for XDP RX/TX/COMP operations
+inline constexpr uint32_t XDP_BATCH_SIZE = 64;
+
+// SO_BUSY_POLL settings
+inline constexpr uint32_t XDP_BUSY_POLL_USEC = 1000;     // 1ms busy-poll duration
+inline constexpr uint32_t XDP_BUSY_POLL_BUDGET = 64;     // packets per poll
+
+// RX trickle (igc driver TX completion workaround)
+inline constexpr uint32_t XDP_TRICKLE_INTERVAL_US = 2000; // 500 Hz
 
 // ============================================================================
 // Timing Configuration

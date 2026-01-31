@@ -52,9 +52,19 @@
 #include "../../src/pipeline/20_ws_process.hpp"
 #include "../../src/pipeline/msg_inbox.hpp"
 #include "../../src/core/http.hpp"
-#include "../../src/policy/ssl.hpp"  // WolfSSLPolicy
+#include "../../src/policy/ssl.hpp"  // OpenSSLPolicy / WolfSSLPolicy
 
 using namespace websocket::pipeline;
+using namespace websocket::ssl;
+
+// Select SSL policy based on compile-time flags
+#if defined(USE_OPENSSL)
+using SSLPolicyType = OpenSSLPolicy;
+#elif defined(USE_WOLFSSL)
+using SSLPolicyType = WolfSSLPolicy;
+#else
+#error "Must define USE_OPENSSL or USE_WOLFSSL"
+#endif
 
 // ============================================================================
 // Configuration
@@ -413,21 +423,20 @@ bool get_default_gateway(const char* interface, std::string& gateway_out) {
 // Enable debug modes
 static constexpr bool PROFILING_ENABLED = true;
 static constexpr bool DEBUG_TCP_ENABLED = true;  // TCP debug mode for retransmit detection
-static constexpr bool DEBUG_XDP_ENABLED = true;  // XDP debug mode for fill-ring monitoring
 
-// XDP Poll Process types (with profiling and debug enabled)
+// XDP Poll Process types (with profiling enabled)
+// Note: XDPCopyProcess is available but experimental - use XDPPollProcess for production
 using XDPPollType = XDPPollProcess<
     IPCRingProducer<UMEMFrameDescriptor>,
     IPCRingConsumer<UMEMFrameDescriptor>,
     true,                                   // TrickleEnabled
     PROFILING_ENABLED,                      // Profiling
     256,                                    // FrameHeadroom (default)
-    2048,                                   // FrameSize (default)
-    DEBUG_XDP_ENABLED>;                     // DebugXDP - fill-ring monitoring
+    2048>;                                  // FrameSize (default)
 
-// Transport Process types (with WolfSSL and profiling enabled)
+// Transport Process types (with SSL and profiling enabled)
 using TransportType = TransportProcess<
-    WolfSSLPolicy,                         // WolfSSL for WSS
+    SSLPolicyType,                         // OpenSSL or WolfSSL for WSS
     IPCRingConsumer<UMEMFrameDescriptor>,  // RawInboxCons
     IPCRingProducer<UMEMFrameDescriptor>,  // RawOutboxProd
     IPCRingProducer<UMEMFrameDescriptor>,  // AckOutboxProd
@@ -703,8 +712,8 @@ public:
 
         printf("[PARENT] Forked Transport process (PID %d)\n", transport_pid_);
 
-        // Wait for TLS handshake to complete (WolfSSL requires actual TLS handshake)
-        printf("[PARENT] Waiting for TLS handshake (WolfSSL)...\n");
+        // Wait for TLS handshake to complete
+        printf("[PARENT] Waiting for TLS handshake (%s)...\n", SSLPolicyType::name());
         auto start = std::chrono::steady_clock::now();
         while (!conn_state_->is_handshake_tls_ready()) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -719,7 +728,7 @@ public:
             }
             usleep(1000);
         }
-        printf("[PARENT] TLS handshake complete (WolfSSL)\n");
+        printf("[PARENT] TLS handshake complete (%s)\n", SSLPolicyType::name());
 
         // Fork WebSocket process
         websocket_pid_ = fork();
@@ -1078,9 +1087,6 @@ private:
         // Create ring adapters in child process
         IPCRingProducer<UMEMFrameDescriptor> raw_inbox_prod(*raw_inbox_region_);
         IPCRingConsumer<UMEMFrameDescriptor> raw_outbox_cons(*raw_outbox_region_);
-        IPCRingConsumer<UMEMFrameDescriptor> ack_outbox_cons(*ack_outbox_region_);
-        IPCRingConsumer<UMEMFrameDescriptor> pong_outbox_cons(*pong_outbox_region_);
-
         XDPPollType xdp_poll(interface_);
 
         // Set profiling data buffers
@@ -1093,8 +1099,6 @@ private:
             umem_area_, umem_size_, bpf_path_,
             &raw_inbox_prod,
             &raw_outbox_cons,
-            &ack_outbox_cons,
-            &pong_outbox_cons,
             conn_state_);
 
         if (!ok) {
@@ -1242,22 +1246,22 @@ void parse_args(int argc, char* argv[]) {
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <interface> <bpf_path> [ignored...] [--timeout <ms>]\n", argv[0]);
-        fprintf(stderr, "NOTE: Do NOT run directly. Use: USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp\n");
+        fprintf(stderr, "NOTE: Do NOT run directly. Use: ./scripts/build_xdp.sh 20_websocket_binance.cpp\n");
         fprintf(stderr, "\nOptions:\n");
         fprintf(stderr, "  --timeout <ms>   Stream timeout in milliseconds (default: %d)\n", DEFAULT_STREAM_DURATION_MS);
         fprintf(stderr, "                   If <= 0, run forever (display all messages, Ctrl+C to stop)\n");
         fprintf(stderr, "\nThis test:\n");
-        fprintf(stderr, "  - Forks XDP Poll (core 2), Transport<WolfSSL> (core 4), WebSocket (core 6)\n");
-        fprintf(stderr, "  - Connects to %s:%u (WSS with WolfSSL)\n", WSS_HOST, WSS_PORT);
+        fprintf(stderr, "  - Forks XDP Poll (core 2), Transport<%s> (core 4), WebSocket (core 6)\n", SSLPolicyType::name());
+        fprintf(stderr, "  - Connects to %s:%u (WSS with %s)\n", WSS_HOST, WSS_PORT, SSLPolicyType::name());
         fprintf(stderr, "  - WebSocketProcess handles HTTP+WS handshake\n");
         fprintf(stderr, "  - Streams BTCUSDT trades for the specified timeout\n");
         fprintf(stderr, "  - Parent consumes WS_FRAME_INFO, validates JSON trade data\n");
         fprintf(stderr, "  - Expects at least %d trades (BTCUSDT is very liquid)\n", MIN_EXPECTED_TRADES);
         fprintf(stderr, "  - Waits %dms, then verifies ringbuffer consumers caught up\n", FINAL_DRAIN_MS);
         fprintf(stderr, "\nExamples:\n");
-        fprintf(stderr, "  USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp                # Default 5s\n");
-        fprintf(stderr, "  USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp --timeout 10000  # 10s\n");
-        fprintf(stderr, "  USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp --timeout -1     # Forever\n");
+        fprintf(stderr, "  ./scripts/build_xdp.sh 20_websocket_binance.cpp                # Build\n");
+        fprintf(stderr, "  ./build/test_pipeline_websocket_binance enp108s0 src/xdp/bpf/exchange_filter.bpf.o --timeout 10000  # 10s\n");
+        fprintf(stderr, "  ./build/test_pipeline_websocket_binance enp108s0 src/xdp/bpf/exchange_filter.bpf.o --timeout -1     # Forever\n");
         return 1;
     }
 
@@ -1272,8 +1276,8 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "========================================\n");
         fprintf(stderr, "ERROR: Do NOT run as root!\n");
         fprintf(stderr, "========================================\n");
-        fprintf(stderr, "\nRun via the wrapper script which sets capabilities properly:\n");
-        fprintf(stderr, "  USE_WOLFSSL=1 ./scripts/test_xdp.sh 20_websocket_binance.cpp\n");
+        fprintf(stderr, "\nRun via the build script which sets capabilities properly:\n");
+        fprintf(stderr, "  ./scripts/build_xdp.sh 20_websocket_binance.cpp\n");
         return 1;
     }
 
@@ -1287,7 +1291,7 @@ int main(int argc, char* argv[]) {
     printf("  Interface:  %s\n", interface);
     printf("  Target:     %s:%u (WSS)\n", WSS_HOST, WSS_PORT);
     printf("  Path:       %s\n", WSS_PATH);
-    printf("  SSL:        WolfSSL\n");
+    printf("  SSL:        %s\n", SSLPolicyType::name());
     printf("  Processes:  XDP Poll (core %d)\n", XDP_POLL_CPU_CORE);
     printf("              Transport (core %d)\n", TRANSPORT_CPU_CORE);
     printf("              WebSocket (core %d)\n", WEBSOCKET_CPU_CORE);

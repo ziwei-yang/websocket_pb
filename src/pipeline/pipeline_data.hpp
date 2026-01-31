@@ -25,35 +25,16 @@
 #include <hftshm/layout.hpp>
 
 #include "pipeline_config.hpp"
+#include "../xdp/packet_frame_descriptor.hpp"
 
 namespace websocket::pipeline {
 
 // ============================================================================
-// UMEMFrameDescriptor - Passed through RAW_INBOX/OUTBOX rings
-// Size: 32 bytes (fits 2 per cache line)
+// UMEMFrameDescriptor - Type alias for PacketFrameDescriptor
+// Used in RAW_INBOX/OUTBOX rings. Size: 32 bytes (fits 2 per cache line)
 // ============================================================================
 
-struct alignas(32) UMEMFrameDescriptor {
-    uint64_t umem_addr;              // UMEM base address of frame
-    uint64_t nic_timestamp_ns;       // NIC hardware timestamp (ns)
-    uint64_t nic_frame_poll_cycle;   // TSC cycle when XDP Poll retrieved frame from NIC
-    uint16_t frame_len;              // Actual frame length (Ethernet + IP + TCP + payload)
-    uint8_t  frame_type;             // FrameType enum (RX/ACK/PONG/MSG)
-    uint8_t  consumed;               // Set by Transport when frame processing done
-    uint8_t  acked;                  // Set when OOO ACK sent for this frame (prevents repeat ACKs)
-    uint8_t  _pad[3];                // Padding to 32 bytes
-
-    void clear() {
-        umem_addr = 0;
-        nic_timestamp_ns = 0;
-        nic_frame_poll_cycle = 0;
-        frame_len = 0;
-        frame_type = FRAME_TYPE_RX;
-        consumed = 0;
-        acked = 0;
-    }
-};
-static_assert(sizeof(UMEMFrameDescriptor) == 32, "UMEMFrameDescriptor must be 32 bytes");
+using UMEMFrameDescriptor = websocket::xdp::PacketFrameDescriptor;
 
 // ============================================================================
 // MsgMetadata - Passed through MSG_METADATA_INBOX ring
@@ -293,6 +274,12 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
     char bpf_path[256];                             // Path to BPF object file
     char interface_name[64];                        // Network interface name
 
+    // Exchange IPs for BPF filter (resolved by parent before forking)
+    static constexpr size_t MAX_EXCHANGE_IPS = 8;
+    uint32_t exchange_ips[MAX_EXCHANGE_IPS];        // Network byte order IPs
+    uint8_t  exchange_ip_count;                     // Number of valid IPs
+    uint8_t  _pad_exchange[7];
+
     // ========================================================================
     // Cache Line 5: TCP state (Transport process only - no atomics needed)
     // ========================================================================
@@ -345,9 +332,10 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         std::atomic<uint64_t> msg_alloc_pos;
         std::atomic<uint64_t> msg_release_pos;
         std::atomic<uint64_t> msg_acked_pos;
+        std::atomic<uint64_t> msg_sent_pos;    // XDP Poll increments after sending to NIC
 
-        // Pad to 2 cache lines (9 × 8 = 72 bytes, need 128)
-        char _pad[2 * CACHE_LINE_SIZE - 72];
+        // Pad to 2 cache lines (10 × 8 = 80 bytes, need 128)
+        char _pad[2 * CACHE_LINE_SIZE - 80];
     } tx_frame;
 
     // ========================================================================
@@ -428,6 +416,18 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         return true;
     }
 
+    bool wait_for_handshake_tls_ready(uint64_t timeout_us = 15000000) const {
+        auto start = std::chrono::steady_clock::now();
+        while (!is_handshake_tls_ready()) {
+            if (!is_running(PROC_TRANSPORT)) return false;
+            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (static_cast<uint64_t>(elapsed) > timeout_us) return false;
+            __builtin_ia32_pause();
+        }
+        return true;
+    }
+
     bool wait_for_handshake_ws_ready(uint64_t timeout_us = 30000000) const {
         auto start = std::chrono::steady_clock::now();
         while (!is_handshake_ws_ready()) {
@@ -468,6 +468,10 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         std::memset(bpf_path, 0, sizeof(bpf_path));
         std::memset(interface_name, 0, sizeof(interface_name));
 
+        // Exchange IPs (set by parent before forking)
+        std::memset(exchange_ips, 0, sizeof(exchange_ips));
+        exchange_ip_count = 0;
+
         // TCP state (plain assignments - Transport only)
         snd_nxt = 0;
         snd_una = 0;
@@ -481,7 +485,7 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         remote_port = 0;
         std::memset(local_mac, 0, 6);
         std::memset(remote_mac, 0, 6);
-        peer_mss = PIPELINE_TCP_MSS;  // From pipeline_config.hpp (NIC_MTU - 40)
+        peer_mss = PIPELINE_TCP_MSS;  // From pipeline_config.hpp (NIC_MTU - 52 with TS)
         sack_enabled = false;         // Will be set true if peer sends SACK_OK in SYN-ACK
         timestamp_enabled = false;    // Will be set true if peer sends TS in SYN-ACK
         peer_ts_val = 0;              // Latest peer timestamp (for TSecr echo)
@@ -498,6 +502,7 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         tx_frame.msg_alloc_pos.store(0, std::memory_order_relaxed);
         tx_frame.msg_release_pos.store(0, std::memory_order_relaxed);
         tx_frame.msg_acked_pos.store(0, std::memory_order_relaxed);
+        tx_frame.msg_sent_pos.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -857,15 +862,11 @@ struct IPCRingConsumer {
             // 4. (T&, int64_t) -> void        (2-param, no stop)
             if constexpr (std::is_invocable_r_v<bool, F, T&, int64_t, bool>) {
                 if (!handler(event, seq, is_end)) {
-                    ++count;
-                    last_processed_ = seq;
-                    return count;  // Handler requested stop
+                    return count;  // Handler rejected this frame — stop, don't advance past it
                 }
             } else if constexpr (std::is_invocable_r_v<bool, F, T&, int64_t>) {
                 if (!handler(event, seq)) {
-                    ++count;
-                    last_processed_ = seq;
-                    return count;  // Handler requested stop
+                    return count;  // Handler rejected this frame — stop, don't advance past it
                 }
             } else if constexpr (std::is_invocable_v<F, T&, int64_t, bool>) {
                 handler(event, seq, is_end);
@@ -873,9 +874,9 @@ struct IPCRingConsumer {
                 handler(event, seq);
             }
             ++count;
+            last_processed_ = seq;  // Track last successfully consumed frame
         }
 
-        last_processed_ = end;
         return count;
     }
 

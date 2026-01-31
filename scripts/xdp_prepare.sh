@@ -2,17 +2,22 @@
 # XDP Preparation Script
 # Prepares the NIC and environment for AF_XDP zero-copy operation
 #
-# Usage: ./scripts/xdp_prepare.sh [--reload] [--domain <hostname>] <interface>
+# Usage: ./scripts/xdp_prepare.sh [--reload] [--domain <hostname>] [--enable-gro] <interface>
 # Example: ./scripts/xdp_prepare.sh enp108s0
 #          ./scripts/xdp_prepare.sh --reload enp108s0  # Reload NIC driver first
 #          ./scripts/xdp_prepare.sh --domain stream.binance.com enp108s0
+#          ./scripts/xdp_prepare.sh --enable-gro enp108s0  # Enable GRO for packet coalescing
 #
 # Options:
 #   --reload              Reload NIC driver to reset stuck XDP state
 #   --domain <hostname>   Update /etc/hosts with latest DNS for hostname
+#   --enable-gro          Enable GRO for packet coalescing (prevents OOO during TLS handshake)
 #
 # The --reload flag is useful when XDP gets stuck after a previous session.
 # This is a known issue with the igc driver.
+#
+# The --enable-gro flag enables Generic Receive Offload to coalesce packets.
+# This adds 5-50μs latency but prevents out-of-order packet delivery during TLS handshake.
 
 set -e
 
@@ -20,6 +25,7 @@ set -e
 RELOAD_DRIVER=0
 IFACE="enp108s0"
 DOMAIN=""
+ENABLE_GRO=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -30,6 +36,10 @@ while [[ $# -gt 0 ]]; do
         --domain)
             DOMAIN="$2"
             shift 2
+            ;;
+        --enable-gro)
+            ENABLE_GRO=1
+            shift
             ;;
         *)
             IFACE="$1"
@@ -207,23 +217,36 @@ set_ring_buffers_max() {
     fi
 }
 
-# Disable GRO/LRO for lowest latency (prevents packet batching)
+# Configure GRO/LRO based on --enable-gro flag
 disable_gro_lro() {
-    echo "Disabling GRO/LRO for lowest latency..."
-
-    # Disable GRO (Generic Receive Offload) - adds 5-50μs latency
     local gro_before=$(ethtool -k "$IFACE" 2>/dev/null | grep "generic-receive-offload:" | awk '{print $2}')
-    if sudo ethtool -K "$IFACE" gro off 2>/dev/null; then
-        if [[ "$gro_before" == "on" ]]; then
-            print_status "GRO disabled (was: on) - saves 5-50μs per packet"
+
+    if [[ "$ENABLE_GRO" == "1" ]]; then
+        echo "Enabling GRO for packet coalescing (--enable-gro specified)..."
+        if sudo ethtool -K "$IFACE" gro on 2>/dev/null; then
+            if [[ "$gro_before" == "off" ]]; then
+                print_status "GRO enabled (was: off) - prevents OOO during TLS handshake"
+            else
+                print_status "GRO already enabled"
+            fi
         else
-            print_status "GRO already disabled"
+            print_warning "Could not enable GRO (may be fixed or unsupported)"
         fi
     else
-        print_warning "Could not disable GRO (may be fixed or unsupported)"
+        echo "Disabling GRO/LRO for lowest latency..."
+        # Disable GRO (Generic Receive Offload) - adds 5-50μs latency
+        if sudo ethtool -K "$IFACE" gro off 2>/dev/null; then
+            if [[ "$gro_before" == "on" ]]; then
+                print_status "GRO disabled (was: on) - saves 5-50μs per packet"
+            else
+                print_status "GRO already disabled"
+            fi
+        else
+            print_warning "Could not disable GRO (may be fixed or unsupported)"
+        fi
     fi
 
-    # Disable LRO (Large Receive Offload)
+    # LRO stays disabled (fixed on most NICs anyway)
     local lro_before=$(ethtool -k "$IFACE" 2>/dev/null | grep "large-receive-offload:" | awk '{print $2}')
     if sudo ethtool -K "$IFACE" lro off 2>/dev/null; then
         if [[ "$lro_before" == "on" ]]; then

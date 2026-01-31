@@ -50,7 +50,8 @@ constexpr uint8_t TCP_FLAG_CWR = 0x80;
 constexpr size_t TCP_HEADER_MIN_LEN = 20;
 constexpr size_t TCP_HEADER_MAX_LEN = 60;
 constexpr uint16_t USERSPACE_TCP_MSS = NIC_MTU - 40;  // MSS = MTU - IP(20) - TCP(20)
-constexpr uint32_t TCP_MAX_WINDOW = 65535;
+constexpr uint32_t TCP_MAX_WINDOW = 42340;  // Match Python fingerprint (42340 * 4096 = 168MB receive window)
+constexpr uint32_t TCP_HANDSHAKE_ACK_WINDOW = 11;  // Match Python fingerprint for handshake ACK
 
 // TCP options
 constexpr uint8_t TCP_OPT_EOL = 0;       // End of option list

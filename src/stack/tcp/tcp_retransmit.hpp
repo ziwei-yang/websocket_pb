@@ -53,7 +53,7 @@ struct RetransmitSegmentRef {
 
 // Zero-copy retransmit queue - Fixed-size circular array (no heap allocation)
 struct ZeroCopyRetransmitQueue {
-    static constexpr size_t MAX_SEGMENTS = 256;       // Max segments in flight
+    static constexpr size_t MAX_SEGMENTS = 1024;      // Max segments in flight
     static constexpr uint8_t MAX_RETRANSMITS = 5;     // Connection dead after this many retries
 
     ZeroCopyRetransmitQueue() = default;
@@ -201,14 +201,16 @@ private:
 //   - Higher FILL ring pressure under load
 
 // Callback type for releasing frames back to XDP
-using FrameReleaseCallback = void(*)(uint64_t umem_addr, void* user_data);
+// Uses frame_idx for the new mark_frame_consumed() API
+using FrameReleaseCallback = void(*)(uint32_t frame_idx, void* user_data);
 
 // Reference to a received frame's TCP payload
 struct FrameRef {
     const uint8_t* data;       // Pointer to TCP payload in UMEM
     uint16_t len;              // Payload length
     uint16_t offset;           // Current read offset within payload
-    uint64_t umem_addr;        // UMEM address for releasing to FILL ring
+    uint32_t frame_idx;        // RX frame index for mark_frame_consumed()
+    uint64_t umem_addr;        // UMEM address (frame pointer, kept for compatibility)
     uint64_t hw_timestamp_ns;  // NIC hardware RX timestamp (0 if unavailable)
 };
 
@@ -231,13 +233,19 @@ struct ZeroCopyReceiveBuffer {
 
     // Add a received frame (zero-copy - just stores pointer)
     // Returns false if buffer is full
-    bool push_frame(const uint8_t* payload, uint16_t len, uint64_t umem_addr,
-                    uint64_t hw_timestamp_ns = 0) {
+    // Parameters:
+    //   - payload: pointer to TCP payload data in UMEM
+    //   - len: payload length
+    //   - frame_idx: RX frame index for mark_frame_consumed()
+    //   - umem_addr: UMEM address (frame pointer, for compatibility)
+    //   - hw_timestamp_ns: NIC hardware RX timestamp (0 if unavailable)
+    bool push_frame(const uint8_t* payload, uint16_t len, uint32_t frame_idx,
+                    uint64_t umem_addr, uint64_t hw_timestamp_ns = 0) {
         if (count_ >= MAX_FRAMES) {
             return false;  // Buffer full
         }
 
-        frames_[tail_] = {payload, len, 0, umem_addr, hw_timestamp_ns};
+        frames_[tail_] = {payload, len, 0, frame_idx, umem_addr, hw_timestamp_ns};
         tail_ = (tail_ + 1) % MAX_FRAMES;
         count_++;
         return true;
@@ -279,9 +287,9 @@ struct ZeroCopyReceiveBuffer {
 
             // Frame fully consumed?
             if (frame.offset >= frame.len) {
-                // Release frame back to FILL ring
+                // Release frame back to FILL ring via mark_frame_consumed()
                 if (release_cb_) {
-                    release_cb_(frame.umem_addr, release_user_data_);
+                    release_cb_(frame.frame_idx, release_user_data_);
                 }
 
                 head_ = (head_ + 1) % MAX_FRAMES;
@@ -320,7 +328,7 @@ struct ZeroCopyReceiveBuffer {
     void clear() {
         while (count_ > 0) {
             if (release_cb_) {
-                release_cb_(frames_[head_].umem_addr, release_user_data_);
+                release_cb_(frames_[head_].frame_idx, release_user_data_);
             }
             head_ = (head_ + 1) % MAX_FRAMES;
             count_--;

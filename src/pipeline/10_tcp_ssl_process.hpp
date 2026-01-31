@@ -7,8 +7,10 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <ctime>
 #include <netdb.h>
 #include <unistd.h>
 #include <algorithm>
@@ -296,6 +298,14 @@ struct TransportProcess {
     static constexpr uint32_t kTcpDelackMinMs = TcpDelackMinMs;
     static constexpr uint32_t kTcpDelackMaxMs = TcpDelackMaxMs;
 
+    // Transport phase state machine for unified main loop
+    enum class TransportPhase {
+        TCP_HANDSHAKE,      // Waiting for SYN-ACK, sending ACK
+        TLS_HANDSHAKE,      // TLS negotiation
+        RUNNING,            // Normal operation
+        FINISHED            // Connection closed
+    };
+
     // Debug printf - only prints when DebugTCP is enabled (zero overhead otherwise)
     template<typename... Args>
     static void debug_printf([[maybe_unused]] const char* fmt, [[maybe_unused]] Args&&... args) {
@@ -419,21 +429,15 @@ struct TransportProcess {
             }
         }
 
-        // Step 1: TCP handshake via IPC rings
-        // This uses the userspace TCP stack to send SYN, receive SYN-ACK, send ACK
-        if (!perform_tcp_handshake_via_ipc(target_host, target_port)) {
+        // Start TCP handshake (non-blocking) - sends SYN and returns immediately
+        // Handshake completion (SYN-ACK recv, ACK send, TLS) happens in run() via unified loop
+        if (!start_tcp_handshake(target_host, target_port)) {
             return false;
         }
-        conn_state_->set_handshake_tcp_ready();
 
-        // Step 2: TLS handshake (skip if using NoSSLPolicy)
-        if (!perform_tls_handshake_via_ipc(target_host)) {
-            return false;
-        }
-        conn_state_->set_handshake_tls_ready();
-
-        // NOTE: Application protocol handshakes (WebSocket upgrade, HTTP, etc.)
-        // are handled by upstream processes via MSG_OUTBOX/MSG_INBOX after tls_ready
+        // NOTE: TCP handshake, TLS handshake, and application protocol handshakes
+        // (WebSocket upgrade, HTTP, etc.) are now handled in run() via the unified main loop.
+        // The handshake_tcp_ready and handshake_tls_ready flags are set as each phase completes.
         return true;
     }
 
@@ -515,7 +519,8 @@ struct TransportProcess {
         uint64_t loop_id = 0;
         uint32_t loops_since_retransmit_check = 0;
 
-        while (conn_state_->is_running(PROC_TRANSPORT)) {
+        // Unified main loop - handles all phases
+        while (phase_ != TransportPhase::FINISHED && conn_state_->is_running(PROC_TRANSPORT)) {
             [[maybe_unused]] uint64_t loop_start = 0;
             [[maybe_unused]] CycleSample* slot = nullptr;
             if constexpr (Profiling) {
@@ -526,13 +531,38 @@ struct TransportProcess {
                 slot = profiling_data_->next_slot();
             }
 
+            // Phase-specific processing
+            if (phase_ == TransportPhase::TCP_HANDSHAKE ||
+                phase_ == TransportPhase::TLS_HANDSHAKE) {
+                // Handshake phase: only RX processing and timeout check
+                [[maybe_unused]] int32_t rx_count = process_rx_unified();
+
+                // Check for timeout
+                if (check_handshake_timeout()) {
+                    on_finished(false);
+                    break;
+                }
+
+                // Profiling: record handshake loop
+                if constexpr (Profiling) {
+                    slot->packet_nic_ns = 0;
+                    slot->nic_poll_cycle = 0;
+                    slot->transport_poll_cycle = 0;
+                    profiling_data_->commit();
+                }
+
+                loop_id++;
+                continue;  // Skip normal processing during handshake
+            }
+
+            // RUNNING phase: normal operation
             // 0. TX MSG
             int32_t msg_count = profile_op(
                 [this]{ return static_cast<int32_t>(process_outbound<TxType::MSG>()); }, slot, 0);
 
-            // 1. RX
+            // 1. RX (use unified RX that routes to normal processing)
             int32_t rx_count = profile_op(
-                [this]{ return static_cast<int32_t>(process_rx()); }, slot, 1);
+                [this]{ return static_cast<int32_t>(process_rx_unified()); }, slot, 1);
 
             bool data_moved = (msg_count > 0) || (rx_count > 0);
 
@@ -656,6 +686,10 @@ struct TransportProcess {
                                 pong_deficit > 0 ? "!" : " ");
                         fprintf(stderr, "│ rcv_nxt=%-10u snd_nxt=%-10u snd_una=%-10u │\n",
                                 conn_state_->rcv_nxt, conn_state_->snd_nxt, conn_state_->snd_una);
+                        fprintf(stderr, "│ peer_wnd=%-10u (scale=%u, eff=%uK)                     │\n",
+                                conn_state_->peer_recv_window,
+                                conn_state_->window_scale,
+                                conn_state_->peer_recv_window / 1024);
                         fprintf(stderr, "├──────────┬──────────┬──────────┬──────────┬─────────────────┤\n");
                         fprintf(stderr, "│ RX=%-5lu │ TX=%-5lu │ OOO=%-4lu │ DUP=%-4lu │ RTX=%-10lu │\n",
                                 health_rx_frames_, health_tx_frames_,
@@ -714,6 +748,65 @@ struct TransportProcess {
     // RX Path
     // ========================================================================
 
+    /**
+     * Unified RX processing for all phases (handshake and normal operation)
+     * Routes packets to handshake_packet_recv() or normal process_rx() based on phase
+     *
+     * @return Number of frames processed
+     */
+    uint32_t process_rx_unified() {
+        if (phase_ == TransportPhase::TCP_HANDSHAKE ||
+            phase_ == TransportPhase::TLS_HANDSHAKE) {
+            // Handshake phase: process packets via handshake handler
+            uint32_t rx_count = 0;
+
+            raw_inbox_cons_->process_manually(
+                [&](UMEMFrameDescriptor& desc, [[maybe_unused]] int64_t seq) -> bool {
+                    rx_count++;
+                    uint8_t* frame = umem_area_ + desc.frame_ptr;
+                    return handshake_packet_recv(frame, desc.frame_len, desc);
+                }, 16);  // Process up to 16 frames per call
+
+            raw_inbox_cons_->commit_manually();
+            return rx_count;
+
+        } else if (phase_ == TransportPhase::RUNNING) {
+            // Normal operation: use regular process_rx()
+            return process_rx();
+        }
+
+        return 0;  // FINISHED or other state
+    }
+
+    /**
+     * Check handshake timeout
+     * @return true if handshake has timed out, false otherwise
+     */
+    bool check_handshake_timeout() {
+        if (phase_ != TransportPhase::TCP_HANDSHAKE &&
+            phase_ != TransportPhase::TLS_HANDSHAKE) {
+            return false;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - handshake_start_time_).count();
+
+        int timeout_ms = (phase_ == TransportPhase::TCP_HANDSHAKE)
+            ? TCP_HANDSHAKE_TIMEOUT_MS
+            : TLS_HANDSHAKE_TIMEOUT_MS;
+
+        if (elapsed >= timeout_ms) {
+            fprintf(stderr, "[TRANSPORT] %s handshake timeout after %lldms\n",
+                    phase_ == TransportPhase::TCP_HANDSHAKE ? "TCP" : "TLS",
+                    static_cast<long long>(elapsed));
+            phase_ = TransportPhase::FINISHED;
+            return true;
+        }
+
+        return false;
+    }
+
     uint32_t process_rx() {
         uint32_t rx_count = 0;
         uint32_t payload_frames = 0;  // Frames with payload (added to SSL view ring)
@@ -756,7 +849,7 @@ struct TransportProcess {
 
                 // Parse TCP using TCPPacket::parse directly (we have all params in conn_state_)
                 // Note: conn_state_ stores IPs in network byte order, parse() expects host byte order
-                uint8_t* frame = umem_area_ + desc.umem_addr;
+                uint8_t* frame = umem_area_ + desc.frame_ptr;
                 auto parsed = userspace_stack::TCPPacket::parse(
                     frame, desc.frame_len,
                     ntohl(conn_state_->local_ip),
@@ -765,36 +858,37 @@ struct TransportProcess {
                     conn_state_->remote_port);
 
                 // Debug: Print UMEM frame ID on Transport RX
-                uint32_t umem_frame_id = static_cast<uint32_t>(desc.umem_addr / frame_size_);
+                uint32_t umem_frame_id = static_cast<uint32_t>(desc.frame_ptr / frame_size_);
                 if (!parsed.valid) {
                     fprintf(stderr, "[TRANSPORT-RX] umem_id=%u INVALID slot=%ld\n",
                             umem_frame_id, seq);
                     return true;
                 }
 
-                // Log received packet with seq, ack, flags, len for timeline reconstruction
-                fprintf(stderr, "[TRANSPORT-RX] umem_id=%u seq=%u ack=%u flags=0x%02x len=%zu slot=%ld\n",
-                        umem_frame_id, parsed.seq, parsed.ack, parsed.flags, parsed.payload_len, seq);
-
-                // Hex dump first 32 bytes of payload for debugging
-                if (parsed.payload_len > 0) {
-                    const uint8_t* payload = reinterpret_cast<const uint8_t*>(parsed.payload);
-                    size_t dump_len = std::min(parsed.payload_len, static_cast<size_t>(32));
-                    fprintf(stderr, "[TRANSPORT-RX] payload[0:%zu]: ", dump_len);
-                    for (size_t i = 0; i < dump_len; ++i) {
-                        fprintf(stderr, "%02x ", payload[i]);
-                    }
-                    if (parsed.payload_len > 32) {
-                        fprintf(stderr, "...");
+                // Log received packet with wall-clock time, seq, ack, flags, len, window for tcpdump comparison
+                // Window is raw value; multiply by 2^window_scale for effective window
+                if constexpr (kDebugTCP) {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    struct tm tm_info;
+                    localtime_r(&ts.tv_sec, &tm_info);
+                    fprintf(stderr, "[TRANSPORT-RX-DATA] %02d:%02d:%02d.%06ld seq=%u ack=%u flags=0x%02x win=%u payload=%zu len=%u\n",
+                            tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                            parsed.seq, parsed.ack, parsed.flags, parsed.window, parsed.payload_len, desc.frame_len);
+                    // Full frame hex dump for tcpdump comparison
+                    fprintf(stderr, "[TRANSPORT-RX-DATA-HEX] ");
+                    for (uint16_t i = 0; i < desc.frame_len; i++) {
+                        fprintf(stderr, "%02x ", frame[i]);
                     }
                     fprintf(stderr, "\n");
+                    fflush(stderr);
                 }
 
                 // DEBUG: Retransmit detection via TCP timestamp comparison (RFC 7323 PAWS)
                 // Only enabled when DebugTCP=true - zero overhead otherwise
                 if constexpr (kDebugTCP) {
                     if (conn_state_->timestamp_enabled && parsed.payload_len > 0) {
-                        uint8_t* frame = umem_area_ + desc.umem_addr;
+                        uint8_t* frame = umem_area_ + desc.frame_ptr;
                         auto ts_result = parse_timestamp_option(frame, desc.frame_len);
                         if (ts_result.found) {
                             // Check BEFORE recording (compare against previous packets)
@@ -884,8 +978,8 @@ struct TransportProcess {
                                 fprintf(stderr, "[TRANSPORT] OOO BUFFER FULL! Dropping segment seq=%u len=%zu (buffer has %zu/%zu)\n",
                                         parsed.seq, parsed.payload_len, ooo_buffer_.count(), ooo_buffer_.max_segments());
                             } else {
-                                fprintf(stderr, "[TRANSPORT] OOO BUFFERED: seq=%u len=%zu ext_id=%ld ooo_count=%zu/%zu\n",
-                                        parsed.seq, parsed.payload_len, seq, ooo_buffer_.count(), ooo_buffer_.max_segments());
+                                debug_printf("[TRANSPORT-RX] OOO DETECTED @%lu: seq=%u len=%zu rcv_nxt=%u gap=%d\n",
+                                             rdtsc(), parsed.seq, parsed.payload_len, conn_state_->rcv_nxt, seq_diff);
                             }
                         }
                         out_of_order = true;
@@ -923,7 +1017,7 @@ struct TransportProcess {
                 // Update peer_ts_val for in-order packets only (RFC 7323 §4.1 RTTM)
                 if constexpr (kTimestampEnabled) {
                     if (conn_state_->timestamp_enabled) {
-                        uint8_t* frame = umem_area_ + desc.umem_addr;
+                        uint8_t* frame = umem_area_ + desc.frame_ptr;
                         auto ts_result = parse_timestamp_option(frame, desc.frame_len);
                         if (ts_result.found) {
                             conn_state_->peer_ts_val = ts_result.ts_val;
@@ -1008,11 +1102,19 @@ struct TransportProcess {
             }
         }
 
-        // Out of order - set flag for deferred SACK in IDLE loop
+        // RFC 5681: Send immediate ACKs with SACK when OOO detected (don't wait for IDLE)
+        // Fast retransmit requires 3 duplicate ACKs. Send 3 ACKs for first OOO
+        // to trigger fast retransmit before any in-order packet changes ack number.
         if (out_of_order) {
-            fprintf(stderr, "[TRANSPORT] OOO detected: rcv_nxt=%u ooo_count=%zu (SACK in IDLE)\n",
-                    conn_state_->rcv_nxt, ooo_buffer_.count());
-            seen_ooo_packet_ = true;  // Deferred SACK in IDLE
+            debug_printf("[TRANSPORT-TX] OOO immediate ACK @%lu rcv_nxt=%u ooo_count=%zu\n",
+                         rdtsc(), conn_state_->rcv_nxt, ooo_buffer_.count());
+            seen_ooo_packet_ = true;  // Mark for IDLE loop stats
+            // Send 3 SACK ACKs for first OOO of a gap (triggers fast retransmit)
+            // For subsequent OOO in same gap, send 1 ACK (maintains SACK info)
+            size_t ack_count = (ooo_buffer_.count() == 1) ? 3 : 1;
+            for (size_t i = 0; i < ack_count; i++) {
+                send_ack();
+            }
         }
 
         return rx_count;
@@ -1294,20 +1396,40 @@ struct TransportProcess {
                 int64_t out_seq = batch_start + slot_idx;
                 if constexpr (Type == TxType::MSG) {
                     UMEMFrameDescriptor& desc = producer[out_seq];
-                    desc.umem_addr = umem_addr_ret;
+                    desc.frame_ptr = umem_addr_ret;
                     desc.frame_len = frame_len;
                     desc.frame_type = FRAME_TYPE_MSG;
                     desc.nic_frame_poll_cycle = rdtsc();
                     desc.consumed = 0;
                 } else {
                     UMEMFrameDescriptor& desc = producer[out_seq];
-                    desc.umem_addr = umem_addr_ret;
+                    desc.frame_ptr = umem_addr_ret;
                     desc.frame_len = frame_len;
                     desc.frame_type = FRAME_TYPE_PONG;
                     desc.nic_timestamp_ns = 0;
                     desc.nic_frame_poll_cycle = 0;
                     desc.consumed = 0;
                 }
+
+                // Full frame hex dump with wall-clock time for tcpdump comparison
+                if constexpr (kDebugTCP) {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    struct tm tm_info;
+                    localtime_r(&ts.tv_sec, &tm_info);
+                    const uint8_t* frame_data = umem_area_ + umem_addr_ret;
+                    const char* pkt_type = (Type == TxType::MSG) ? "MSG" : "PONG";
+                    fprintf(stderr, "[TRANSPORT-TX-%s] %02d:%02d:%02d.%06ld seq=%u len=%u\n",
+                            pkt_type, tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                            conn_state_->snd_nxt - static_cast<uint32_t>(encrypted_len), frame_len);
+                    fprintf(stderr, "[TRANSPORT-TX-%s-HEX] ", pkt_type);
+                    for (uint16_t i = 0; i < frame_len; i++) {
+                        fprintf(stderr, "%02x ", frame_data[i]);
+                    }
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
+                }
+
                 slot_idx++;
 
                 // Publish chunk when reaching TX_BATCH_SIZE
@@ -1442,6 +1564,9 @@ struct TransportProcess {
     }
 
     void send_ack() {
+        debug_printf("[TRANSPORT-TX] send_ack() called @%lu rcv_nxt=%u ooo_count=%zu\n",
+                     rdtsc(), conn_state_->rcv_nxt, ooo_buffer_.count());
+
         uint32_t frame_idx = allocate_ack_frame();
         if (frame_idx == UINT32_MAX) {
             fprintf(stderr, "[TRANSPORT] FATAL: ACK frame pool exhausted\n");
@@ -1521,6 +1646,7 @@ struct TransportProcess {
                     fprintf(stderr, "%02x ", frame[i]);
                 }
                 fprintf(stderr, "\n");
+                fflush(stderr);
             }
         }
 
@@ -1546,7 +1672,7 @@ struct TransportProcess {
         if (seq < 0) std::abort();  // ACK_OUTBOX full
 
         auto& desc = (*ack_outbox_prod_)[seq];
-        desc.umem_addr = umem_addr;
+        desc.frame_ptr = umem_addr;
         desc.frame_len = static_cast<uint16_t>(frame_len);
         desc.frame_type = FRAME_TYPE_ACK;
         desc.nic_timestamp_ns = 0;
@@ -1554,6 +1680,24 @@ struct TransportProcess {
         desc.consumed = 0;
         ack_outbox_prod_->publish(seq);
 
+        // Full frame hex dump with wall-clock time for tcpdump comparison
+        if constexpr (kDebugTCP) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            struct tm tm_info;
+            localtime_r(&ts.tv_sec, &tm_info);
+            fprintf(stderr, "[TRANSPORT-TX-ACK] %02d:%02d:%02d.%06ld seq=%u ack=%u flags=0x10 win=%u len=%zu\n",
+                    tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                    params.snd_nxt, params.rcv_nxt, params.rcv_wnd, frame_len);
+            fprintf(stderr, "[TRANSPORT-TX-ACK-HEX] ");
+            for (size_t i = 0; i < frame_len; i++) {
+                fprintf(stderr, "%02x ", frame[i]);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+
+        // Reset ACK timing (flags are managed by IDLE loop)
         packets_since_ack_ = 0;
         last_ack_cycle_ = rdtsc();
     }
@@ -1603,7 +1747,7 @@ struct TransportProcess {
         }
 
         auto& desc = (*ack_outbox_prod_)[seq];
-        desc.umem_addr = umem_addr;
+        desc.frame_ptr = umem_addr;
         desc.frame_len = static_cast<uint16_t>(frame_len);
         desc.frame_type = FRAME_TYPE_ACK;
         desc.nic_timestamp_ns = 0;
@@ -1721,7 +1865,7 @@ struct TransportProcess {
                 // Write descriptor to pre-claimed slot
                 int64_t out_seq = batch_start + slot_idx;
                 UMEMFrameDescriptor& desc = (*raw_outbox_prod_)[out_seq];
-                desc.umem_addr = static_cast<uint64_t>(seg.frame_idx) * frame_size_;
+                desc.frame_ptr = static_cast<uint64_t>(seg.frame_idx) * frame_size_;
                 desc.frame_len = seg.frame_len;
                 desc.frame_type = frame_type;
                 desc.nic_timestamp_ns = 0;
@@ -1872,7 +2016,7 @@ struct TransportProcess {
         params.remote_port = conn_state_->remote_port;
         params.snd_nxt = conn_state_->snd_nxt;
         params.rcv_nxt = conn_state_->rcv_nxt;
-        params.rcv_wnd = 65535;  // Advertise full window
+        params.rcv_wnd = userspace_stack::TCP_MAX_WINDOW;  // Advertise configured window
 
         // Populate timestamps if enabled at compile-time AND runtime
         if constexpr (kTimestampEnabled) {
@@ -1948,19 +2092,45 @@ private:
             return false;
         }
         auto& syn_desc = (*raw_outbox_prod_)[syn_seq];
-        syn_desc.umem_addr = syn_addr;
+        syn_desc.frame_ptr = syn_addr;
         syn_desc.frame_len = static_cast<uint16_t>(syn_len);
         syn_desc.frame_type = FRAME_TYPE_MSG;
         syn_desc.nic_frame_poll_cycle = rdtsc();
         syn_desc.consumed = 0;
         raw_outbox_prod_->publish(syn_seq);
 
-        if constexpr (kTimestampEnabled) {
-            fprintf(stderr, "[TRANSPORT-TX] SYN umem_id=%u seq=%u ts_val=%u ts_ecr=0\n",
-                    syn_alloc.frame_idx, tcp_params_.snd_nxt, tcp_params_.ts_val);
-        } else {
-            fprintf(stderr, "[TRANSPORT-TX] SYN umem_id=%u seq=%u\n",
-                    syn_alloc.frame_idx, tcp_params_.snd_nxt);
+        // Log SYN with wall-clock time and full TCP details
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            struct tm tm_info;
+            localtime_r(&ts.tv_sec, &tm_info);
+            if constexpr (kTimestampEnabled) {
+                fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld SYN seq=%u ack=0 flags=0x02 win=%u ts_val=%u ts_ecr=0 len=%zu\n",
+                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                        tcp_params_.snd_nxt, tcp_params_.snd_wnd, tcp_params_.ts_val, syn_len);
+            } else {
+                fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld SYN seq=%u ack=0 flags=0x02 win=%u len=%zu\n",
+                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                        tcp_params_.snd_nxt, tcp_params_.snd_wnd, syn_len);
+            }
+            // Log additional fields: IP ID, checksums, source port
+            if constexpr (kDebugTCP) {
+                // Parse IP header fields (offset 14 = after Ethernet header)
+                uint16_t ip_id = (syn_buffer[18] << 8) | syn_buffer[19];
+                uint16_t ip_checksum = (syn_buffer[24] << 8) | syn_buffer[25];
+                uint16_t src_port = (syn_buffer[34] << 8) | syn_buffer[35];
+                uint16_t tcp_checksum = (syn_buffer[50] << 8) | syn_buffer[51];
+                fprintf(stderr, "[TRANSPORT-TX-SYN-DEBUG] src_port=%u ip_id=0x%04x ip_csum=0x%04x tcp_csum=0x%04x\n",
+                        src_port, ip_id, ip_checksum, tcp_checksum);
+                // Full hex dump
+                fprintf(stderr, "[TRANSPORT-TX-SYN-HEX] ");
+                for (size_t i = 0; i < syn_len; i++) {
+                    fprintf(stderr, "%02x ", syn_buffer[i]);
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
         }
         tcp_params_.snd_nxt++;  // SYN consumes 1 seq
 
@@ -1978,7 +2148,7 @@ private:
 
             raw_inbox_cons_->process_manually(
                 [&](UMEMFrameDescriptor& rx_desc, int64_t) -> bool {
-                    uint8_t* frame = umem_area_ + rx_desc.umem_addr;
+                    uint8_t* frame = umem_area_ + rx_desc.frame_ptr;
                     auto parsed = stack_.parse_tcp(frame, rx_desc.frame_len,
                                                    tcp_params_.local_port,
                                                    tcp_params_.remote_ip,
@@ -1999,24 +2169,56 @@ private:
                         // Parse TCP options for Window Scale (RFC 7323)
                         conn_state_->window_scale = parse_window_scale_option(frame, rx_desc.frame_len);
 
+                        // Parse TCP options for MSS (RFC 879) - server's receive MSS
+                        uint16_t peer_mss = parse_mss_option(frame, rx_desc.frame_len);
+                        if (peer_mss > 0) {
+                            conn_state_->peer_mss = peer_mss;
+                        }
+
                         // Parse TCP options for Timestamps (RFC 7323)
+                        // Log SYN-ACK with wall-clock time and full TCP details
+                        struct timespec ts;
+                        clock_gettime(CLOCK_REALTIME, &ts);
+                        struct tm tm_info;
+                        localtime_r(&ts.tv_sec, &tm_info);
                         if constexpr (kTimestampEnabled) {
                             auto ts_result = parse_timestamp_option(frame, rx_desc.frame_len);
                             conn_state_->timestamp_enabled = ts_result.found;
                             if (ts_result.found) {
                                 conn_state_->peer_ts_val = ts_result.ts_val;
                             }
-                            fprintf(stderr, "[TRANSPORT-RX] SYN-ACK seq=%u ack=%u flags=0x%02x, SACK %s, TS %s, WS=%u\n",
-                                    parsed.seq, parsed.ack, parsed.flags,
-                                    conn_state_->sack_enabled ? "ENABLED" : "DISABLED",
-                                    conn_state_->timestamp_enabled ? "ENABLED" : "DISABLED",
-                                    conn_state_->window_scale);
+                            fprintf(stderr, "[TRANSPORT-RX] %02d:%02d:%02d.%06ld SYN-ACK seq=%u ack=%u flags=0x%02x win=%u MSS=%u SACK=%s TS=%s WS=%u len=%u\n",
+                                    tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                                    parsed.seq, parsed.ack, parsed.flags, parsed.window,
+                                    conn_state_->peer_mss,
+                                    conn_state_->sack_enabled ? "ON" : "OFF",
+                                    conn_state_->timestamp_enabled ? "ON" : "OFF",
+                                    conn_state_->window_scale, rx_desc.frame_len);
                         } else {
                             conn_state_->timestamp_enabled = false;
-                            fprintf(stderr, "[TRANSPORT-RX] SYN-ACK seq=%u ack=%u flags=0x%02x, SACK %s, WS=%u\n",
-                                    parsed.seq, parsed.ack, parsed.flags,
-                                    conn_state_->sack_enabled ? "ENABLED" : "DISABLED",
-                                    conn_state_->window_scale);
+                            fprintf(stderr, "[TRANSPORT-RX] %02d:%02d:%02d.%06ld SYN-ACK seq=%u ack=%u flags=0x%02x win=%u MSS=%u SACK=%s WS=%u len=%u\n",
+                                    tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                                    parsed.seq, parsed.ack, parsed.flags, parsed.window,
+                                    conn_state_->peer_mss,
+                                    conn_state_->sack_enabled ? "ON" : "OFF",
+                                    conn_state_->window_scale, rx_desc.frame_len);
+                        }
+                        // Log additional fields: IP ID, checksums, source port
+                        if constexpr (kDebugTCP) {
+                            // Parse IP header fields (offset 14 = after Ethernet header)
+                            uint16_t ip_id = (frame[18] << 8) | frame[19];
+                            uint16_t ip_checksum = (frame[24] << 8) | frame[25];
+                            uint16_t src_port = (frame[34] << 8) | frame[35];
+                            uint16_t tcp_checksum = (frame[50] << 8) | frame[51];
+                            fprintf(stderr, "[TRANSPORT-RX-SYNACK-DEBUG] src_port=%u ip_id=0x%04x ip_csum=0x%04x tcp_csum=0x%04x\n",
+                                    src_port, ip_id, ip_checksum, tcp_checksum);
+                            // Full hex dump
+                            fprintf(stderr, "[TRANSPORT-RX-SYNACK-HEX] ");
+                            for (uint16_t i = 0; i < rx_desc.frame_len; i++) {
+                                fprintf(stderr, "%02x ", frame[i]);
+                            }
+                            fprintf(stderr, "\n");
+                            fflush(stderr);
                         }
 
                         got_synack = true;
@@ -2058,7 +2260,7 @@ private:
             return false;
         }
         auto& ack_desc = (*ack_outbox_prod_)[ack_seq];
-        ack_desc.umem_addr = ack_addr;
+        ack_desc.frame_ptr = ack_addr;
         ack_desc.frame_len = static_cast<uint16_t>(ack_len);
         ack_desc.frame_type = FRAME_TYPE_ACK;
         ack_desc.nic_timestamp_ns = 0;
@@ -2066,17 +2268,45 @@ private:
         ack_desc.consumed = 0;
         ack_outbox_prod_->publish(ack_seq);
 
-        if constexpr (kTimestampEnabled) {
-            if (conn_state_->timestamp_enabled) {
-                fprintf(stderr, "[TRANSPORT-TX] TCP-HANDSHAKE ACK umem_id=%u rcv_nxt=%u ts_val=%u ts_ecr=%u\n",
-                        ack_frame_idx, tcp_params_.rcv_nxt, tcp_params_.ts_val, tcp_params_.ts_ecr);
+        // Log TCP handshake ACK with wall-clock time
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            struct tm tm_info;
+            localtime_r(&ts.tv_sec, &tm_info);
+            if constexpr (kTimestampEnabled) {
+                if (conn_state_->timestamp_enabled) {
+                    fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld TCP-ACK seq=%u ack=%u flags=0x10 win=%u ts_val=%u ts_ecr=%u len=%zu\n",
+                            tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                            tcp_params_.snd_nxt, tcp_params_.rcv_nxt, tcp_params_.snd_wnd,
+                            tcp_params_.ts_val, tcp_params_.ts_ecr, ack_len);
+                } else {
+                    fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld TCP-ACK seq=%u ack=%u flags=0x10 win=%u len=%zu (no TS)\n",
+                            tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                            tcp_params_.snd_nxt, tcp_params_.rcv_nxt, tcp_params_.snd_wnd, ack_len);
+                }
             } else {
-                fprintf(stderr, "[TRANSPORT-TX] TCP-HANDSHAKE ACK umem_id=%u rcv_nxt=%u (peer has no TS)\n",
-                        ack_frame_idx, tcp_params_.rcv_nxt);
+                fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld TCP-ACK seq=%u ack=%u flags=0x10 win=%u len=%zu\n",
+                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                        tcp_params_.snd_nxt, tcp_params_.rcv_nxt, tcp_params_.snd_wnd, ack_len);
             }
-        } else {
-            fprintf(stderr, "[TRANSPORT-TX] TCP-HANDSHAKE ACK umem_id=%u rcv_nxt=%u\n",
-                    ack_frame_idx, tcp_params_.rcv_nxt);
+            // Log additional fields: IP ID, checksums, source port
+            if constexpr (kDebugTCP) {
+                // Parse IP header fields (offset 14 = after Ethernet header)
+                uint16_t ip_id = (ack_buffer[18] << 8) | ack_buffer[19];
+                uint16_t ip_checksum = (ack_buffer[24] << 8) | ack_buffer[25];
+                uint16_t src_port = (ack_buffer[34] << 8) | ack_buffer[35];
+                uint16_t tcp_checksum = (ack_buffer[50] << 8) | ack_buffer[51];
+                fprintf(stderr, "[TRANSPORT-TX-ACK-DEBUG] src_port=%u ip_id=0x%04x ip_csum=0x%04x tcp_csum=0x%04x\n",
+                        src_port, ip_id, ip_checksum, tcp_checksum);
+                // Full hex dump
+                fprintf(stderr, "[TRANSPORT-TX-ACK-HEX] ");
+                for (size_t i = 0; i < ack_len; i++) {
+                    fprintf(stderr, "%02x ", ack_buffer[i]);
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
         }
 
         return true;
@@ -2144,6 +2374,14 @@ private:
                 if (pending > 0) {
                     tls_handshake_send_from_buffer(handshake_out_buf);
                 }
+
+                // Log TLS handshake details
+                const char* cipher_name = wolfSSL_get_cipher(ssl_policy_.ssl_);
+                const char* tls_version = wolfSSL_get_version(ssl_policy_.ssl_);
+                debug_printf("[TLS] Handshake SUCCESS\n");
+                debug_printf("[TLS]   Version: %s\n", tls_version ? tls_version : "unknown");
+                debug_printf("[TLS]   Cipher:  %s\n", cipher_name ? cipher_name : "unknown");
+
                 handshake_complete = true;
                 break;
             }
@@ -2220,6 +2458,41 @@ private:
             return false;
         }
 
+        // Debug: Hex dump TLS handshake data (includes ClientHello)
+        if constexpr (kDebugTCP) {
+            // Parse TLS record to identify message type
+            uint8_t content_type = handshake_buf[0];  // 22 = handshake
+            uint16_t tls_version = (handshake_buf[1] << 8) | handshake_buf[2];
+            uint16_t record_len = (handshake_buf[3] << 8) | handshake_buf[4];
+
+            const char* msg_type = "unknown";
+            if (content_type == 22 && pending > 5) {  // Handshake
+                uint8_t hs_type = handshake_buf[5];
+                if (hs_type == 1) msg_type = "ClientHello";
+                else if (hs_type == 2) msg_type = "ServerHello";
+                else if (hs_type == 11) msg_type = "Certificate";
+                else if (hs_type == 16) msg_type = "ClientKeyExchange";
+                else if (hs_type == 20) msg_type = "Finished";
+            } else if (content_type == 20) {
+                msg_type = "ChangeCipherSpec";
+            } else if (content_type == 23) {
+                msg_type = "ApplicationData";
+            }
+
+            fprintf(stderr, "[TLS-TX-DEBUG] %s: content_type=%u tls_version=0x%04x record_len=%u pending=%zu\n",
+                    msg_type, content_type, tls_version, record_len, pending);
+
+            // Full hex dump for ClientHello analysis
+            if (handshake_buf[5] == 1 && content_type == 22) {  // ClientHello
+                fprintf(stderr, "[TLS-TX-CLIENTHELLO-HEX] ");
+                for (size_t i = 0; i < pending && i < 600; i++) {
+                    fprintf(stderr, "%02x ", handshake_buf[i]);
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
+        }
+
         // Calculate MSS for segmentation (MTU - IP(20) - TCP(20) = 1460 for MTU 1500)
         constexpr size_t MSS = PIPELINE_TCP_MSS;
 
@@ -2247,15 +2520,23 @@ private:
             ssl_policy_.reset_encrypted_output_len();
 
             auto& desc = (*raw_outbox_prod_)[seq];
-            desc.umem_addr = addr;
+            desc.frame_ptr = addr;
             desc.frame_len = static_cast<uint16_t>(frame_len);
             desc.frame_type = FRAME_TYPE_MSG;
             desc.nic_frame_poll_cycle = rdtsc();
             desc.consumed = 0;
             raw_outbox_prod_->publish(seq);
 
-            fprintf(stderr, "[TRANSPORT-TX] TLS-HANDSHAKE DATA umem_id=%u seq=%u len=%zu\n",
-                    alloc.frame_idx, tcp_params_.snd_nxt, pending);
+            // Log TLS handshake TX with wall-clock time
+            {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                struct tm tm_info;
+                localtime_r(&ts.tv_sec, &tm_info);
+                fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld TLS-DATA seq=%u ack=%u flags=0x18 win=%u payload=%zu len=%zu\n",
+                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                        tcp_params_.snd_nxt, tcp_params_.rcv_nxt, tcp_params_.snd_wnd, pending, frame_len);
+            }
 
             tcp_params_.snd_nxt += pending;
             conn_state_->snd_nxt = tcp_params_.snd_nxt;
@@ -2302,15 +2583,23 @@ private:
             }
 
             auto& desc = (*raw_outbox_prod_)[seq];
-            desc.umem_addr = addr;
+            desc.frame_ptr = addr;
             desc.frame_len = static_cast<uint16_t>(frame_len);
             desc.frame_type = FRAME_TYPE_MSG;
             desc.nic_frame_poll_cycle = rdtsc();
             desc.consumed = 0;
             raw_outbox_prod_->publish(seq);
 
-            fprintf(stderr, "[TRANSPORT-TX] TLS-HANDSHAKE DATA (seg) umem_id=%u seq=%u len=%zu (sent=%zu/%zu)\n",
-                    alloc.frame_idx, tcp_params_.snd_nxt, seg_len, sent + seg_len, pending);
+            // Log TLS handshake TX segment with wall-clock time
+            {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                struct tm tm_info;
+                localtime_r(&ts.tv_sec, &tm_info);
+                fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld TLS-DATA seq=%u ack=%u flags=0x18 payload=%zu len=%zu (seg %zu/%zu)\n",
+                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                        tcp_params_.snd_nxt, tcp_params_.rcv_nxt, seg_len, frame_len, sent + seg_len, pending);
+            }
 
             // Update tcp_params_ for next segment (sequence number advances)
             tcp_params_.snd_nxt += seg_len;
@@ -2331,7 +2620,7 @@ private:
 
         raw_inbox_cons_->process_manually(
             [&](UMEMFrameDescriptor& desc, int64_t) -> bool {
-                uint8_t* frame = umem_area_ + desc.umem_addr;
+                uint8_t* frame = umem_area_ + desc.frame_ptr;
 
                 auto parsed = stack_.parse_tcp(frame, desc.frame_len,
                                                 tcp_params_.local_port,
@@ -2340,6 +2629,17 @@ private:
 
                 if (!parsed.valid) {
                     return true;  // Skip invalid, continue to next
+                }
+
+                // Log TLS handshake RX with wall-clock time
+                {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    struct tm tm_info;
+                    localtime_r(&ts.tv_sec, &tm_info);
+                    fprintf(stderr, "[TRANSPORT-RX] %02d:%02d:%02d.%06ld TLS-DATA seq=%u ack=%u flags=0x%02x win=%u payload=%zu len=%u\n",
+                            tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                            parsed.seq, parsed.ack, parsed.flags, parsed.window, parsed.payload_len, desc.frame_len);
                 }
 
                 // Update ACK tracking
@@ -2353,12 +2653,18 @@ private:
 
                     if (seq_diff > 0) {
                         // GAP: segment ahead of expected - buffer UMEM pointer
+                        size_t ooo_count_before = ooo_buffer_.count();
                         if (!ooo_buffer_.is_buffered(parsed.seq)) {
                             ooo_buffer_.buffer_segment(parsed.seq,
                                                        static_cast<uint16_t>(parsed.payload_len),
                                                        parsed.payload);
                         }
-                        send_ack_during_handshake();
+                        // RFC 5681: Send 3 dup-ACKs for first OOO of a gap to trigger fast retransmit
+                        // Must send 3 before any in-order packet arrives and changes ack number
+                        size_t ack_count = (ooo_count_before == 0) ? 3 : 1;
+                        for (size_t i = 0; i < ack_count; i++) {
+                            send_ack_during_handshake();
+                        }
                         return false;  // Don't commit - UMEM stays valid
                     } else if (seq_diff < 0) {
                         int32_t overlap = -seq_diff;
@@ -2427,7 +2733,7 @@ private:
     // NOTE: Handshake commit is now done immediately in tls_handshake_recv()
     // because we copy TLS data to a stable buffer, allowing immediate frame release.
 
-    // Helper: Send ACK during handshake
+    // Helper: Send ACK during handshake (with SACK support for OOO packets)
     void send_ack_during_handshake() {
         uint32_t frame_idx = allocate_ack_frame();
         if (frame_idx == UINT32_MAX) return;
@@ -2435,13 +2741,44 @@ private:
         uint64_t addr = frame_idx_to_addr(frame_idx, frame_size_);
         uint8_t* frame = umem_area_ + addr;
 
-        size_t len = stack_.build_ack(frame, frame_size_, tcp_params_);
+        size_t len = 0;
+
+        // Build SACK blocks from OOO buffer if SACK is enabled and we have OOO segments
+        // This enables fast retransmit during TLS handshake (RFC 2018)
+        if (conn_state_->sack_enabled && !ooo_buffer_.is_empty()) {
+            userspace_stack::SACKBlockArray sack_blocks;
+            sack_blocks.count = 0;
+
+            // Calculate max SACK blocks (3 with timestamps, 4 without)
+            const bool ts_in_packet = (tcp_params_.ts_val != 0);
+            const uint8_t max_sack_blocks = ts_in_packet
+                ? userspace_stack::SACK_MAX_BLOCKS_WITH_TS
+                : userspace_stack::SACK_MAX_BLOCKS;
+
+            // Extract SACK blocks from OOO buffer
+            ooo_buffer_.extract_sack_blocks(conn_state_->rcv_nxt, sack_blocks, max_sack_blocks);
+
+            if (sack_blocks.count > 0) {
+                len = userspace_stack::TCPPacket::build_ack_with_sack(
+                    frame, frame_size_, tcp_params_, sack_blocks,
+                    conn_state_->local_mac, conn_state_->remote_mac, ip_id_++);
+
+                debug_printf("[TRANSPORT-TX] TLS handshake SACK ACK: rcv_nxt=%u blocks=%u [%u-%u]\n",
+                             tcp_params_.rcv_nxt, sack_blocks.count,
+                             sack_blocks.blocks[0].left_edge, sack_blocks.blocks[0].right_edge);
+            }
+        }
+
+        // Fall back to plain ACK if no SACK blocks
+        if (len == 0) {
+            len = stack_.build_ack(frame, frame_size_, tcp_params_);
+        }
         if (len == 0) return;
 
         int64_t seq = ack_outbox_prod_->try_claim();
         if (seq < 0) return;  // Skip if outbox full
         auto& desc = (*ack_outbox_prod_)[seq];
-        desc.umem_addr = addr;
+        desc.frame_ptr = addr;
         desc.frame_len = static_cast<uint16_t>(len);
         desc.frame_type = FRAME_TYPE_ACK;
         desc.nic_timestamp_ns = 0;
@@ -2449,8 +2786,543 @@ private:
         desc.consumed = 0;
         ack_outbox_prod_->publish(seq);
 
-        fprintf(stderr, "[TRANSPORT-TX] HANDSHAKE ACK umem_id=%u rcv_nxt=%u\n",
-                frame_idx, tcp_params_.rcv_nxt);
+        // Log handshake ACK with wall-clock time
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            struct tm tm_info;
+            localtime_r(&ts.tv_sec, &tm_info);
+            fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld TLS-ACK seq=%u ack=%u flags=0x10 win=%u len=%zu\n",
+                    tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                    tcp_params_.snd_nxt, tcp_params_.rcv_nxt, tcp_params_.snd_wnd, len);
+        }
+    }
+
+    // ========================================================================
+    // Unified Handshake Packet Handler (called from main loop)
+    // ========================================================================
+
+    /**
+     * Handle incoming packet during handshake phase (TCP or TLS)
+     * Called from process_rx_unified() when phase_ is TCP_HANDSHAKE or TLS_HANDSHAKE
+     *
+     * @param frame Raw Ethernet frame
+     * @param frame_len Frame length
+     * @param desc UMEM frame descriptor
+     * @return true if frame should be committed (released), false to keep UMEM valid
+     */
+    bool handshake_packet_recv(uint8_t* frame, uint16_t frame_len, UMEMFrameDescriptor& desc) {
+        auto parsed = stack_.parse_tcp(frame, frame_len,
+                                        tcp_params_.local_port,
+                                        tcp_params_.remote_ip,
+                                        tcp_params_.remote_port);
+
+        if (!parsed.valid) {
+            return true;  // Skip invalid, commit frame
+        }
+
+        if (phase_ == TransportPhase::TCP_HANDSHAKE) {
+            // Handle SYN-ACK during TCP handshake
+            if ((parsed.flags & userspace_stack::TCP_FLAG_SYN) &&
+                (parsed.flags & userspace_stack::TCP_FLAG_ACK)) {
+                // Got SYN-ACK
+                tcp_params_.rcv_nxt = parsed.seq + 1;  // SYN consumes 1 seq
+                tcp_params_.snd_una = parsed.ack;
+                conn_state_->rcv_nxt = tcp_params_.rcv_nxt;
+                conn_state_->snd_una = tcp_params_.snd_una;
+                conn_state_->snd_nxt = tcp_params_.snd_nxt;
+                conn_state_->peer_recv_window = parsed.window;
+
+                // Parse TCP options for SACK_OK (RFC 2018)
+                conn_state_->sack_enabled = parse_sack_ok_option(frame, frame_len);
+
+                // Parse TCP options for Window Scale (RFC 7323)
+                conn_state_->window_scale = parse_window_scale_option(frame, frame_len);
+
+                // Parse TCP options for MSS (RFC 879)
+                uint16_t peer_mss = parse_mss_option(frame, frame_len);
+                if (peer_mss > 0) {
+                    conn_state_->peer_mss = peer_mss;
+                }
+
+                // Parse TCP options for Timestamps (RFC 7323)
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                struct tm tm_info;
+                localtime_r(&ts.tv_sec, &tm_info);
+                if constexpr (kTimestampEnabled) {
+                    auto ts_result = parse_timestamp_option(frame, frame_len);
+                    conn_state_->timestamp_enabled = ts_result.found;
+                    if (ts_result.found) {
+                        conn_state_->peer_ts_val = ts_result.ts_val;
+                    }
+                    fprintf(stderr, "[TRANSPORT-RX] %02d:%02d:%02d.%06ld SYN-ACK seq=%u ack=%u flags=0x%02x win=%u MSS=%u SACK=%s TS=%s WS=%u len=%u\n",
+                            tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                            parsed.seq, parsed.ack, parsed.flags, parsed.window,
+                            conn_state_->peer_mss,
+                            conn_state_->sack_enabled ? "ON" : "OFF",
+                            conn_state_->timestamp_enabled ? "ON" : "OFF",
+                            conn_state_->window_scale, frame_len);
+                } else {
+                    conn_state_->timestamp_enabled = false;
+                    fprintf(stderr, "[TRANSPORT-RX] %02d:%02d:%02d.%06ld SYN-ACK seq=%u ack=%u flags=0x%02x win=%u MSS=%u SACK=%s WS=%u len=%u\n",
+                            tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                            parsed.seq, parsed.ack, parsed.flags, parsed.window,
+                            conn_state_->peer_mss,
+                            conn_state_->sack_enabled ? "ON" : "OFF",
+                            conn_state_->window_scale, frame_len);
+                }
+                // Log additional fields: IP ID, checksums, source port
+                if constexpr (kDebugTCP) {
+                    // Parse IP header fields (offset 14 = after Ethernet header)
+                    uint16_t ip_id = (frame[18] << 8) | frame[19];
+                    uint16_t ip_checksum = (frame[24] << 8) | frame[25];
+                    uint16_t src_port = (frame[34] << 8) | frame[35];
+                    uint16_t tcp_checksum = (frame[50] << 8) | frame[51];
+                    fprintf(stderr, "[TRANSPORT-RX-SYNACK-DEBUG] src_port=%u ip_id=0x%04x ip_csum=0x%04x tcp_csum=0x%04x\n",
+                            src_port, ip_id, ip_checksum, tcp_checksum);
+                    // Full hex dump
+                    fprintf(stderr, "[TRANSPORT-RX-SYNACK-HEX] ");
+                    for (uint16_t i = 0; i < frame_len; i++) {
+                        fprintf(stderr, "%02x ", frame[i]);
+                    }
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
+                }
+
+                // Send ACK to complete 3-way handshake
+                send_tcp_handshake_ack();
+
+                // Transition to TLS handshake (or RUNNING if NoSSL)
+                conn_state_->set_handshake_tcp_ready();
+                if constexpr (std::is_same_v<SSLPolicy, NoSSLPolicy>) {
+                    phase_ = TransportPhase::RUNNING;
+                    conn_state_->set_handshake_tls_ready();
+                } else {
+                    start_tls_handshake();
+                }
+            }
+            return true;  // Commit frame
+
+        } else if (phase_ == TransportPhase::TLS_HANDSHAKE) {
+            // Log TLS handshake RX
+            {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                struct tm tm_info;
+                localtime_r(&ts.tv_sec, &tm_info);
+                fprintf(stderr, "[TRANSPORT-RX] %02d:%02d:%02d.%06ld TLS-DATA seq=%u ack=%u flags=0x%02x win=%u payload=%zu len=%u\n",
+                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                        parsed.seq, parsed.ack, parsed.flags, parsed.window, parsed.payload_len, frame_len);
+            }
+
+            // Update ACK tracking
+            if (parsed.flags & userspace_stack::TCP_FLAG_ACK) {
+                tcp_params_.snd_una = parsed.ack;
+                conn_state_->snd_una = parsed.ack;
+            }
+
+            if (parsed.payload_len > 0) {
+                int32_t seq_diff = static_cast<int32_t>(parsed.seq - tcp_params_.rcv_nxt);
+
+                if (seq_diff > 0) {
+                    // GAP: segment ahead of expected - buffer UMEM pointer
+                    size_t ooo_count_before = ooo_buffer_.count();
+                    if (!ooo_buffer_.is_buffered(parsed.seq)) {
+                        ooo_buffer_.buffer_segment(parsed.seq,
+                                                   static_cast<uint16_t>(parsed.payload_len),
+                                                   parsed.payload);
+                    }
+                    // RFC 5681: Send 3 dup-ACKs for first OOO of a gap to trigger fast retransmit
+                    size_t ack_count = (ooo_count_before == 0) ? 3 : 1;
+                    for (size_t i = 0; i < ack_count; i++) {
+                        send_ack_during_handshake();
+                    }
+                    return false;  // Don't commit - UMEM stays valid
+                } else if (seq_diff < 0) {
+                    int32_t overlap = -seq_diff;
+                    if (static_cast<size_t>(overlap) >= parsed.payload_len) {
+                        send_ack_during_handshake();
+                        return true;  // Duplicate, skip
+                    }
+                    // Partial overlap - skip duplicate part
+                    parsed.payload += overlap;
+                    parsed.payload_len -= overlap;
+                    parsed.seq = tcp_params_.rcv_nxt;
+                }
+
+                tcp_params_.rcv_nxt += parsed.payload_len;
+                conn_state_->rcv_nxt = tcp_params_.rcv_nxt;
+
+                // Copy to handshake buffer
+                size_t space = sizeof(handshake_rx_buf_) - handshake_rx_len_;
+                if (parsed.payload_len > space) {
+                    fprintf(stderr, "[FATAL] Handshake RX buffer overflow\n");
+                    std::abort();
+                }
+                memcpy(handshake_rx_buf_ + handshake_rx_len_, parsed.payload, parsed.payload_len);
+                handshake_rx_len_ += parsed.payload_len;
+
+                // Check OOO buffer for now-in-order segments
+                ooo_buffer_.try_deliver(tcp_params_.rcv_nxt,
+                    [this](const uint8_t* data, uint16_t offset, uint16_t len) {
+                        size_t space = sizeof(handshake_rx_buf_) - handshake_rx_len_;
+                        if (len > space) {
+                            fprintf(stderr, "[FATAL] OOO: Handshake buffer overflow\n");
+                            std::abort();
+                        }
+                        memcpy(handshake_rx_buf_ + handshake_rx_len_, data + offset, len);
+                        handshake_rx_len_ += len;
+                        return true;
+                    });
+                conn_state_->rcv_nxt = tcp_params_.rcv_nxt;
+
+                // Send ACK for received payload
+                send_ack_during_handshake();
+
+                // Try to advance TLS handshake
+                advance_tls_handshake();
+            }
+            return true;  // Commit frame
+        }
+
+        return true;  // Default: commit frame
+    }
+
+    /**
+     * Send TCP handshake ACK (third packet of 3-way handshake)
+     */
+    void send_tcp_handshake_ack() {
+        uint32_t ack_frame_idx = allocate_ack_frame();
+        if (ack_frame_idx == UINT32_MAX) {
+            fprintf(stderr, "[TRANSPORT] FATAL: Failed to allocate ACK frame for TCP handshake\n");
+            return;
+        }
+        uint64_t ack_addr = frame_idx_to_addr(ack_frame_idx, frame_size_);
+        uint8_t* ack_buffer = umem_area_ + ack_addr;
+
+        // Set timestamps for ACK (echo peer's ts_val from SYN-ACK)
+        if constexpr (kTimestampEnabled) {
+            if (conn_state_->timestamp_enabled) {
+                tcp_params_.ts_val = generate_ts_val();
+                tcp_params_.ts_ecr = conn_state_->peer_ts_val;
+            }
+        }
+
+        // Use small window for handshake ACK to match Python fingerprint
+        tcp_params_.rcv_wnd = userspace_stack::TCP_HANDSHAKE_ACK_WINDOW;
+
+        size_t ack_len = stack_.build_ack(ack_buffer, frame_size_, tcp_params_);
+        if (ack_len == 0) {
+            fprintf(stderr, "[TRANSPORT] FATAL: Failed to build TCP handshake ACK\n");
+            return;
+        }
+
+        int64_t ack_seq = ack_outbox_prod_->try_claim();
+        if (ack_seq < 0) {
+            fprintf(stderr, "[TRANSPORT] FATAL: ACK outbox full for TCP handshake\n");
+            return;
+        }
+        auto& ack_desc = (*ack_outbox_prod_)[ack_seq];
+        ack_desc.frame_ptr = ack_addr;
+        ack_desc.frame_len = static_cast<uint16_t>(ack_len);
+        ack_desc.frame_type = FRAME_TYPE_ACK;
+        ack_desc.nic_timestamp_ns = 0;
+        ack_desc.nic_frame_poll_cycle = 0;
+        ack_desc.consumed = 0;
+        ack_outbox_prod_->publish(ack_seq);
+
+        // Log TCP handshake ACK
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        struct tm tm_info;
+        localtime_r(&ts.tv_sec, &tm_info);
+        if constexpr (kTimestampEnabled) {
+            if (conn_state_->timestamp_enabled) {
+                fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld TCP-ACK seq=%u ack=%u flags=0x10 win=%u ts_val=%u ts_ecr=%u len=%zu\n",
+                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                        tcp_params_.snd_nxt, tcp_params_.rcv_nxt, tcp_params_.snd_wnd,
+                        tcp_params_.ts_val, tcp_params_.ts_ecr, ack_len);
+            } else {
+                fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld TCP-ACK seq=%u ack=%u flags=0x10 win=%u len=%zu (no TS)\n",
+                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                        tcp_params_.snd_nxt, tcp_params_.rcv_nxt, tcp_params_.snd_wnd, ack_len);
+            }
+        } else {
+            fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld TCP-ACK seq=%u ack=%u flags=0x10 win=%u len=%zu\n",
+                    tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                    tcp_params_.snd_nxt, tcp_params_.rcv_nxt, tcp_params_.snd_wnd, ack_len);
+        }
+        // Log additional fields: IP ID, checksums, source port
+        if constexpr (kDebugTCP) {
+            // Parse IP header fields (offset 14 = after Ethernet header)
+            uint16_t ip_id = (ack_buffer[18] << 8) | ack_buffer[19];
+            uint16_t ip_checksum = (ack_buffer[24] << 8) | ack_buffer[25];
+            uint16_t src_port = (ack_buffer[34] << 8) | ack_buffer[35];
+            uint16_t tcp_checksum = (ack_buffer[50] << 8) | ack_buffer[51];
+            fprintf(stderr, "[TRANSPORT-TX-ACK-DEBUG] src_port=%u ip_id=0x%04x ip_csum=0x%04x tcp_csum=0x%04x\n",
+                    src_port, ip_id, ip_checksum, tcp_checksum);
+            // Full hex dump
+            fprintf(stderr, "[TRANSPORT-TX-ACK-HEX] ");
+            for (size_t i = 0; i < ack_len; i++) {
+                fprintf(stderr, "%02x ", ack_buffer[i]);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
+
+    /**
+     * Start TCP handshake (non-blocking)
+     * Resolves hostname, initializes TCP params, sends SYN, returns immediately
+     * SYN-ACK handling is done via handshake_packet_recv() in main loop
+     *
+     * @param target_host Target hostname (e.g., "stream.binance.com")
+     * @param target_port Target port (e.g., 443)
+     * @return true if SYN was sent successfully, false on error
+     */
+    bool start_tcp_handshake(const char* target_host, uint16_t target_port) {
+        // Store target host for SNI during TLS handshake
+        strncpy(target_host_, target_host, sizeof(target_host_) - 1);
+        target_host_[sizeof(target_host_) - 1] = '\0';
+
+        // Resolve hostname to IP
+        struct addrinfo hints = {}, *res = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        int gai_ret = getaddrinfo(target_host, nullptr, &hints, &res);
+        if (gai_ret != 0 || !res) {
+            fprintf(stderr, "[TRANSPORT] Failed to resolve hostname: %s\n", target_host);
+            return false;
+        }
+        uint32_t remote_ip = ntohl(reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr.s_addr);
+        freeaddrinfo(res);
+
+        // Initialize TCP params
+        tcp_params_.remote_ip = remote_ip;
+        tcp_params_.remote_port = target_port;
+        tcp_params_.local_ip = ntohl(conn_state_->local_ip);
+        tcp_params_.local_port = userspace_stack::UserspaceStack::generate_port();
+        tcp_params_.snd_nxt = userspace_stack::UserspaceStack::generate_isn();
+        tcp_params_.snd_una = tcp_params_.snd_nxt;
+        tcp_params_.rcv_nxt = 0;
+        tcp_params_.snd_wnd = userspace_stack::TCP_MAX_WINDOW;
+        tcp_params_.rcv_wnd = userspace_stack::TCP_MAX_WINDOW;
+
+        // Store in shared state
+        conn_state_->local_port = tcp_params_.local_port;
+        conn_state_->remote_port = target_port;
+        conn_state_->remote_ip = htonl(remote_ip);
+
+        // Allocate frame for SYN
+        auto syn_alloc = allocate_msg_frame();
+        if (!syn_alloc.success()) {
+            fprintf(stderr, "[TRANSPORT] Failed to allocate SYN frame\n");
+            return false;
+        }
+        uint64_t syn_addr = frame_idx_to_addr(syn_alloc.frame_idx, frame_size_);
+        uint8_t* syn_buffer = umem_area_ + syn_addr;
+
+        // Set timestamp for SYN (ts_ecr = 0 for initial SYN per RFC 7323)
+        if constexpr (kTimestampEnabled) {
+            tcp_params_.ts_val = generate_ts_val();
+            tcp_params_.ts_ecr = 0;
+        }
+
+        // Build SYN packet
+        size_t syn_len = stack_.build_syn(syn_buffer, frame_size_, tcp_params_);
+        if (syn_len == 0) {
+            fprintf(stderr, "[TRANSPORT] Failed to build SYN packet\n");
+            return false;
+        }
+
+        // Send SYN via RAW_OUTBOX
+        int64_t syn_seq = raw_outbox_prod_->try_claim();
+        if (syn_seq < 0) {
+            fprintf(stderr, "[TRANSPORT] RAW_OUTBOX full, cannot send SYN\n");
+            return false;
+        }
+        auto& syn_desc = (*raw_outbox_prod_)[syn_seq];
+        syn_desc.frame_ptr = syn_addr;
+        syn_desc.frame_len = static_cast<uint16_t>(syn_len);
+        syn_desc.frame_type = FRAME_TYPE_MSG;
+        syn_desc.nic_frame_poll_cycle = rdtsc();
+        syn_desc.consumed = 0;
+        raw_outbox_prod_->publish(syn_seq);
+
+        // Log SYN
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            struct tm tm_info;
+            localtime_r(&ts.tv_sec, &tm_info);
+            if constexpr (kTimestampEnabled) {
+                fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld SYN seq=%u ack=0 flags=0x02 win=%u ts_val=%u ts_ecr=0 len=%zu\n",
+                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                        tcp_params_.snd_nxt, tcp_params_.snd_wnd, tcp_params_.ts_val, syn_len);
+            } else {
+                fprintf(stderr, "[TRANSPORT-TX] %02d:%02d:%02d.%06ld SYN seq=%u ack=0 flags=0x02 win=%u len=%zu\n",
+                        tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec, ts.tv_nsec / 1000,
+                        tcp_params_.snd_nxt, tcp_params_.snd_wnd, syn_len);
+            }
+            // Log additional fields: IP ID, checksums, source port
+            if constexpr (kDebugTCP) {
+                // Parse IP header fields (offset 14 = after Ethernet header)
+                uint16_t ip_id = (syn_buffer[18] << 8) | syn_buffer[19];
+                uint16_t ip_checksum = (syn_buffer[24] << 8) | syn_buffer[25];
+                uint16_t src_port = (syn_buffer[34] << 8) | syn_buffer[35];
+                uint16_t tcp_checksum = (syn_buffer[50] << 8) | syn_buffer[51];
+                fprintf(stderr, "[TRANSPORT-TX-SYN-DEBUG] src_port=%u ip_id=0x%04x ip_csum=0x%04x tcp_csum=0x%04x\n",
+                        src_port, ip_id, ip_checksum, tcp_checksum);
+                // Full hex dump
+                fprintf(stderr, "[TRANSPORT-TX-SYN-HEX] ");
+                for (size_t i = 0; i < syn_len; i++) {
+                    fprintf(stderr, "%02x ", syn_buffer[i]);
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
+        }
+        tcp_params_.snd_nxt++;  // SYN consumes 1 seq
+
+        // Set phase and start timeout
+        phase_ = TransportPhase::TCP_HANDSHAKE;
+        handshake_start_time_ = std::chrono::steady_clock::now();
+
+        return true;
+    }
+
+    /**
+     * Initialize TLS handshake (non-blocking)
+     * Sets up SSL context and initiates handshake, returns immediately
+     * Called after TCP handshake completes
+     */
+    void start_tls_handshake() {
+        if constexpr (std::is_same_v<SSLPolicy, NoSSLPolicy>) {
+            phase_ = TransportPhase::RUNNING;
+            return;
+        }
+
+        // Initialize handshake state
+        handshake_rx_len_ = 0;
+        handshake_rx_appended_ = 0;
+        ooo_buffer_.clear();
+        rx_frames_pending_ = 0;
+
+        // Initialize SSL policy with zero-copy BIO
+        ssl_policy_.init_zero_copy_bio();
+
+        // Set SNI (Server Name Indication) - stored in target_host_
+#ifdef SSL_POLICY_WOLFSSL
+        wolfSSL_UseSNI(ssl_policy_.ssl_, WOLFSSL_SNI_HOST_NAME,
+                       target_host_, static_cast<unsigned short>(strlen(target_host_)));
+#else
+        SSL_set_tlsext_host_name(ssl_policy_.ssl_, target_host_);
+#endif
+
+        // Set output buffer for encrypted data
+        ssl_policy_.set_encrypted_output(tls_handshake_out_buf_, sizeof(tls_handshake_out_buf_));
+
+        // Set phase and start timeout
+        phase_ = TransportPhase::TLS_HANDSHAKE;
+        handshake_start_time_ = std::chrono::steady_clock::now();
+
+        // Initiate TLS handshake (will return WANT_READ/WANT_WRITE)
+        advance_tls_handshake();
+    }
+
+    /**
+     * Advance TLS handshake state machine (non-blocking)
+     * Called after receiving TLS data to progress the handshake
+     */
+    void advance_tls_handshake() {
+        if constexpr (std::is_same_v<SSLPolicy, NoSSLPolicy>) {
+            phase_ = TransportPhase::RUNNING;
+            return;
+        }
+
+        // Append any new handshake data to SSL view ring
+        size_t new_data = handshake_rx_len_ - handshake_rx_appended_;
+        if (new_data > 0) {
+            uint8_t* new_data_ptr = handshake_rx_buf_ + handshake_rx_appended_;
+            if (ssl_policy_.append_encrypted_view(new_data_ptr, new_data) != 0) {
+                fprintf(stderr, "[FATAL] SSL view ring buffer overflow during handshake\n");
+                std::abort();
+            }
+            handshake_rx_appended_ = handshake_rx_len_;
+        }
+
+#ifdef SSL_POLICY_WOLFSSL
+        int ret = wolfSSL_connect(ssl_policy_.ssl_);
+
+        if (ret == WOLFSSL_SUCCESS) {
+            // TLS 1.3: client Finished message may be pending
+            size_t pending = ssl_policy_.encrypted_output_len();
+            if (pending > 0) {
+                tls_handshake_send_from_buffer(tls_handshake_out_buf_);
+            }
+
+            // Log TLS handshake success
+            const char* cipher_name = wolfSSL_get_cipher(ssl_policy_.ssl_);
+            const char* tls_version = wolfSSL_get_version(ssl_policy_.ssl_);
+            debug_printf("[TLS] Handshake SUCCESS\n");
+            debug_printf("[TLS]   Version: %s\n", tls_version ? tls_version : "unknown");
+            debug_printf("[TLS]   Cipher:  %s\n", cipher_name ? cipher_name : "unknown");
+
+            // Cleanup and transition
+            ssl_policy_.clear_encrypted_output();
+            conn_state_->set_handshake_tls_ready();
+            phase_ = TransportPhase::RUNNING;
+            return;
+        }
+
+        int err = wolfSSL_get_error(ssl_policy_.ssl_, ret);
+
+        if (err == WOLFSSL_ERROR_WANT_READ) {
+            // Send any pending output before waiting for input
+            size_t pending = ssl_policy_.encrypted_output_len();
+            if (pending > 0) {
+                tls_handshake_send_from_buffer(tls_handshake_out_buf_);
+            }
+            // Stay in TLS_HANDSHAKE, wait for more data
+        } else if (err == WOLFSSL_ERROR_WANT_WRITE) {
+            tls_handshake_send_from_buffer(tls_handshake_out_buf_);
+        } else {
+            // TLS handshake failed
+            fprintf(stderr, "[TLS] Handshake FAILED: error=%d\n", err);
+            ssl_policy_.clear_encrypted_output();
+            phase_ = TransportPhase::FINISHED;
+        }
+#else
+        // OpenSSL/LibreSSL handshake
+        int ret = SSL_do_handshake(ssl_policy_.ssl_);
+
+        if (ret == 1) {
+            ssl_policy_.clear_encrypted_output();
+            conn_state_->set_handshake_tls_ready();
+            phase_ = TransportPhase::RUNNING;
+            return;
+        }
+
+        int err = SSL_get_error(ssl_policy_.ssl_, ret);
+        size_t pending_out = ssl_policy_.encrypted_output_len();
+
+        if (err == SSL_ERROR_WANT_READ) {
+            if (pending_out > 0) {
+                tls_handshake_send_from_buffer(tls_handshake_out_buf_);
+            }
+            // Stay in TLS_HANDSHAKE, wait for more data
+        } else if (err == SSL_ERROR_WANT_WRITE) {
+            tls_handshake_send_from_buffer(tls_handshake_out_buf_);
+        } else {
+            fprintf(stderr, "[TLS] Handshake FAILED: error=%d\n", err);
+            ssl_policy_.clear_encrypted_output();
+            phase_ = TransportPhase::FINISHED;
+        }
+#endif
+
+        // Always send any remaining pending output
+        tls_handshake_send_from_buffer(tls_handshake_out_buf_);
     }
 
     // ========================================================================
@@ -2675,6 +3547,77 @@ private:
         return result;
     }
 
+    /**
+     * Parse TCP options to extract MSS value (RFC 879)
+     * Must be called on SYN-ACK frames during handshake.
+     *
+     * @param frame Raw Ethernet frame
+     * @param frame_len Frame length
+     * @return MSS value from peer, or 0 if not found
+     */
+    static uint16_t parse_mss_option(const uint8_t* frame, size_t frame_len) {
+        constexpr size_t ETH_LEN = userspace_stack::ETH_HEADER_LEN;
+        constexpr size_t IP_LEN = userspace_stack::IP_HEADER_LEN;
+        constexpr size_t TCP_MIN = userspace_stack::TCP_HEADER_MIN_LEN;
+
+        // Minimum size check
+        if (frame_len < ETH_LEN + IP_LEN + TCP_MIN) {
+            return 0;
+        }
+
+        const auto* tcp = reinterpret_cast<const userspace_stack::TCPHeader*>(
+            frame + ETH_LEN + IP_LEN);
+
+        // Get TCP header length from data offset field
+        size_t tcp_header_len = ((tcp->doff_reserved >> 4) & 0x0F) * 4;
+        if (tcp_header_len <= TCP_MIN) {
+            return 0;  // No options
+        }
+
+        // Validate frame has full TCP header
+        if (frame_len < ETH_LEN + IP_LEN + tcp_header_len) {
+            return 0;
+        }
+
+        // Parse TCP options
+        const uint8_t* options = frame + ETH_LEN + IP_LEN + TCP_MIN;
+        size_t options_len = tcp_header_len - TCP_MIN;
+        size_t pos = 0;
+
+        while (pos < options_len) {
+            uint8_t kind = options[pos];
+
+            if (kind == userspace_stack::TCP_OPT_EOL) {
+                break;  // End of options list
+            }
+            if (kind == userspace_stack::TCP_OPT_NOP) {
+                pos++;
+                continue;
+            }
+
+            // All other options have length byte
+            if (pos + 1 >= options_len) {
+                break;  // Malformed
+            }
+            uint8_t len = options[pos + 1];
+            if (len < 2 || pos + len > options_len) {
+                break;  // Malformed
+            }
+
+            // Check for MSS (kind=2, length=4)
+            if (kind == userspace_stack::TCP_OPT_MSS && len == 4) {
+                // MSS value at offset +2 (2 bytes, network byte order)
+                uint16_t mss_n;
+                std::memcpy(&mss_n, &options[pos + 2], 2);
+                return ntohs(mss_n);
+            }
+
+            pos += len;
+        }
+
+        return 0;  // Not found
+    }
+
     void reset_timestamps() {
         has_pending_timestamps_ = false;
         first_nic_timestamp_ns_ = 0;
@@ -2694,6 +3637,7 @@ private:
     uint8_t* umem_area_ = nullptr;
     uint32_t frame_size_ = 0;
     SSLPolicy ssl_policy_;  // SSL policy (abstracts library-specific details)
+    char target_host_[256] = {};  // Target hostname for SNI (stored during TCP handshake init)
 
     // Memory BIO pointers for SSL I/O (OpenSSL/LibreSSL only)
     // - OpenSSL/LibreSSL: Use memory BIOs for userspace transport
@@ -2778,6 +3722,15 @@ private:
     uint64_t connection_start_cycle_ = 0;  // TSC cycle when run() begins (post-handshake)
     bool finished_called_ = false;         // Prevent double-invocation of on_finished()
 
+    // Transport phase state (unified main loop)
+    TransportPhase phase_ = TransportPhase::TCP_HANDSHAKE;
+    std::chrono::steady_clock::time_point handshake_start_time_;  // For timeout tracking
+    static constexpr int TCP_HANDSHAKE_TIMEOUT_MS = 5000;   // 5 second TCP handshake timeout
+    static constexpr int TLS_HANDSHAKE_TIMEOUT_MS = 10000;  // 10 second TLS handshake timeout
+
+    // TLS handshake output buffer (set during TLS phase)
+    uint8_t tls_handshake_out_buf_[4096];
+
     // Retransmit state - separate queues for MSG and PONG frames
     ZeroCopyRetransmitQueue msg_retransmit_queue_;       // MSG frames
     ZeroCopyRetransmitQueue pong_retransmit_queue_;  // PONG frames
@@ -2809,8 +3762,8 @@ private:
     // RX frame lifecycle - track frames pending SSL consumption in main loop
     size_t rx_frames_pending_ = 0;
 
-    // IP identification counter for outgoing packets
-    uint16_t ip_id_ = 0;
+    // IP identification counter for outgoing packets (random start like Python/kernel)
+    uint16_t ip_id_ = static_cast<uint16_t>(std::time(nullptr) ^ (std::time(nullptr) >> 16));
 
     // Userspace TCP stack for building/parsing packets (fork-first handshake)
     userspace_stack::UserspaceStack stack_;

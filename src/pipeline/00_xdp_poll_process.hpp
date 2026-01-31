@@ -29,6 +29,7 @@
 #include "pipeline_config.hpp"
 #include "pipeline_data.hpp"
 #include "../core/timing.hpp"
+#include "../xdp/packet_frame_descriptor.hpp"
 
 namespace websocket::pipeline {
 
@@ -36,15 +37,15 @@ namespace websocket::pipeline {
 // XDPPollProcess - Core XDP packet I/O handler
 //
 // Template Parameters:
-//   RingProducer   - Producer type for RAW_INBOX (UMEMFrameDescriptor)
-//   OutboxConsumer - Consumer type for all outbox rings (UMEMFrameDescriptor)
+//   RingProducer   - Producer type for RAW_INBOX (PacketFrameDescriptor)
+//   OutboxConsumer - Consumer type for all outbox rings (PacketFrameDescriptor)
 //                    Uses frame_type field to distinguish ACK/PONG/MSG frames
 //   TrickleEnabled - Enable trickle packets (igc driver workaround), default true
 //   FrameHeadroom  - XDP metadata headroom (e.g., 256 for timestamps), default 256
 //   FrameSize      - UMEM frame size, default 2048 (for MTU 1500)
 //
 // Responsibilities:
-// 1. Collect TX packets from outbox rings (RAW_OUTBOX, ACK_OUTBOX, PONG_OUTBOX)
+// 1. Collect TX packets from RAW_OUTBOX (unified outbox for all TX types)
 // 2. Submit TX batch to kernel, kick sendto()
 // 3. Receive RX packets from rx_ring, publish to RAW_INBOX with timestamps
 // 4. Reclaim consumed RX frames back to fill_ring
@@ -57,8 +58,7 @@ template<typename RingProducer,
          bool TrickleEnabled = true,
          bool Profiling = false,
          uint32_t FrameHeadroom = 256,
-         uint32_t FrameSize = 2048,
-         bool DebugXDP = false>
+         uint32_t FrameSize = FRAME_SIZE>
 struct XDPPollProcess {
     // Compile-time constants from template args
     static constexpr bool kTrickleEnabled = TrickleEnabled;
@@ -66,18 +66,10 @@ struct XDPPollProcess {
     static constexpr uint32_t kFrameHeadroom = FrameHeadroom;
     static constexpr uint32_t kFrameSize = FrameSize;
     static constexpr uint32_t kQueueId = 0;  // Always queue 0
-    static constexpr bool kDebugXDP = DebugXDP;
 
-    // Debug printf - only prints when DebugXDP enabled (zero overhead otherwise)
-    template<typename... Args>
-    static void debug_printf([[maybe_unused]] const char* fmt, [[maybe_unused]] Args&&... args) {
-        if constexpr (kDebugXDP) {
-            fprintf(stderr, fmt, std::forward<Args>(args)...);
-        }
-    }
     // Pre-reserve TX slots: min(256, TX_RING_SIZE/4) to avoid exhausting small rings
     static constexpr uint32_t TX_PRESERVE_SIZE =
-        (256 < XSK_RING_PROD__DEFAULT_NUM_DESCS / 4) ? 256 : XSK_RING_PROD__DEFAULT_NUM_DESCS / 4;
+        (256 < XDP_TX_RING_SIZE / 4) ? 256 : XDP_TX_RING_SIZE / 4;
 
     // Profiling helper: wraps function, measures cycles, stores result and cycles
     // If condition is false, skips execution and records 0 for both details and cycles
@@ -117,16 +109,12 @@ struct XDPPollProcess {
               const char* bpf_path,
               RingProducer* raw_inbox_prod,
               OutboxConsumer* raw_outbox_cons,
-              OutboxConsumer* ack_outbox_cons,
-              OutboxConsumer* pong_outbox_cons,
               ConnStateShm* conn_state) {
 
         umem_area_ = umem_area;
         umem_size_ = umem_size;
         raw_inbox_prod_ = raw_inbox_prod;
         raw_outbox_cons_ = raw_outbox_cons;
-        ack_outbox_cons_ = ack_outbox_cons;
-        pong_outbox_cons_ = pong_outbox_cons;
         conn_state_ = conn_state;
 
         // Get interface index
@@ -195,8 +183,8 @@ struct XDPPollProcess {
 
         // Configure XDP socket - always zero-copy mode
         struct xsk_socket_config xsk_cfg = {};
-        xsk_cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
-        xsk_cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
+        xsk_cfg.rx_size = XDP_RX_RING_SIZE;
+        xsk_cfg.tx_size = XDP_TX_RING_SIZE;
         xsk_cfg.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
         xsk_cfg.xdp_flags = 0;
         xsk_cfg.bind_flags = XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP;
@@ -242,12 +230,12 @@ struct XDPPollProcess {
             }
         }
 
-        // Enable SO_BUSY_POLL (budget=32, interval=50us for lower latency)
+        // Enable SO_BUSY_POLL
         int busy_poll = 1;
         setsockopt(xsk_fd_, SOL_SOCKET, SO_PREFER_BUSY_POLL, &busy_poll, sizeof(busy_poll));
-        int budget = 32;
+        int budget = XDP_BUSY_POLL_BUDGET;
         setsockopt(xsk_fd_, SOL_SOCKET, SO_BUSY_POLL_BUDGET, &budget, sizeof(budget));
-        int usec = 50;  // 50us busy poll interval
+        int usec = XDP_BUSY_POLL_USEC;
         setsockopt(xsk_fd_, SOL_SOCKET, SO_BUSY_POLL, &usec, sizeof(usec));
 
         // Populate fill ring with RX pool frames
@@ -270,14 +258,63 @@ struct XDPPollProcess {
             create_trickle_socket();
         }
 
+        // Configure BPF filter with exchange IPs from ConnStateShm
+        // (resolved by parent process before forking)
+        fprintf(stderr, "[XDP-POLL] BPF config check: bpf_loader_=%p, conn_state_=%p, ip_count=%u\n",
+               (void*)bpf_loader_.get(), (void*)conn_state_,
+               conn_state_ ? conn_state_->exchange_ip_count : 0);
+        if (bpf_loader_ && conn_state_ && conn_state_->exchange_ip_count > 0) {
+            fprintf(stderr, "[XDP-POLL] Configuring BPF filter with %u exchange IPs\n",
+                   conn_state_->exchange_ip_count);
+            for (uint8_t i = 0; i < conn_state_->exchange_ip_count; i++) {
+                char ip_str[INET_ADDRSTRLEN];
+                struct in_addr addr;
+                addr.s_addr = conn_state_->exchange_ips[i];
+                inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+                fprintf(stderr, "[XDP-POLL] Adding exchange IP: %s\n", ip_str);
+                try {
+                    bpf_loader_->add_exchange_ip(ip_str);
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "[XDP-POLL] ERROR adding IP: %s\n", e.what());
+                }
+            }
+            // Also add the target port
+            fprintf(stderr, "[XDP-POLL] Adding exchange port: %u\n", conn_state_->target_port);
+            try {
+                bpf_loader_->add_exchange_port(conn_state_->target_port);
+            } catch (const std::exception& e) {
+                fprintf(stderr, "[XDP-POLL] ERROR adding port: %s\n", e.what());
+            }
+
+            // Set local IP for incoming packet filtering
+            // Get local IP from interface
+            int sock = socket(AF_INET, SOCK_DGRAM, 0);
+            if (sock >= 0) {
+                struct ifreq ifr = {};
+                strncpy(ifr.ifr_name, interface_, IFNAMSIZ - 1);
+                if (ioctl(sock, SIOCGIFADDR, &ifr) == 0) {
+                    auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
+                    char ip_str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
+                    fprintf(stderr, "[XDP-POLL] Setting local IP: %s\n", ip_str);
+                    try {
+                        bpf_loader_->set_local_ip(ip_str);
+                    } catch (const std::exception& e) {
+                        fprintf(stderr, "[XDP-POLL] ERROR setting local IP: %s\n", e.what());
+                    }
+                } else {
+                    fprintf(stderr, "[XDP-POLL] WARNING: Failed to get interface IP\n");
+                }
+                ::close(sock);
+            }
+        } else {
+            fprintf(stderr, "[XDP-POLL] WARNING: Cannot configure BPF filter (missing data)\n");
+        }
+
         // Signal XDP ready for fork-first architecture
         if (conn_state_) {
             conn_state_->set_handshake_xdp_ready();
         }
-
-        // Initialize BPF stats timing (1 second interval)
-        stats_interval_cycles_ = conn_state_->tsc_freq_hz;
-        stats_last_cycle_ = rdtsc();
 
         return true;
     }
@@ -310,35 +347,21 @@ struct XDPPollProcess {
             int32_t rx_count = profile_op([this, loop_id]{ return process_rx(loop_id); }, slot, 1);
 
             bool data_moved = (tx_count > 0) || (rx_count > 0);
-
-            // Debug: Fill-ring starvation monitoring (non-IDLE, every loop when debug enabled)
-            if constexpr (kDebugXDP) {
-                uint32_t fill_prod = *fill_ring_.producer;
-                uint32_t fill_cons = *fill_ring_.consumer;
-                uint32_t fill_avail = fill_prod - fill_cons;  // Available slots in fill ring
-                uint32_t fill_size = fill_ring_.size;
-
-                // Warn if fill ring is getting low (< 25% capacity)
-                if (fill_avail < fill_size / 4) {
-                    debug_printf("[XDP-DEBUG] Fill-ring LOW: avail=%u/%u (%.1f%%) prod=%u cons=%u last_released=%ld\n",
-                                 fill_avail, fill_size,
-                                 (fill_avail * 100.0) / fill_size,
-                                 fill_prod, fill_cons, last_released_seq_);
-                }
-            }
+            bool tx_starved = (tx_preserved_count_ == 0);
 
             // 2. Trickle (every 8th iteration)
             bool trickle_triggered = ((++trickle_counter & 0x07) == 0);
             profile_op([this]{ send_trickle(); return 1; }, slot, 2, trickle_triggered);
 
-            // 3. Process completions (idle only)
-            profile_op([this]{ return process_completions(); }, slot, 3, !data_moved);
+            // 3. Process completions (idle or TX-starved)
+            bool maint_gate = !data_moved || tx_starved;
+            int32_t comp_count = profile_op([this]{ return process_completions(); }, slot, 3, maint_gate);
 
-            // 4. Release ACKed TX frames + Proactive TX reservation (idle only)
-            profile_op([this]{ return release_and_reserve_tx(); }, slot, 4, !data_moved);
+            // 4. Release ACKed TX frames + Proactive TX reservation (idle or TX-starved)
+            int32_t reserve_count = profile_op([this]{ return release_and_reserve_tx(); }, slot, 4, maint_gate);
 
-            // 5. Reclaim RX frames (idle only)
-            profile_op([this]{ return reclaim_rx_frames(); }, slot, 5, !data_moved);
+            // 5. Reclaim RX frames (idle or TX-starved)
+            int32_t reclaim_count = profile_op([this]{ return reclaim_rx_frames(); }, slot, 5, maint_gate);
 
             // Record sample
             if constexpr (Profiling) {
@@ -346,17 +369,6 @@ struct XDPPollProcess {
                 slot->nic_poll_cycle = first_rx_poll_cycle_;
                 slot->transport_poll_cycle = 0;  // Not used by XDP Poll
                 profiling_data_->commit();
-            }
-
-            // Periodic BPF stats printing (every 1 second)
-            {
-                uint64_t now = rdtsc();
-                if (now - stats_last_cycle_ >= stats_interval_cycles_) {
-                    if (bpf_loader_) {
-                        bpf_loader_->print_stats();
-                    }
-                    stats_last_cycle_ = now;
-                }
             }
 
             loop_id++;
@@ -371,57 +383,32 @@ struct XDPPollProcess {
         uint32_t tx_count = 0;
 
         // Pre-check: any data to send?
-        bool has_raw = raw_outbox_cons_ && raw_outbox_cons_->has_data();
-        bool has_ack = ack_outbox_cons_ && ack_outbox_cons_->has_data();
-        bool has_pong = pong_outbox_cons_ && pong_outbox_cons_->has_data();
-
-        if (!has_raw && !has_ack && !has_pong) {
+        if (!raw_outbox_cons_ || !raw_outbox_cons_->has_data()) {
             return 0;  // Nothing to send
         }
 
-        // Use pre-reserved slots (no reservation here - done in proactive_reserve_tx)
+        // Use pre-reserved slots (no reservation here - done in release_and_reserve_tx)
         uint32_t available = tx_preserved_count_;
         uint32_t tx_idx = tx_preserved_idx_;
 
         if (available == 0) {
-            return 0;  // No slots available, wait for proactive_reserve_tx()
+            return 0;  // No slots available
         }
 
-        // Reusable lambda for collecting TX frames from any outbox
-        // Returns true to continue, false to stop (when TX batch is full)
-        auto collect_tx_frames = [&](UMEMFrameDescriptor& desc, int64_t seq) -> bool {
-            (void)seq;  // Unused
-            if (tx_count >= available) return false;  // TX batch full
+        // Collect from RAW_OUTBOX unconditionally
+        raw_outbox_cons_->process_manually([&](auto& desc, [[maybe_unused]] int64_t seq) -> bool {
+            if (tx_count >= available) {
+                return false;  // TX batch full
+            }
 
             struct xdp_desc* tx_desc = xsk_ring_prod__tx_desc(&tx_ring_, tx_idx++);
-            tx_desc->addr = desc.umem_addr;
+            tx_desc->addr = desc.frame_ptr;
             tx_desc->len = desc.frame_len;
             tx_desc->options = 0;
             tx_count++;
 
-            // Debug: Print UMEM frame ID on TX
-            uint32_t umem_frame_id = static_cast<uint32_t>(desc.umem_addr / FrameSize);
-            fprintf(stderr, "[XDP-TX] umem_id=%u addr=0x%lx len=%u type=%u\n",
-                    umem_frame_id, (unsigned long)desc.umem_addr, desc.frame_len, desc.frame_type);
-
-#if DEBUG
-            fprintf(stderr, "[XDP-TX] Collected frame: addr=0x%lx len=%u\n",
-                    (unsigned long)desc.umem_addr, desc.frame_len);
-            fflush(stderr);
-#endif
-            return true;  // Continue processing
-        };
-
-        // Collect from all TX outboxes using shared lambda
-        if (has_raw && tx_count < available) {
-            raw_outbox_cons_->process_manually(collect_tx_frames);
-        }
-        if (has_ack && tx_count < available) {
-            ack_outbox_cons_->process_manually(collect_tx_frames);
-        }
-        if (has_pong && tx_count < available) {
-            pong_outbox_cons_->process_manually(collect_tx_frames);
-        }
+            return true;
+        });
 
         // Update preserved tracking BEFORE submit
         tx_preserved_idx_ += tx_count;
@@ -431,59 +418,18 @@ struct XDPPollProcess {
         xsk_ring_prod__submit(&tx_ring_, tx_count);
 
         if (tx_count > 0) {
-            static uint32_t tx_total = 0;
-#if DEBUG
-            static uint32_t tx_submit_count = 0;
-            tx_submit_count += tx_count;
-            fprintf(stderr, "[XDP-TX] Submitted %u frames (total: %u)\n", tx_count, tx_submit_count);
-            fflush(stderr);
-#endif
-
-            // Conditional kick: only wake kernel if driver needs it (XDP_USE_NEED_WAKEUP)
-            //
-            // PERFORMANCE NOTE (igc driver / Intel I225/I226):
-            // The sendto() syscall costs ~400-600ns and is the main bottleneck in TX path.
-            // With XDP_USE_NEED_WAKEUP flag, the driver sets needs_wakeup when idle.
-            // For igc driver, needs_wakeup is almost always true because:
-            //   1. The driver doesn't have busy-poll mode for TX
-            //   2. It needs the syscall to trigger TX descriptor ring processing
-            //
-            // submit_tx_batch() breakdown (~550ns total for 1 frame):
-            //   - has_data() checks: ~10ns (3 atomic loads)
-            //   - process_manually(): ~50-100ns (iterate IPC ring, write TX desc)
-            //   - xsk_ring_prod__submit(): ~10ns (atomic store)
-            //   - sendto() syscall: ~400-600ns (the bottleneck)
-            //   - commit_manually(): ~30ns (3 atomic stores)
-            //
-            // Options to reduce TX latency:
-            //   1. Batch more TX frames - amortize syscall cost over multiple frames
-            //   2. Skip sendto() if NIC already processing - igc doesn't support well
-            //   3. Use busy-poll on TX side - not supported by igc
-            //
-            // The ~550ns per TX frame is typical for AF_XDP with igc driver.
-            // For comparison, Mellanox mlx5 can do TX without syscall in some modes.
-            //
+            // Always kick kernel when we have frames to send
             if (xsk_ring_prod__needs_wakeup(&tx_ring_)) {
-                [[maybe_unused]] int ret = sendto(xsk_fd_, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
-#if DEBUG
-                fprintf(stderr, "[XDP-TX] Kicked kernel: sendto ret=%d errno=%d tx_prod=%u tx_cons=%u\n",
-                        ret, ret < 0 ? errno : 0,
-                        *tx_ring_.producer, *tx_ring_.consumer);
-                fflush(stderr);
-#endif
+                sendto(xsk_fd_, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
             }
 
-            // Commit consumers ONLY after successful TX submission
-            // This ensures frames are in flight to NIC before we mark them consumed
-            if (has_raw) raw_outbox_cons_->commit_manually();
-            if (has_ack) ack_outbox_cons_->commit_manually();
-            if (has_pong) pong_outbox_cons_->commit_manually();
+            // Commit consumer after successful TX submission
+            raw_outbox_cons_->commit_manually();
 
-            return static_cast<int32_t>(tx_count);  // Return TX frame count
-        } else {
-            // We had data but couldn't collect any frames
-            return 0;
+            return static_cast<int32_t>(tx_count);
         }
+
+        return 0;
     }
 
     // ========================================================================
@@ -518,7 +464,7 @@ struct XDPPollProcess {
 
             // Write directly to claimed slot (zero-copy)
             auto& desc = (*raw_inbox_prod_)[slot];
-            desc.umem_addr = rx_desc->addr;
+            desc.frame_ptr = rx_desc->addr;
             desc.frame_len = rx_desc->len;
             desc.nic_frame_poll_cycle = poll_cycle;
             desc.frame_type = FRAME_TYPE_RX;
@@ -543,11 +489,6 @@ struct XDPPollProcess {
                 first_rx_timestamp_ns_ = desc.nic_timestamp_ns;  // First packet's timestamp for profiling
                 first_rx_poll_cycle_ = poll_cycle;               // First packet's poll cycle for profiling
             }
-
-            // Debug: Print UMEM frame ID on RX
-            uint32_t umem_frame_id = static_cast<uint32_t>(rx_desc->addr / FrameSize);
-            fprintf(stderr, "[XDP-RX] umem_id=%u addr=0x%lx len=%u slot=%ld\n",
-                    umem_frame_id, (unsigned long)rx_desc->addr, rx_desc->len, slot);
 
             // Record NIC latency sample (when profiling enabled)
             if constexpr (Profiling) {
@@ -597,7 +538,6 @@ struct XDPPollProcess {
         static bool first_logged = false;
         total_completions += nb_completed;
         if (!first_logged) {
-            // Only log first few batches to avoid spam
             fprintf(stderr, "[XDP-COMP] Got %u completions (total: %u) prod=%u cons=%u\n",
                     nb_completed, total_completions, *comp_ring_.producer, *comp_ring_.consumer);
             if (total_completions > 100) first_logged = true;
@@ -605,46 +545,7 @@ struct XDPPollProcess {
         fflush(stderr);
 #endif
 
-        for (uint32_t i = 0; i < nb_completed; i++) {
-            uint64_t addr = *xsk_ring_cons__comp_addr(&comp_ring_, comp_idx++);
-            uint32_t frame_idx = addr_to_frame_idx(addr, kFrameSize);
-
-#if DEBUG
-            // Verify FIFO ordering: completion addresses should be in order
-            // This helps detect TX ring corruption or out-of-order completions
-            // Design doc specifies abort on FIFO violation (indicates NIC/driver bug)
-            if (last_comp_addr_ != 0 && addr < last_comp_addr_) {
-                fprintf(stderr, "[XDP-COMP] FATAL: Out-of-order completion! prev=0x%lx curr=0x%lx\n",
-                        last_comp_addr_, addr);
-                fprintf(stderr, "[XDP-COMP] comp_ring FIFO assumption violated - indicates NIC/driver bug\n");
-                std::abort();
-            }
-            last_comp_addr_ = addr;
-
-            static bool addr_logged = false;
-            if (!addr_logged) {
-                fprintf(stderr, "[XDP-COMP] addr=0x%lx frame_idx=%u\n", addr, frame_idx);
-                if (i > 3) addr_logged = true;
-            }
-#endif
-
-            // Determine pool and handle accordingly
-            if (frame_idx < RX_POOL_END) {
-                // RX frame in comp_ring - should NEVER happen
-                // RX frames are returned via fill_ring, not comp_ring
-                fprintf(stderr, "[XDP-COMP] BUG: RX frame 0x%lx (idx=%u) in comp_ring!\n",
-                        addr, frame_idx);
-                std::abort();
-            } else if (frame_idx < ACK_POOL_END) {
-                // ACK frame - release now (no retransmit needed, NIC confirmed send)
-                conn_state_->tx_frame.ack_release_pos.fetch_add(1, std::memory_order_release);
-            } else if (frame_idx < PONG_POOL_END) {
-                // PONG frame - release after TCP ACK (handled by Transport)
-            } else {
-                // MSG frame - release after TCP ACK (handled by Transport)
-            }
-        }
-
+        // Just peek and release - Transport handles frame lifecycle via mark_frame_acked()
         xsk_ring_cons__release(&comp_ring_, nb_completed);
         tx_completions_ += nb_completed;
         return static_cast<int32_t>(nb_completed);
@@ -658,22 +559,6 @@ struct XDPPollProcess {
     // ========================================================================
 
     uint32_t release_and_reserve_tx() {
-        // PONG frames: advance pong_release_pos up to pong_acked_pos
-        uint64_t pong_release = conn_state_->tx_frame.pong_release_pos.load(std::memory_order_relaxed);
-        uint64_t pong_acked = conn_state_->tx_frame.pong_acked_pos.load(std::memory_order_acquire);
-        while (pong_release < pong_acked) {
-            conn_state_->tx_frame.pong_release_pos.fetch_add(1, std::memory_order_release);
-            pong_release++;
-        }
-
-        // MSG frames: advance msg_release_pos up to msg_acked_pos
-        uint64_t msg_release = conn_state_->tx_frame.msg_release_pos.load(std::memory_order_relaxed);
-        uint64_t msg_acked = conn_state_->tx_frame.msg_acked_pos.load(std::memory_order_acquire);
-        while (msg_release < msg_acked) {
-            conn_state_->tx_frame.msg_release_pos.fetch_add(1, std::memory_order_release);
-            msg_release++;
-        }
-
         // Proactive TX slot reservation
         if (tx_preserved_count_ >= TX_PRESERVE_SIZE) return 0;  // Already have enough
 
@@ -682,16 +567,7 @@ struct XDPPollProcess {
         uint32_t got = xsk_ring_prod__reserve(&tx_ring_, needed, &idx);
 
         if (got == 0) {
-            // No slots available - fatal if below threshold
-            if (tx_preserved_count_ < TX_PRESERVE_SIZE) {
-                fprintf(stderr, "[XDP-TX] FATAL: proactive_reserve_tx failed, preserved=%u, need=%u\n",
-                        tx_preserved_count_, TX_PRESERVE_SIZE);
-                fprintf(stderr, "[XDP-TX] prod=%u cons=%u cached_prod=%u cached_cons=%u\n",
-                        *tx_ring_.producer, *tx_ring_.consumer,
-                        tx_ring_.cached_prod, tx_ring_.cached_cons);
-                abort();
-            }
-            return 0;
+            return 0;  // Retry next iteration
         }
 
         if (tx_preserved_count_ == 0) {
@@ -728,7 +604,7 @@ struct XDPPollProcess {
         for (int64_t pos = last_released_seq_ + 1; pos <= consumer_pos && reclaimed < available; pos++) {
             // Get descriptor from ring buffer at this position
             const auto& desc = (*raw_inbox_prod_)[pos];
-            uint64_t addr = desc.umem_addr;
+            uint64_t addr = desc.frame_ptr;
 
             // Return frame to fill ring (mask to frame boundary)
             *xsk_ring_prod__fill_addr(&fill_ring_, fill_idx++) = addr & ~(static_cast<uint64_t>(kFrameSize) - 1);
@@ -907,8 +783,6 @@ private:
     // Ring pointers
     RingProducer* raw_inbox_prod_ = nullptr;
     OutboxConsumer* raw_outbox_cons_ = nullptr;
-    OutboxConsumer* ack_outbox_cons_ = nullptr;
-    OutboxConsumer* pong_outbox_cons_ = nullptr;
     ConnStateShm* conn_state_ = nullptr;
 
     // RX frame reclaim tracking (via consumer sequence, no local buffer needed)
@@ -936,10 +810,6 @@ private:
     // Pre-reserved TX slots (proactive reservation in idle loop)
     uint32_t tx_preserved_count_ = 0;   // Current number of preserved slots
     uint32_t tx_preserved_idx_ = 0;     // Starting index of preserved slots
-
-    // Periodic BPF stats and debug timing
-    uint64_t stats_interval_cycles_ = 0;  // 1 second in cycles
-    uint64_t stats_last_cycle_ = 0;       // Last stats print timestamp
 
 #if DEBUG
     // For FIFO ordering verification (design doc: abort on out-of-order)

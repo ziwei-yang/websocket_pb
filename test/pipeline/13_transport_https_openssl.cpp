@@ -1024,9 +1024,6 @@ private:
 
         IPCRingProducer<UMEMFrameDescriptor> raw_inbox_prod(*raw_inbox_region_);
         IPCRingConsumer<UMEMFrameDescriptor> raw_outbox_cons(*raw_outbox_region_);
-        IPCRingConsumer<UMEMFrameDescriptor> ack_outbox_cons(*ack_outbox_region_);
-        IPCRingConsumer<UMEMFrameDescriptor> pong_outbox_cons(*pong_outbox_region_);
-
         XDPPollType xdp_poll(interface_);
 
         if constexpr (PROFILING_ENABLED) {
@@ -1036,7 +1033,7 @@ private:
 
         bool ok = xdp_poll.init(
             umem_area_, umem_size_, bpf_path_,
-            &raw_inbox_prod, &raw_outbox_cons, &ack_outbox_cons, &pong_outbox_cons,
+            &raw_inbox_prod, &raw_outbox_cons,
             conn_state_);
 
         if (!ok) {

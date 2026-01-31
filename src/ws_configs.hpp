@@ -20,6 +20,9 @@
 
 // Transport policy (BSD sockets + event, XDP)
 #include "policy/transport.hpp"
+#ifdef USE_XDP
+#include "xdp/xdp_packet_io.hpp"
+#endif
 
 // ============================================================================
 // Configuration 1: Linux Default (Optimized for HFT)
@@ -80,7 +83,7 @@
 // Default Transport Policy: XDP zero-copy when USE_XDP, otherwise BSD socket
 #ifdef USE_XDP
 // XDP zero-copy mode: AF_XDP + userspace TCP/IP (kernel bypass)
-using DefaultTransportPolicy = websocket::transport::XDPUserspaceTransport;
+using DefaultTransportPolicy = websocket::transport::PacketTransport<websocket::xdp::XDPPacketIO>;
 #else
 // BSD socket + event loop (kernel TCP/IP stack)
 using DefaultTransportPolicy = websocket::transport::BSDSocketTransport<DefaultEventPolicy>;
@@ -242,7 +245,7 @@ using PortableWebSocket = DefaultWebSocket;
 //   USE_XDP=1 USE_OPENSSL=1 make
 
 #ifdef USE_XDP
-using XDPTransportPolicy = websocket::transport::XDPUserspaceTransport;
+using XDPTransportPolicy = websocket::transport::PacketTransport<websocket::xdp::XDPPacketIO>;
 
 using XDPWebSocket = WebSocketClient<
     DefaultSSLPolicy,

@@ -105,9 +105,10 @@ struct TCPPacket {
         bool include_timestamp = (params.ts_val != 0);
         size_t tcp_header_len = TCP_HEADER_MIN_LEN;
         if (flags & TCP_FLAG_SYN) {
-            // SYN: MSS(4) + SACK_OK(2) + WS(3) + NOP(1) + [NOP(2) padding] = 12 bytes options (32 byte header)
-            // With timestamps: + NOP(2) + TS(10) + NOP(2) padding = 24 bytes options (44 byte header)
-            tcp_header_len = include_timestamp ? 44 : 32;
+            // SYN options order (matches Linux kernel):
+            //   MSS(4) + SACK_OK(2) + TS(10) + NOP(1) + WS(3) = 20 bytes (40 byte header)
+            //   MSS(4) + SACK_OK(2) + NOP(1) + WS(3) + NOP(2) = 12 bytes (32 byte header, no TS)
+            tcp_header_len = include_timestamp ? 40 : 32;
         } else if (include_timestamp) {
             // Non-SYN with timestamps: 20 + 12 (NOP+NOP+TS)
             tcp_header_len = 32;
@@ -132,7 +133,8 @@ struct TCPPacket {
         tcp->ack_seq = (flags & TCP_FLAG_ACK) ? htonl(params.rcv_nxt) : 0;
 
         if (flags & TCP_FLAG_SYN) {
-            // SYN header: 32 bytes (no TS) or 44 bytes (with TS)
+            // SYN header: 32 bytes (no TS) or 40 bytes (with TS)
+            // Options order matches Linux kernel: MSS + SACK_OK + TS + NOP + WS
             tcp->doff_reserved = static_cast<uint8_t>((tcp_header_len / 4) << 4);
             uint8_t* options = buffer + tcp_offset + TCP_HEADER_MIN_LEN;
             // MSS option (4 bytes)
@@ -143,32 +145,32 @@ struct TCPPacket {
             // SACK Permitted (2 bytes)
             options[4] = TCP_OPT_SACK_OK;  // SACK Permitted (RFC 2018)
             options[5] = 2;                // Length = 2
-            // Window Scale (3 bytes) - RFC 7323
-            options[6] = TCP_OPT_WSCALE;
-            options[7] = TCP_OPT_WSCALE_LEN;  // Length = 3
-            options[8] = TCP_WSCALE_CLIENT;   // Shift = 12 (2^12 = 4096x scaling)
-            // NOP padding (1 byte to align)
-            options[9] = TCP_OPT_NOP;
             if (include_timestamp) {
-                // NOP padding for timestamp alignment (2 bytes)
-                options[10] = TCP_OPT_NOP;
-                options[11] = TCP_OPT_NOP;
-                // Timestamp option (10 bytes)
-                options[12] = TCP_OPT_TIMESTAMP;
-                options[13] = TCP_TIMESTAMP_OPT_LEN;  // 10 bytes
-                // TSval (network byte order)
+                // Timestamp option (10 bytes) - placed before WS to match kernel
+                options[6] = TCP_OPT_TIMESTAMP;
+                options[7] = TCP_TIMESTAMP_OPT_LEN;  // 10 bytes
                 uint32_t ts_val_n = htonl(params.ts_val);
-                std::memcpy(&options[14], &ts_val_n, 4);
-                // TSecr (0 for SYN, or echoed value)
+                std::memcpy(&options[8], &ts_val_n, 4);
                 uint32_t ts_ecr_n = htonl(params.ts_ecr);
-                std::memcpy(&options[18], &ts_ecr_n, 4);
-                // NOP padding to 24 bytes options (44 byte header)
-                options[22] = TCP_OPT_NOP;
-                options[23] = TCP_OPT_NOP;
+                std::memcpy(&options[12], &ts_ecr_n, 4);
+                // NOP padding (1 byte)
+                options[16] = TCP_OPT_NOP;
+                // Window Scale (3 bytes) - RFC 7323
+                options[17] = TCP_OPT_WSCALE;
+                options[18] = TCP_OPT_WSCALE_LEN;  // Length = 3
+                options[19] = TCP_WSCALE_CLIENT;   // Shift = 12 (2^12 = 4096x scaling)
+                // Total: 4 + 2 + 10 + 1 + 3 = 20 bytes options (40 byte header)
             } else {
+                // NOP padding (1 byte)
+                options[6] = TCP_OPT_NOP;
+                // Window Scale (3 bytes) - RFC 7323
+                options[7] = TCP_OPT_WSCALE;
+                options[8] = TCP_OPT_WSCALE_LEN;  // Length = 3
+                options[9] = TCP_WSCALE_CLIENT;   // Shift = 12 (2^12 = 4096x scaling)
                 // NOP padding to 12 bytes options (32 byte header)
                 options[10] = TCP_OPT_NOP;
                 options[11] = TCP_OPT_NOP;
+                // Total: 4 + 2 + 1 + 3 + 2 = 12 bytes options (32 byte header)
             }
         } else if (include_timestamp) {
             // Non-SYN with timestamps: 32 bytes header
