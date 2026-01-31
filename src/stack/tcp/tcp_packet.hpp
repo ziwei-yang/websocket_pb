@@ -570,22 +570,24 @@ struct TCPPacket {
         // Calculate TCP data length from IP header (original, un-truncated)
         size_t orig_tcp_data_len = ip_payload_len - tcp_header_len;
 
-        // Clamp to actual frame data (handles truncated frames from NIC/XDP)
+        // Verify frame contains full payload declared by IP header
         size_t actual_data_offset = tcp_offset + tcp_header_len;
         size_t actual_data_available = (frame_len > actual_data_offset) ?
                                         (frame_len - actual_data_offset) : 0;
-        size_t tcp_data_len = (orig_tcp_data_len > actual_data_available) ?
-                               actual_data_available : orig_tcp_data_len;
+        if (orig_tcp_data_len > actual_data_available) {
+            fprintf(stderr, "[TCP] FATAL: frame truncated - IP header declares %zu bytes payload "
+                    "but frame only has %zu bytes (frame_len=%u, ip_total=%u, UMEM frame_size too small?)\n",
+                    orig_tcp_data_len, actual_data_available,
+                    static_cast<unsigned>(frame_len), ip_total_len);
+            abort();
+        }
+        size_t tcp_data_len = orig_tcp_data_len;
 
         const uint8_t* tcp_data = (tcp_data_len > 0) ? (frame + actual_data_offset) : nullptr;
 
-        // Skip checksum verification for truncated frames (checksum offload may be in use)
-        // Full frames still get checksum validation
-        if (actual_data_available >= ip_payload_len - tcp_header_len) {
-            if (verify_tcp_checksum(result.src_ip, expected_local_ip,
-                                   tcp, tcp_header_len, tcp_data, tcp_data_len) != 0) {
-                return result;  // Invalid checksum
-            }
+        if (verify_tcp_checksum(result.src_ip, expected_local_ip,
+                               tcp, tcp_header_len, tcp_data, tcp_data_len) != 0) {
+            return result;  // Invalid checksum
         }
 
         // Extract TCP fields
@@ -686,13 +688,27 @@ private:
 
         // Check for data
         if (parsed.payload_len > 0) {
-            // Validate sequence number (in-order delivery only for HFT)
             if (parsed.seq == params.rcv_nxt) {
+                // In-order delivery
                 result.action = TCPAction::DATA_RECEIVED;
                 result.data = parsed.payload;
                 result.data_len = parsed.payload_len;
+            } else if (seq_lt(parsed.seq, params.rcv_nxt) &&
+                       seq_gt(parsed.seq + static_cast<uint32_t>(parsed.orig_payload_len),
+                              params.rcv_nxt)) {
+                // Overlapping retransmit: starts before rcv_nxt, extends past it.
+                // Trim already-received prefix, deliver the new suffix.
+                uint32_t skip = params.rcv_nxt - parsed.seq;
+                if (skip < parsed.payload_len) {
+                    result.action = TCPAction::DATA_RECEIVED;
+                    result.data = parsed.payload + skip;
+                    result.data_len = parsed.payload_len - skip;
+                } else {
+                    // Actual frame data doesn't reach past rcv_nxt (truncated frame)
+                    result.action = TCPAction::SEND_ACK;
+                }
             } else {
-                // Out of order - send duplicate ACK
+                // Future data (OOO) or pure duplicate - send duplicate ACK
                 result.action = TCPAction::SEND_ACK;
             }
         }

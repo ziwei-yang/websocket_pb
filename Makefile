@@ -966,7 +966,7 @@ test-pipeline-98-binance: $(PIPELINE_98_BINANCE_BIN) bpf
 PIPELINE_96_BINANCE_SRC := test/pipeline/96_websocket_binance.cpp
 PIPELINE_96_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_96_websocket_binance
 
-$(PIPELINE_96_BINANCE_BIN): $(PIPELINE_96_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/00_xdp_poll_process.hpp src/pipeline/96_pio_tcp_ssl_process.hpp src/pipeline/disruptor_packet_io.hpp src/pipeline/20_ws_process.hpp | $(BUILD_DIR)
+$(PIPELINE_96_BINANCE_BIN): $(PIPELINE_96_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/00_xdp_poll_process.hpp src/pipeline/10_tcp_ssl_process.hpp src/pipeline/disruptor_packet_io.hpp src/pipeline/20_ws_process.hpp | $(BUILD_DIR)
 	@echo "🔨 Compiling XDP Poll + PIO Transport + WebSocket Pipeline test (96_*)..."
 ifdef USE_XDP
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))

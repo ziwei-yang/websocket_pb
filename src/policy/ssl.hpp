@@ -344,10 +344,11 @@ struct OpenSSLPolicy {
      * Example: XDPUserspaceTransport, or any custom userspace TCP stack.
      *
      * @param transport Transport policy instance
+     * @param hostname  Optional hostname for SNI (Server Name Indication)
      * @throws std::runtime_error on handshake failure
      */
     template<typename TransportPolicy>
-    void handshake_userspace_transport(TransportPolicy* transport) {
+    void handshake_userspace_transport(TransportPolicy* transport, const char* hostname = nullptr) {
         if (!transport) {
             throw std::runtime_error("Transport is null");
         }
@@ -373,6 +374,11 @@ struct OpenSSLPolicy {
             char err_buf[256];
             ERR_error_string_n(err, err_buf, sizeof(err_buf));
             throw std::runtime_error(std::string("SSL_new() failed: ") + err_buf);
+        }
+
+        // Set SNI hostname for virtual hosting
+        if (hostname) {
+            SSL_set_tlsext_host_name(ssl_, hostname);
         }
 
         // Create custom BIO for userspace transport
@@ -1013,10 +1019,11 @@ struct LibreSSLPolicy {
      * Example: XDPUserspaceTransport, or any custom userspace TCP stack.
      *
      * @param transport Transport policy instance
+     * @param hostname  Optional hostname for SNI (Server Name Indication)
      * @throws std::runtime_error on handshake failure
      */
     template<typename TransportPolicy>
-    void handshake_userspace_transport(TransportPolicy* transport) {
+    void handshake_userspace_transport(TransportPolicy* transport, const char* hostname = nullptr) {
         if (!transport) {
             throw std::runtime_error("Transport is null");
         }
@@ -1042,6 +1049,11 @@ struct LibreSSLPolicy {
             char err_buf[256];
             ERR_error_string_n(err, err_buf, sizeof(err_buf));
             throw std::runtime_error(std::string("SSL_new() failed: ") + err_buf);
+        }
+
+        // Set SNI hostname for virtual hosting
+        if (hostname) {
+            SSL_set_tlsext_host_name(ssl_, hostname);
         }
 
         // Create custom BIO for userspace transport
@@ -1681,7 +1693,7 @@ struct WolfSSLPolicy {
      * @throws std::runtime_error on handshake failure
      */
     template<typename TransportPolicy>
-    void handshake_userspace_transport(TransportPolicy* transport) {
+    void handshake_userspace_transport(TransportPolicy* transport, const char* hostname = nullptr) {
         if (!transport) {
             throw std::runtime_error("Transport is null");
         }
@@ -1712,6 +1724,11 @@ struct WolfSSLPolicy {
 
         if (!ssl_) {
             throw std::runtime_error("wolfSSL_new() failed");
+        }
+
+        // Set SNI hostname for virtual hosting
+        if (hostname) {
+            wolfSSL_UseSNI(ssl_, WOLFSSL_SNI_HOST_NAME, hostname, (unsigned short)strlen(hostname));
         }
 
         // Set transport as the I/O context for this SSL session
@@ -2155,7 +2172,7 @@ struct NoSSLPolicy {
 
     // Userspace transport handshake - store transport pointer
     template<typename TransportPolicy>
-    void handshake_userspace_transport(TransportPolicy* transport) {
+    void handshake_userspace_transport(TransportPolicy* transport, const char* hostname = nullptr) {
         transport_ = static_cast<void*>(transport);
         recv_fn_ = [](void* tp, void* buf, size_t len) -> ssize_t {
             return static_cast<TransportPolicy*>(tp)->recv(buf, len);

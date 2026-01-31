@@ -42,7 +42,7 @@ namespace websocket::pipeline {
 //                    Uses frame_type field to distinguish ACK/PONG/MSG frames
 //   TrickleEnabled - Enable trickle packets (igc driver workaround), default true
 //   FrameHeadroom  - XDP metadata headroom (e.g., 256 for timestamps), default 256
-//   FrameSize      - UMEM frame size, default 2048 (for MTU 1500)
+//   MTU            - NIC MTU, frame size computed via calculate_frame_size()
 //
 // Responsibilities:
 // 1. Collect TX packets from RAW_OUTBOX (unified outbox for all TX types)
@@ -58,13 +58,13 @@ template<typename RingProducer,
          bool TrickleEnabled = true,
          bool Profiling = false,
          uint32_t FrameHeadroom = 256,
-         uint32_t FrameSize = FRAME_SIZE>
+         uint32_t MTU = NIC_MTU>
 struct XDPPollProcess {
     // Compile-time constants from template args
     static constexpr bool kTrickleEnabled = TrickleEnabled;
     static constexpr bool kProfiling = Profiling;
     static constexpr uint32_t kFrameHeadroom = FrameHeadroom;
-    static constexpr uint32_t kFrameSize = FrameSize;
+    static constexpr uint32_t kFrameSize = calculate_frame_size(MTU);
     static constexpr uint32_t kQueueId = 0;  // Always queue 0
 
     // Pre-reserve TX slots: min(256, TX_RING_SIZE/4) to avoid exhausting small rings
@@ -405,6 +405,7 @@ struct XDPPollProcess {
             tx_desc->addr = desc.frame_ptr;
             tx_desc->len = desc.frame_len;
             tx_desc->options = 0;
+
             tx_count++;
 
             return true;

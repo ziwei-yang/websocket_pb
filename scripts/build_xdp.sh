@@ -362,6 +362,10 @@ build_test() {
     elif [[ -n "$USE_OPENSSL" ]] || [[ "$MAKE_TARGET" == *"wss"* ]] || [[ "$MAKE_TARGET" == *"binance"* ]] || [[ "$MAKE_TARGET" == *"okx"* ]] || [[ "$MAKE_TARGET" == *"openssl"* ]]; then
         SSL_FLAGS="USE_OPENSSL=1"
         log_info "Using OpenSSL (USE_OPENSSL=1)"
+    else
+        # Default to OpenSSL for tests that include ssl.hpp (e.g. NoSSLPolicy tests)
+        SSL_FLAGS="USE_OPENSSL=1"
+        log_info "Defaulting to OpenSSL (USE_OPENSSL=1)"
     fi
 
     # Build BPF first if needed

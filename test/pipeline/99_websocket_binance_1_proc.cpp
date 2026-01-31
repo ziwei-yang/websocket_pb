@@ -460,7 +460,7 @@ int main(int argc, char** argv) {
                 }
 
                 // Print message and latency
-                printf("[MSG #%lu] %.*s\n",
+                printf("[TEST-MSG] #%lu %.*s\n",
                        text_frames,
                        (int)std::min(frame.payload_len, 200u),
                        (const char*)payload);

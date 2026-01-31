@@ -246,6 +246,17 @@ public:
             timing.recv_end_cycle = rdtscp();
 
             if (read_len > 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                const uint8_t* rd = reinterpret_cast<const uint8_t*>(frame_buffer_ + buffer_offset_);
+                fprintf(stderr, "[%ld.%06ld] [SSL-READ] %zd bytes \"",
+                        ts.tv_sec, ts.tv_nsec / 1000, read_len);
+                for (ssize_t i = 0; i < read_len; ++i) {
+                    uint8_t c = rd[i];
+                    if (c >= 0x20 && c < 0x7f) fputc(c, stderr);
+                    else fprintf(stderr, "\\x%02x", c);
+                }
+                fprintf(stderr, "\"\n");
                 buffer_offset_ += read_len;
 
                 // Parse all complete frames in buffer
@@ -358,6 +369,10 @@ private:
             transport_.poll();
             ssize_t sent = ssl_.write(upgrade_req + total_sent, req_len - total_sent);
             if (sent > 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                fprintf(stderr, "[%ld.%06ld] [SSL-WRITE] %zd bytes\n",
+                        ts.tv_sec, ts.tv_nsec / 1000, sent);
                 total_sent += sent;
             } else if (sent < 0 && errno != EAGAIN) {
                 fprintf(stderr, "[UNIFIED] Failed to send upgrade request\n");
@@ -378,6 +393,10 @@ private:
             ssize_t received = ssl_.read(response_buf, sizeof(response_buf));
 
             if (received > 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                fprintf(stderr, "[%ld.%06ld] [SSL-READ] %zd bytes\n",
+                        ts.tv_sec, ts.tv_nsec / 1000, received);
                 if (validate_http_upgrade_response(response_buf, received)) {
                     printf("[UNIFIED] HTTP 101 Switching Protocols validated\n");
                     response_validated = true;
@@ -502,6 +521,10 @@ private:
             ssize_t pong_sent_bytes = ssl_.write(pong_buffer + pong_total,
                                                   pong_len - pong_total);
             if (pong_sent_bytes > 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                fprintf(stderr, "[%ld.%06ld] [SSL-WRITE] %zd bytes\n",
+                        ts.tv_sec, ts.tv_nsec / 1000, pong_sent_bytes);
                 pong_total += pong_sent_bytes;
             }
             usleep(100);
@@ -547,7 +570,10 @@ private:
                                 timing_record_t& timing) {
         uint64_t callback_cycle = rdtscp();
 
-        printf("\n[MSG #%lu] payload_len=%zu\n", msg_count_, frame.payload_len);
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        fprintf(stderr, "[%ld.%06ld] [WS-MSG] #%lu payload_len=%zu\n",
+                ts.tv_sec, ts.tv_nsec / 1000, msg_count_, frame.payload_len);
 
         // Parse "E" (event time) field from Binance JSON
         uint64_t event_time_ms = 0;

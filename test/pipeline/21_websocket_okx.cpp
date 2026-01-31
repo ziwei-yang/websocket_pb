@@ -56,6 +56,7 @@
 
 using namespace websocket::pipeline;
 using namespace websocket::ssl;
+using websocket::xdp::PacketFrameDescriptor;
 
 // Select SSL policy based on compile-time flags
 #if defined(USE_OPENSSL)
@@ -270,14 +271,10 @@ public:
         }
 
         // XDP Poll <-> Transport rings
-        if (!create_ring("raw_inbox", RAW_INBOX_SIZE * sizeof(UMEMFrameDescriptor),
-                         sizeof(UMEMFrameDescriptor), 1)) return false;
-        if (!create_ring("raw_outbox", RAW_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
-                         sizeof(UMEMFrameDescriptor), 1)) return false;
-        if (!create_ring("ack_outbox", ACK_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
-                         sizeof(UMEMFrameDescriptor), 1)) return false;
-        if (!create_ring("pong_outbox", PONG_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
-                         sizeof(UMEMFrameDescriptor), 1)) return false;
+        if (!create_ring("raw_inbox", RAW_INBOX_SIZE * sizeof(PacketFrameDescriptor),
+                         sizeof(PacketFrameDescriptor), 1)) return false;
+        if (!create_ring("raw_outbox", RAW_OUTBOX_SIZE * sizeof(PacketFrameDescriptor),
+                         sizeof(PacketFrameDescriptor), 1)) return false;
 
         // Transport <-> WebSocket rings
         if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
@@ -300,7 +297,7 @@ public:
 
         std::string base = "/dev/shm/hft/" + ipc_ring_dir_;
         const char* ring_names[] = {
-            "raw_inbox", "raw_outbox", "ack_outbox", "pong_outbox",
+            "raw_inbox", "raw_outbox",
             "msg_outbox", "msg_metadata", "pongs", "ws_frame_info"
         };
 
@@ -424,29 +421,17 @@ static constexpr bool PROFILING_ENABLED = true;
 static constexpr bool DEBUG_TCP_ENABLED = true;  // TCP debug mode for retransmit detection
 // XDP Poll Process types (with profiling enabled)
 using XDPPollType = XDPPollProcess<
-    IPCRingProducer<UMEMFrameDescriptor>,
-    IPCRingConsumer<UMEMFrameDescriptor>,
+    IPCRingProducer<PacketFrameDescriptor>,
+    IPCRingConsumer<PacketFrameDescriptor>,
     true,                                   // TrickleEnabled
-    PROFILING_ENABLED,                      // Profiling
-    256,                                    // FrameHeadroom (default)
-    2048>;                                  // FrameSize (default)
+    PROFILING_ENABLED>;                     // Profiling
 
 // Transport Process types (with SSL and profiling enabled)
 using TransportType = TransportProcess<
-    SSLPolicyType,                         // OpenSSL or WolfSSL for WSS
-    IPCRingConsumer<UMEMFrameDescriptor>,  // RawInboxCons
-    IPCRingProducer<UMEMFrameDescriptor>,  // RawOutboxProd
-    IPCRingProducer<UMEMFrameDescriptor>,  // AckOutboxProd
-    IPCRingProducer<UMEMFrameDescriptor>,  // PongOutboxProd
-    IPCRingConsumer<MsgOutboxEvent>,       // MsgOutboxCons
-    IPCRingProducer<MsgMetadata>,          // MsgMetadataProd
-    IPCRingConsumer<PongFrameAligned>,     // PongsCons
-    PROFILING_ENABLED,                     // Profiling
-    true,                                  // TCPTimestampEnabled (RFC 7323)
-    DEBUG_TCP_ENABLED,                     // DebugTCP - retransmit detection
-    2,                                     // TcpDelackNum (ACK after N packets)
-    40,                                    // TcpDelackMinMs (min delay before ACK)
-    200>;                                  // TcpDelackMaxMs (max delay, forced ACK)
+    SSLPolicyType,
+    IPCRingProducer<MsgMetadata>,
+    IPCRingConsumer<PongFrameAligned>,
+    PROFILING_ENABLED>;
 
 // WebSocket Process types
 using WebSocketType = WebSocketProcess<
@@ -614,8 +599,6 @@ public:
         try {
             raw_inbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_inbox"));
             raw_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_outbox"));
-            ack_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("ack_outbox"));
-            pong_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pong_outbox"));
             msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
             msg_metadata_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata"));
             pongs_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pongs"));
@@ -652,8 +635,6 @@ public:
         // Cleanup shared regions
         delete raw_inbox_region_;
         delete raw_outbox_region_;
-        delete ack_outbox_region_;
-        delete pong_outbox_region_;
         delete msg_outbox_region_;
         delete msg_metadata_region_;
         delete pongs_region_;
@@ -1087,8 +1068,8 @@ private:
         pin_to_cpu(XDP_POLL_CPU_CORE);
 
         // Create ring adapters in child process
-        IPCRingProducer<UMEMFrameDescriptor> raw_inbox_prod(*raw_inbox_region_);
-        IPCRingConsumer<UMEMFrameDescriptor> raw_outbox_cons(*raw_outbox_region_);
+        IPCRingProducer<PacketFrameDescriptor> raw_inbox_prod(*raw_inbox_region_);
+        IPCRingConsumer<PacketFrameDescriptor> raw_outbox_cons(*raw_outbox_region_);
         XDPPollType xdp_poll(interface_);
 
         // Set profiling data buffers
@@ -1128,44 +1109,30 @@ private:
     void run_transport_process() {
         pin_to_cpu(TRANSPORT_CPU_CORE);
 
-        // Create ring adapters in child process
-        IPCRingConsumer<UMEMFrameDescriptor> raw_inbox_cons(*raw_inbox_region_);
-        IPCRingProducer<UMEMFrameDescriptor> raw_outbox_prod(*raw_outbox_region_);
-        IPCRingProducer<UMEMFrameDescriptor> ack_outbox_prod(*ack_outbox_region_);
-        IPCRingProducer<UMEMFrameDescriptor> pong_outbox_prod(*pong_outbox_region_);
-        IPCRingConsumer<MsgOutboxEvent> msg_outbox_cons(*msg_outbox_region_);
+        IPCRingConsumer<PacketFrameDescriptor> raw_inbox_cons(*raw_inbox_region_);
+        IPCRingProducer<PacketFrameDescriptor> raw_outbox_prod(*raw_outbox_region_);
         IPCRingProducer<MsgMetadata> msg_metadata_prod(*msg_metadata_region_);
         IPCRingConsumer<PongFrameAligned> pongs_cons(*pongs_region_);
+        IPCRingConsumer<MsgOutboxEvent> msg_outbox_cons(*msg_outbox_region_);
 
-        TransportType transport;
+        // Build URL
+        char url[512];
+        snprintf(url, sizeof(url), "wss://%s:%u%s", WSS_HOST, WSS_PORT, WSS_PATH);
 
-        // Set profiling data buffer
-        if constexpr (PROFILING_ENABLED) {
-            transport.set_profiling_data(&profiling_->transport);
-        }
+        TransportType transport(
+            url, umem_area_, FRAME_SIZE,
+            &raw_inbox_cons, &raw_outbox_prod,
+            msg_inbox_, &msg_metadata_prod, &pongs_cons,
+            conn_state_, &msg_outbox_cons);
 
-        // Pass the hostname (not IP) for SNI
-        bool ok = transport.init_with_handshake(
-            umem_area_, FRAME_SIZE,
-            WSS_HOST, WSS_PORT,
-            &raw_inbox_cons,
-            &raw_outbox_prod,
-            &ack_outbox_prod,
-            &pong_outbox_prod,
-            &msg_outbox_cons,
-            &msg_metadata_prod,
-            &pongs_cons,
-            msg_inbox_,
-            conn_state_);
-
-        if (!ok) {
-            fprintf(stderr, "[TRANSPORT] init_with_handshake() failed\n");
+        if (!transport.init()) {
+            fprintf(stderr, "[TRANSPORT] init() failed\n");
             conn_state_->shutdown_all();
             return;
         }
 
-        fprintf(stderr, "[TRANSPORT] TLS handshake complete, running main loop\n");
         transport.run();
+        transport.cleanup();
     }
 
     // WebSocket child process
@@ -1217,8 +1184,6 @@ private:
 
     disruptor::ipc::shared_region* raw_inbox_region_ = nullptr;
     disruptor::ipc::shared_region* raw_outbox_region_ = nullptr;
-    disruptor::ipc::shared_region* ack_outbox_region_ = nullptr;
-    disruptor::ipc::shared_region* pong_outbox_region_ = nullptr;
     disruptor::ipc::shared_region* msg_outbox_region_ = nullptr;
     disruptor::ipc::shared_region* msg_metadata_region_ = nullptr;
     disruptor::ipc::shared_region* pongs_region_ = nullptr;

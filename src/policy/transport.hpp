@@ -1099,21 +1099,6 @@ private:
                                            tcp_params_.remote_ip,
                                            tcp_params_.remote_port);
 
-            if (parsed.valid) {
-                char fs[8]; int fi = 0;
-                if (parsed.flags & 0x02) fs[fi++] = 'S';
-                if (parsed.flags & 0x10) fs[fi++] = 'A';
-                if (parsed.flags & 0x08) fs[fi++] = 'P';
-                if (parsed.flags & 0x01) fs[fi++] = 'F';
-                if (parsed.flags & 0x04) fs[fi++] = 'R';
-                fs[fi] = '\0';
-                struct timespec ts;
-                clock_gettime(CLOCK_MONOTONIC, &ts);
-                fprintf(stderr, "[%ld.%06ld] [TRANSPORT-POLL] len=%u seq=%u ack=%u flags=%s win=%u payload=%zu\n",
-                        ts.tv_sec, ts.tv_nsec / 1000, frame_len,
-                        parsed.seq, parsed.ack, fs, parsed.window, parsed.payload_len);
-            }
-
             bool frame_consumed = false;  // Track if frame was pushed to recv_buffer_
 
             if (parsed.valid) {

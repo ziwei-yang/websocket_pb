@@ -615,7 +615,9 @@ private:
         (void)sequence;
         (void)end_of_batch;
 
-        fprintf(stderr, "[WS] on_event: seq=%ld len=%u\n", sequence, meta.decrypted_len);
+        { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+          fprintf(stderr, "[%ld.%06ld] [WS-EVENT] seq=%ld len=%u\n",
+                  _ts.tv_sec, _ts.tv_nsec / 1000, sequence, meta.decrypted_len); }
 
         // Accumulate metadata for timestamp recovery
         if (!has_pending_frame_) {
@@ -875,8 +877,9 @@ private:
             int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now.time_since_epoch()).count();
 
-            fprintf(stderr, "[WS-MSG] #%lu received: opcode=%s payload_len=%lu nic_ts=%lu ns unix_ts=%ld ms text=[%s]\n",
-                    msg_count_, opcode_str, payload_len, current_metadata_.latest_nic_timestamp_ns, unix_ms, msg_preview);
+            { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+              fprintf(stderr, "[%ld.%06ld] [WS-MSG] #%lu received: opcode=%s payload_len=%lu nic_ts=%lu ns unix_ts=%ld ms text=[%s]\n",
+                      _ts.tv_sec, _ts.tv_nsec / 1000, msg_count_, opcode_str, payload_len, current_metadata_.latest_nic_timestamp_ns, unix_ms, msg_preview); }
 
             publish_frame_info(opcode, payload_len, frame_total_len, parse_cycle,
                               false, false);
@@ -953,8 +956,9 @@ private:
             int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now.time_since_epoch()).count();
 
-            fprintf(stderr, "[WS-MSG] #%lu received: opcode=%s payload_len=%u nic_ts=%lu ns unix_ts=%ld ms text=[%s] (fragmented)\n",
-                    msg_count_, opcode_str, fragment_total_len_, current_metadata_.latest_nic_timestamp_ns, unix_ms, msg_preview);
+            { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+              fprintf(stderr, "[%ld.%06ld] [WS-MSG] #%lu received: opcode=%s payload_len=%u nic_ts=%lu ns unix_ts=%ld ms text=[%s] (fragmented)\n",
+                      _ts.tv_sec, _ts.tv_nsec / 1000, msg_count_, opcode_str, fragment_total_len_, current_metadata_.latest_nic_timestamp_ns, unix_ms, msg_preview); }
 
             // Final fragment - publish with is_last_fragment=true
             publish_frame_info(fragment_opcode_, payload_len, frame_total_len, parse_cycle,

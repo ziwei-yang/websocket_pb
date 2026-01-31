@@ -51,6 +51,7 @@
 #include "../../src/policy/ssl.hpp"  // LibreSSLPolicy
 
 using namespace websocket::pipeline;
+using websocket::xdp::PacketFrameDescriptor;
 
 // ============================================================================
 // Configuration
@@ -244,14 +245,10 @@ public:
         }
 
         // XDP Poll <-> Transport rings
-        if (!create_ring("raw_inbox", RAW_INBOX_SIZE * sizeof(UMEMFrameDescriptor),
-                         sizeof(UMEMFrameDescriptor), 1)) return false;
-        if (!create_ring("raw_outbox", RAW_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
-                         sizeof(UMEMFrameDescriptor), 1)) return false;
-        if (!create_ring("ack_outbox", ACK_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
-                         sizeof(UMEMFrameDescriptor), 1)) return false;
-        if (!create_ring("pong_outbox", PONG_OUTBOX_SIZE * sizeof(UMEMFrameDescriptor),
-                         sizeof(UMEMFrameDescriptor), 1)) return false;
+        if (!create_ring("raw_inbox", RAW_INBOX_SIZE * sizeof(PacketFrameDescriptor),
+                         sizeof(PacketFrameDescriptor), 1)) return false;
+        if (!create_ring("raw_outbox", RAW_OUTBOX_SIZE * sizeof(PacketFrameDescriptor),
+                         sizeof(PacketFrameDescriptor), 1)) return false;
 
         // Transport <-> Test rings
         if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
@@ -270,7 +267,7 @@ public:
 
         std::string base = "/dev/shm/hft/" + ipc_ring_dir_;
         const char* ring_names[] = {
-            "raw_inbox", "raw_outbox", "ack_outbox", "pong_outbox",
+            "raw_inbox", "raw_outbox",
             "msg_outbox", "msg_metadata", "pongs"
         };
 
@@ -392,19 +389,14 @@ bool get_default_gateway(const char* interface, std::string& gateway_out) {
 static constexpr bool PROFILING_ENABLED = true;
 
 using XDPPollType = XDPPollProcess<
-    IPCRingProducer<UMEMFrameDescriptor>,
-    IPCRingConsumer<UMEMFrameDescriptor>,
+    IPCRingProducer<PacketFrameDescriptor>,
+    IPCRingConsumer<PacketFrameDescriptor>,
     true,
     PROFILING_ENABLED>;
 
 // Transport with LibreSSL
 using TransportType = TransportProcess<
-    LibreSSLPolicy,                        // LibreSSL for HTTPS
-    IPCRingConsumer<UMEMFrameDescriptor>,
-    IPCRingProducer<UMEMFrameDescriptor>,
-    IPCRingProducer<UMEMFrameDescriptor>,
-    IPCRingProducer<UMEMFrameDescriptor>,
-    IPCRingConsumer<MsgOutboxEvent>,
+    LibreSSLPolicy,
     IPCRingProducer<MsgMetadata>,
     IPCRingConsumer<PongFrameAligned>,
     PROFILING_ENABLED>;
@@ -540,8 +532,6 @@ public:
         try {
             raw_inbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_inbox"));
             raw_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_outbox"));
-            ack_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("ack_outbox"));
-            pong_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pong_outbox"));
             msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
             msg_metadata_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata"));
             pongs_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pongs"));
@@ -571,8 +561,6 @@ public:
 
         delete raw_inbox_region_;
         delete raw_outbox_region_;
-        delete ack_outbox_region_;
-        delete pong_outbox_region_;
         delete msg_outbox_region_;
         delete msg_metadata_region_;
         delete pongs_region_;
@@ -909,8 +897,8 @@ private:
     void run_xdp_poll_process() {
         pin_to_cpu(XDP_POLL_CPU_CORE);
 
-        IPCRingProducer<UMEMFrameDescriptor> raw_inbox_prod(*raw_inbox_region_);
-        IPCRingConsumer<UMEMFrameDescriptor> raw_outbox_cons(*raw_outbox_region_);
+        IPCRingProducer<PacketFrameDescriptor> raw_inbox_prod(*raw_inbox_region_);
+        IPCRingConsumer<PacketFrameDescriptor> raw_outbox_cons(*raw_outbox_region_);
         XDPPollType xdp_poll(interface_);
 
         if constexpr (PROFILING_ENABLED) {
@@ -944,35 +932,33 @@ private:
     void run_transport_process() {
         pin_to_cpu(TRANSPORT_CPU_CORE);
 
-        IPCRingConsumer<UMEMFrameDescriptor> raw_inbox_cons(*raw_inbox_region_);
-        IPCRingProducer<UMEMFrameDescriptor> raw_outbox_prod(*raw_outbox_region_);
-        IPCRingProducer<UMEMFrameDescriptor> ack_outbox_prod(*ack_outbox_region_);
-        IPCRingProducer<UMEMFrameDescriptor> pong_outbox_prod(*pong_outbox_region_);
+        IPCRingConsumer<PacketFrameDescriptor> raw_inbox_cons(*raw_inbox_region_);
+        IPCRingProducer<PacketFrameDescriptor> raw_outbox_prod(*raw_outbox_region_);
         IPCRingConsumer<MsgOutboxEvent> msg_outbox_cons(*msg_outbox_region_);
         IPCRingProducer<MsgMetadata> msg_metadata_prod(*msg_metadata_region_);
         IPCRingConsumer<PongFrameAligned> pongs_cons(*pongs_region_);
 
-        TransportType transport;
+        char url[512];
+        snprintf(url, sizeof(url), "https://%s:%u/", HTTPS_HOST, HTTPS_PORT);
+
+        TransportType transport(
+            url, umem_area_, FRAME_SIZE,
+            &raw_inbox_cons, &raw_outbox_prod,
+            msg_inbox_, &msg_metadata_prod, &pongs_cons,
+            conn_state_, &msg_outbox_cons);
 
         if constexpr (PROFILING_ENABLED) {
             transport.set_profiling_data(&profiling_->transport);
         }
 
-        // Pass the hostname (not IP) for SNI - TCP stack will resolve it
-        bool ok = transport.init_with_handshake(
-            umem_area_, FRAME_SIZE,
-            HTTPS_HOST, HTTPS_PORT,
-            &raw_inbox_cons, &raw_outbox_prod, &ack_outbox_prod, &pong_outbox_prod,
-            &msg_outbox_cons, &msg_metadata_prod, &pongs_cons,
-            msg_inbox_, conn_state_);
-
-        if (!ok) {
-            fprintf(stderr, "[TRANSPORT] init_with_handshake() failed\n");
+        if (!transport.init()) {
+            fprintf(stderr, "[TRANSPORT] init() failed\n");
             conn_state_->shutdown_all();
             return;
         }
 
         transport.run();
+        transport.cleanup();
     }
 
     const char* interface_;
@@ -994,8 +980,6 @@ private:
 
     disruptor::ipc::shared_region* raw_inbox_region_ = nullptr;
     disruptor::ipc::shared_region* raw_outbox_region_ = nullptr;
-    disruptor::ipc::shared_region* ack_outbox_region_ = nullptr;
-    disruptor::ipc::shared_region* pong_outbox_region_ = nullptr;
     disruptor::ipc::shared_region* msg_outbox_region_ = nullptr;
     disruptor::ipc::shared_region* msg_metadata_region_ = nullptr;
     disruptor::ipc::shared_region* pongs_region_ = nullptr;

@@ -1,23 +1,34 @@
-// test/pipeline/20_websocket_binance.cpp
-// Test WebSocketProcess with XDP Poll + Transport against Binance WSS stream
+// test/pipeline/96_websocket_binance.cpp
+// Test XDP Poll + PIO Transport + WebSocket Process against Binance WSS stream
 //
-// Usage: ./test_pipeline_websocket_binance <interface> <bpf_path> [ignored...] [--timeout <ms>]
-// (Called by scripts/test_xdp.sh 20_websocket_binance.cpp)
+// Architecture (3 child processes):
+//   - Child 1 (Core 2): XDPPollProcess - XDP kernel interface
+//   - Child 2 (Core 4): PIOTransportProcess - TCP + SSL via DisruptorPacketIO
+//   - Child 3 (Core 6): WebSocketProcess - WS frame parsing
+//   - Parent: Consumes WS_FRAME_INFO, prints latency
 //
-// Build: make build-test-pipeline-websocket-binance USE_XDP=1 USE_WOLFSSL=1
+// Data Flow:
+//   XDP Poll (Core 2)           PIO Transport (Core 4)      WebSocket (Core 6)
+//   ┌────────────────┐          ┌─────────────────────┐     ┌─────────────────┐
+//   │ XDP → RAW_INBOX ──────────→ DisruptorPacketIO   │     │                 │
+//   │                │          │      ↓              │     │                 │
+//   │ XDP ← RAW_OUTBOX ◄─────────────PacketTransport  │     │                 │
+//   │                │          │      ↓              │     │                 │
+//   └────────────────┘          │  TCP + SSL         │     │                 │
+//          │                    │      ↓              │     │                 │
+//          └─── Shared UMEM ────│ MSG_INBOX ─────────────────→ WS Parse      │
+//                               │ MSG_METADATA ──────────────→              │
+//                               │              ◄─────────────── PONGS       │
+//                               └─────────────────────┘     │ WS_FRAME_INFO ──→ Parent
+//                                                           └─────────────────┘
+//
+// Usage: ./test_pipeline_96_websocket_binance <interface> <bpf_path> [--timeout <ms>]
+//
+// Build: ./scripts/build_xdp.sh 96_websocket_binance.cpp
 //
 // Options:
 //   --timeout <ms>   Stream timeout in milliseconds (default: 5000)
 //                    If <= 0, run forever and display every message received
-//
-// This test:
-// - Forks XDP Poll (core 2), Transport (core 4), WebSocket (core 6)
-// - Connects to stream.binance.com on port 443 (WSS with WolfSSL)
-// - WebSocketProcess handles HTTP+WS handshake, frame parsing
-// - Parent consumes WS_FRAME_INFO ring, validates JSON trade events
-// - Verifies ring buffer consumers caught up
-//
-// Safety: Uses dedicated test interface, never touches default route
 
 #include <cstdio>
 #include <cstdlib>
@@ -52,7 +63,7 @@
 #include "../../src/pipeline/20_ws_process.hpp"
 #include "../../src/pipeline/msg_inbox.hpp"
 #include "../../src/core/http.hpp"
-#include "../../src/policy/ssl.hpp"  // OpenSSLPolicy / WolfSSLPolicy
+#include "../../src/policy/ssl.hpp"
 
 using namespace websocket::pipeline;
 using namespace websocket::ssl;
@@ -73,34 +84,30 @@ using SSLPolicyType = WolfSSLPolicy;
 
 namespace {
 
-// CPU core assignments for latency-critical processes
-constexpr int XDP_POLL_CPU_CORE = 2;
-constexpr int TRANSPORT_CPU_CORE = 4;
-constexpr int WEBSOCKET_CPU_CORE = 6;
+// CPU core assignments (3 processes)
+constexpr int XDP_POLL_CPU_CORE = 2;     // XDP Poll process
+constexpr int PIO_TRANSPORT_CPU_CORE = 4; // PIO Transport process
+constexpr int WEBSOCKET_CPU_CORE = 6;     // WebSocket parsing process
 
-// Test parameters (defaults, can be overridden by --timeout argument)
-constexpr int DEFAULT_STREAM_DURATION_MS = 5000;   // Stream for 5 seconds
-constexpr int FINAL_DRAIN_MS = 2000;               // Wait 2s after streaming
-constexpr int MIN_EXPECTED_TRADES = 10;            // Expect at least 10 trades in 5s for BTCUSDT
+// Test parameters
+constexpr int DEFAULT_STREAM_DURATION_MS = 5000;
+constexpr int FINAL_DRAIN_MS = 2000;
+constexpr int MIN_EXPECTED_TRADES = 10;
 
-// Runtime timeout (set by --timeout argument)
-int g_timeout_ms = DEFAULT_STREAM_DURATION_MS;     // -1 or 0 = run forever
+// Runtime timeout
+int g_timeout_ms = DEFAULT_STREAM_DURATION_MS;
 
 // WebSocket target
 static constexpr const char* WSS_HOST = "stream.binance.com";
 static constexpr uint16_t WSS_PORT = 443;
 static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade";
 
-// Test configuration
-std::string g_local_ip;  // Detected from interface
-
 // Global shutdown flag and connection state pointer for signal handler
 std::atomic<bool> g_shutdown{false};
-ConnStateShm* g_conn_state = nullptr;  // Set after setup, used by signal handler
+ConnStateShm* g_conn_state = nullptr;
 
 void signal_handler(int sig) {
     g_shutdown.store(true, std::memory_order_release);
-    // Notify all processes to stop immediately
     if (g_conn_state) {
         g_conn_state->shutdown_all();
     }
@@ -145,38 +152,26 @@ void calibrate_tsc() {
     uint64_t elapsed_tsc = end_tsc - start_tsc;
     uint64_t elapsed_ns = end_ns - start_ns;
     g_tsc_freq_ghz = static_cast<double>(elapsed_tsc) / static_cast<double>(elapsed_ns);
-    printf("[TSC] Calibrated: %.3f GHz (%.3f cycles/ns)\n", g_tsc_freq_ghz, g_tsc_freq_ghz);
-}
-
-// Resolve hostname to IP at runtime
-std::string resolve_hostname(const char* hostname) {
-    struct addrinfo hints = {}, *res = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    if (getaddrinfo(hostname, nullptr, &hints, &res) != 0 || !res) {
-        fprintf(stderr, "FAIL: Cannot resolve %s\n", hostname);
-        return "";
-    }
-
-    auto* addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr);
-    char ip_str[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
-    freeaddrinfo(res);
-
-    printf("Resolved %s -> %s\n", hostname, ip_str);
-    return ip_str;
+    printf("[TSC] Calibrated: %.3f GHz\n", g_tsc_freq_ghz);
 }
 
 // Validate Binance trade JSON
 bool is_valid_trade_json(const char* data, size_t len) {
     std::string_view sv(data, len);
-    // Binance trade events have {"stream":"btcusdt@trade","data":{"e":"trade",...}}
     if (sv.find("\"stream\"") == std::string_view::npos) return false;
     if (sv.find("btcusdt@trade") == std::string_view::npos) return false;
     if (sv.find("\"data\"") == std::string_view::npos) return false;
     if (sv.find("\"e\":\"trade\"") == std::string_view::npos) return false;
     return true;
+}
+
+// Parse "E" field (event timestamp) from Binance JSON
+uint64_t parse_event_time(const uint8_t* payload, size_t len) {
+    const char* e_pos = (const char*)memmem(payload, len, "\"E\":", 4);
+    if (e_pos) {
+        return strtoull(e_pos + 4, nullptr, 10);
+    }
+    return 0;
 }
 
 }  // namespace
@@ -192,7 +187,7 @@ public:
         struct tm* tm_info = localtime(&now);
         char timestamp[32];
         strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);
-        ipc_ring_dir_ = std::string("websocket_binance_test_") + timestamp;
+        ipc_ring_dir_ = std::string("websocket_96_test_") + timestamp;
     }
 
     ~IPCRingManager() {
@@ -271,13 +266,13 @@ public:
             return false;
         }
 
-        // XDP Poll <-> Transport rings
+        // XDP Poll <-> PIO Transport rings (unified RAW_OUTBOX for all TX)
         if (!create_ring("raw_inbox", RAW_INBOX_SIZE * sizeof(PacketFrameDescriptor),
                          sizeof(PacketFrameDescriptor), 1)) return false;
         if (!create_ring("raw_outbox", RAW_OUTBOX_SIZE * sizeof(PacketFrameDescriptor),
                          sizeof(PacketFrameDescriptor), 1)) return false;
 
-        // Transport <-> WebSocket rings
+        // PIO Transport <-> WebSocket rings
         if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
                          sizeof(MsgOutboxEvent), 1)) return false;
         if (!create_ring("msg_metadata", MSG_METADATA_SIZE * sizeof(MsgMetadata),
@@ -285,7 +280,7 @@ public:
         if (!create_ring("pongs", PONGS_SIZE * sizeof(PongFrameAligned),
                          sizeof(PongFrameAligned), 1)) return false;
 
-        // WebSocket <-> Parent (Test) ring
+        // WebSocket <-> Parent ring
         if (!create_ring("ws_frame_info", WS_FRAME_INFO_SIZE * sizeof(WSFrameInfo),
                          sizeof(WSFrameInfo), 1)) return false;
 
@@ -318,194 +313,47 @@ private:
 };
 
 // ============================================================================
-// Network Helpers
-// ============================================================================
-
-bool get_interface_mac(const char* interface, uint8_t* mac_out) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return false;
-
-    struct ifreq ifr = {};
-    strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
-
-    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
-        close(fd);
-        return false;
-    }
-    close(fd);
-
-    memcpy(mac_out, ifr.ifr_hwaddr.sa_data, 6);
-    return true;
-}
-
-bool get_interface_ip(const char* interface, std::string& ip_out) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return false;
-
-    struct ifreq ifr = {};
-    strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
-    ifr.ifr_addr.sa_family = AF_INET;
-
-    if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) {
-        close(fd);
-        return false;
-    }
-    close(fd);
-
-    struct sockaddr_in* addr = (struct sockaddr_in*)&ifr.ifr_addr;
-    ip_out = inet_ntoa(addr->sin_addr);
-    return true;
-}
-
-bool get_gateway_mac(const char* interface, const char* gateway_ip, uint8_t* mac_out) {
-    FILE* fp = fopen("/proc/net/arp", "r");
-    if (!fp) return false;
-
-    char line[256];
-    if (!fgets(line, sizeof(line), fp)) {
-        fclose(fp);
-        return false;
-    }
-
-    while (fgets(line, sizeof(line), fp)) {
-        char ip[64], hw_type[16], flags[16], mac_str[32], mask[16], dev[32];
-        if (sscanf(line, "%63s %15s %15s %31s %15s %31s",
-                   ip, hw_type, flags, mac_str, mask, dev) == 6) {
-            if (strcmp(ip, gateway_ip) == 0 && strcmp(dev, interface) == 0) {
-                unsigned int m[6];
-                if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
-                           &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
-                    for (int i = 0; i < 6; i++) mac_out[i] = (uint8_t)m[i];
-                    fclose(fp);
-                    return true;
-                }
-            }
-        }
-    }
-    fclose(fp);
-    return false;
-}
-
-bool get_default_gateway(const char* interface, std::string& gateway_out) {
-    FILE* fp = fopen("/proc/net/route", "r");
-    if (!fp) return false;
-
-    char line[256];
-    if (!fgets(line, sizeof(line), fp)) {
-        fclose(fp);
-        return false;
-    }
-
-    while (fgets(line, sizeof(line), fp)) {
-        char iface[32];
-        unsigned int dest, gateway, flags;
-        if (sscanf(line, "%31s %x %x %x", iface, &dest, &gateway, &flags) >= 4) {
-            if (strcmp(iface, interface) == 0 && dest == 0 && gateway != 0) {
-                struct in_addr addr;
-                addr.s_addr = gateway;
-                gateway_out = inet_ntoa(addr);
-                fclose(fp);
-                return true;
-            }
-        }
-    }
-    fclose(fp);
-    return false;
-}
-
-// ============================================================================
 // Type Aliases
 // ============================================================================
 
-// Enable debug modes
-static constexpr bool PROFILING_ENABLED = true;
-static constexpr bool DEBUG_TCP_ENABLED = true;  // TCP debug mode for retransmit detection
-
-// XDP Poll Process types (with profiling enabled)
-// Note: XDPCopyProcess is available but experimental - use XDPPollProcess for production
+// XDP Poll Process type
 using XDPPollType = XDPPollProcess<
     IPCRingProducer<PacketFrameDescriptor>,
     IPCRingConsumer<PacketFrameDescriptor>,
-    true,                                   // TrickleEnabled
-    PROFILING_ENABLED>;                     // Profiling
+    true,   // TrickleEnabled
+    false>; // Profiling
 
-// Transport Process types (with SSL and profiling enabled)
+// Transport Process type (with profiling enabled)
 using TransportType = TransportProcess<
     SSLPolicyType,
     IPCRingProducer<MsgMetadata>,
     IPCRingConsumer<PongFrameAligned>,
-    PROFILING_ENABLED>;
+    true>;  // Profiling
 
-// WebSocket Process types
+// WebSocket Process type
 using WebSocketType = WebSocketProcess<
-    IPCRingConsumer<MsgMetadata>,          // MsgMetadataCons
-    IPCRingProducer<WSFrameInfo>,          // WSFrameInfoProd
-    IPCRingProducer<PongFrameAligned>,     // PongsProd
-    IPCRingProducer<MsgOutboxEvent>>;      // MsgOutboxProd
+    IPCRingConsumer<MsgMetadata>,
+    IPCRingProducer<WSFrameInfo>,
+    IPCRingProducer<PongFrameAligned>,
+    IPCRingProducer<MsgOutboxEvent>>;
 
 // ============================================================================
 // Test Class
 // ============================================================================
 
-class WebSocketBinanceTest {
+class WebSocket96Test {
 public:
-    WebSocketBinanceTest(const char* interface, const char* bpf_path)
+    WebSocket96Test(const char* interface, const char* bpf_path)
         : interface_(interface), bpf_path_(bpf_path) {}
 
     bool setup() {
-        printf("\n=== Setting up WebSocket Binance Test ===\n");
+        printf("\n=== Setting up WebSocket 96 Test (3-Process Architecture) ===\n");
         printf("Interface:   %s\n", interface_);
         printf("BPF Path:    %s\n", bpf_path_);
-
-        // Resolve WSS target
-        wss_target_ip_ = resolve_hostname(WSS_HOST);
-        if (wss_target_ip_.empty()) {
-            fprintf(stderr, "FAIL: Cannot resolve %s\n", WSS_HOST);
-            return false;
-        }
-        printf("Target:      %s:%u (%s)\n", WSS_HOST, WSS_PORT, wss_target_ip_.c_str());
+        printf("Target:      %s:%u\n", WSS_HOST, WSS_PORT);
         printf("Path:        %s\n\n", WSS_PATH);
 
         calibrate_tsc();
-
-        // Get interface MAC
-        if (!get_interface_mac(interface_, local_mac_)) {
-            fprintf(stderr, "FAIL: Cannot get MAC address for %s\n", interface_);
-            return false;
-        }
-        printf("Local MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-               local_mac_[0], local_mac_[1], local_mac_[2],
-               local_mac_[3], local_mac_[4], local_mac_[5]);
-
-        // Get interface IP
-        if (!get_interface_ip(interface_, local_ip_)) {
-            fprintf(stderr, "FAIL: Cannot get IP address for %s\n", interface_);
-            return false;
-        }
-        printf("Local IP:  %s\n", local_ip_.c_str());
-        g_local_ip = local_ip_;
-
-        // Get gateway
-        if (!get_default_gateway(interface_, gateway_ip_)) {
-            fprintf(stderr, "FAIL: Cannot get gateway for %s\n", interface_);
-            return false;
-        }
-        printf("Gateway:   %s\n", gateway_ip_.c_str());
-
-        // Ping gateway to populate ARP cache
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "ping -c 1 -W 1 %s >/dev/null 2>&1", gateway_ip_.c_str());
-        [[maybe_unused]] int ping_ret = system(cmd);
-
-        if (!get_gateway_mac(interface_, gateway_ip_.c_str(), gateway_mac_)) {
-            fprintf(stderr, "FAIL: Cannot get gateway MAC for %s\n", gateway_ip_.c_str());
-            return false;
-        }
-        printf("Gateway MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-               gateway_mac_[0], gateway_mac_[1], gateway_mac_[2],
-               gateway_mac_[3], gateway_mac_[4], gateway_mac_[5]);
-
-        printf("WSS Target IP: %s (route must be set by test script)\n", wss_target_ip_.c_str());
 
         // Create IPC rings
         if (!ipc_manager_.create_all_rings()) {
@@ -513,15 +361,14 @@ public:
             return false;
         }
 
-        // Allocate UMEM (shared between processes via MAP_SHARED)
-        umem_size_ = UMEM_TOTAL_SIZE;
-        umem_area_ = mmap(nullptr, umem_size_,
-                         PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB,
-                         -1, 0);
+        // Allocate UMEM (shared between XDP Poll and PIO Transport)
+        umem_area_ = mmap(nullptr, UMEM_TOTAL_SIZE,
+                          PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB,
+                          -1, 0);
         if (umem_area_ == MAP_FAILED) {
-            printf("WARN: Huge pages not available, using regular pages\n");
-            umem_area_ = mmap(nullptr, umem_size_,
+            // Fall back to regular pages
+            umem_area_ = mmap(nullptr, UMEM_TOTAL_SIZE,
                               PROT_READ | PROT_WRITE,
                               MAP_SHARED | MAP_ANONYMOUS,
                               -1, 0);
@@ -529,8 +376,10 @@ public:
                 fprintf(stderr, "FAIL: Cannot allocate UMEM\n");
                 return false;
             }
+            printf("[UMEM] Allocated %zu bytes (regular pages)\n", UMEM_TOTAL_SIZE);
+        } else {
+            printf("[UMEM] Allocated %zu bytes (huge pages)\n", UMEM_TOTAL_SIZE);
         }
-        printf("UMEM: %p (%zu bytes)\n", umem_area_, umem_size_);
 
         // Allocate MsgInbox (shared)
         msg_inbox_ = static_cast<MsgInbox*>(
@@ -557,43 +406,26 @@ public:
         }
         conn_state_->init();
 
-        // Set target and network config in shared state (use resolved IP)
+        // Set target configuration
         strncpy(conn_state_->target_host, WSS_HOST, sizeof(conn_state_->target_host) - 1);
         conn_state_->target_port = WSS_PORT;
         strncpy(conn_state_->target_path, WSS_PATH, sizeof(conn_state_->target_path) - 1);
         strncpy(conn_state_->bpf_path, bpf_path_, sizeof(conn_state_->bpf_path) - 1);
         strncpy(conn_state_->interface_name, interface_, sizeof(conn_state_->interface_name) - 1);
 
-        // Set local IP in network byte order
-        struct in_addr addr;
-        inet_aton(local_ip_.c_str(), &addr);
-        conn_state_->local_ip = addr.s_addr;
-
-        // Set local MAC
-        memcpy(conn_state_->local_mac, local_mac_, 6);
-        memcpy(conn_state_->remote_mac, gateway_mac_, 6);
-
         // Set TSC frequency
         conn_state_->tsc_freq_hz = static_cast<uint64_t>(g_tsc_freq_ghz * 1e9);
 
-        printf("ConnStateShm: %p\n", conn_state_);
-
-        // Allocate ProfilingShm (shared between processes)
-        if constexpr (PROFILING_ENABLED) {
-            profiling_ = static_cast<ProfilingShm*>(
-                mmap(nullptr, sizeof(ProfilingShm),
-                     PROT_READ | PROT_WRITE,
-                     MAP_SHARED | MAP_ANONYMOUS,
-                     -1, 0));
-            if (profiling_ == MAP_FAILED) {
-                fprintf(stderr, "FAIL: Cannot allocate ProfilingShm (%zu bytes)\n", sizeof(ProfilingShm));
-                return false;
-            }
-            profiling_->init();
-            printf("ProfilingShm: %p (%zu bytes)\n", profiling_, sizeof(ProfilingShm));
+        // Resolve DNS and store exchange IPs for XDP Poll to configure BPF filter
+        printf("[DNS] Resolving %s...\n", WSS_HOST);
+        if (!resolve_and_store_exchange_ips(WSS_HOST)) {
+            fprintf(stderr, "FAIL: Cannot resolve %s\n", WSS_HOST);
+            return false;
         }
 
-        // Open shared regions (after ring files created, before fork)
+        printf("ConnStateShm: %p\n", conn_state_);
+
+        // Open shared regions
         try {
             raw_inbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_inbox"));
             raw_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_outbox"));
@@ -617,9 +449,9 @@ public:
         g_shutdown.store(true);
 
         // Wait for child processes
-        if (xdp_pid_ > 0) {
-            kill(xdp_pid_, SIGTERM);
-            waitpid(xdp_pid_, nullptr, 0);
+        if (xdp_poll_pid_ > 0) {
+            kill(xdp_poll_pid_, SIGTERM);
+            waitpid(xdp_poll_pid_, nullptr, 0);
         }
         if (transport_pid_ > 0) {
             kill(transport_pid_, SIGTERM);
@@ -644,74 +476,67 @@ public:
         if (msg_inbox_ && msg_inbox_ != MAP_FAILED) {
             munmap(msg_inbox_, sizeof(MsgInbox));
         }
-        if (profiling_ && profiling_ != MAP_FAILED) {
-            munmap(profiling_, sizeof(ProfilingShm));
-        }
         if (umem_area_ && umem_area_ != MAP_FAILED) {
-            munmap(umem_area_, umem_size_);
+            munmap(umem_area_, UMEM_TOTAL_SIZE);
         }
 
         printf("=== Teardown Complete ===\n");
     }
 
     bool fork_processes() {
-        // Fork XDP Poll process
-        xdp_pid_ = fork();
-        if (xdp_pid_ < 0) {
+        // Build URL
+        char url[512];
+        snprintf(url, sizeof(url), "wss://%s:%u%s", WSS_HOST, WSS_PORT, WSS_PATH);
+
+        // Fork XDP Poll process (Core 2) - must be first to initialize XDP
+        xdp_poll_pid_ = fork();
+        if (xdp_poll_pid_ < 0) {
             fprintf(stderr, "FAIL: fork() for XDP Poll failed\n");
             return false;
         }
 
-        if (xdp_pid_ == 0) {
+        if (xdp_poll_pid_ == 0) {
             // Child: XDP Poll process
             run_xdp_poll_process();
             _exit(0);
         }
 
-        printf("[PARENT] Forked XDP Poll process (PID %d)\n", xdp_pid_);
+        printf("[PARENT] Forked XDP Poll process (PID %d) on core %d\n",
+               xdp_poll_pid_, XDP_POLL_CPU_CORE);
 
-        // Wait for XDP Poll to be ready
-        printf("[PARENT] Waiting for XDP Poll ready...\n");
+        // Wait for XDP to be ready
+        printf("[PARENT] Waiting for XDP to be ready...\n");
         if (!conn_state_->wait_for_handshake_xdp_ready(10000000)) {
-            fprintf(stderr, "FAIL: Timeout waiting for XDP Poll ready\n");
+            fprintf(stderr, "FAIL: Timeout waiting for XDP ready\n");
             return false;
         }
-        printf("[PARENT] XDP Poll ready\n");
+        printf("[PARENT] XDP ready\n");
 
-        // Fork Transport process
+        // Fork PIO Transport process (Core 4)
         transport_pid_ = fork();
         if (transport_pid_ < 0) {
-            fprintf(stderr, "FAIL: fork() for Transport failed\n");
+            fprintf(stderr, "FAIL: fork() for PIO Transport failed\n");
             return false;
         }
 
         if (transport_pid_ == 0) {
-            // Child: Transport process
-            run_transport_process();
+            // Child: PIO Transport process
+            run_transport_process(url);
             _exit(0);
         }
 
-        printf("[PARENT] Forked Transport process (PID %d)\n", transport_pid_);
+        printf("[PARENT] Forked PIO Transport process (PID %d) on core %d\n",
+               transport_pid_, PIO_TRANSPORT_CPU_CORE);
 
         // Wait for TLS handshake to complete
         printf("[PARENT] Waiting for TLS handshake (%s)...\n", SSLPolicyType::name());
-        auto start = std::chrono::steady_clock::now();
-        while (!conn_state_->is_handshake_tls_ready()) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start).count();
-            if (elapsed > 15000) {  // 15s timeout for TLS handshake
-                fprintf(stderr, "FAIL: Timeout waiting for TLS handshake\n");
-                return false;
-            }
-            if (!conn_state_->is_running(PROC_TRANSPORT)) {
-                fprintf(stderr, "FAIL: Transport process exited during TLS handshake\n");
-                return false;
-            }
-            usleep(1000);
+        if (!conn_state_->wait_for_handshake_tls_ready(15000000)) {
+            fprintf(stderr, "FAIL: Timeout waiting for TLS handshake\n");
+            return false;
         }
-        printf("[PARENT] TLS handshake complete (%s)\n", SSLPolicyType::name());
+        printf("[PARENT] TLS handshake complete\n");
 
-        // Fork WebSocket process
+        // Fork WebSocket process (Core 6)
         websocket_pid_ = fork();
         if (websocket_pid_ < 0) {
             fprintf(stderr, "FAIL: fork() for WebSocket failed\n");
@@ -724,7 +549,8 @@ public:
             _exit(0);
         }
 
-        printf("[PARENT] Forked WebSocket process (PID %d)\n", websocket_pid_);
+        printf("[PARENT] Forked WebSocket process (PID %d) on core %d\n",
+               websocket_pid_, WEBSOCKET_CPU_CORE);
 
         // Wait for WebSocket handshake to complete
         printf("[PARENT] Waiting for WebSocket handshake...\n");
@@ -797,17 +623,26 @@ public:
                 switch (frame.opcode) {
                     case 0x01:  // TEXT
                         text_frames++;
-                        // Validate JSON trade data
                         if (frame.payload_len > 0) {
                             const uint8_t* payload = msg_inbox_->data_at(frame.msg_inbox_offset);
                             if (is_valid_trade_json(reinterpret_cast<const char*>(payload), frame.payload_len)) {
                                 valid_trades++;
-                                // In forever mode, display every message; otherwise only first 3
-                                if (run_forever || valid_trades <= 3) {
-                                    printf("[TRADE #%lu] %.*s\n",
-                                           valid_trades,
-                                           (int)std::min(static_cast<uint32_t>(500), frame.payload_len),
-                                           reinterpret_cast<const char*>(payload));
+
+                                // Parse "E" field for exchange latency
+                                uint64_t event_time_ms = parse_event_time(payload, frame.payload_len);
+                                if (event_time_ms > 0) {
+                                    struct timespec ts;
+                                    clock_gettime(CLOCK_REALTIME, &ts);
+                                    uint64_t local_time_ms = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+                                    int64_t exchange_latency_ms = (int64_t)local_time_ms - (int64_t)event_time_ms;
+
+                                    if (run_forever || valid_trades <= 3) {
+                                        printf("\n[MSG #%lu] %.*s\n",
+                                               valid_trades,
+                                               (int)std::min(static_cast<uint32_t>(200), frame.payload_len),
+                                               reinterpret_cast<const char*>(payload));
+                                        printf("  Exchange latency: %ld ms\n", exchange_latency_ms);
+                                    }
                                 }
                             }
                         }
@@ -819,15 +654,7 @@ public:
 
                     case 0x09:  // PING
                         ping_frames++;
-                        {
-                            auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
-                                std::chrono::steady_clock::now() - start_time).count();
-                            int64_t pongs_prod = pongs_region_->producer_published()->load(std::memory_order_acquire);
-                            int64_t pongs_cons = pongs_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-                            printf("[PING @%lds] Received PING (payload_len=%u) - PONGS ring: prod=%ld, cons=%ld\n",
-                                   elapsed_s, frame.payload_len, pongs_prod, pongs_cons);
-                            fflush(stdout);
-                        }
+                        printf("[PING] Received PING #%lu\n", ping_frames);
                         break;
 
                     case 0x0A:  // PONG
@@ -844,12 +671,10 @@ public:
                 }
             }
 
-            // Status logging consolidated in TRANSPORT process (see transport_process.hpp)
-
             __builtin_ia32_pause();
         }
 
-        // Final drain (skip in forever mode since we're exiting on signal)
+        // Final drain
         if (!run_forever) {
             printf("[WSS] Final %dms drain...\n", FINAL_DRAIN_MS);
             auto drain_start = std::chrono::steady_clock::now();
@@ -886,16 +711,6 @@ public:
         printf("  BINARY frames:   %lu\n", binary_frames);
         printf("  PING frames:     %lu\n", ping_frames);
         printf("  PONG frames:     %lu\n", pong_frames);
-        // PONG deficit check: compare PINGs received with PONGs queued
-        {
-            int64_t pongs_queued = pongs_region_->producer_published()->load(std::memory_order_acquire) + 1;  // +1 for 0-based
-            int64_t deficit = static_cast<int64_t>(ping_frames) - pongs_queued;
-            if (deficit > 0) {
-                printf("  PONG DEFICIT:    %ld (PINGs received but PONGs not queued - INVESTIGATE!)\n", deficit);
-            } else {
-                printf("  PONG balance:    OK (all PINGs have corresponding PONGs queued)\n");
-            }
-        }
         printf("  CLOSE frames:    %lu\n", close_frames);
         printf("  Valid trades:    %lu\n", valid_trades);
         printf("  Sequence errors: %s\n", sequence_error ? "YES" : "none");
@@ -903,52 +718,37 @@ public:
         // Verify ring buffer status
         printf("\n--- Ring Buffer Status ---\n");
 
-        // WS_FRAME_INFO
         int64_t ws_frame_prod = ws_frame_info_region_->producer_published()->load(std::memory_order_acquire);
         int64_t ws_frame_cons_seq = ws_frame_cons.sequence();
         bool ws_frame_caught_up = ws_frame_cons_seq >= ws_frame_prod;
         printf("  WS_FRAME_INFO producer: %ld, consumer: %ld\n", ws_frame_prod, ws_frame_cons_seq);
         printf("  Consumer caught up: %s\n", ws_frame_caught_up ? "yes" : "NO - FAIL");
 
-        // MSG_METADATA
         int64_t meta_prod = msg_metadata_region_->producer_published()->load(std::memory_order_acquire);
         int64_t meta_cons = msg_metadata_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-        bool meta_caught_up = meta_cons >= meta_prod - 1;  // Allow 1 pending
         printf("  MSG_METADATA producer: %ld, consumer: %ld\n", meta_prod, meta_cons);
-        printf("  Consumer caught up: %s\n", meta_caught_up ? "yes" : "NO - FAIL");
 
-        // MSG_OUTBOX
-        int64_t outbox_prod = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
-        int64_t outbox_cons = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-        bool outbox_caught_up = outbox_cons >= outbox_prod;
-        printf("  MSG_OUTBOX producer: %ld, consumer: %ld\n", outbox_prod, outbox_cons);
-        printf("  Consumer caught up: %s\n", outbox_caught_up ? "yes" : "NO - FAIL");
+        int64_t raw_inbox_prod = raw_inbox_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t raw_inbox_cons = raw_inbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+        printf("  RAW_INBOX producer: %ld, consumer: %ld\n", raw_inbox_prod, raw_inbox_cons);
 
-        // PONGS
-        int64_t pongs_prod = pongs_region_->producer_published()->load(std::memory_order_acquire);
-        int64_t pongs_cons = pongs_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-        bool pongs_caught_up = pongs_cons >= pongs_prod;
-        printf("  PONGS producer: %ld, consumer: %ld\n", pongs_prod, pongs_cons);
-        printf("  Consumer caught up: %s\n", pongs_caught_up ? "yes" : "NO - FAIL");
+        int64_t raw_outbox_prod = raw_outbox_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t raw_outbox_cons = raw_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+        printf("  RAW_OUTBOX producer: %ld, consumer: %ld\n", raw_outbox_prod, raw_outbox_cons);
 
         printf("====================\n");
         fflush(stdout);
 
         // Signal children to stop and wait
         conn_state_->shutdown_all();
-        if (xdp_pid_ > 0) waitpid(xdp_pid_, nullptr, 0);
+        if (xdp_poll_pid_ > 0) waitpid(xdp_poll_pid_, nullptr, 0);
         if (transport_pid_ > 0) waitpid(transport_pid_, nullptr, 0);
         if (websocket_pid_ > 0) waitpid(websocket_pid_, nullptr, 0);
-        xdp_pid_ = 0;
+        xdp_poll_pid_ = 0;
         transport_pid_ = 0;
         websocket_pid_ = 0;
 
-        // Save profiling data
-        save_profiling_data();
-
-        // === FAILURE CONDITIONS ===
-
-        // In forever mode, always pass if we got frames (was killed by timeout command or Ctrl+C)
+        // Failure conditions
         if (run_forever) {
             printf("\nFOREVER MODE: Received %lu trades over %ld ms\n",
                    valid_trades, actual_duration);
@@ -956,108 +756,32 @@ public:
             return true;
         }
 
-        // 1. Check we received WebSocket frames
         if (total_frames == 0) {
             printf("\nFAIL: No WebSocket frames received\n");
             return false;
         }
 
-        // 2. Check we received trade data
         if (valid_trades < static_cast<uint64_t>(MIN_EXPECTED_TRADES)) {
             printf("\nFAIL: Only %lu trades received (expected %d+)\n",
                    valid_trades, MIN_EXPECTED_TRADES);
             return false;
         }
 
-        // 3. Check ringbuffer consumer caught up
         if (!ws_frame_caught_up) {
-            printf("\nFAIL: WS_FRAME_INFO consumer did not catch up with producer\n");
+            printf("\nFAIL: WS_FRAME_INFO consumer did not catch up\n");
             return false;
         }
 
-        // 4. Check for sequence errors
         if (sequence_error) {
             printf("\nFAIL: Out-of-order frame delivery detected\n");
             return false;
         }
 
-        printf("\nPASS: WebSocket process working, received %lu trades in %ld ms\n",
+        printf("\nPASS: WebSocket pipeline working, received %lu trades in %ld ms\n",
                valid_trades, actual_duration);
         return true;
     }
 
-    void save_profiling_data() {
-        if constexpr (!PROFILING_ENABLED) return;
-        if (!profiling_) return;
-
-        pid_t pid = getpid();
-
-        // Helper to save a CycleSampleBuffer to file
-        auto save_buffer = [pid](const CycleSampleBuffer& buf, const char* name) {
-            char filename[256];
-            snprintf(filename, sizeof(filename), "/tmp/%s_profiling_%d.bin", name, pid);
-
-            FILE* f = fopen(filename, "wb");
-            if (!f) {
-                fprintf(stderr, "[PROFILING] Failed to create %s\n", filename);
-                return;
-            }
-
-            uint32_t count = std::min(buf.total_count, CycleSampleBuffer::SAMPLE_COUNT);
-            uint32_t start_idx = (buf.total_count > CycleSampleBuffer::SAMPLE_COUNT)
-                ? (buf.write_idx & CycleSampleBuffer::MASK)
-                : 0;
-
-            // Write header: total_count, sample_count
-            fwrite(&buf.total_count, sizeof(uint32_t), 1, f);
-            fwrite(&count, sizeof(uint32_t), 1, f);
-
-            // Write samples in order (oldest to newest)
-            for (uint32_t i = 0; i < count; ++i) {
-                uint32_t idx = (start_idx + i) & CycleSampleBuffer::MASK;
-                fwrite(&buf.samples[idx], sizeof(CycleSample), 1, f);
-            }
-            fclose(f);
-            printf("[PROFILING] %s saved to %s (%u samples, %u total)\n",
-                   name, filename, count, buf.total_count);
-        };
-
-        save_buffer(profiling_->xdp_poll, "xdp_poll");
-        save_buffer(profiling_->transport, "transport");
-
-        // Save NIC latency data
-        {
-            char filename[256];
-            snprintf(filename, sizeof(filename), "/tmp/nic_latency_profiling_%d.bin", pid);
-
-            FILE* f = fopen(filename, "wb");
-            if (!f) {
-                fprintf(stderr, "[PROFILING] Failed to create %s\n", filename);
-                return;
-            }
-
-            const auto& buf = profiling_->nic_latency;
-            uint32_t count = std::min(buf.total_count, NicLatencyBuffer::SAMPLE_COUNT);
-            uint32_t start_idx = (buf.total_count > NicLatencyBuffer::SAMPLE_COUNT)
-                ? (buf.write_idx & NicLatencyBuffer::MASK)
-                : 0;
-
-            // Write header: total_count, sample_count
-            fwrite(&buf.total_count, sizeof(uint32_t), 1, f);
-            fwrite(&count, sizeof(uint32_t), 1, f);
-
-            // Write samples in order (oldest to newest)
-            for (uint32_t i = 0; i < count; ++i) {
-                uint32_t idx = (start_idx + i) & NicLatencyBuffer::MASK;
-                fwrite(&buf.samples[idx], sizeof(NicLatencySample), 1, f);
-            }
-            fclose(f);
-            printf("[PROFILING] nic_latency saved to %s (%u samples, %u total)\n",
-                   filename, count, buf.total_count);
-        }
-    }
-
-    // Getter for connection state (used by signal handler)
     ConnStateShm* get_conn_state() const { return conn_state_; }
 
 private:
@@ -1065,63 +789,47 @@ private:
     void run_xdp_poll_process() {
         pin_to_cpu(XDP_POLL_CPU_CORE);
 
-        // Create ring adapters in child process
+        // Create ring adapters
         IPCRingProducer<PacketFrameDescriptor> raw_inbox_prod(*raw_inbox_region_);
         IPCRingConsumer<PacketFrameDescriptor> raw_outbox_cons(*raw_outbox_region_);
+
         XDPPollType xdp_poll(interface_);
 
-        // Set profiling data buffers
-        if constexpr (PROFILING_ENABLED) {
-            xdp_poll.set_profiling_data(&profiling_->xdp_poll);
-            xdp_poll.set_nic_latency_data(&profiling_->nic_latency);
-        }
-
-        bool ok = xdp_poll.init(
-            umem_area_, umem_size_, bpf_path_,
-            &raw_inbox_prod,
-            &raw_outbox_cons,
-            conn_state_);
-
-        if (!ok) {
+        if (!xdp_poll.init(umem_area_, UMEM_TOTAL_SIZE,
+                           bpf_path_,
+                           &raw_inbox_prod,
+                           &raw_outbox_cons,
+                           conn_state_)) {
             fprintf(stderr, "[XDP-POLL] init() failed\n");
             conn_state_->shutdown_all();
             return;
         }
 
-        // Configure BPF maps for WSS target traffic
-        auto* bpf = xdp_poll.get_bpf_loader();
-        if (bpf) {
-            fprintf(stderr, "[XDP-POLL] Configuring BPF maps: local_ip=%s, exchange_ip=%s, port=%u\n",
-                    g_local_ip.c_str(), wss_target_ip_.c_str(), WSS_PORT);
-            bpf->set_local_ip(g_local_ip.c_str());
-            bpf->add_exchange_ip(wss_target_ip_.c_str());
-            bpf->add_exchange_port(WSS_PORT);
-        } else {
-            fprintf(stderr, "[XDP-POLL] WARNING: BPF loader is NULL!\n");
-        }
+        printf("[XDP-POLL] Initialized, running main loop\n");
         xdp_poll.run();
         xdp_poll.cleanup();
     }
 
-    // Transport child process
-    void run_transport_process() {
-        pin_to_cpu(TRANSPORT_CPU_CORE);
+    // PIO Transport child process
+    void run_transport_process(const char* url) {
+        pin_to_cpu(PIO_TRANSPORT_CPU_CORE);
 
+        // Create ring adapters
         IPCRingConsumer<PacketFrameDescriptor> raw_inbox_cons(*raw_inbox_region_);
         IPCRingProducer<PacketFrameDescriptor> raw_outbox_prod(*raw_outbox_region_);
         IPCRingProducer<MsgMetadata> msg_metadata_prod(*msg_metadata_region_);
         IPCRingConsumer<PongFrameAligned> pongs_cons(*pongs_region_);
-        IPCRingConsumer<MsgOutboxEvent> msg_outbox_cons(*msg_outbox_region_);
-
-        // Build URL
-        char url[512];
-        snprintf(url, sizeof(url), "wss://%s:%u%s", WSS_HOST, WSS_PORT, WSS_PATH);
 
         TransportType transport(
-            url, umem_area_, FRAME_SIZE,
-            &raw_inbox_cons, &raw_outbox_prod,
-            msg_inbox_, &msg_metadata_prod, &pongs_cons,
-            conn_state_, &msg_outbox_cons);
+            url,
+            umem_area_,
+            FRAME_SIZE,
+            &raw_inbox_cons,
+            &raw_outbox_prod,
+            msg_inbox_,
+            &msg_metadata_prod,
+            &pongs_cons,
+            conn_state_);
 
         if (!transport.init()) {
             fprintf(stderr, "[TRANSPORT] init() failed\n");
@@ -1137,7 +845,7 @@ private:
     void run_websocket_process() {
         pin_to_cpu(WEBSOCKET_CPU_CORE);
 
-        // Create ring adapters in child process
+        // Create ring adapters
         IPCRingConsumer<MsgMetadata> msg_metadata_cons(*msg_metadata_region_);
         IPCRingProducer<WSFrameInfo> ws_frame_info_prod(*ws_frame_info_region_);
         IPCRingProducer<MsgOutboxEvent> msg_outbox_prod(*msg_outbox_region_);
@@ -1159,26 +867,64 @@ private:
             return;
         }
 
-        // Run with handshake (performs HTTP upgrade, subscription, then main loop)
-        ws_process.run_with_handshake();
+        // Wait for WS ready (PIO Transport handles the HTTP upgrade)
+        printf("[WS-PROCESS] Waiting for WS ready from PIO Transport...\n");
+        while (!conn_state_->is_handshake_ws_ready()) {
+            if (!conn_state_->is_running(PROC_WEBSOCKET)) {
+                fprintf(stderr, "[WS-PROCESS] Shutdown during WS ready wait\n");
+                return;
+            }
+            __builtin_ia32_pause();
+        }
+        printf("[WS-PROCESS] WS ready, starting frame parsing\n");
+
+        // Skip handshake - PIO Transport already did HTTP upgrade
+        // Go straight to main loop for WS frame parsing
+        ws_process.run();
+    }
+
+    // Resolve hostname and store IPs in ConnStateShm for XDP Poll
+    bool resolve_and_store_exchange_ips(const char* hostname) {
+        struct addrinfo hints = {};
+        struct addrinfo* result = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        int ret = getaddrinfo(hostname, nullptr, &hints, &result);
+        if (ret != 0 || !result) {
+            if (result) freeaddrinfo(result);
+            return false;
+        }
+
+        uint8_t count = 0;
+        for (struct addrinfo* p = result; p != nullptr && count < ConnStateShm::MAX_EXCHANGE_IPS; p = p->ai_next) {
+            if (p->ai_family == AF_INET) {
+                auto* addr = reinterpret_cast<struct sockaddr_in*>(p->ai_addr);
+                conn_state_->exchange_ips[count] = addr->sin_addr.s_addr;  // Already network byte order
+
+                char ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
+                printf("[DNS] Resolved IP %u: %s\n", count, ip_str);
+
+                count++;
+            }
+        }
+
+        conn_state_->exchange_ip_count = count;
+        freeaddrinfo(result);
+
+        printf("[DNS] Total IPs resolved: %u\n", count);
+        return count > 0;
     }
 
     const char* interface_;
     const char* bpf_path_;
-    std::string wss_target_ip_;  // Resolved IP of WSS_HOST
 
     IPCRingManager ipc_manager_;
 
     void* umem_area_ = nullptr;
-    size_t umem_size_ = 0;
-    uint8_t local_mac_[6] = {};
-    uint8_t gateway_mac_[6] = {};
-    std::string local_ip_;
-    std::string gateway_ip_;
-
     MsgInbox* msg_inbox_ = nullptr;
     ConnStateShm* conn_state_ = nullptr;
-    ProfilingShm* profiling_ = nullptr;
 
     disruptor::ipc::shared_region* raw_inbox_region_ = nullptr;
     disruptor::ipc::shared_region* raw_outbox_region_ = nullptr;
@@ -1187,7 +933,7 @@ private:
     disruptor::ipc::shared_region* pongs_region_ = nullptr;
     disruptor::ipc::shared_region* ws_frame_info_region_ = nullptr;
 
-    pid_t xdp_pid_ = 0;
+    pid_t xdp_poll_pid_ = 0;
     pid_t transport_pid_ = 0;
     pid_t websocket_pid_ = 0;
 };
@@ -1196,7 +942,6 @@ private:
 // Main
 // ============================================================================
 
-// Parse --timeout argument from argv
 void parse_args(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
@@ -1210,97 +955,71 @@ void parse_args(int argc, char* argv[]) {
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <interface> <bpf_path> [ignored...] [--timeout <ms>]\n", argv[0]);
-        fprintf(stderr, "NOTE: Do NOT run directly. Use: ./scripts/build_xdp.sh 20_websocket_binance.cpp\n");
+        fprintf(stderr, "Usage: %s <interface> <bpf_path> [--timeout <ms>]\n", argv[0]);
+        fprintf(stderr, "NOTE: Do NOT run directly. Use: ./scripts/build_xdp.sh 96_websocket_binance.cpp\n");
         fprintf(stderr, "\nOptions:\n");
-        fprintf(stderr, "  --timeout <ms>   Stream timeout in milliseconds (default: %d)\n", DEFAULT_STREAM_DURATION_MS);
-        fprintf(stderr, "                   If <= 0, run forever (display all messages, Ctrl+C to stop)\n");
-        fprintf(stderr, "\nThis test:\n");
-        fprintf(stderr, "  - Forks XDP Poll (core 2), Transport<%s> (core 4), WebSocket (core 6)\n", SSLPolicyType::name());
-        fprintf(stderr, "  - Connects to %s:%u (WSS with %s)\n", WSS_HOST, WSS_PORT, SSLPolicyType::name());
-        fprintf(stderr, "  - WebSocketProcess handles HTTP+WS handshake\n");
-        fprintf(stderr, "  - Streams BTCUSDT trades for the specified timeout\n");
-        fprintf(stderr, "  - Parent consumes WS_FRAME_INFO, validates JSON trade data\n");
-        fprintf(stderr, "  - Expects at least %d trades (BTCUSDT is very liquid)\n", MIN_EXPECTED_TRADES);
-        fprintf(stderr, "  - Waits %dms, then verifies ringbuffer consumers caught up\n", FINAL_DRAIN_MS);
-        fprintf(stderr, "\nExamples:\n");
-        fprintf(stderr, "  ./scripts/build_xdp.sh 20_websocket_binance.cpp                # Build\n");
-        fprintf(stderr, "  ./build/test_pipeline_websocket_binance enp108s0 src/xdp/bpf/exchange_filter.bpf.o --timeout 10000  # 10s\n");
-        fprintf(stderr, "  ./build/test_pipeline_websocket_binance enp108s0 src/xdp/bpf/exchange_filter.bpf.o --timeout -1     # Forever\n");
+        fprintf(stderr, "  --timeout <ms>   Stream timeout (default: %d, <= 0 = forever)\n", DEFAULT_STREAM_DURATION_MS);
+        fprintf(stderr, "\nArchitecture (3 processes):\n");
+        fprintf(stderr, "  - XDP Poll (core %d): XDP kernel interface\n", XDP_POLL_CPU_CORE);
+        fprintf(stderr, "  - PIO Transport (core %d): TCP + SSL via IPC\n", PIO_TRANSPORT_CPU_CORE);
+        fprintf(stderr, "  - WebSocket (core %d): WS frame parsing\n", WEBSOCKET_CPU_CORE);
         return 1;
     }
 
     const char* interface = argv[1];
     const char* bpf_path = argv[2];
 
-    // Parse optional arguments
     parse_args(argc, argv);
 
-    // PREVENT ROOT USER FROM RUNNING
     if (geteuid() == 0) {
-        fprintf(stderr, "========================================\n");
-        fprintf(stderr, "ERROR: Do NOT run as root!\n");
-        fprintf(stderr, "========================================\n");
-        fprintf(stderr, "\nRun via the build script which sets capabilities properly:\n");
-        fprintf(stderr, "  ./scripts/build_xdp.sh 20_websocket_binance.cpp\n");
+        fprintf(stderr, "ERROR: Do NOT run as root! Use: ./scripts/build_xdp.sh 96_websocket_binance.cpp\n");
         return 1;
     }
 
-    // Install signal handlers
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
     printf("==============================================\n");
-    printf("  WebSocket Binance Test                      \n");
+    printf("  WebSocket 96 Test (XDP + PIO + WS)          \n");
     printf("==============================================\n");
     printf("  Interface:  %s\n", interface);
     printf("  Target:     %s:%u (WSS)\n", WSS_HOST, WSS_PORT);
     printf("  Path:       %s\n", WSS_PATH);
     printf("  SSL:        %s\n", SSLPolicyType::name());
     printf("  Processes:  XDP Poll (core %d)\n", XDP_POLL_CPU_CORE);
-    printf("              Transport (core %d)\n", TRANSPORT_CPU_CORE);
+    printf("              PIO Transport (core %d)\n", PIO_TRANSPORT_CPU_CORE);
     printf("              WebSocket (core %d)\n", WEBSOCKET_CPU_CORE);
     if (g_timeout_ms <= 0) {
         printf("  Timeout:    FOREVER (Ctrl+C to stop)\n");
-        printf("  Mode:       Display all messages\n");
     } else {
         printf("  Timeout:    %d ms\n", g_timeout_ms);
-        printf("  Expected:   %d+ trades\n", MIN_EXPECTED_TRADES);
-        printf("  Drain:      %dms then check ringbuffers\n", FINAL_DRAIN_MS);
     }
     printf("==============================================\n\n");
 
-    WebSocketBinanceTest test(interface, bpf_path);
+    WebSocket96Test test(interface, bpf_path);
 
-    // Setup
     if (!test.setup()) {
         fprintf(stderr, "\nFATAL: Setup failed\n");
         return 1;
     }
 
-    // Set global conn_state for signal handler to use
     g_conn_state = test.get_conn_state();
 
-    // Fork processes
     if (!test.fork_processes()) {
         fprintf(stderr, "\nFATAL: Failed to fork processes\n");
         test.teardown();
         return 1;
     }
 
-    // Give processes time to stabilize
-    usleep(500000);  // 500ms
+    usleep(500000);  // 500ms stabilization
 
-    // Run streaming test
     int result = 0;
     if (!test.run_stream_test()) {
         result = 1;
     }
 
-    // Cleanup
     test.teardown();
 
-    // Summary
     printf("\n==============================================\n");
     if (result == 0) {
         printf("  TEST PASSED\n");
@@ -1316,7 +1035,7 @@ int main(int argc, char* argv[]) {
 
 int main() {
     fprintf(stderr, "Error: Build with USE_XDP=1 USE_WOLFSSL=1\n");
-    fprintf(stderr, "Example: make build-test-pipeline-websocket_binance USE_XDP=1 USE_WOLFSSL=1\n");
+    fprintf(stderr, "Example: ./scripts/build_xdp.sh 96_websocket_binance.cpp\n");
     return 1;
 }
 
