@@ -475,6 +475,7 @@ public:
                 if (has_pending_ping_) {
                     flush_pending_pong();
                 }
+                maybe_send_client_ping();
                 __builtin_ia32_pause();
             } else {
                 busy_count++;
@@ -638,6 +639,10 @@ private:
 
         // Store current metadata for latest timestamps
         current_metadata_ = meta;
+
+        // Pre-count complete frames for M/N batch display
+        batch_total_frames_ = count_complete_frames_in_buffer();
+        batch_frame_index_ = 0;
 
         // Parse WebSocket frames from accumulated data
         while (parse_offset_ < data_accumulated_) {
@@ -816,7 +821,7 @@ private:
                 break;
 
             case static_cast<uint8_t>(websocket::http::WebSocketOpcode::PONG):
-                // Ignore PONG frames
+                handle_pong(payload_len);
                 break;
 
             case static_cast<uint8_t>(websocket::http::WebSocketOpcode::CLOSE):
@@ -834,6 +839,7 @@ private:
         if (fin) {
             // Complete single-frame message
             msg_count_++;
+            batch_frame_index_++;
             const char* opcode_str = (opcode == static_cast<uint8_t>(websocket::http::WebSocketOpcode::TEXT))
                                      ? "TEXT" : "BINARY";
 
@@ -878,8 +884,9 @@ private:
                 now.time_since_epoch()).count();
 
             { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
-              fprintf(stderr, "[%ld.%06ld] [WS-MSG] #%lu received: opcode=%s payload_len=%lu nic_ts=%lu ns unix_ts=%ld ms text=[%s]\n",
-                      _ts.tv_sec, _ts.tv_nsec / 1000, msg_count_, opcode_str, payload_len, current_metadata_.latest_nic_timestamp_ns, unix_ms, msg_preview); }
+              fprintf(stderr, "[%ld.%06ld] [WS-MSG] #%lu %zu/%zu received: opcode=%s payload_len=%lu nic_ts=%lu ns unix_ts=%ld ms text=[%s]\n",
+                      _ts.tv_sec, _ts.tv_nsec / 1000, msg_count_, batch_frame_index_, batch_total_frames_, opcode_str, payload_len, current_metadata_.latest_nic_timestamp_ns, unix_ms, msg_preview); }
+            print_ssl_read_timeline();
 
             publish_frame_info(opcode, payload_len, frame_total_len, parse_cycle,
                               false, false);
@@ -915,6 +922,7 @@ private:
         } else {
             // Final fragment - log complete fragmented message
             msg_count_++;
+            batch_frame_index_++;
             const char* opcode_str = (fragment_opcode_ == static_cast<uint8_t>(websocket::http::WebSocketOpcode::TEXT))
                                      ? "TEXT" : "BINARY";
 
@@ -957,8 +965,9 @@ private:
                 now.time_since_epoch()).count();
 
             { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
-              fprintf(stderr, "[%ld.%06ld] [WS-MSG] #%lu received: opcode=%s payload_len=%u nic_ts=%lu ns unix_ts=%ld ms text=[%s] (fragmented)\n",
-                      _ts.tv_sec, _ts.tv_nsec / 1000, msg_count_, opcode_str, fragment_total_len_, current_metadata_.latest_nic_timestamp_ns, unix_ms, msg_preview); }
+              fprintf(stderr, "[%ld.%06ld] [WS-MSG] #%lu %zu/%zu received: opcode=%s payload_len=%u nic_ts=%lu ns unix_ts=%ld ms text=[%s] (fragmented)\n",
+                      _ts.tv_sec, _ts.tv_nsec / 1000, msg_count_, batch_frame_index_, batch_total_frames_, opcode_str, fragment_total_len_, current_metadata_.latest_nic_timestamp_ns, unix_ms, msg_preview); }
+            print_ssl_read_timeline();
 
             // Final fragment - publish with is_last_fragment=true
             publish_frame_info(fragment_opcode_, payload_len, frame_total_len, parse_cycle,
@@ -1003,18 +1012,17 @@ private:
 
         pongs_prod_->publish(pong_seq);
 
-        // Format payload as hex string for logging
-        char pong_payload_hex[64] = {0};
-        size_t hex_len = std::min(safe_payload_len, size_t(20));  // Limit to 20 bytes
-        for (size_t i = 0; i < hex_len; i++) {
-            snprintf(pong_payload_hex + i * 2, 3, "%02x", ping_payload[i]);
-        }
-        if (safe_payload_len > 20) {
-            snprintf(pong_payload_hex + 40, 4, "...");
+        // Format payload as ASCII string for logging
+        char pong_payload_ascii[32] = {0};
+        size_t ascii_len = std::min(safe_payload_len, size_t(31));
+        for (size_t i = 0; i < ascii_len; i++) {
+            pong_payload_ascii[i] = static_cast<char>(ping_payload[i]);
         }
 
-        fprintf(stderr, "[WS-PONG] #%lu queued: payload_len=%u queue_latency=%lu ns payload=[%s]\n",
-                pong_count_, pending_ping_.payload_len, queue_latency_ns, pong_payload_hex);
+        { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+          fprintf(stderr, "[%ld.%06ld] [WS-PONG] #%lu queued: payload_len=%u queue_latency=%lu ns payload=[%s]\n",
+                  _ts.tv_sec, _ts.tv_nsec / 1000, pong_count_, pending_ping_.payload_len, queue_latency_ns, pong_payload_ascii);
+        }
 
         has_pending_ping_ = false;
     }
@@ -1047,8 +1055,15 @@ private:
             diff_ms = unix_ms - payload_ms;
         }
 
-        fprintf(stderr, "[WS-PING] #%lu received: payload_len=%lu nic_ts=%lu ns unix_ts=%ld ms payload=[%s] payload_ms=%ld diff_ms=%ld\n",
-                ping_count_, payload_len, recv_nic_ts_ns, unix_ms, payload_ascii, payload_ms, diff_ms);
+        { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+          if (payload_ms > 0) {
+              fprintf(stderr, "[%ld.%06ld] [WS-PING] #%lu received: payload_len=%lu payload=[%s] diff_ms=%ld\n",
+                      _ts.tv_sec, _ts.tv_nsec / 1000, ping_count_, payload_len, payload_ascii, diff_ms);
+          } else {
+              fprintf(stderr, "[%ld.%06ld] [WS-PING] #%lu received: payload_len=%lu payload=[%s]\n",
+                      _ts.tv_sec, _ts.tv_nsec / 1000, ping_count_, payload_len, payload_ascii);
+          }
+        }
 
         // Publish WSFrameInfo for PING
         int64_t ws_seq = ws_frame_info_prod_->try_claim();
@@ -1149,6 +1164,110 @@ private:
         conn_state_->shutdown_all();
     }
 
+    void handle_pong(uint64_t payload_len) {
+        // Get current time immediately
+        auto now = std::chrono::system_clock::now();
+        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+
+        // Read payload
+        const uint8_t* payload = msg_inbox_->data_at(current_payload_offset_);
+        char payload_ascii[32] = {0};
+        size_t ascii_len = std::min(payload_len, uint64_t(31));
+        for (size_t i = 0; i < ascii_len; i++)
+            payload_ascii[i] = static_cast<char>(payload[i]);
+
+        // Parse as timestamp and compute RTT
+        int64_t payload_ms = std::strtoll(payload_ascii, nullptr, 10);
+        int64_t rtt_ms = now_ms - payload_ms;
+
+        // Clear watchdog — PONG received
+        awaiting_client_pong_ = false;
+
+        // Log
+        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+        fprintf(stderr, "[%ld.%06ld] [WS-CLIENT-PONG] received: payload=[%s] rtt_ms=%ld\n",
+                _ts.tv_sec, _ts.tv_nsec / 1000, payload_ascii, rtt_ms);
+    }
+
+    void maybe_send_client_ping() {
+        uint64_t now_cycle = rdtscp();
+        uint64_t tsc_freq = conn_state_->tsc_freq_hz;
+
+        // First call: initialize and skip (don't PING during handshake warmup)
+        if (last_client_ping_cycle_ == 0) {
+            last_client_ping_cycle_ = now_cycle;
+            return;
+        }
+
+        // Check if 1 second has elapsed since last PING
+        uint64_t elapsed_ns = cycles_to_ns(now_cycle - last_client_ping_cycle_, tsc_freq);
+        if (elapsed_ns < 1000000000ULL) return;
+
+        // If awaiting PONG from previous PING
+        if (awaiting_client_pong_) {
+            uint64_t since_ping_ns = cycles_to_ns(now_cycle - last_client_ping_cycle_, tsc_freq);
+            uint64_t since_ping_s = since_ping_ns / 1000000000ULL;
+
+            // Log warning every 1s (throttled)
+            uint64_t since_warning_ns = cycles_to_ns(now_cycle - last_pong_warning_cycle_, tsc_freq);
+            if (since_warning_ns >= 1000000000ULL) {
+                struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                fprintf(stderr, "[%ld.%06ld] [WS-CLIENT-PING] WARNING: no PONG for %lus\n",
+                        _ts.tv_sec, _ts.tv_nsec / 1000, (unsigned long)since_ping_s);
+                last_pong_warning_cycle_ = now_cycle;
+            }
+
+            // Abort after 10s with no PONG
+            if (since_ping_s >= 10) {
+                struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                fprintf(stderr, "[%ld.%06ld] [WS-CLIENT-PING] FATAL: no PONG for 10s, aborting\n",
+                        _ts.tv_sec, _ts.tv_nsec / 1000);
+                std::abort();
+            }
+
+            return;  // Don't send new PING while awaiting PONG
+        }
+
+        // Build payload: current system_clock -> Unix-ms -> ASCII string
+        auto now = std::chrono::system_clock::now();
+        int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+
+        char payload_ascii[16];
+        int payload_len = snprintf(payload_ascii, sizeof(payload_ascii), "%ld", unix_ms);
+
+        // Build PING frame into PongFrameAligned (reuse same ring for control frames)
+        int64_t seq = pongs_prod_->try_claim();
+        if (seq < 0) {
+            // Ring full — skip this PING, will retry next second
+            return;
+        }
+
+        auto& frame = (*pongs_prod_)[seq];
+        frame.clear();
+
+        uint8_t mask_key[4] = {0x12, 0x34, 0x56, 0x78};
+        frame.data_len = static_cast<uint8_t>(websocket::http::build_ping_frame(
+            reinterpret_cast<const uint8_t*>(payload_ascii),
+            static_cast<size_t>(payload_len),
+            frame.data, mask_key));
+
+        pongs_prod_->publish(seq);
+
+        // Update state
+        client_ping_count_++;
+        last_client_ping_cycle_ = now_cycle;
+        last_client_ping_ms_ = unix_ms;
+        awaiting_client_pong_ = true;
+        last_pong_warning_cycle_ = now_cycle;
+
+        // Log
+        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+        fprintf(stderr, "[%ld.%06ld] [WS-CLIENT-PING] #%lu sent: payload=[%s]\n",
+                _ts.tv_sec, _ts.tv_nsec / 1000, client_ping_count_, payload_ascii);
+    }
+
     void publish_frame_info(uint8_t opcode, uint64_t payload_len, uint32_t frame_total_len,
                            uint64_t parse_cycle, bool is_fragmented, bool is_last_fragment) {
         int64_t seq = ws_frame_info_prod_->try_claim();
@@ -1185,13 +1304,16 @@ private:
         if (accumulated_metadata_count_ > 0) {
             const auto& first_meta = accumulated_metadata_[0];
             info.first_byte_ts = first_meta.first_nic_timestamp_ns;
-            info.first_nic_frame_poll_cycle = first_meta.first_nic_frame_poll_cycle;
+            info.first_bpf_entry_ns = first_meta.first_bpf_entry_ns;
+            info.first_poll_cycle = first_meta.first_nic_frame_poll_cycle;
             info.first_ssl_read_cycle = first_meta.ssl_read_cycle;
+            info.first_ssl_read_id = first_meta.ssl_read_id;
         }
 
+        info.latest_ssl_read_id = current_metadata_.ssl_read_id;
         info.last_byte_ts = current_metadata_.latest_nic_timestamp_ns;
-        info.latest_nic_frame_poll_cycle = current_metadata_.latest_nic_frame_poll_cycle;
-        info.latest_raw_frame_poll_cycle = current_metadata_.latest_raw_frame_poll_cycle;
+        info.latest_bpf_entry_ns = current_metadata_.latest_bpf_entry_ns;
+        info.latest_poll_cycle = current_metadata_.latest_nic_frame_poll_cycle;
         info.last_ssl_read_cycle = current_metadata_.ssl_read_cycle;
         info.ssl_read_ct = static_cast<uint32_t>(accumulated_metadata_count_);
 
@@ -1200,6 +1322,111 @@ private:
         for (size_t i = 0; i < accumulated_metadata_count_; ++i) {
             info.nic_packet_ct += accumulated_metadata_[i].nic_packet_ct;
         }
+    }
+
+    // ========================================================================
+    // Per-SSL_read Timeline Debug Print
+    // ========================================================================
+
+    void print_ssl_read_timeline() {
+        if (accumulated_metadata_count_ == 0) return;
+
+        struct timespec ts_mono;
+        clock_gettime(CLOCK_MONOTONIC, &ts_mono);
+        uint64_t mono_now_ns = (uint64_t)ts_mono.tv_sec * 1000000000ULL + ts_mono.tv_nsec;
+        uint64_t now_cycle = rdtscp();
+        uint64_t tsc_freq = conn_state_->tsc_freq_hz;
+
+        for (size_t i = 0; i < accumulated_metadata_count_; ++i) {
+            const auto& m = accumulated_metadata_[i];
+
+            // BPF timestamps (CLOCK_MONOTONIC ns -> "us ago")
+            double first_bpf_ago_us = (m.first_bpf_entry_ns > 0)
+                ? (double)(mono_now_ns - m.first_bpf_entry_ns) / 1000.0 : 0;
+            double latest_bpf_ago_us = (m.latest_bpf_entry_ns > 0)
+                ? (double)(mono_now_ns - m.latest_bpf_entry_ns) / 1000.0 : 0;
+
+            // Poll cycles (TSC -> "us ago")
+            double first_poll_ago_us = (m.first_nic_frame_poll_cycle > 0 && tsc_freq > 0)
+                ? cycles_to_ns(now_cycle - m.first_nic_frame_poll_cycle, tsc_freq) / 1000.0 : 0;
+            double latest_poll_ago_us = (m.latest_nic_frame_poll_cycle > 0 && tsc_freq > 0)
+                ? cycles_to_ns(now_cycle - m.latest_nic_frame_poll_cycle, tsc_freq) / 1000.0 : 0;
+
+            // Format BPF field
+            char bpf_str[64];
+            if (m.first_bpf_entry_ns == 0) {
+                snprintf(bpf_str, sizeof(bpf_str), "N/A");
+            } else if (m.nic_packet_ct <= 1 || m.first_bpf_entry_ns == m.latest_bpf_entry_ns) {
+                snprintf(bpf_str, sizeof(bpf_str), "%.1fus ago", latest_bpf_ago_us);
+            } else {
+                snprintf(bpf_str, sizeof(bpf_str), "%.1f ~ %.1fus ago",
+                         first_bpf_ago_us, latest_bpf_ago_us);
+            }
+
+            // Format poll field
+            char poll_str[64];
+            if (m.first_nic_frame_poll_cycle == 0) {
+                snprintf(poll_str, sizeof(poll_str), "N/A");
+            } else if (m.nic_packet_ct <= 1 || m.first_nic_frame_poll_cycle == m.latest_nic_frame_poll_cycle) {
+                snprintf(poll_str, sizeof(poll_str), "%.1fus ago", latest_poll_ago_us);
+            } else {
+                snprintf(poll_str, sizeof(poll_str), "%.1f ~ %.1fus ago",
+                         first_poll_ago_us, latest_poll_ago_us);
+            }
+
+            fprintf(stderr, "  | ssl_read %lu | packets %u | NIC ~ | BPF %s | poll %s |\n",
+                    m.ssl_read_id, m.nic_packet_ct, bpf_str, poll_str);
+        }
+    }
+
+    // ========================================================================
+    // Batch Frame Counting
+    // ========================================================================
+
+    size_t count_complete_frames_in_buffer() {
+        size_t count = 0;
+        uint32_t scan = parse_offset_;
+
+        // If continuing a partial frame, that's the first "frame"
+        if (has_pending_frame_ && pending_frame_.header_complete) {
+            uint64_t remaining = pending_frame_.payload_len - pending_frame_.payload_bytes_received;
+            if (remaining <= (data_accumulated_ - scan)) {
+                count++;
+                scan += remaining;
+            } else {
+                return 0;  // Partial frame can't complete
+            }
+        }
+
+        // Count remaining complete frames
+        while (scan < data_accumulated_) {
+            uint32_t offset = (data_start_offset_ + scan) % MSG_INBOX_SIZE;
+            const uint8_t* data = msg_inbox_->data_at(offset);
+            size_t avail = data_accumulated_ - scan;
+
+            if (avail < 2) break;
+
+            uint8_t hdr_len = calculate_header_len(data[0], data[1]);
+            if (avail < hdr_len) break;
+
+            uint8_t len_field = data[1] & 0x7F;
+            uint64_t payload_len;
+            if (len_field < 126) {
+                payload_len = len_field;
+            } else if (len_field == 126) {
+                payload_len = (uint64_t(data[2]) << 8) | data[3];
+            } else {
+                payload_len = 0;
+                for (int k = 2; k < 10; k++)
+                    payload_len = (payload_len << 8) | data[k];
+            }
+
+            if (avail < hdr_len + payload_len) break;
+            count++;
+            scan += hdr_len + payload_len;
+        }
+
+        return count;
     }
 
     // ========================================================================
@@ -1269,6 +1496,17 @@ private:
     uint64_t ping_count_ = 0;      // Total PINGs received
     uint64_t pong_count_ = 0;      // Total PONGs sent
     uint64_t msg_count_ = 0;       // Total TEXT/BINARY messages received
+
+    // Client-initiated PING state (for RTT measurement)
+    uint64_t client_ping_count_ = 0;
+    uint64_t last_client_ping_cycle_ = 0;   // TSC of last client PING sent
+    int64_t  last_client_ping_ms_ = 0;      // Unix-ms payload of last client PING
+    bool     awaiting_client_pong_ = false;  // true after PING sent, cleared on PONG receipt
+    uint64_t last_pong_warning_cycle_ = 0;  // TSC of last "no PONG" warning (for 1s throttle)
+
+    // Batch frame counting (M/N format in [WS-MSG] output)
+    size_t batch_total_frames_ = 0;    // Total frames in current on_event batch
+    size_t batch_frame_index_ = 0;     // Current frame position (1-based)
 };
 
 }  // namespace websocket::pipeline

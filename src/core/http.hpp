@@ -8,7 +8,7 @@
 //
 // Key features:
 //   - WebSocket frame parsing (RFC 6455)
-//   - WebSocket frame building (PONG, TEXT, BINARY, CLOSE)
+//   - WebSocket frame building (PING, PONG, TEXT, BINARY, CLOSE)
 //   - HTTP upgrade request/response handling
 //   - Transport-agnostic design (no socket/SSL dependencies)
 
@@ -312,6 +312,43 @@ inline size_t build_pong_frame(const uint8_t* payload, size_t payload_len,
 
     // Byte 0: FIN + opcode 0x0A (PONG)
     out_buffer[0] = 0x8A;
+
+    // Byte 1: MASK + payload length
+    out_buffer[1] = 0x80 | (uint8_t)payload_len;
+
+    // Masking key
+    memcpy(out_buffer + 2, mask_key, 4);
+
+    // Masked payload
+    for (size_t i = 0; i < payload_len; i++) {
+        out_buffer[6 + i] = payload[i] ^ mask_key[i % 4];
+    }
+
+    return 6 + payload_len;
+}
+
+/**
+ * Build WebSocket PING frame
+ *
+ * Builds a client-initiated PING frame for RTT measurement.
+ * Client frames must be masked. RFC 6455: Control frames must have
+ * payload <= 125 bytes.
+ *
+ * @param payload PING payload (e.g., Unix-ms timestamp as ASCII)
+ * @param payload_len Payload length (will be capped at 125)
+ * @param out_buffer Output buffer (must be >= 131 bytes)
+ * @param mask_key 4-byte masking key
+ * @return Total frame size (6 + payload_len)
+ */
+inline size_t build_ping_frame(const uint8_t* payload, size_t payload_len,
+                                uint8_t* out_buffer, const uint8_t mask_key[4]) {
+    // Validate payload length (RFC 6455: control frames <= 125 bytes)
+    if (payload_len > 125) {
+        payload_len = 125;  // Truncate
+    }
+
+    // Byte 0: FIN + opcode 0x09 (PING)
+    out_buffer[0] = 0x89;
 
     // Byte 1: MASK + payload length
     out_buffer[1] = 0x80 | (uint8_t)payload_len;
