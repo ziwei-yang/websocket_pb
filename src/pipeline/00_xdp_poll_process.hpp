@@ -71,30 +71,6 @@ struct XDPPollProcess {
     static constexpr uint32_t TX_PRESERVE_SIZE =
         (256 < XDP_TX_RING_SIZE / 4) ? 256 : XDP_TX_RING_SIZE / 4;
 
-    // Profiling helper: wraps function, measures cycles, stores result and cycles
-    // If condition is false, skips execution and records 0 for both details and cycles
-    // Uses pointer to write directly to shared memory slot (avoids stack copy)
-    template<typename Func>
-    inline auto profile_op(Func&& func, CycleSample* slot, size_t idx, bool condition = true) {
-        using ReturnType = decltype(func());
-        if constexpr (Profiling) {
-            if (!condition) {
-                slot->op_details[idx] = 0;
-                slot->op_cycles[idx] = 0;
-                return ReturnType{};
-            }
-            uint64_t start = rdtsc();
-            auto result = func();
-            uint64_t end = rdtsc();
-            slot->op_details[idx] = static_cast<int32_t>(result);
-            slot->op_cycles[idx] = static_cast<int32_t>(end - start);
-            return result;
-        } else {
-            if (!condition) return ReturnType{};
-            return func();
-        }
-    }
-
     // ========================================================================
     // Constructor
     // ========================================================================
@@ -341,27 +317,27 @@ struct XDPPollProcess {
             }
 
             // 0. TX submit
-            int32_t tx_count = profile_op([this]{ return submit_tx_batch(); }, slot, 0);
+            int32_t tx_count = profile_op<Profiling>([this]{ return submit_tx_batch(); }, slot, 0);
 
             // 1. RX process
-            int32_t rx_count = profile_op([this, loop_id]{ return process_rx(loop_id); }, slot, 1);
+            int32_t rx_count = profile_op<Profiling>([this, loop_id]{ return process_rx(loop_id); }, slot, 1);
 
             bool data_moved = (tx_count > 0) || (rx_count > 0);
             bool tx_starved = (tx_preserved_count_ == 0);
 
             // 2. Trickle (every 8th iteration)
             bool trickle_triggered = ((++trickle_counter & 0x07) == 0);
-            profile_op([this]{ send_trickle(); return 1; }, slot, 2, trickle_triggered);
+            profile_op<Profiling>([this]{ send_trickle(); return 1; }, slot, 2, trickle_triggered);
 
             // 3. Process completions (idle or TX-starved)
             bool maint_gate = !data_moved || tx_starved;
-            int32_t comp_count = profile_op([this]{ return process_completions(); }, slot, 3, maint_gate);
+            [[maybe_unused]] int32_t comp_count = profile_op<Profiling>([this]{ return process_completions(); }, slot, 3, maint_gate);
 
             // 4. Release ACKed TX frames + Proactive TX reservation (idle or TX-starved)
-            int32_t reserve_count = profile_op([this]{ return release_and_reserve_tx(); }, slot, 4, maint_gate);
+            [[maybe_unused]] int32_t reserve_count = profile_op<Profiling>([this]{ return release_and_reserve_tx(); }, slot, 4, maint_gate);
 
             // 5. Reclaim RX frames (idle or TX-starved)
-            int32_t reclaim_count = profile_op([this]{ return reclaim_rx_frames(); }, slot, 5, maint_gate);
+            [[maybe_unused]] int32_t reclaim_count = profile_op<Profiling>([this]{ return reclaim_rx_frames(); }, slot, 5, maint_gate);
 
             // Record sample
             if constexpr (Profiling) {
@@ -484,7 +460,7 @@ struct XDPPollProcess {
             auto* meta = reinterpret_cast<xdp_user_metadata*>(
                 static_cast<uint8_t*>(umem_area_) + rx_desc->addr - sizeof(xdp_user_metadata));
             desc.nic_timestamp_ns = meta->rx_timestamp_ns;
-            uint64_t bpf_entry_ns = meta->bpf_entry_ns;
+            desc.bpf_entry_ns = meta->bpf_entry_ns;
             last_rx_timestamp_ns_ = desc.nic_timestamp_ns;  // Track for testing
             if (i == 0) {
                 first_rx_timestamp_ns_ = desc.nic_timestamp_ns;  // First packet's timestamp for profiling
@@ -502,14 +478,14 @@ struct XDPPollProcess {
                                                  static_cast<uint64_t>(ts_mono.tv_nsec);
                     uint64_t poll_realtime_ns = static_cast<uint64_t>(ts_real.tv_sec) * 1'000'000'000ULL +
                                                 static_cast<uint64_t>(ts_real.tv_nsec);
-                    nic_latency_data_->record(desc.nic_timestamp_ns, bpf_entry_ns,
+                    nic_latency_data_->record(desc.nic_timestamp_ns, desc.bpf_entry_ns,
                                               poll_cycle, poll_timestamp_ns, poll_realtime_ns);
                 }
             }
 
 #if DEBUG
             fprintf(stderr, "[XDP-RX] Frame addr=%lu meta=%p nic_ts=%lu bpf_ts=%lu slot=%ld\n",
-                    rx_desc->addr, (void*)meta, desc.nic_timestamp_ns, bpf_entry_ns, slot);
+                    rx_desc->addr, (void*)meta, desc.nic_timestamp_ns, desc.bpf_entry_ns, slot);
             fflush(stderr);
 #endif
 

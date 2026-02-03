@@ -118,7 +118,7 @@ inline ParsedURL parse_url(const char* url) {
 //                SSL behavior is fully determined by this template argument.
 //                NoSSLPolicy methods are safe no-ops / pass-through delegates.
 //   - MsgMetadataProd: IPCRingProducer<MsgMetadata> for publishing metadata
-//   - PongsCons: IPCRingConsumer<PongFrameAligned> for PONG responses to send
+//   - LowPrioCons: IPCRingConsumer<PongFrameAligned> for low-priority outbound (PONGs, etc.)
 //   - Profiling: Enable profiling counters
 //
 // This process runs on a single core and handles:
@@ -127,14 +127,14 @@ inline ParsedURL parse_url(const char* url) {
 //   3. SSL/TLS handshake (via SSLPolicy; no-op for NoSSLPolicy)
 //   4. SSL/raw read -> MSG_INBOX
 //   5. Publishing MsgMetadata to downstream process
-//   6. Consuming PONGs from WS process and sending via SSL/raw
+//   6. Consuming low-priority outbox (PONGs) from WS process and sending via SSL/raw
 //   7. Consuming MSG_OUTBOX events and sending via SSL/raw (optional)
 //   8. Producing TX packets to RAW_OUTBOX (via DisruptorPacketIO)
 // ============================================================================
 
 template<typename SSLPolicy,
          typename MsgMetadataProd,
-         typename PongsCons,
+         typename LowPrioCons,
          bool Profiling = false>
 struct TransportProcess {
 public:
@@ -154,7 +154,7 @@ public:
                      RawOutboxProd* raw_outbox_prod,
                      MsgInbox* msg_inbox,
                      MsgMetadataProd* msg_metadata_prod,
-                     PongsCons* pongs_cons,
+                     LowPrioCons* low_prio_cons,
                      ConnStateShm* conn_state,
                      MsgOutboxCons* msg_outbox_cons = nullptr)
         : url_(url)
@@ -164,7 +164,7 @@ public:
         , raw_outbox_prod_(raw_outbox_prod)
         , msg_inbox_(msg_inbox)
         , msg_metadata_prod_(msg_metadata_prod)
-        , pongs_cons_(pongs_cons)
+        , low_prio_cons_(low_prio_cons)
         , conn_state_(conn_state)
         , msg_outbox_cons_(msg_outbox_cons) {
 
@@ -218,6 +218,7 @@ public:
         pio_config.conn_state = conn_state_;
 
         transport_.init_with_pio_config(pio_config);
+        transport_.set_conn_state(conn_state_);
 
         // Resolve hostname
         auto ips = resolve_hostname(parsed_url_.host.c_str());
@@ -264,70 +265,89 @@ public:
         memset(&timing, 0, sizeof(timing));
 
         while (running_ && check_running()) {
-            // Stage 2: Event loop start
-            timing.event_cycle = rdtsc();
-
-            // 1. Poll transport (handles TX completions, etc.)
-            transport_.poll();
-
-            // 2. Process MSG_OUTBOX (optional outbound message processing)
-            if (msg_outbox_cons_) process_msg_outbox();
-
-            // 3. SSL/raw read -> MSG_INBOX
-            // Calculate linear space available in circular buffer
-            uint32_t write_pos = msg_inbox_->current_write_pos();
-            uint32_t linear_space = MSG_INBOX_SIZE - write_pos;
-            if (linear_space > 16384) linear_space = 16384;  // Limit read size
-
-            timing.recv_start_cycle = rdtsc();
-            ssize_t read_len = ssl_.read(msg_inbox_->write_ptr(), linear_space);
-            timing.recv_end_cycle = rdtscp();
-
-            if (read_len > 0) {
-                // Capture HW timestamps before advancing write pointer
-                timing.hw_timestamp_count = transport_.get_recv_packet_count();
-                if (timing.hw_timestamp_count > 0) {
-                    timing.hw_timestamp_oldest_ns = transport_.get_recv_oldest_timestamp();
-                    timing.hw_timestamp_latest_ns = transport_.get_recv_latest_timestamp();
-                } else {
-                    timing.hw_timestamp_oldest_ns = 0;
-                    timing.hw_timestamp_latest_ns = 0;
-                }
-
-                uint32_t write_offset = msg_inbox_->current_write_pos();
-                msg_inbox_->advance_write(static_cast<uint32_t>(read_len));
-
-                // 5. Publish MsgMetadata
-                publish_metadata(write_offset, static_cast<uint32_t>(read_len), timing);
-
-                // 6. Print timing breakdown (if Profiling)
-                if constexpr (Profiling) {
-                    print_timing_breakdown(static_cast<uint32_t>(read_len), timing);
-                }
-
-                // Reset timestamps for next batch
-                transport_.reset_recv_stats();
-
-                ssl_read_count_++;
-
-            } else if (read_len < 0 && errno != EAGAIN) {
-                fprintf(stderr, "[TRANSPORT] Read error: %s\n", strerror(errno));
-                break;
+            [[maybe_unused]] CycleSample* slot = nullptr;
+            if constexpr (Profiling) {
+                slot = profiling_data_->next_slot();
             }
 
-            // 4. Process PONGs (consume from PONGS ring, encrypt, send)
-            process_pongs();
-            // Pure busy-poll for lowest latency
+            // Op 0: Poll transport
+            profile_op<Profiling>([this]{ return static_cast<int32_t>(transport_.poll()); }, slot, 0);
+
+            // Op 1: Process MSG_OUTBOX (high priority outbound messages)
+            profile_op<Profiling>(
+                [this]{ return process_msg_outbox(); }, slot, 1,
+                msg_outbox_cons_ != nullptr);
+
+            // Op 2: SSL/raw read -> MSG_INBOX (manually profiled via timing struct)
+            int32_t ssl_bytes = process_ssl_read(timing);
+            if constexpr (Profiling) {
+                slot->op_details[2] = ssl_bytes;
+                slot->op_cycles[2] = (timing.recv_end_cycle > timing.recv_start_cycle)
+                    ? static_cast<int32_t>(timing.recv_end_cycle - timing.recv_start_cycle)
+                    : 0;
+            }
+
+            if (ssl_bytes < 0) break;  // Fatal error
+
+            // Op 3: Process LOW_MSG_OUTBOX (IDLE only — when SSL read returned no data)
+            bool idle = (ssl_bytes <= 0);
+            profile_op<Profiling>(
+                [this]{ return process_low_prio_outbox(); }, slot, 3, idle);
+
+            // Commit profiling sample
+            if constexpr (Profiling) {
+                slot->transport_poll_cycle = timing.recv_start_cycle;
+                slot->packet_nic_ns = 0;
+                slot->nic_poll_cycle = 0;
+                profiling_data_->commit();
+            }
         }
 
-        printf("[TRANSPORT] Streaming ended. Reads: %lu, PONGs sent: %lu\n",
-               ssl_read_count_, pong_count_);
+        on_disconnect();
+
+        printf("[TRANSPORT] Streaming ended. Reads: %lu, Low-prio TX: %lu\n",
+               ssl_read_count_, low_prio_tx_count_);
     }
 
     void cleanup() {
         printf("[TRANSPORT] Cleanup\n");
         ssl_.shutdown();
         transport_.close();
+    }
+
+    void on_disconnect() {
+        struct timespec _ts;
+        clock_gettime(CLOCK_MONOTONIC, &_ts);
+
+        auto reason = conn_state_ ? conn_state_->get_disconnect_reason() : DisconnectReason::UNKNOWN;
+        const char* reason_str = "Unknown";
+        switch (reason) {
+            case DisconnectReason::TCP_RST:         reason_str = "TCP RST (connection reset by peer)"; break;
+            case DisconnectReason::TCP_FIN:         reason_str = "TCP FIN (graceful close by peer)"; break;
+            case DisconnectReason::WS_CLOSE:        reason_str = "WebSocket CLOSE frame"; break;
+            case DisconnectReason::WS_PONG_TIMEOUT: reason_str = "WebSocket PONG timeout (10s)"; break;
+            case DisconnectReason::SSL_READ_ERROR:  reason_str = "SSL read error"; break;
+            default:                                reason_str = "Unknown"; break;
+        }
+
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[%ld.%06ld] ╔══════════════════════════════════════════════════════════════╗\n", _ts.tv_sec, _ts.tv_nsec / 1000);
+        fprintf(stderr, "[%ld.%06ld] ║  [DISCONNECT] Connection lost                               ║\n", _ts.tv_sec, _ts.tv_nsec / 1000);
+        fprintf(stderr, "[%ld.%06ld] ╠══════════════════════════════════════════════════════════════╣\n", _ts.tv_sec, _ts.tv_nsec / 1000);
+        fprintf(stderr, "[%ld.%06ld] ║  Reason: %-51s║\n", _ts.tv_sec, _ts.tv_nsec / 1000, reason_str);
+        if (conn_state_ && reason == DisconnectReason::WS_CLOSE) {
+            fprintf(stderr, "[%ld.%06ld] ║  WS close code: %-44u║\n", _ts.tv_sec, _ts.tv_nsec / 1000, conn_state_->disconnect.ws_close_code);
+        }
+        if (conn_state_ && conn_state_->disconnect.detail[0]) {
+            fprintf(stderr, "[%ld.%06ld] ║  Detail: %-51s║\n", _ts.tv_sec, _ts.tv_nsec / 1000, conn_state_->disconnect.detail);
+        }
+        fprintf(stderr, "[%ld.%06ld] ║  SSL reads: %-48lu║\n", _ts.tv_sec, _ts.tv_nsec / 1000, ssl_read_count_);
+        fprintf(stderr, "[%ld.%06ld] ║  Low-prio TX: %-46lu║\n", _ts.tv_sec, _ts.tv_nsec / 1000, low_prio_tx_count_);
+        fprintf(stderr, "[%ld.%06ld] ╚══════════════════════════════════════════════════════════════╝\n", _ts.tv_sec, _ts.tv_nsec / 1000);
+
+        if (conn_state_) {
+            conn_state_->shutdown_all();
+        }
     }
 
     void stop() {
@@ -339,7 +359,7 @@ public:
     // ========================================================================
 
     uint64_t ssl_read_count() const { return ssl_read_count_; }
-    uint64_t pong_count() const { return pong_count_; }
+    uint64_t low_prio_tx_count() const { return low_prio_tx_count_; }
 
 private:
     // ========================================================================
@@ -386,11 +406,14 @@ private:
 
         auto& meta = (*msg_metadata_prod_)[seq];
         meta.first_nic_timestamp_ns = timing.hw_timestamp_oldest_ns;
-        meta.first_nic_frame_poll_cycle = timing.recv_start_cycle;
         meta.latest_nic_timestamp_ns = timing.hw_timestamp_latest_ns;
-        meta.latest_nic_frame_poll_cycle = timing.recv_end_cycle;
-        meta.latest_raw_frame_poll_cycle = timing.recv_end_cycle;
-        meta.ssl_read_cycle = timing.recv_end_cycle;
+        meta.first_bpf_entry_ns = timing.bpf_entry_oldest_ns;
+        meta.latest_bpf_entry_ns = timing.bpf_entry_latest_ns;
+        meta.first_nic_frame_poll_cycle = timing.poll_cycle_oldest;
+        meta.latest_nic_frame_poll_cycle = timing.poll_cycle_latest;
+        meta.ssl_read_start_cycle = last_valid_ssl_start_cycle_;
+        meta.ssl_read_end_cycle = last_valid_ssl_end_cycle_;
+        meta.ssl_read_id = ssl_read_count_;
         meta.msg_inbox_offset = write_offset;
         meta.decrypted_len = len;
         meta.nic_packet_ct = timing.hw_timestamp_count;
@@ -398,15 +421,67 @@ private:
     }
 
     // ========================================================================
-    // PONG Processing
+    // SSL Read -> MSG_INBOX
     // ========================================================================
 
-    void process_pongs() {
+    int32_t process_ssl_read(timing_record_t& timing) {
+        uint32_t write_pos = msg_inbox_->current_write_pos();
+        uint32_t linear_space = MSG_INBOX_SIZE - write_pos;
+        if (linear_space > 16384) linear_space = 16384;
+
+        timing.recv_start_cycle = rdtsc();
+        ssize_t read_len = ssl_.read(msg_inbox_->write_ptr(), linear_space);
+        timing.recv_end_cycle = rdtscp();
+
+        if (read_len > 0) {
+            // Capture timestamps from transport before advancing write pointer
+            timing.hw_timestamp_count = transport_.get_recv_packet_count();
+            if (timing.hw_timestamp_count > 0) {
+                timing.hw_timestamp_oldest_ns = transport_.get_recv_oldest_timestamp();
+                timing.hw_timestamp_latest_ns = transport_.get_recv_latest_timestamp();
+                last_valid_ssl_start_cycle_ = timing.recv_start_cycle;
+                last_valid_ssl_end_cycle_ = timing.recv_end_cycle;
+            } else {
+                timing.hw_timestamp_oldest_ns = 0;
+                timing.hw_timestamp_latest_ns = 0;
+            }
+            timing.bpf_entry_oldest_ns = transport_.get_recv_oldest_bpf_entry_ns();
+            timing.bpf_entry_latest_ns = transport_.get_recv_latest_bpf_entry_ns();
+            timing.poll_cycle_oldest = transport_.get_recv_oldest_poll_cycle();
+            timing.poll_cycle_latest = transport_.get_recv_latest_poll_cycle();
+
+            uint32_t write_offset = msg_inbox_->current_write_pos();
+            msg_inbox_->advance_write(static_cast<uint32_t>(read_len));
+
+            publish_metadata(write_offset, static_cast<uint32_t>(read_len), timing);
+
+            transport_.reset_recv_stats();
+            ssl_read_count_++;
+            return static_cast<int32_t>(read_len);
+
+        } else if (read_len < 0 && errno != EAGAIN) {
+            fprintf(stderr, "[TRANSPORT] Read error: %s\n", strerror(errno));
+            if (conn_state_) {
+                conn_state_->set_disconnect(DisconnectReason::SSL_READ_ERROR, 0, strerror(errno));
+            }
+            running_ = false;
+            return -1;
+        }
+
+        return 0;  // No data (EAGAIN)
+    }
+
+    // ========================================================================
+    // Low-Priority Outbox Processing (PONGs, etc.)
+    // ========================================================================
+
+    int32_t process_low_prio_outbox() {
+        int32_t count = 0;
         PongFrameAligned pong;
-        while (pongs_cons_->try_consume(pong)) {
+        while (low_prio_cons_->try_consume(pong)) {
             if (pong.data_len == 0) continue;
 
-            // Send PONG via SSL
+            // Send via SSL
             size_t total_sent = 0;
             while (total_sent < pong.data_len) {
                 transport_.poll();
@@ -414,22 +489,24 @@ private:
                 if (sent > 0) {
                     total_sent += sent;
                 } else if (sent < 0 && errno != EAGAIN) {
-                    fprintf(stderr, "[TRANSPORT] PONG send error: %s\n", strerror(errno));
+                    fprintf(stderr, "[TRANSPORT] Low-prio send error: %s\n", strerror(errno));
                     break;
                 }
                 usleep(100);
             }
 
-            pong_count_++;
-            fprintf(stderr, "[PONG-TX] Sent PONG #%lu (%u bytes)\n", pong_count_, pong.data_len);
+            low_prio_tx_count_++;
+            count++;
         }
+        return count;
     }
 
     // ========================================================================
-    // MSG_OUTBOX Processing (optional outbound messages)
+    // MSG_OUTBOX Processing (high priority outbound messages)
     // ========================================================================
 
-    void process_msg_outbox() {
+    int32_t process_msg_outbox() {
+        int32_t count = 0;
         MsgOutboxEvent evt;
         while (msg_outbox_cons_->try_consume(evt)) {
             if (evt.data_len == 0) continue;
@@ -446,7 +523,9 @@ private:
                 }
                 usleep(100);
             }
+            count++;
         }
+        return count;
     }
 
     // ========================================================================
@@ -455,43 +534,72 @@ private:
 
     void print_timing_breakdown(uint32_t len, timing_record_t& timing) {
         uint64_t callback_cycle = rdtscp();
+        struct timespec ts_mono, ts_real;
+        clock_gettime(CLOCK_MONOTONIC, &ts_mono);
+        clock_gettime(CLOCK_REALTIME, &ts_real);
+        uint64_t mono_now_ns = (uint64_t)ts_mono.tv_sec * 1000000000ULL + ts_mono.tv_nsec;
+        uint64_t real_now_ns = (uint64_t)ts_real.tv_sec * 1000000000ULL + ts_real.tv_nsec;
 
-        printf("\n[SSL_READ #%lu] decrypted_len=%u\n", ssl_read_count_ + 1, len);
-        printf("  Latency Breakdown:\n");
+        // Header line
+        fprintf(stderr, "[%ld.%06ld] [SSL_READ #%lu] packets=%u decrypted_len=%u\n",
+                ts_mono.tv_sec, ts_mono.tv_nsec / 1000, ssl_read_count_ + 1,
+                timing.hw_timestamp_count, len);
 
-        // Stage 1: Hardware timestamp from NIC
-        if (timing.hw_timestamp_latest_ns > 0) {
-            struct timespec ts_real, ts_mono;
-            clock_gettime(CLOCK_REALTIME, &ts_real);
-            clock_gettime(CLOCK_MONOTONIC, &ts_mono);
-            uint64_t realtime_now_ns = (uint64_t)ts_real.tv_sec * 1000000000ULL + ts_real.tv_nsec;
-            uint64_t monotonic_now_ns = (uint64_t)ts_mono.tv_sec * 1000000000ULL + ts_mono.tv_nsec;
+        // Helper lambda to format a NIC/BPF/poll line
+        auto print_packet_line = [&](const char* label,
+                                     uint64_t nic_ns, uint64_t bpf_ns, uint64_t poll_cycle) {
+            // NIC ~ (CLOCK_REALTIME, unreliable in XDP mode)
+            char nic_str[32];
+            if (nic_ns > 0 && real_now_ns > nic_ns) {
+                snprintf(nic_str, sizeof(nic_str), "~ %.1fus ago", (double)(real_now_ns - nic_ns) / 1000.0);
+            } else {
+                snprintf(nic_str, sizeof(nic_str), "N/A");
+            }
 
-            int64_t hw_ts_mono_ns = (int64_t)timing.hw_timestamp_latest_ns -
-                                    (int64_t)realtime_now_ns + (int64_t)monotonic_now_ns;
-            printf("    [Stage 1] NIC HW timestamp: %.6f s (MONOTONIC)\n",
-                   hw_ts_mono_ns / 1e9);
+            // BPF (CLOCK_MONOTONIC)
+            char bpf_str[32];
+            if (bpf_ns > 0 && mono_now_ns > bpf_ns) {
+                snprintf(bpf_str, sizeof(bpf_str), "%.1fus ago", (double)(mono_now_ns - bpf_ns) / 1000.0);
+            } else {
+                snprintf(bpf_str, sizeof(bpf_str), "N/A");
+            }
 
-            uint64_t stage2_to_6_ns = cycles_to_ns(callback_cycle - timing.event_cycle, tsc_freq_hz_);
-            int64_t stage2_mono_ns = (int64_t)monotonic_now_ns - (int64_t)stage2_to_6_ns;
-            int64_t stage1_to_2_ns = stage2_mono_ns - hw_ts_mono_ns;
-            printf("    [Stage 1->2] NIC->Event: %.3f us\n", stage1_to_2_ns / 1000.0);
+            // Poll (TSC cycles)
+            char poll_str[32];
+            if (poll_cycle > 0 && tsc_freq_hz_ > 0 && callback_cycle > poll_cycle) {
+                snprintf(poll_str, sizeof(poll_str), "%.1fus ago",
+                         cycles_to_ns(callback_cycle - poll_cycle, tsc_freq_hz_) / 1000.0);
+            } else {
+                snprintf(poll_str, sizeof(poll_str), "N/A");
+            }
+
+            fprintf(stderr, "  %s | NIC %s | BPF %s | poll %s |\n", label, nic_str, bpf_str, poll_str);
+        };
+
+        // Oldest/latest packet lines
+        if (timing.hw_timestamp_count > 1) {
+            print_packet_line("oldest", timing.hw_timestamp_oldest_ns,
+                             timing.bpf_entry_oldest_ns, timing.poll_cycle_oldest);
+            print_packet_line("latest", timing.hw_timestamp_latest_ns,
+                             timing.bpf_entry_latest_ns, timing.poll_cycle_latest);
+        } else {
+            print_packet_line("packet", timing.hw_timestamp_latest_ns,
+                             timing.bpf_entry_latest_ns, timing.poll_cycle_latest);
         }
 
-        if (timing.recv_start_cycle > timing.event_cycle) {
-            printf("    [Stage 2->3] Event->Recv: %.3f us\n",
-                   cycles_to_ns(timing.recv_start_cycle - timing.event_cycle, tsc_freq_hz_) / 1000.0);
+        // Pipeline stages
+        double poll_recv_us = 0, ssl_us = 0, total_us = 0;
+        if (timing.poll_cycle_latest > 0 && timing.recv_start_cycle > timing.poll_cycle_latest) {
+            poll_recv_us = cycles_to_ns(timing.recv_start_cycle - timing.poll_cycle_latest, tsc_freq_hz_) / 1000.0;
         }
-
         if (timing.recv_end_cycle > timing.recv_start_cycle) {
-            printf("    [Stage 3->4] SSL decrypt: %.3f us\n",
-                   cycles_to_ns(timing.recv_end_cycle - timing.recv_start_cycle, tsc_freq_hz_) / 1000.0);
+            ssl_us = cycles_to_ns(timing.recv_end_cycle - timing.recv_start_cycle, tsc_freq_hz_) / 1000.0;
         }
-
-        if (callback_cycle > timing.event_cycle) {
-            printf("    [Total] Event->Callback: %.3f us\n",
-                   cycles_to_ns(callback_cycle - timing.event_cycle, tsc_freq_hz_) / 1000.0);
+        if (timing.poll_cycle_latest > 0 && callback_cycle > timing.poll_cycle_latest) {
+            total_us = cycles_to_ns(callback_cycle - timing.poll_cycle_latest, tsc_freq_hz_) / 1000.0;
         }
+        fprintf(stderr, "  poll->recv %.1fus | SSL decrypt %.1fus | total poll->cb %.1fus\n",
+                poll_recv_us, ssl_us, total_us);
     }
 
     // ========================================================================
@@ -522,7 +630,7 @@ private:
     // IPC interfaces
     MsgInbox* msg_inbox_ = nullptr;
     MsgMetadataProd* msg_metadata_prod_ = nullptr;
-    PongsCons* pongs_cons_ = nullptr;
+    LowPrioCons* low_prio_cons_ = nullptr;
     ConnStateShm* conn_state_ = nullptr;
     MsgOutboxCons* msg_outbox_cons_ = nullptr;
 
@@ -533,6 +641,10 @@ private:
     // Timing
     uint64_t tsc_freq_hz_ = 0;
 
+    // Last-valid SSL read timestamps (for packets=0 case)
+    uint64_t last_valid_ssl_start_cycle_ = 0;
+    uint64_t last_valid_ssl_end_cycle_ = 0;
+
     // Profiling (optional)
     CycleSampleBuffer* profiling_data_ = nullptr;
 
@@ -541,7 +653,7 @@ private:
 
     // Counters
     uint64_t ssl_read_count_ = 0;
-    uint64_t pong_count_ = 0;
+    uint64_t low_prio_tx_count_ = 0;
 };
 
 }  // namespace websocket::pipeline

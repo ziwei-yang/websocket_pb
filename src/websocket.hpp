@@ -486,9 +486,6 @@ public:
                     }
                 }
 
-                // Stage 2: Record CPU cycle when event loop processing starts
-                timing_.event_cycle = rdtsc();
-
                 // Read data into ring buffer and process frames
                 // recv_into_buffer() now loops with SSL_pending() and calls process_frames() internally
                 if (!recv_into_buffer()) {

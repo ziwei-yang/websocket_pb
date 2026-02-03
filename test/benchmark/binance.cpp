@@ -135,19 +135,18 @@ bool on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& t
 
     if (g_tsc_freq_hz > 0) {
         // Stage 2 → Stage 3: Event loop to recv start
-        if (timing.recv_start_cycle > timing.event_cycle) {
-            stage2_to_3_us = cycles_to_ns(timing.recv_start_cycle - timing.event_cycle, g_tsc_freq_hz) / 1000.0;
-        }
+        // Non-XDP: no separate event loop cycle, so this is always 0
+        // (recv_start_cycle is our earliest reference point)
 
         // Stage 3 → Stage 4: SSL decryption
         if (timing.recv_end_cycle > timing.recv_start_cycle) {
             stage3_to_4_us = cycles_to_ns(timing.recv_end_cycle - timing.recv_start_cycle, g_tsc_freq_hz) / 1000.0;
         }
 
-        // Stage 1 → Stage 2: NIC RX to event loop start
-        if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0 && timing.event_cycle > 0) {
+        // Stage 1 → Stage 2: NIC RX to recv start
+        if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0 && timing.recv_start_cycle > 0) {
             hw_ts_available = true;
-            uint64_t stage2_to_stage6_ns = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz);
+            uint64_t stage2_to_stage6_ns = cycles_to_ns(stage6_cycle - timing.recv_start_cycle, g_tsc_freq_hz);
             uint64_t stage2_monotonic_ns = stage6_monotonic_ns - stage2_to_stage6_ns;
 
 #ifdef USE_XDP
@@ -209,9 +208,9 @@ bool on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& t
             latency.stage5_to_stage6_us = 0;
         }
 
-        // Total (Stage 2 → Stage 6)
-        if (stage6_cycle > 0 && timing.event_cycle > 0) {
-            uint64_t delta_cycles = stage6_cycle - timing.event_cycle;
+        // Total (Recv Start → Stage 6)
+        if (stage6_cycle > 0 && timing.recv_start_cycle > 0) {
+            uint64_t delta_cycles = stage6_cycle - timing.recv_start_cycle;
             latency.total_us = cycles_to_ns(delta_cycles, g_tsc_freq_hz) / 1000.0;
         } else {
             latency.total_us = 0;

@@ -727,8 +727,7 @@ public:
 
         // Latency tracking
         LatencyStats nic_to_xdp_latency;      // NIC PHC -> XDP Poll
-        LatencyStats xdp_to_transport_latency; // XDP Poll -> Transport
-        LatencyStats transport_to_ssl_latency; // Transport -> SSL read
+        LatencyStats xdp_to_transport_latency; // XDP Poll -> SSL read
         LatencyStats total_latency;            // NIC PHC -> SSL read
 
         // Helper to process metadata and compute latencies
@@ -763,30 +762,20 @@ public:
                 }
             }
 
-            // XDP Poll -> Transport: cycle difference (same packet)
-            // XDP Poll -> Transport: use latest packet timestamps (same packet)
-            if (meta.latest_nic_frame_poll_cycle != 0 && meta.latest_raw_frame_poll_cycle != 0) {
-                uint64_t cycles = meta.latest_raw_frame_poll_cycle - meta.latest_nic_frame_poll_cycle;
+            // XDP Poll -> SSL read: cycle difference (poll_cycle to ssl_read_cycle)
+            if (meta.latest_nic_frame_poll_cycle != 0 && meta.ssl_read_end_cycle != 0) {
+                uint64_t cycles = meta.ssl_read_end_cycle - meta.latest_nic_frame_poll_cycle;
                 int64_t ns = static_cast<int64_t>(cycles / g_tsc_freq_ghz);
                 if (ns > 0 && ns < 1'000'000'000) {
                     xdp_to_transport_latency.update(ns);
                 }
             }
 
-            // Transport -> SSL read: cycle difference
-            if (meta.latest_raw_frame_poll_cycle != 0 && meta.ssl_read_cycle != 0) {
-                uint64_t cycles = meta.ssl_read_cycle - meta.latest_raw_frame_poll_cycle;
-                int64_t ns = static_cast<int64_t>(cycles / g_tsc_freq_ghz);
-                if (ns > 0 && ns < 1'000'000'000) {
-                    transport_to_ssl_latency.update(ns);
-                }
-            }
-
             // Total: NIC PHC -> SSL read (using latest packet for consistency)
-            if (meta.latest_nic_timestamp_ns != 0 && meta.ssl_read_cycle != 0) {
+            if (meta.latest_nic_timestamp_ns != 0 && meta.ssl_read_end_cycle != 0) {
                 uint64_t now_tsc = rdtsc();
                 uint64_t now_realtime_ns = get_realtime_ns();
-                uint64_t elapsed_cycles = now_tsc - meta.ssl_read_cycle;
+                uint64_t elapsed_cycles = now_tsc - meta.ssl_read_end_cycle;
                 uint64_t elapsed_ns = static_cast<uint64_t>(elapsed_cycles / g_tsc_freq_ghz);
                 uint64_t ssl_read_realtime_ns = now_realtime_ns - elapsed_ns;
 
@@ -887,8 +876,7 @@ public:
 
         // Print latency statistics
         nic_to_xdp_latency.print("NIC-to-XDP_Poll");
-        xdp_to_transport_latency.print("XDP_Poll-to-Transport");
-        transport_to_ssl_latency.print("Transport-to-SSL_Read");
+        xdp_to_transport_latency.print("XDP_Poll-to-SSL_Read");
         total_latency.print("Total (NIC-to-SSL_Read)");
 
         if (received == 0) {

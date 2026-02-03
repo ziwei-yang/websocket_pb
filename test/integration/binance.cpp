@@ -55,17 +55,17 @@ bool on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& t
     bool hw_ts_available = false;
 
     if (g_tsc_freq_hz > 0) {
-        if (timing.recv_start_cycle > timing.event_cycle) {
-            stage2_to_3_us = cycles_to_ns(timing.recv_start_cycle - timing.event_cycle, g_tsc_freq_hz) / 1000.0;
-        }
+        // Non-XDP: no separate event loop cycle, so stage 2->3 is always 0
+        // (recv_start_cycle is our earliest reference point)
+        (void)stage2_to_3_us;
         if (timing.recv_end_cycle > timing.recv_start_cycle) {
             stage3_to_4_us = cycles_to_ns(timing.recv_end_cycle - timing.recv_start_cycle, g_tsc_freq_hz) / 1000.0;
         }
 
         // Stage 1→2 calculation (shared for batch)
-        if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0 && timing.event_cycle > 0) {
+        if (timing.hw_timestamp_count > 0 && timing.hw_timestamp_latest_ns > 0 && timing.recv_start_cycle > 0) {
             hw_ts_available = true;
-            uint64_t stage2_to_stage6_ns = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz);
+            uint64_t stage2_to_stage6_ns = cycles_to_ns(stage6_cycle - timing.recv_start_cycle, g_tsc_freq_hz);
             uint64_t stage2_monotonic_ns = stage6_monotonic_ns - stage2_to_stage6_ns;
 #ifdef USE_XDP
             struct timespec ts_real;
@@ -99,8 +99,8 @@ bool on_messages(const MessageInfo* msgs, size_t count, const timing_record_t& t
             mt.stage5_to_6_us = 0;
         }
 
-        if (g_tsc_freq_hz > 0 && stage6_cycle > 0 && timing.event_cycle > 0) {
-            mt.total_us = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz) / 1000.0;
+        if (g_tsc_freq_hz > 0 && stage6_cycle > 0 && timing.recv_start_cycle > 0) {
+            mt.total_us = cycles_to_ns(stage6_cycle - timing.recv_start_cycle, g_tsc_freq_hz) / 1000.0;
         } else {
             mt.total_us = 0;
         }

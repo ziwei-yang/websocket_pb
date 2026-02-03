@@ -212,6 +212,8 @@ struct FrameRef {
     uint32_t frame_idx;        // RX frame index for mark_frame_consumed()
     uint64_t umem_addr;        // UMEM address (frame pointer, kept for compatibility)
     uint64_t hw_timestamp_ns;  // NIC hardware RX timestamp (0 if unavailable)
+    uint64_t bpf_entry_ns;    // BPF entry bpf_ktime_get_ns() (CLOCK_MONOTONIC ns)
+    uint64_t poll_cycle;       // XDP Poll rdtscp cycle when packet was polled
 };
 
 // Statistics from a read() operation
@@ -219,6 +221,10 @@ struct ReadStats {
     uint32_t packet_count = 0;        // Number of frames consumed
     uint64_t oldest_timestamp_ns = 0; // Oldest HW timestamp in consumed frames
     uint64_t latest_timestamp_ns = 0; // Latest HW timestamp in consumed frames
+    uint64_t oldest_bpf_entry_ns = 0; // Oldest BPF entry timestamp
+    uint64_t latest_bpf_entry_ns = 0; // Latest BPF entry timestamp
+    uint64_t oldest_poll_cycle = 0;   // Oldest XDP Poll rdtscp cycle
+    uint64_t latest_poll_cycle = 0;   // Latest XDP Poll rdtscp cycle
 };
 
 struct ZeroCopyReceiveBuffer {
@@ -240,12 +246,14 @@ struct ZeroCopyReceiveBuffer {
     //   - umem_addr: UMEM address (frame pointer, for compatibility)
     //   - hw_timestamp_ns: NIC hardware RX timestamp (0 if unavailable)
     bool push_frame(const uint8_t* payload, uint16_t len, uint32_t frame_idx,
-                    uint64_t umem_addr, uint64_t hw_timestamp_ns = 0) {
+                    uint64_t umem_addr, uint64_t hw_timestamp_ns = 0,
+                    uint64_t bpf_entry_ns = 0, uint64_t poll_cycle = 0) {
         if (count_ >= MAX_FRAMES) {
             return false;  // Buffer full
         }
 
-        frames_[tail_] = {payload, len, 0, frame_idx, umem_addr, hw_timestamp_ns};
+        frames_[tail_] = {payload, len, 0, frame_idx, umem_addr,
+                          hw_timestamp_ns, bpf_entry_ns, poll_cycle};
         tail_ = (tail_ + 1) % MAX_FRAMES;
         count_++;
         return true;
@@ -268,12 +276,26 @@ struct ZeroCopyReceiveBuffer {
             FrameRef& frame = frames_[head_];
 
             // Track stats when starting to read from a new frame (offset == 0)
-            if (frame.offset == 0 && frame.hw_timestamp_ns > 0) {
-                last_read_stats_.packet_count++;
-                if (last_read_stats_.oldest_timestamp_ns == 0) {
-                    last_read_stats_.oldest_timestamp_ns = frame.hw_timestamp_ns;
+            if (frame.offset == 0) {
+                if (frame.hw_timestamp_ns > 0) {
+                    last_read_stats_.packet_count++;
+                    if (last_read_stats_.oldest_timestamp_ns == 0) {
+                        last_read_stats_.oldest_timestamp_ns = frame.hw_timestamp_ns;
+                    }
+                    last_read_stats_.latest_timestamp_ns = frame.hw_timestamp_ns;
                 }
-                last_read_stats_.latest_timestamp_ns = frame.hw_timestamp_ns;
+                if (frame.bpf_entry_ns > 0) {
+                    if (last_read_stats_.oldest_bpf_entry_ns == 0) {
+                        last_read_stats_.oldest_bpf_entry_ns = frame.bpf_entry_ns;
+                    }
+                    last_read_stats_.latest_bpf_entry_ns = frame.bpf_entry_ns;
+                }
+                if (frame.poll_cycle > 0) {
+                    if (last_read_stats_.oldest_poll_cycle == 0) {
+                        last_read_stats_.oldest_poll_cycle = frame.poll_cycle;
+                    }
+                    last_read_stats_.latest_poll_cycle = frame.poll_cycle;
+                }
             }
 
             // How much left in this frame?

@@ -47,6 +47,7 @@ struct CycleSample {
     uint64_t transport_poll_cycle;  // Transport rdtsc when packet processed (0 for XDP Poll)
     int32_t op_details[N];
     int32_t op_cycles[N];
+    int16_t noop_ct[N];
 
     // Compute total loop cycles from sum of op_cycles
     uint64_t total_op_cycles() const {
@@ -57,7 +58,7 @@ struct CycleSample {
         return sum;
     }
 };
-static_assert(sizeof(CycleSample) == 72, "CycleSample must be 72 bytes");
+static_assert(sizeof(CycleSample) == 88, "CycleSample must be 88 bytes");
 
 // NicLatencySample structure (must match pipeline_data.hpp)
 struct NicLatencySample {
@@ -81,12 +82,22 @@ static const char* XDP_POLL_OP_NAMES[CycleSample::N] = {
 
 // Operation names for Transport process
 static const char* TRANSPORT_OP_NAMES[CycleSample::N] = {
-    "TX MSG",              // 0: process_outbound<MSG>() - count of MSG frames
-    "RX Process",          // 1: process_rx() - count of RX frames
-    "ACK Check",           // 2: check_and_send_ack() - triggered (0/1)
-    "TX PONG",             // 3: process_outbound<PONG>() - count of PONG frames
-    "MSG Retransmit",      // 4: process_retransmit_queue(MSG) - triggered (0/1)
-    "PONG Retransmit"      // 5: process_retransmit_queue(PONG) - triggered (0/1)
+    "Poll",                // 0: transport_.poll() - always 0
+    "MSG Outbox",          // 1: process_msg_outbox() - messages sent
+    "SSL Read",            // 2: process_ssl_read() - bytes read
+    "Low-Prio TX",         // 3: process_low_prio_outbox() - messages sent (IDLE only)
+    "(reserved)",          // 4: unused
+    "(reserved)"           // 5: unused
+};
+
+// Operation names for WebSocket process
+static const char* WS_PROCESS_OP_NAMES[CycleSample::N] = {
+    "WS Process",          // 0: process_manually + commit
+    "Ping/Pong",           // 1: flush_pending_pong + maybe_send_client_ping
+    "(reserved)",          // 2: unused
+    "(reserved)",          // 3: unused
+    "(reserved)",          // 4: unused
+    "(reserved)"           // 5: unused
 };
 
 // Current operation names (set based on file type)
@@ -123,16 +134,21 @@ struct Stats {
     uint64_t count = 0;
     double sum = 0;
     double sum_sq = 0;
-    int64_t min_val = INT64_MAX;
-    int64_t max_val = INT64_MIN;
+    int64_t min_val = 0;
+    int64_t max_val = 0;
     std::vector<int64_t> values;  // For percentile calculation
 
     void add(int64_t v) {
+        if (count == 0) {
+            min_val = v;
+            max_val = v;
+        } else {
+            min_val = std::min(min_val, v);
+            max_val = std::max(max_val, v);
+        }
         count++;
         sum += v;
         sum_sq += static_cast<double>(v) * v;
-        min_val = std::min(min_val, v);
-        max_val = std::max(max_val, v);
         values.push_back(v);
     }
 
@@ -1104,10 +1120,12 @@ int analyze_by_pid(const char* pid_str) {
     char xdp_poll_file[256];
     char nic_latency_file[256];
     char transport_file[256];
+    char ws_process_file[256];
 
     snprintf(xdp_poll_file, sizeof(xdp_poll_file), "/tmp/xdp_poll_profiling_%s.bin", pid_str);
     snprintf(nic_latency_file, sizeof(nic_latency_file), "/tmp/nic_latency_profiling_%s.bin", pid_str);
     snprintf(transport_file, sizeof(transport_file), "/tmp/transport_profiling_%s.bin", pid_str);
+    snprintf(ws_process_file, sizeof(ws_process_file), "/tmp/ws_process_profiling_%s.bin", pid_str);
 
     int result = 0;
     bool found_any = false;
@@ -1153,6 +1171,18 @@ int analyze_by_pid(const char* pid_str) {
         analyze_xdp_poll_loop(transport_file);
     }
 
+    // Try to analyze WebSocket process profiling
+    f = fopen(ws_process_file, "rb");
+    if (f) {
+        fclose(f);
+        found_any = true;
+        printf("\n");
+        printf("%s############################################################%s\n", Color::BoldYellow, Color::Reset);
+        printf("%s##             WEBSOCKET PROCESS LOOP PROFILING            ##%s\n", Color::BoldYellow, Color::Reset);
+        printf("%s############################################################%s\n", Color::BoldYellow, Color::Reset);
+        analyze_xdp_poll_loop(ws_process_file);
+    }
+
     // Analyze NIC latency
     f = fopen(nic_latency_file, "rb");
     if (f) {
@@ -1170,6 +1200,7 @@ int analyze_by_pid(const char* pid_str) {
         printf("Expected files:\n");
         printf("  %s\n", xdp_poll_file);
         printf("  %s\n", transport_file);
+        printf("  %s\n", ws_process_file);
         printf("  %s\n", nic_latency_file);
         return 1;
     }
@@ -1186,6 +1217,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "\nSupported file types:\n");
         fprintf(stderr, "  xdp_poll_profiling_*.bin    - XDP Poll loop profiling\n");
         fprintf(stderr, "  transport_profiling_*.bin   - Transport loop profiling\n");
+        fprintf(stderr, "  ws_process_profiling_*.bin  - WebSocket process loop profiling\n");
         fprintf(stderr, "  nic_latency_profiling_*.bin - NIC->XDP latency per packet\n");
         fprintf(stderr, "\nExamples:\n");
         fprintf(stderr, "  %s 2047333\n", argv[0]);
@@ -1214,7 +1246,7 @@ int main(int argc, char* argv[]) {
         return analyze_nic_latency(filename);
     }
 
-    // Otherwise, analyze as XDP Poll / Transport loop profiling
+    // Otherwise, analyze as XDP Poll / Transport / WebSocket loop profiling
     return analyze_xdp_poll_loop(filename);
 }
 
@@ -1223,6 +1255,8 @@ int analyze_xdp_poll_loop(const char* filename) {
     // Set operation names based on file type
     if (strstr(filename, "transport") != nullptr) {
         OP_NAMES = TRANSPORT_OP_NAMES;
+    } else if (strstr(filename, "ws_process") != nullptr) {
+        OP_NAMES = WS_PROCESS_OP_NAMES;
     } else {
         OP_NAMES = XDP_POLL_OP_NAMES;
     }
@@ -1242,10 +1276,11 @@ int analyze_xdp_poll_loop(const char* filename) {
         return 1;
     }
 
-    const char* process_name = (OP_NAMES == TRANSPORT_OP_NAMES) ? "Transport" : "XDP Poll";
     bool is_transport_local = (OP_NAMES == TRANSPORT_OP_NAMES);
+    bool is_ws_process = (OP_NAMES == WS_PROCESS_OP_NAMES);
+    const char* process_name = is_transport_local ? "Transport" : is_ws_process ? "WebSocket" : "XDP Poll";
 
-    const char* header_color = is_transport_local ? Color::BoldGreen : Color::BoldCyan;
+    const char* header_color = is_transport_local ? Color::BoldGreen : is_ws_process ? Color::BoldYellow : Color::BoldCyan;
     printf("%s========================================%s\n", Color::Dim, Color::Reset);
     printf("%s%s Profiling Analysis%s\n", header_color, process_name, Color::Reset);
     printf("%s========================================%s\n", Color::Dim, Color::Reset);
@@ -1604,6 +1639,10 @@ int analyze_xdp_poll_loop(const char* filename) {
     Histogram event_latency_hist;
     bool is_transport = (OP_NAMES == TRANSPORT_OP_NAMES);
 
+    // Total latency stats (sum of op_cycles for data-moved samples)
+    Stats total_latency_stats;
+    AutoScaleLatencyHistogram total_latency_hist;
+
     // Process samples
     uint64_t data_moved_count = 0;
     uint64_t idle_count = 0;
@@ -1614,8 +1653,19 @@ int analyze_xdp_poll_loop(const char* filename) {
         total_cycles_stats.add(static_cast<int64_t>(total_cycles));
         total_cycles_hist.add(static_cast<int64_t>(total_cycles));
 
-        // Determine if data was moved (TX > 0 or RX > 0)
-        bool data_moved = (sample.op_details[0] > 0) || (sample.op_details[1] > 0);
+        // Determine if data was moved
+        // XDP Poll: TX submitted (op 0) or RX received (op 1)
+        // Transport: any op produced work — poll (op 0), msg outbox (op 1),
+        //            SSL read (op 2), or low-prio outbox (op 3)
+        // WebSocket: metadata consumed (op 0)
+        bool data_moved;
+        if (is_transport)
+            data_moved = (sample.op_details[0] > 0) || (sample.op_details[1] > 0) ||
+                         (sample.op_details[2] > 0) || (sample.op_details[3] > 0);
+        else if (is_ws_process)
+            data_moved = (sample.op_details[0] > 0);
+        else
+            data_moved = (sample.op_details[0] > 0) || (sample.op_details[1] > 0);
 
         if (data_moved) {
             data_moved_count++;
@@ -1632,6 +1682,20 @@ int analyze_xdp_poll_loop(const char* filename) {
                 if (sample.op_details[i] != 0) {
                     op_active_in_dm_count[i]++;
                 }
+            }
+
+            // Total latency: sum of op_cycles from first to last active op
+            int last_active = -1;
+            for (int i = CycleSample::N - 1; i >= 0; --i) {
+                if (sample.op_cycles[i] != 0) { last_active = i; break; }
+            }
+            if (last_active >= 0) {
+                int64_t sum_cycles = 0;
+                for (int i = 0; i <= last_active; ++i)
+                    sum_cycles += sample.op_cycles[i];
+                double lat_ns = cycles_to_ns(static_cast<double>(sum_cycles));
+                total_latency_stats.add(static_cast<int64_t>(lat_ns));
+                total_latency_hist.add(lat_ns);
             }
         } else {
             idle_count++;
@@ -1770,6 +1834,33 @@ int analyze_xdp_poll_loop(const char* filename) {
                                       op_cycles_active_hist[i], active_label, op_cycles_active_stats[i],
                                       op_cycles_inactive_hist[i], inactive_label, op_cycles_inactive_stats[i],
                                       per_unit);
+    }
+
+    // Per-op IDLE summary: recorded idle count vs cumulative noop_ct
+    printf("\n  IDLE summary per step:\n");
+    int16_t last_noop_ct[CycleSample::N] = {};
+    if (!samples.empty()) {
+        for (size_t i = 0; i < CycleSample::N; ++i)
+            last_noop_ct[i] = samples.back().noop_ct[i];
+    }
+    for (size_t i = 0; i < CycleSample::N; ++i) {
+        printf("    %s: recorded=%lu  implied_total=%d%s\n",
+               OP_NAMES[i],
+               op_cycles_inactive_stats[i].count,
+               last_noop_ct[i],
+               last_noop_ct[i] >= 10000 ? " (suppressed)" : "");
+    }
+
+    // Total processing latency histogram (all process types)
+    if (total_latency_stats.count > 0) {
+        printf("\n");
+        const char* label = is_ws_process  ? "Total Processing Latency (ns) — WS"
+                          : is_transport   ? "Total Processing Latency (ns) — Transport"
+                          :                  "Total Processing Latency (ns) — XDP Poll";
+        printf("%s========================================%s\n", Color::Dim, Color::Reset);
+        printf("%s%s%s\n", Color::BoldYellow, label, Color::Reset);
+        printf("%s========================================%s\n", Color::Dim, Color::Reset);
+        total_latency_hist.print(label);
     }
 
     // NIC->XDP_poll->Transport Latency Analysis (for Transport only)

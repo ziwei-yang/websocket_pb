@@ -292,9 +292,6 @@ int main(int argc, char** argv) {
 
         uint64_t start_time_ms = get_current_time_ms();
         while (g_running && (g_timeout_ms < 0 || (get_current_time_ms() - start_time_ms) < (uint64_t)g_timeout_ms)) {
-            // Stage 2: Event loop start
-            timing.event_cycle = rdtsc();
-
             // Poll transport first (handles TX completions, etc.)
             transport.poll();
 
@@ -361,6 +358,11 @@ int main(int argc, char** argv) {
                         timing.hw_timestamp_oldest_ns = 0;
                         timing.hw_timestamp_latest_ns = 0;
                     }
+                    // BPF entry and XDP poll cycle timestamps
+                    timing.bpf_entry_oldest_ns = transport.get_recv_oldest_bpf_entry_ns();
+                    timing.bpf_entry_latest_ns = transport.get_recv_latest_bpf_entry_ns();
+                    timing.poll_cycle_oldest = transport.get_recv_oldest_poll_cycle();
+                    timing.poll_cycle_latest = transport.get_recv_latest_poll_cycle();
                     // Reset for next batch (after capturing)
                     transport.reset_recv_stats();
 
@@ -438,18 +440,18 @@ int main(int argc, char** argv) {
                             printf("    [Stage 1] NIC HW timestamp: %.6f s (converted to MONOTONIC)\n",
                                    hw_ts_mono_ns / 1e9);
 
-                            uint64_t stage2_to_6_ns = cycles_to_ns(stage6_cycle - timing.event_cycle, g_tsc_freq_hz);
+                            uint64_t stage2_to_6_ns = cycles_to_ns(stage6_cycle - timing.poll_cycle_latest, g_tsc_freq_hz);
                             int64_t stage2_mono_ns = (int64_t)monotonic_now_ns - (int64_t)stage2_to_6_ns;
                             int64_t stage1_to_2_ns = stage2_mono_ns - hw_ts_mono_ns;
-                            printf("    [Stage 1→2] NIC→Event:      %.3f μs\n",
+                            printf("    [Stage 1→2] NIC→Poll:       %.3f μs\n",
                                    stage1_to_2_ns / 1000.0);
                         } else {
                             printf("    [Stage 1] NIC HW timestamp: N/A (not available)\n");
                         }
 
-                        if (timing.recv_start_cycle > timing.event_cycle) {
-                            uint64_t delta = timing.recv_start_cycle - timing.event_cycle;
-                            printf("    [Stage 2→3] Event→Recv:     %.3f μs\n",
+                        if (timing.recv_start_cycle > timing.poll_cycle_latest) {
+                            uint64_t delta = timing.recv_start_cycle - timing.poll_cycle_latest;
+                            printf("    [Stage 2→3] Poll→Recv:      %.3f μs\n",
                                    cycles_to_ns(delta, g_tsc_freq_hz) / 1000.0);
                         }
 
@@ -471,10 +473,10 @@ int main(int argc, char** argv) {
                                    cycles_to_ns(delta, g_tsc_freq_hz) / 1000.0);
                         }
 
-                        if (stage6_cycle > timing.event_cycle) {
-                            uint64_t total = stage6_cycle - timing.event_cycle;
+                        if (stage6_cycle > timing.poll_cycle_latest) {
+                            uint64_t total = stage6_cycle - timing.poll_cycle_latest;
                             printf("    ────────────────────────────────────────────────────────\n");
-                            printf("    [Total]     Event→Callback: %.3f μs\n",
+                            printf("    [Total]     Poll→Callback:  %.3f μs\n",
                                    cycles_to_ns(total, g_tsc_freq_hz) / 1000.0);
                         }
 

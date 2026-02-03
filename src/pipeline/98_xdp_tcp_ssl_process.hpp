@@ -239,9 +239,6 @@ public:
         memset(&timing, 0, sizeof(timing));
 
         while (running_ && check_running()) {
-            // Stage 2: Event loop start
-            timing.event_cycle = rdtsc();
-
             // 1. Poll transport (handles TX completions, etc.)
             transport_.poll();
 
@@ -259,15 +256,23 @@ public:
             timing.recv_end_cycle = rdtscp();
 
             if (read_len > 0) {
-                // Capture HW timestamps before advancing write pointer
+                // Capture timestamps from transport before advancing write pointer
                 timing.hw_timestamp_count = transport_.get_recv_packet_count();
                 if (timing.hw_timestamp_count > 0) {
                     timing.hw_timestamp_oldest_ns = transport_.get_recv_oldest_timestamp();
                     timing.hw_timestamp_latest_ns = transport_.get_recv_latest_timestamp();
+                    // New packets arrived — these are valid SSL timestamps
+                    last_valid_ssl_start_cycle_ = timing.recv_start_cycle;
+                    last_valid_ssl_end_cycle_ = timing.recv_end_cycle;
                 } else {
                     timing.hw_timestamp_oldest_ns = 0;
                     timing.hw_timestamp_latest_ns = 0;
+                    // packets==0: SSL returned from internal buffer, reuse last valid timestamps
                 }
+                timing.bpf_entry_oldest_ns = transport_.get_recv_oldest_bpf_entry_ns();
+                timing.bpf_entry_latest_ns = transport_.get_recv_latest_bpf_entry_ns();
+                timing.poll_cycle_oldest = transport_.get_recv_oldest_poll_cycle();
+                timing.poll_cycle_latest = transport_.get_recv_latest_poll_cycle();
 
                 uint32_t write_offset = msg_inbox_->current_write_pos();
                 msg_inbox_->advance_write(static_cast<uint32_t>(read_len));
@@ -418,11 +423,14 @@ private:
 
         auto& meta = (*msg_metadata_prod_)[seq];
         meta.first_nic_timestamp_ns = timing.hw_timestamp_oldest_ns;
-        meta.first_nic_frame_poll_cycle = timing.recv_start_cycle;
         meta.latest_nic_timestamp_ns = timing.hw_timestamp_latest_ns;
-        meta.latest_nic_frame_poll_cycle = timing.recv_end_cycle;
-        meta.latest_raw_frame_poll_cycle = timing.recv_end_cycle;
-        meta.ssl_read_cycle = timing.recv_end_cycle;
+        meta.first_bpf_entry_ns = timing.bpf_entry_oldest_ns;
+        meta.latest_bpf_entry_ns = timing.bpf_entry_latest_ns;
+        meta.first_nic_frame_poll_cycle = timing.poll_cycle_oldest;
+        meta.latest_nic_frame_poll_cycle = timing.poll_cycle_latest;
+        meta.ssl_read_start_cycle = last_valid_ssl_start_cycle_;
+        meta.ssl_read_end_cycle = last_valid_ssl_end_cycle_;
+        meta.ssl_read_id = ssl_read_count_;
         meta.msg_inbox_offset = write_offset;
         meta.decrypted_len = len;
         meta.nic_packet_ct = timing.hw_timestamp_count;
@@ -453,7 +461,6 @@ private:
             }
 
             pong_count_++;
-            fprintf(stderr, "[PONG-TX] Sent PONG #%lu (%u bytes)\n", pong_count_, pong.data_len);
         }
     }
 
@@ -463,43 +470,72 @@ private:
 
     void print_timing_breakdown(uint32_t len, timing_record_t& timing) {
         uint64_t callback_cycle = rdtscp();
+        struct timespec ts_mono, ts_real;
+        clock_gettime(CLOCK_MONOTONIC, &ts_mono);
+        clock_gettime(CLOCK_REALTIME, &ts_real);
+        uint64_t mono_now_ns = (uint64_t)ts_mono.tv_sec * 1000000000ULL + ts_mono.tv_nsec;
+        uint64_t real_now_ns = (uint64_t)ts_real.tv_sec * 1000000000ULL + ts_real.tv_nsec;
 
-        printf("\n[SSL_READ #%lu] decrypted_len=%u\n", ssl_read_count_ + 1, len);
-        printf("  Latency Breakdown:\n");
+        // Header line
+        fprintf(stderr, "[%ld.%06ld] [SSL_READ #%lu] packets=%u decrypted_len=%u\n",
+                ts_mono.tv_sec, ts_mono.tv_nsec / 1000, ssl_read_count_ + 1,
+                timing.hw_timestamp_count, len);
 
-        // Stage 1: Hardware timestamp from NIC
-        if (timing.hw_timestamp_latest_ns > 0) {
-            struct timespec ts_real, ts_mono;
-            clock_gettime(CLOCK_REALTIME, &ts_real);
-            clock_gettime(CLOCK_MONOTONIC, &ts_mono);
-            uint64_t realtime_now_ns = (uint64_t)ts_real.tv_sec * 1000000000ULL + ts_real.tv_nsec;
-            uint64_t monotonic_now_ns = (uint64_t)ts_mono.tv_sec * 1000000000ULL + ts_mono.tv_nsec;
+        // Helper lambda to format a NIC/BPF/poll line
+        auto print_packet_line = [&](const char* label,
+                                     uint64_t nic_ns, uint64_t bpf_ns, uint64_t poll_cycle) {
+            // NIC ~ (CLOCK_REALTIME, unreliable in XDP mode)
+            char nic_str[32];
+            if (nic_ns > 0 && real_now_ns > nic_ns) {
+                snprintf(nic_str, sizeof(nic_str), "~ %.1fus ago", (double)(real_now_ns - nic_ns) / 1000.0);
+            } else {
+                snprintf(nic_str, sizeof(nic_str), "N/A");
+            }
 
-            int64_t hw_ts_mono_ns = (int64_t)timing.hw_timestamp_latest_ns -
-                                    (int64_t)realtime_now_ns + (int64_t)monotonic_now_ns;
-            printf("    [Stage 1] NIC HW timestamp: %.6f s (MONOTONIC)\n",
-                   hw_ts_mono_ns / 1e9);
+            // BPF (CLOCK_MONOTONIC)
+            char bpf_str[32];
+            if (bpf_ns > 0 && mono_now_ns > bpf_ns) {
+                snprintf(bpf_str, sizeof(bpf_str), "%.1fus ago", (double)(mono_now_ns - bpf_ns) / 1000.0);
+            } else {
+                snprintf(bpf_str, sizeof(bpf_str), "N/A");
+            }
 
-            uint64_t stage2_to_6_ns = cycles_to_ns(callback_cycle - timing.event_cycle, tsc_freq_hz_);
-            int64_t stage2_mono_ns = (int64_t)monotonic_now_ns - (int64_t)stage2_to_6_ns;
-            int64_t stage1_to_2_ns = stage2_mono_ns - hw_ts_mono_ns;
-            printf("    [Stage 1->2] NIC->Event: %.3f us\n", stage1_to_2_ns / 1000.0);
+            // Poll (TSC cycles)
+            char poll_str[32];
+            if (poll_cycle > 0 && tsc_freq_hz_ > 0 && callback_cycle > poll_cycle) {
+                snprintf(poll_str, sizeof(poll_str), "%.1fus ago",
+                         cycles_to_ns(callback_cycle - poll_cycle, tsc_freq_hz_) / 1000.0);
+            } else {
+                snprintf(poll_str, sizeof(poll_str), "N/A");
+            }
+
+            fprintf(stderr, "  %s | NIC %s | BPF %s | poll %s |\n", label, nic_str, bpf_str, poll_str);
+        };
+
+        // Oldest/latest packet lines
+        if (timing.hw_timestamp_count > 1) {
+            print_packet_line("oldest", timing.hw_timestamp_oldest_ns,
+                             timing.bpf_entry_oldest_ns, timing.poll_cycle_oldest);
+            print_packet_line("latest", timing.hw_timestamp_latest_ns,
+                             timing.bpf_entry_latest_ns, timing.poll_cycle_latest);
+        } else {
+            print_packet_line("packet", timing.hw_timestamp_latest_ns,
+                             timing.bpf_entry_latest_ns, timing.poll_cycle_latest);
         }
 
-        if (timing.recv_start_cycle > timing.event_cycle) {
-            printf("    [Stage 2->3] Event->Recv: %.3f us\n",
-                   cycles_to_ns(timing.recv_start_cycle - timing.event_cycle, tsc_freq_hz_) / 1000.0);
+        // Pipeline stages
+        double poll_recv_us = 0, ssl_us = 0, total_us = 0;
+        if (timing.poll_cycle_latest > 0 && timing.recv_start_cycle > timing.poll_cycle_latest) {
+            poll_recv_us = cycles_to_ns(timing.recv_start_cycle - timing.poll_cycle_latest, tsc_freq_hz_) / 1000.0;
         }
-
         if (timing.recv_end_cycle > timing.recv_start_cycle) {
-            printf("    [Stage 3->4] SSL decrypt: %.3f us\n",
-                   cycles_to_ns(timing.recv_end_cycle - timing.recv_start_cycle, tsc_freq_hz_) / 1000.0);
+            ssl_us = cycles_to_ns(timing.recv_end_cycle - timing.recv_start_cycle, tsc_freq_hz_) / 1000.0;
         }
-
-        if (callback_cycle > timing.event_cycle) {
-            printf("    [Total] Event->Callback: %.3f us\n",
-                   cycles_to_ns(callback_cycle - timing.event_cycle, tsc_freq_hz_) / 1000.0);
+        if (timing.poll_cycle_latest > 0 && callback_cycle > timing.poll_cycle_latest) {
+            total_us = cycles_to_ns(callback_cycle - timing.poll_cycle_latest, tsc_freq_hz_) / 1000.0;
         }
+        fprintf(stderr, "  poll->recv %.1fus | SSL decrypt %.1fus | total poll->cb %.1fus\n",
+                poll_recv_us, ssl_us, total_us);
     }
 
     // ========================================================================
@@ -535,6 +571,10 @@ private:
 
     // Timing
     uint64_t tsc_freq_hz_ = 0;
+
+    // Last-valid SSL read timestamps (for packets=0 case)
+    uint64_t last_valid_ssl_start_cycle_ = 0;
+    uint64_t last_valid_ssl_end_cycle_ = 0;
 
     // State
     std::atomic<bool> running_{false};

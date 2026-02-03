@@ -229,9 +229,6 @@ public:
         memset(&timing, 0, sizeof(timing));
 
         while (running_ && check_running()) {
-            // Stage 2: Event loop start
-            timing.event_cycle = rdtsc();
-
             // Poll transport (handles TX completions, etc.)
             transport_.poll();
 
@@ -260,6 +257,8 @@ public:
                 buffer_offset_ += read_len;
 
                 // Parse all complete frames in buffer
+                batch_frame_num_ = 0;
+                current_ssl_read_bytes_ = static_cast<uint32_t>(read_len);
                 size_t consumed = 0;
                 while (consumed < buffer_offset_) {
                     WebSocketFrame frame;
@@ -284,6 +283,10 @@ public:
                 } else if (consumed == buffer_offset_) {
                     buffer_offset_ = 0;
                 }
+
+                // Reset timestamps for next batch and increment SSL read counter
+                transport_.reset_recv_stats();
+                ssl_read_count_++;
 
             } else if (read_len < 0 && errno != EAGAIN) {
                 fprintf(stderr, "[UNIFIED] SSL read error: %s\n", strerror(errno));
@@ -420,7 +423,7 @@ private:
 
     void handle_frame(const WebSocketFrame& frame, uint64_t parse_cycle,
                       timing_record_t& timing) {
-        // Capture NIC timestamps
+        // Capture timestamps from transport
         timing.hw_timestamp_count = transport_.get_recv_packet_count();
         if (timing.hw_timestamp_count > 0) {
             timing.hw_timestamp_oldest_ns = transport_.get_recv_oldest_timestamp();
@@ -429,6 +432,10 @@ private:
             timing.hw_timestamp_oldest_ns = 0;
             timing.hw_timestamp_latest_ns = 0;
         }
+        timing.bpf_entry_oldest_ns = transport_.get_recv_oldest_bpf_entry_ns();
+        timing.bpf_entry_latest_ns = transport_.get_recv_latest_bpf_entry_ns();
+        timing.poll_cycle_oldest = transport_.get_recv_oldest_poll_cycle();
+        timing.poll_cycle_latest = transport_.get_recv_latest_poll_cycle();
 
         switch (frame.opcode) {
             case 0x01:  // TEXT
@@ -545,7 +552,6 @@ private:
 
         info.msg_inbox_offset = inbox_offset;
         info.payload_len = static_cast<uint32_t>(frame.payload_len);
-        info.frame_total_len = static_cast<uint32_t>(frame.header_len + frame.payload_len);
         info.opcode = frame.opcode;
         info.is_fin = true;
         info.is_fragmented = false;
@@ -554,16 +560,24 @@ private:
         // Timestamps
         info.first_byte_ts = timing.hw_timestamp_oldest_ns;
         info.last_byte_ts = timing.hw_timestamp_latest_ns;
-        info.first_nic_frame_poll_cycle = timing.recv_start_cycle;
-        info.latest_nic_frame_poll_cycle = timing.recv_end_cycle;
-        info.latest_raw_frame_poll_cycle = timing.recv_end_cycle;
-        info.first_ssl_read_cycle = timing.recv_start_cycle;
-        info.last_ssl_read_cycle = timing.recv_end_cycle;
+        info.first_bpf_entry_ns = timing.bpf_entry_oldest_ns;
+        info.latest_bpf_entry_ns = timing.bpf_entry_latest_ns;
+        info.first_poll_cycle = timing.poll_cycle_oldest;
+        info.latest_poll_cycle = timing.poll_cycle_latest;
+        info.first_ssl_read_start_cycle = timing.recv_start_cycle;
+        info.first_ssl_read_end_cycle = timing.recv_end_cycle;
+        info.latest_ssl_read_start_cycle = timing.recv_start_cycle;
+        info.latest_ssl_read_end_cycle = timing.recv_end_cycle;
         info.ssl_read_ct = 1;
-        info.nic_packet_ct = timing.hw_timestamp_count;
+        info.ssl_read_batch_num = ++batch_frame_num_;
+        info.ssl_read_total_bytes = current_ssl_read_bytes_;
+        info.ws_last_op_cycle = last_op_cycle_;
+        info.nic_packet_ct = static_cast<uint16_t>(timing.hw_timestamp_count);
         info.ws_parse_cycle = parse_cycle;
 
+        info.ws_frame_publish_cycle = rdtscp();
         ws_frame_info_prod_->publish(seq);
+        last_op_cycle_ = rdtscp();
     }
 
     void print_timing_breakdown(const WebSocketFrame& frame, uint64_t parse_cycle,
@@ -584,16 +598,16 @@ private:
 
         // Calculate exchange-to-local latency
         if (event_time_ms > 0) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            uint64_t local_time_ms = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+            struct timespec ts_rt;
+            clock_gettime(CLOCK_REALTIME, &ts_rt);
+            uint64_t local_time_ms = (uint64_t)ts_rt.tv_sec * 1000 + ts_rt.tv_nsec / 1000000;
             int64_t exchange_latency_ms = (int64_t)local_time_ms - (int64_t)event_time_ms;
             printf("  Exchange Latency: %ld ms\n", exchange_latency_ms);
         }
 
         printf("  Latency Breakdown:\n");
 
-        // Stage 1: Hardware timestamp
+        // Stage 1: NIC HW timestamp
         if (timing.hw_timestamp_latest_ns > 0) {
             struct timespec ts_real, ts_mono;
             clock_gettime(CLOCK_REALTIME, &ts_real);
@@ -603,38 +617,61 @@ private:
 
             int64_t hw_ts_mono_ns = (int64_t)timing.hw_timestamp_latest_ns -
                                     (int64_t)realtime_now_ns + (int64_t)monotonic_now_ns;
-            printf("    [Stage 1] NIC HW timestamp: %.6f s (MONOTONIC)\n",
-                   hw_ts_mono_ns / 1e9);
+            printf("    [Stage 1] NIC HW: %.6f s (MONOTONIC)\n", hw_ts_mono_ns / 1e9);
 
-            uint64_t stage2_to_6_ns = cycles_to_ns(callback_cycle - timing.event_cycle, tsc_freq_hz_);
-            int64_t stage2_mono_ns = (int64_t)monotonic_now_ns - (int64_t)stage2_to_6_ns;
-            int64_t stage1_to_2_ns = stage2_mono_ns - hw_ts_mono_ns;
-            printf("    [Stage 1->2] NIC->Event: %.3f us\n", stage1_to_2_ns / 1000.0);
+            // Stage 1->1.5: NIC->BPF
+            if (timing.bpf_entry_latest_ns > 0) {
+                int64_t nic_to_bpf_ns = (int64_t)timing.bpf_entry_latest_ns - hw_ts_mono_ns;
+                printf("    [Stage 1->1.5] NIC->BPF: %.3f us\n", nic_to_bpf_ns / 1000.0);
+            }
         }
 
-        if (timing.recv_start_cycle > timing.event_cycle) {
-            printf("    [Stage 2->3] Event->Recv: %.3f us\n",
-                   cycles_to_ns(timing.recv_start_cycle - timing.event_cycle, tsc_freq_hz_) / 1000.0);
+        // Stage 1.5: BPF entry
+        if (timing.bpf_entry_latest_ns > 0) {
+            printf("    [Stage 1.5] BPF entry: %.6f s (MONOTONIC)\n",
+                   timing.bpf_entry_latest_ns / 1e9);
+
+            // Stage 1.5->2: BPF->Poll
+            if (timing.poll_cycle_latest > 0 && tsc_freq_hz_ > 0) {
+                struct timespec ts_mono;
+                clock_gettime(CLOCK_MONOTONIC, &ts_mono);
+                uint64_t mono_now_ns = (uint64_t)ts_mono.tv_sec * 1000000000ULL + ts_mono.tv_nsec;
+                uint64_t elapsed_cycles = callback_cycle - timing.poll_cycle_latest;
+                uint64_t elapsed_ns = cycles_to_ns(elapsed_cycles, tsc_freq_hz_);
+                int64_t poll_mono_ns = (int64_t)mono_now_ns - (int64_t)elapsed_ns;
+                int64_t bpf_to_poll_ns = poll_mono_ns - (int64_t)timing.bpf_entry_latest_ns;
+                printf("    [Stage 1.5->2] BPF->Poll: %.3f us\n", bpf_to_poll_ns / 1000.0);
+            }
         }
 
+        // Stage 2->3: Poll->Recv
+        if (timing.poll_cycle_latest > 0 && timing.recv_start_cycle > timing.poll_cycle_latest) {
+            printf("    [Stage 2->3] Poll->Recv: %.3f us\n",
+                   cycles_to_ns(timing.recv_start_cycle - timing.poll_cycle_latest, tsc_freq_hz_) / 1000.0);
+        }
+
+        // Stage 3->4: SSL decrypt
         if (timing.recv_end_cycle > timing.recv_start_cycle) {
             printf("    [Stage 3->4] SSL decrypt: %.3f us\n",
                    cycles_to_ns(timing.recv_end_cycle - timing.recv_start_cycle, tsc_freq_hz_) / 1000.0);
         }
 
+        // Stage 4->5: WS parse
         if (parse_cycle > timing.recv_end_cycle) {
             printf("    [Stage 4->5] WS parse: %.3f us\n",
                    cycles_to_ns(parse_cycle - timing.recv_end_cycle, tsc_freq_hz_) / 1000.0);
         }
 
+        // Stage 5->6: To callback
         if (callback_cycle > parse_cycle) {
             printf("    [Stage 5->6] To callback: %.3f us\n",
                    cycles_to_ns(callback_cycle - parse_cycle, tsc_freq_hz_) / 1000.0);
         }
 
-        if (callback_cycle > timing.event_cycle) {
-            printf("    [Total] Event->Callback: %.3f us\n",
-                   cycles_to_ns(callback_cycle - timing.event_cycle, tsc_freq_hz_) / 1000.0);
+        // Total: Poll->Callback
+        if (timing.poll_cycle_latest > 0 && callback_cycle > timing.poll_cycle_latest) {
+            printf("    [Total] Poll->Callback: %.3f us\n",
+                   cycles_to_ns(callback_cycle - timing.poll_cycle_latest, tsc_freq_hz_) / 1000.0);
         }
     }
 
@@ -681,8 +718,12 @@ private:
 
     // Counters
     uint64_t msg_count_ = 0;
+    uint64_t ssl_read_count_ = 0;
+    uint64_t last_op_cycle_ = 0;
     uint64_t ping_count_ = 0;
     uint64_t pong_count_ = 0;
+    uint32_t batch_frame_num_ = 0;
+    uint32_t current_ssl_read_bytes_ = 0;
 };
 
 }  // namespace websocket::pipeline

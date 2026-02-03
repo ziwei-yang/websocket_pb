@@ -178,6 +178,27 @@ bool is_valid_orderbook_json(const char* data, size_t len) {
     return true;
 }
 
+// ============================================================================
+// Frame Recording (NIC-to-message latency)
+// ============================================================================
+
+static constexpr size_t MAX_FRAME_RECORDS = 65536;
+
+void dump_frame_records(const WSFrameInfo* records, size_t count, const char* tag) {
+    if (count == 0) return;
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/%s_frame_records_%d.bin", tag, getpid());
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Failed to create %s\n", path); return; }
+    uint32_t n = static_cast<uint32_t>(count);
+    uint32_t sz = static_cast<uint32_t>(sizeof(WSFrameInfo));
+    fwrite(&n, 4, 1, f);
+    fwrite(&sz, 4, 1, f);
+    fwrite(records, sizeof(WSFrameInfo), count, f);
+    fclose(f);
+    printf("[FRAME-RECORDS] Saved %u records to %s\n", n, path);
+}
+
 }  // namespace
 
 // ============================================================================
@@ -433,12 +454,13 @@ using TransportType = TransportProcess<
     IPCRingConsumer<PongFrameAligned>,
     PROFILING_ENABLED>;
 
-// WebSocket Process types
+// WebSocket Process types (with profiling enabled)
 using WebSocketType = WebSocketProcess<
     IPCRingConsumer<MsgMetadata>,          // MsgMetadataCons
     IPCRingProducer<WSFrameInfo>,          // WSFrameInfoProd
     IPCRingProducer<PongFrameAligned>,     // PongsProd
-    IPCRingProducer<MsgOutboxEvent>>;      // MsgOutboxProd
+    IPCRingProducer<MsgOutboxEvent>,       // MsgOutboxProd
+    PROFILING_ENABLED>;                    // Profiling
 
 // ============================================================================
 // Test Class
@@ -760,8 +782,14 @@ public:
         uint64_t pong_frames = 0;
         uint64_t close_frames = 0;
         uint64_t valid_updates = 0;
+        uint64_t partial_events = 0;
         int64_t last_sequence = -1;
         bool sequence_error = false;
+
+        // Frame recording for latency analysis
+        std::vector<WSFrameInfo> frame_records;
+        frame_records.reserve(MAX_FRAME_RECORDS);
+        uint64_t tsc_freq = conn_state_->tsc_freq_hz;
 
         auto start_time = std::chrono::steady_clock::now();
         auto stream_end = start_time + std::chrono::milliseconds(g_timeout_ms);
@@ -785,6 +813,11 @@ public:
             bool end_of_batch;
             while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
                 total_frames++;
+                frame.print_timeline(tsc_freq);
+
+                if (frame_records.size() < MAX_FRAME_RECORDS) {
+                    frame_records.push_back(frame);
+                }
 
                 // Verify sequence ordering
                 int64_t current_seq = ws_frame_cons.sequence();
@@ -795,7 +828,14 @@ public:
                 }
                 last_sequence = current_seq;
 
-                // Count by opcode
+                // Skip partial frame events (intermediate SSL read boundaries)
+                // These are early notifications; the complete event follows.
+                if (frame.is_fragmented && !frame.is_last_fragment) {
+                    partial_events++;
+                    continue;
+                }
+
+                // Count by opcode (complete messages only)
                 switch (frame.opcode) {
                     case 0x01:  // TEXT
                         text_frames++;
@@ -864,6 +904,14 @@ public:
                 WSFrameInfo frame;
                 while (ws_frame_cons.try_consume(frame)) {
                     total_frames++;
+                    frame.print_timeline(tsc_freq);
+                    if (frame_records.size() < MAX_FRAME_RECORDS) {
+                        frame_records.push_back(frame);
+                    }
+                    if (frame.is_fragmented && !frame.is_last_fragment) {
+                        partial_events++;
+                        continue;
+                    }
                     if (frame.opcode == 0x01) {
                         text_frames++;
                         if (frame.payload_len > 0) {
@@ -883,7 +931,8 @@ public:
 
         printf("\n=== Test Results ===\n");
         printf("  Duration:        %ld ms\n", actual_duration);
-        printf("  Total frames:    %lu\n", total_frames);
+        printf("  Total events:    %lu (ring events incl. partial)\n", total_frames);
+        printf("  Partial events:  %lu\n", partial_events);
         printf("  TEXT frames:     %lu\n", text_frames);
         printf("  BINARY frames:   %lu\n", binary_frames);
         printf("  PING frames:     %lu\n", ping_frames);
@@ -901,6 +950,46 @@ public:
         printf("  CLOSE frames:    %lu\n", close_frames);
         printf("  Valid updates:   %lu\n", valid_updates);
         printf("  Sequence errors: %s\n", sequence_error ? "YES" : "none");
+
+        // --- NIC-to-message latency stats (qualifying: 1-pkt, 1-ssl, TEXT, >=100B) ---
+        {
+            std::vector<double> msg_latencies_us;
+            for (const auto& r : frame_records) {
+                if (r.opcode == 0x01 &&
+                    !r.is_fragmented &&
+                    r.ssl_read_ct == 1 &&
+                    r.nic_packet_ct == 1 &&
+                    r.first_poll_cycle > 0 &&
+                    r.ws_frame_publish_cycle > r.first_poll_cycle &&
+                    r.payload_len >= 100) {
+                    uint64_t lat_ns = cycles_to_ns(
+                        r.ws_frame_publish_cycle - r.first_poll_cycle, tsc_freq);
+                    msg_latencies_us.push_back(static_cast<double>(lat_ns) / 1000.0);
+                }
+            }
+            if (!msg_latencies_us.empty()) {
+                std::sort(msg_latencies_us.begin(), msg_latencies_us.end());
+                size_t n = msg_latencies_us.size();
+                auto pctile = [&](double p) -> double {
+                    return msg_latencies_us[static_cast<size_t>(p / 100.0 * (n - 1))];
+                };
+                double sum = 0;
+                for (double v : msg_latencies_us) sum += v;
+                printf("\n=== NIC-to-Message Latency (poll->publish, 1-pkt 1-ssl TEXT) (N=%zu) ===\n", n);
+                printf("  Min:    %.2f us\n", msg_latencies_us.front());
+                printf("  P50:    %.2f us\n", pctile(50));
+                printf("  P90:    %.2f us\n", pctile(90));
+                printf("  P99:    %.2f us\n", pctile(99));
+                printf("  Max:    %.2f us\n", msg_latencies_us.back());
+                printf("  Mean:   %.2f us\n", sum / n);
+            } else {
+                printf("\n=== NIC-to-Message Latency: No qualifying samples ===\n");
+            }
+        }
+
+        // Dump all frame records to binary file
+        dump_frame_records(frame_records.data(), frame_records.size(),
+                           "okx");
 
         // Verify ring buffer status
         printf("\n--- Ring Buffer Status ---\n");
@@ -1005,12 +1094,14 @@ public:
                 return;
             }
 
-            uint32_t count = std::min(buf.total_count, CycleSampleBuffer::SAMPLE_COUNT);
-            uint32_t start_idx = (buf.total_count > CycleSampleBuffer::SAMPLE_COUNT)
-                ? (buf.write_idx & CycleSampleBuffer::MASK)
+            // write_idx = committed samples (may be < total_count due to idle suppression)
+            uint32_t committed = buf.write_idx;
+            uint32_t count = std::min(committed, CycleSampleBuffer::SAMPLE_COUNT);
+            uint32_t start_idx = (committed > CycleSampleBuffer::SAMPLE_COUNT)
+                ? (committed & CycleSampleBuffer::MASK)
                 : 0;
 
-            // Write header: total_count, sample_count
+            // Write header: total_iterations, sample_count
             fwrite(&buf.total_count, sizeof(uint32_t), 1, f);
             fwrite(&count, sizeof(uint32_t), 1, f);
 
@@ -1026,6 +1117,7 @@ public:
 
         save_buffer(profiling_->xdp_poll, "xdp_poll");
         save_buffer(profiling_->transport, "transport");
+        save_buffer(profiling_->ws_process, "ws_process");
 
         // Save NIC latency data
         {
@@ -1125,6 +1217,11 @@ private:
             msg_inbox_, &msg_metadata_prod, &pongs_cons,
             conn_state_, &msg_outbox_cons);
 
+        // Wire up transport profiling data
+        if constexpr (PROFILING_ENABLED) {
+            transport.set_profiling_data(&profiling_->transport);
+        }
+
         if (!transport.init()) {
             fprintf(stderr, "[TRANSPORT] init() failed\n");
             conn_state_->shutdown_all();
@@ -1146,6 +1243,11 @@ private:
         IPCRingProducer<PongFrameAligned> pongs_prod(*pongs_region_);
 
         WebSocketType ws_process;
+
+        // Wire up WS profiling data
+        if constexpr (PROFILING_ENABLED) {
+            ws_process.set_profiling_data(&profiling_->ws_process);
+        }
 
         bool ok = ws_process.init(
             msg_inbox_,

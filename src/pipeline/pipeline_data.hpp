@@ -10,6 +10,8 @@
 #include <cstring>
 #include <chrono>
 
+#include "../core/timing.hpp"
+
 // Disruptor IPC includes (MUST be before pipeline_config.hpp to avoid macro conflict)
 #include <disruptor/src/ipc/shared_region.hpp>
 #include <disruptor/src/core/ring_buffer.hpp>
@@ -30,8 +32,23 @@
 namespace websocket::pipeline {
 
 // ============================================================================
+// DisconnectReason - Tracks root cause of connection termination
+// Used by ConnStateShm::disconnect for unified disconnect handling
+// ============================================================================
+
+enum class DisconnectReason : uint8_t {
+    NONE = 0,
+    TCP_RST,            // TCP RST received
+    TCP_FIN,            // TCP FIN received (graceful close)
+    WS_CLOSE,           // WebSocket CLOSE frame received
+    WS_PONG_TIMEOUT,    // Client PING got no PONG for 10s
+    SSL_READ_ERROR,     // SSL_read returned fatal error
+    UNKNOWN             // Loop exited for unknown reason
+};
+
+// ============================================================================
 // UMEMFrameDescriptor - Type alias for PacketFrameDescriptor
-// Used in RAW_INBOX/OUTBOX rings. Size: 32 bytes (fits 2 per cache line)
+// Used in RAW_INBOX/OUTBOX rings. Size: 64 bytes (1 per cache line)
 // ============================================================================
 
 using UMEMFrameDescriptor = websocket::xdp::PacketFrameDescriptor;
@@ -42,18 +59,25 @@ using UMEMFrameDescriptor = websocket::xdp::PacketFrameDescriptor;
 // Tracks timestamps from NIC through SSL_read
 // ============================================================================
 
-struct alignas(64) MsgMetadata {
-    // First packet timestamps (oldest in SSL_read batch)
+struct alignas(128) MsgMetadata {
+    // Stage 1: NIC HW timestamps
     uint64_t first_nic_timestamp_ns;       // NIC HW timestamp of first packet
-    uint64_t first_nic_frame_poll_cycle;   // XDP Poll rdtscp of first packet
-
-    // Latest packet timestamps (newest in SSL_read batch)
     uint64_t latest_nic_timestamp_ns;      // NIC HW timestamp of latest packet
-    uint64_t latest_nic_frame_poll_cycle;  // XDP Poll rdtscp of latest packet
-    uint64_t latest_raw_frame_poll_cycle;  // Transport rdtscp of latest packet
 
-    // SSL timing
-    uint64_t ssl_read_cycle;               // Transport rdtscp after SSL_read()
+    // Stage 1.5: BPF entry timestamps (CLOCK_MONOTONIC ns)
+    uint64_t first_bpf_entry_ns;           // bpf_ktime_get_ns() of first packet
+    uint64_t latest_bpf_entry_ns;          // bpf_ktime_get_ns() of latest packet
+
+    // Stage 2: XDP Poll cycles (TSC rdtscp)
+    uint64_t first_nic_frame_poll_cycle;   // XDP Poll rdtscp of first packet
+    uint64_t latest_nic_frame_poll_cycle;  // XDP Poll rdtscp of latest packet
+
+    // Stage 3-4: SSL read
+    uint64_t ssl_read_start_cycle;         // Transport rdtsc BEFORE SSL_read()
+    uint64_t ssl_read_end_cycle;           // Transport rdtscp AFTER SSL_read()
+
+    // Batch correlation
+    uint64_t ssl_read_id;                  // Monotonic SSL_read counter for batch correlation
 
     // Data location in MSG_INBOX
     uint32_t msg_inbox_offset;             // Start offset in MSG_INBOX buffer
@@ -62,26 +86,44 @@ struct alignas(64) MsgMetadata {
     // Packet counting
     uint32_t nic_packet_ct;                // Number of NIC packets in this SSL_read batch
 
-    uint8_t _pad[4];                       // Padding to 64 bytes
+    uint8_t _pad[44];                      // Padding to 128 bytes (84 data + 44 pad)
 
     void clear() {
         first_nic_timestamp_ns = 0;
-        first_nic_frame_poll_cycle = 0;
         latest_nic_timestamp_ns = 0;
+        first_bpf_entry_ns = 0;
+        latest_bpf_entry_ns = 0;
+        first_nic_frame_poll_cycle = 0;
         latest_nic_frame_poll_cycle = 0;
-        latest_raw_frame_poll_cycle = 0;
-        ssl_read_cycle = 0;
+        ssl_read_start_cycle = 0;
+        ssl_read_end_cycle = 0;
+        ssl_read_id = 0;
         msg_inbox_offset = 0;
         decrypted_len = 0;
         nic_packet_ct = 0;
     }
 };
-static_assert(sizeof(MsgMetadata) == 64, "MsgMetadata must be 64 bytes");
+static_assert(sizeof(MsgMetadata) == 128, "MsgMetadata must be 128 bytes");
 
 // ============================================================================
 // WSFrameInfo - Passed through WS_FRAME_INFO_RING to AppClient
 // Size: 128 bytes (2 per cache line)
-// Full timestamp chain from NIC to WS parse completion
+// Full timestamp chain from NIC to WS frame publish
+//
+// Layout (128 bytes):
+//   offset  0: uint32_t msg_inbox_offset     (4)
+//   offset  4: uint32_t payload_len          (4)
+//   offset  8: uint8_t  opcode               (1)
+//   offset  9: bool     is_fin               (1)
+//   offset 10: bool     is_fragmented        (1)
+//   offset 11: bool     is_last_fragment     (1)
+//   offset 12: uint16_t ssl_read_ct          (2)
+//   offset 14: uint16_t nic_packet_ct        (2)
+//   offset 16: [10 x uint64_t timestamps]   (80)
+//   offset 96: uint32_t ssl_read_batch_num  (4)
+//   offset100: uint32_t ssl_read_total_bytes(4)
+//   offset104: [3 x uint64_t timestamps]   (24)
+//   offset128: total                        (128)
 // ============================================================================
 
 struct alignas(64) WSFrameInfo {
@@ -102,27 +144,39 @@ struct alignas(64) WSFrameInfo {
     //   - is_fragmented=false: Complete single-frame message
     //   - is_fragmented=true, is_last_fragment=false: Partial frame or intermediate fragment
     //   - is_fragmented=true, is_last_fragment=true: Final fragment (message complete)
-    uint32_t frame_total_len;              // THIS frame's total length (header + payload)
 
-    // Full timestamp chain
-    uint64_t first_byte_ts;                // NIC timestamp when first byte arrived
-    uint64_t first_nic_frame_poll_cycle;   // XDP Poll rdtscp (first packet)
-    uint64_t last_byte_ts;                 // NIC timestamp when frame completed
-    uint64_t latest_nic_frame_poll_cycle;  // XDP Poll rdtscp (latest packet)
-    uint64_t latest_raw_frame_poll_cycle;  // Transport rdtscp (latest packet)
+    // Counts (packed into header area)
+    uint16_t ssl_read_ct;                  // Number of SSL_read calls for this frame
+    uint16_t nic_packet_ct;                // Number of NIC packets for this frame
 
-    // SSL_read timing (replaces single ssl_read_cycle)
-    uint64_t first_ssl_read_cycle;         // TSC cycle of first SSL_read for this frame
-    uint64_t last_ssl_read_cycle;          // TSC cycle of last SSL_read for this frame
-    uint32_t ssl_read_ct;                  // Number of SSL_read calls for this frame
+    // Stage 1: NIC HW timestamps
+    uint64_t first_byte_ts;                // NIC HW timestamp (first packet)
+    uint64_t last_byte_ts;                 // NIC HW timestamp (latest packet)
 
-    // Packet counting
-    uint32_t nic_packet_ct;                // Number of NIC packets for this frame
+    // Stage 1.5: BPF entry timestamps (CLOCK_MONOTONIC ns)
+    uint64_t first_bpf_entry_ns;           // bpf_ktime_get_ns() (first packet)
+    uint64_t latest_bpf_entry_ns;          // bpf_ktime_get_ns() (latest packet)
 
+    // Stage 2: XDP Poll cycles (TSC rdtscp)
+    uint64_t first_poll_cycle;             // XDP Poll rdtscp (first packet)
+    uint64_t latest_poll_cycle;            // XDP Poll rdtscp (latest packet)
+
+    // Stage 3-4: SSL read
+    uint64_t first_ssl_read_start_cycle;   // Start cycle of first SSL_read for this frame
+    uint64_t first_ssl_read_end_cycle;     // End cycle of first SSL_read for this frame
+    uint64_t latest_ssl_read_start_cycle;  // Start cycle of latest SSL_read for this frame
+    uint64_t latest_ssl_read_end_cycle;    // End cycle of latest SSL_read for this frame
+
+    // Batch correlation
+    uint32_t ssl_read_batch_num;           // 1-based index of this WS frame within SSL_read batch
+    uint32_t ssl_read_total_bytes;         // Total decrypted bytes from the SSL_read batch
+    uint64_t ws_last_op_cycle;             // WS process rdtscp after previous operation completed
+
+    // Stage 5: WS parse
     uint64_t ws_parse_cycle;               // WS frame parse completion cycle
 
-    // Padding adjusted for new fields
-    uint8_t  _pad2[40];                    // Padding to maintain 128-byte alignment
+    // Stage 6: WS frame publish (stamped just before ring publish)
+    uint64_t ws_frame_publish_cycle;       // rdtscp() immediately before publish()
 
     void clear() {
         msg_inbox_offset = 0;
@@ -131,17 +185,68 @@ struct alignas(64) WSFrameInfo {
         is_fin = false;
         is_fragmented = false;
         is_last_fragment = false;
-        frame_total_len = 0;
-        first_byte_ts = 0;
-        first_nic_frame_poll_cycle = 0;
-        last_byte_ts = 0;
-        latest_nic_frame_poll_cycle = 0;
-        latest_raw_frame_poll_cycle = 0;
-        first_ssl_read_cycle = 0;
-        last_ssl_read_cycle = 0;
         ssl_read_ct = 0;
         nic_packet_ct = 0;
+        first_byte_ts = 0;
+        last_byte_ts = 0;
+        first_bpf_entry_ns = 0;
+        latest_bpf_entry_ns = 0;
+        first_poll_cycle = 0;
+        latest_poll_cycle = 0;
+        first_ssl_read_start_cycle = 0;
+        first_ssl_read_end_cycle = 0;
+        latest_ssl_read_start_cycle = 0;
+        latest_ssl_read_end_cycle = 0;
+        ssl_read_batch_num = 0;
+        ssl_read_total_bytes = 0;
+        ws_last_op_cycle = 0;
         ws_parse_cycle = 0;
+        ws_frame_publish_cycle = 0;
+    }
+
+    void print_timeline(uint64_t tsc_freq_hz) const {
+        uint64_t now = rdtscp();
+        double to_us = 1e6 / static_cast<double>(tsc_freq_hz);
+        auto us_ago = [&](uint64_t cycle) -> double {
+            return (cycle > 0 && now > cycle) ? static_cast<double>(now - cycle) * to_us : 0.0;
+        };
+        // Range formatting: same unit (determined by larger value), unit only on second value
+        auto fmt_range = [](char* b_first, char* b_last, double us_first, double us_last) {
+            double larger = std::max(us_first, us_last);
+            if (larger < 1000.0) {
+                std::snprintf(b_first, 16, "%6.1f",   us_first);
+                std::snprintf(b_last,  16, "%6.1fus",  us_last);
+            } else {
+                std::snprintf(b_first, 16, "%6.2f",   us_first / 1000.0);
+                std::snprintf(b_last,  16, "%6.2fms",  us_last / 1000.0);
+            }
+        };
+        // Single value (with unit)
+        auto fmt = [](char* b, double us) {
+            if (us < 1000.0) std::snprintf(b, 16, "%6.1fus", us);
+            else             std::snprintf(b, 16, "%6.2fms", us / 1000.0);
+        };
+        char t[6][16];
+        fmt_range(t[0], t[1], us_ago(first_poll_cycle), us_ago(latest_poll_cycle));
+        fmt_range(t[2], t[3], us_ago(first_ssl_read_start_cycle), us_ago(latest_ssl_read_end_cycle));
+        fmt(t[4], us_ago(ws_parse_cycle));
+        fmt(t[5], us_ago(ws_frame_publish_cycle));
+        char sz[24];
+        std::snprintf(sz, sizeof(sz), "%u/%uB", payload_len, ssl_read_total_bytes);
+        char late[24] = "";
+        if (ws_last_op_cycle > latest_ssl_read_end_cycle) {
+            double late_us = static_cast<double>(ws_last_op_cycle - latest_ssl_read_end_cycle) * to_us;
+            if (late_us < 1000.0) std::snprintf(late, sizeof(late), " ws_late %6.1fus", late_us);
+            else                  std::snprintf(late, sizeof(late), " ws_late %6.2fms", late_us / 1000.0);
+        }
+        fprintf(stderr,
+                "| poll %2u pkt %6s ~ %8s "
+                "| ssl %2u x %-10s %6s ~ %8s "
+                "| parse %03u %8s "
+                "| pub %8s |%s\n",
+                nic_packet_ct, t[0], t[1],
+                ssl_read_ct, sz, t[2], t[3],
+                ssl_read_batch_num, t[4], t[5], late);
     }
 };
 static_assert(sizeof(WSFrameInfo) == 128, "WSFrameInfo must be 128 bytes");
@@ -259,7 +364,16 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
     } handshake_stage;
 
     // ========================================================================
-    // Cache Line 5: Target URL + TSC frequency (set once, read-only after init)
+    // Cache Line 5: Disconnect reason tracking (first writer wins)
+    // ========================================================================
+    alignas(CACHE_LINE_SIZE) struct {
+        std::atomic<uint8_t> reason;   // DisconnectReason
+        uint16_t ws_close_code;        // WS CLOSE status code (if WS_CLOSE)
+        char detail[57];               // Short reason text (null-terminated)
+    } disconnect;
+
+    // ========================================================================
+    // Cache Line 6: Target URL + TSC frequency (set once, read-only after init)
     // ========================================================================
     alignas(CACHE_LINE_SIZE) char target_host[64];  // e.g., "stream.binance.com"
     uint16_t target_port;                           // e.g., 443
@@ -349,6 +463,24 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         for (int i = 0; i < PROC_COUNT; ++i) {
             running[i].flag.store(0, std::memory_order_release);
         }
+    }
+
+    // Disconnect reason tracking (first writer wins — don't overwrite root cause)
+    void set_disconnect(DisconnectReason r, uint16_t ws_code = 0, const char* detail_str = nullptr) {
+        uint8_t expected = static_cast<uint8_t>(DisconnectReason::NONE);
+        uint8_t desired = static_cast<uint8_t>(r);
+        if (disconnect.reason.compare_exchange_strong(expected, desired,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            disconnect.ws_close_code = ws_code;
+            if (detail_str) {
+                std::strncpy(disconnect.detail, detail_str, sizeof(disconnect.detail) - 1);
+                disconnect.detail[sizeof(disconnect.detail) - 1] = '\0';
+            }
+        }
+    }
+
+    DisconnectReason get_disconnect_reason() const {
+        return static_cast<DisconnectReason>(disconnect.reason.load(std::memory_order_acquire));
     }
 
     // Ready flag methods for startup synchronization
@@ -456,6 +588,11 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         handshake_stage.tcp_ready.store(0, std::memory_order_relaxed);
         handshake_stage.tls_ready.store(0, std::memory_order_relaxed);
         handshake_stage.ws_ready.store(0, std::memory_order_relaxed);
+
+        // Disconnect reason
+        disconnect.reason.store(static_cast<uint8_t>(DisconnectReason::NONE), std::memory_order_relaxed);
+        disconnect.ws_close_code = 0;
+        std::memset(disconnect.detail, 0, sizeof(disconnect.detail));
 
         // Target URL (set by handshake manager)
         std::memset(target_host, 0, sizeof(target_host));
@@ -954,12 +1091,13 @@ struct IPCRingConsumer {
 // Single loop iteration profiling record (64 bytes, cache-line aligned)
 // Records CPU cycles and per-operation details for each main loop iteration
 //
-// Size: 72 bytes
+// Size: 88 bytes (84 data + 4 padding for uint64_t alignment)
 // - uint64_t packet_nic_ns = 8 bytes
 // - uint64_t nic_poll_cycle = 8 bytes
 // - uint64_t transport_poll_cycle = 8 bytes
 // - int32_t op_details[6] = 24 bytes
 // - int32_t op_cycles[6] = 24 bytes
+// - int16_t noop_ct[6] = 12 bytes
 struct CycleSample {
     static constexpr size_t N = 6;  // Array size for op_details and op_cycles
 
@@ -968,6 +1106,7 @@ struct CycleSample {
     uint64_t transport_poll_cycle;  // Transport rdtsc when packet processed (0 for XDP Poll)
     int32_t op_details[N];          // Per-operation details (counts, triggered flags)
     int32_t op_cycles[N];           // Per-operation CPU cycles
+    int16_t noop_ct[N];            // cumulative zero-return count per op (saturates at INT16_MAX)
 
     void clear() {
         packet_nic_ns = 0;
@@ -976,10 +1115,11 @@ struct CycleSample {
         for (size_t i = 0; i < N; ++i) {
             op_details[i] = 0;
             op_cycles[i] = 0;
+            noop_ct[i] = 0;
         }
     }
 };
-static_assert(sizeof(CycleSample) == 72, "CycleSample must be 72 bytes");
+static_assert(sizeof(CycleSample) == 88, "CycleSample must be 88 bytes");
 
 // Circular buffer for 4M samples per process
 struct alignas(64) CycleSampleBuffer {
@@ -987,18 +1127,42 @@ struct alignas(64) CycleSampleBuffer {
     static constexpr uint32_t MASK = SAMPLE_COUNT - 1;
 
     CycleSample samples[SAMPLE_COUNT];
-    uint32_t write_idx;         // Next write position (wraps via MASK)
-    uint32_t total_count;       // Total samples collected (saturates at UINT32_MAX)
+    uint32_t write_idx;         // Next write position (committed samples only)
+    uint32_t total_count;       // Total loop iterations (saturates at UINT32_MAX)
 
     // Get pointer to next write slot (for direct assignment, avoids stack copy)
     CycleSample* next_slot() {
         return &samples[write_idx & MASK];
     }
 
-    // Commit after writing to slot
+    // Commit after writing to slot — skips ring buffer write when all
+    // "tracked" ops are suppressed and idle, preserving buffer space for
+    // data-moved samples.  total_count always increments (total iterations).
+    //
+    // An op is "tracked" when noop_ct[i] > 0, meaning it has returned zero
+    // at least once.  Ops that never return zero (maintenance ops like
+    // Trickle, unused slots) have noop_ct == 0 and are ignored.
     void commit() {
-        write_idx++;
+        auto* cur = &samples[write_idx & MASK];
         if (total_count < UINT32_MAX) total_count++;
+
+        // Skip commit when every tracked op is both suppressed and idle.
+        bool any_tracked = false;
+        bool all_suppressed_idle = true;
+        for (size_t i = 0; i < CycleSample::N; ++i) {
+            if (cur->noop_ct[i] == 0) continue;   // never-idle / unused — ignore
+            any_tracked = true;
+            if (cur->noop_ct[i] < 10000 || cur->op_details[i] != 0) {
+                all_suppressed_idle = false;
+                break;
+            }
+        }
+        if (any_tracked && all_suppressed_idle) return;  // reuse slot
+
+        write_idx++;
+        auto* nxt = &samples[write_idx & MASK];
+        for (size_t i = 0; i < CycleSample::N; ++i)
+            nxt->noop_ct[i] = cur->noop_ct[i];
     }
 
     // Copy-based record (kept for compatibility)
@@ -1010,8 +1174,61 @@ struct alignas(64) CycleSampleBuffer {
     void init() {
         write_idx = 0;
         total_count = 0;
+        for (size_t i = 0; i < CycleSample::N; ++i)
+            samples[0].noop_ct[i] = 0;
     }
 };
+
+// ============================================================================
+// profile_op — Zero-overhead operation profiler (compile-time gated)
+//
+// Wraps a callable with TSC timing. Records return value in op_details[idx]
+// and elapsed cycles in op_cycles[idx]. Compiles away when Profiling=false.
+// ============================================================================
+
+template<bool Profiling, typename Func>
+inline auto profile_op(Func&& func, CycleSample* slot, size_t idx, bool condition = true) {
+    using ReturnType = decltype(func());
+    if constexpr (Profiling) {
+        if (!condition) {
+            slot->op_details[idx] = 0;
+            slot->op_cycles[idx] = 0;
+            return ReturnType{};
+        }
+
+        // Fast path: after 10000 cumulative zero returns, skip timing
+        if (slot->noop_ct[idx] >= 10000) {
+            auto result = func();
+            if (result == 0) {
+                if (slot->noop_ct[idx] < INT16_MAX) ++slot->noop_ct[idx];
+                slot->op_details[idx] = 0;
+                slot->op_cycles[idx] = 0;
+            } else {
+                // Data arrived after long idle — reset to re-enable timing
+                slot->noop_ct[idx] = 0;
+                slot->op_details[idx] = static_cast<int32_t>(result);
+                slot->op_cycles[idx] = 0;  // This iteration untimed; next will be timed
+            }
+            return result;
+        }
+
+        // Normal profiling path
+        uint64_t start = rdtsc();
+        auto result = func();
+        uint64_t end = rdtsc();
+        slot->op_details[idx] = static_cast<int32_t>(result);
+        slot->op_cycles[idx] = static_cast<int32_t>(end - start);
+
+        if (result == 0) {
+            if (slot->noop_ct[idx] < INT16_MAX) ++slot->noop_ct[idx];
+        }
+
+        return result;
+    } else {
+        if (!condition) return ReturnType{};
+        return func();
+    }
+}
 
 // Per-RX-packet NIC latency record (40 bytes)
 struct NicLatencySample {
@@ -1050,15 +1267,17 @@ struct alignas(64) NicLatencyBuffer {
     }
 };
 
-// Full profiling shared memory region (~640MB total)
+// Full profiling shared memory region (~1GB total)
 struct ProfilingShm {
-    CycleSampleBuffer xdp_poll;      // 256MB - loop profiling
-    CycleSampleBuffer transport;     // 256MB - loop profiling
-    NicLatencyBuffer nic_latency;    // 128MB - per-packet NIC latency
+    CycleSampleBuffer xdp_poll;      // ~352MB - loop profiling
+    CycleSampleBuffer transport;     // ~352MB - loop profiling
+    CycleSampleBuffer ws_process;    // ~352MB - loop profiling
+    NicLatencyBuffer nic_latency;    // ~160MB - per-packet NIC latency
 
     void init() {
         xdp_poll.init();
         transport.init();
+        ws_process.init();
         nic_latency.init();
     }
 };

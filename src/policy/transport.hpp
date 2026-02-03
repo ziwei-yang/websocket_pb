@@ -357,8 +357,9 @@ struct BSDSocketTransport {
     /**
      * Poll (no-op for BSD sockets - event loop handles this)
      */
-    void poll() {
+    size_t poll() {
         // BSD sockets don't need explicit polling
+        return 0;
     }
 
     /**
@@ -485,6 +486,7 @@ private:
 #include "../xdp/xdp_packet_io.hpp"
 #include "../xdp/xdp_frame.hpp"
 #include "../stack/userspace_stack.hpp"
+#include "../pipeline/pipeline_data.hpp"
 #include <net/if.h>
 #include <sys/ioctl.h>
 #endif
@@ -903,6 +905,18 @@ struct PacketTransport {
             if (stats.latest_timestamp_ns > 0) {
                 consumed_recv_latest_timestamp_ns_ = stats.latest_timestamp_ns;
             }
+            if (consumed_recv_oldest_bpf_entry_ns_ == 0 && stats.oldest_bpf_entry_ns > 0) {
+                consumed_recv_oldest_bpf_entry_ns_ = stats.oldest_bpf_entry_ns;
+            }
+            if (stats.latest_bpf_entry_ns > 0) {
+                consumed_recv_latest_bpf_entry_ns_ = stats.latest_bpf_entry_ns;
+            }
+            if (consumed_recv_oldest_poll_cycle_ == 0 && stats.oldest_poll_cycle > 0) {
+                consumed_recv_oldest_poll_cycle_ = stats.oldest_poll_cycle;
+            }
+            if (stats.latest_poll_cycle > 0) {
+                consumed_recv_latest_poll_cycle_ = stats.latest_poll_cycle;
+            }
         }
 
         return result;
@@ -941,11 +955,12 @@ struct PacketTransport {
         return 0;
     }
 
-    void poll() {
+    size_t poll() {
         pio_.poll_wait();
-        poll_rx_and_process();
+        size_t n = poll_rx_and_process();
         check_retransmit();
         // Note: FIFO release now happens automatically in mark_frame_acked()
+        return n;
     }
 
     // ========================================================================
@@ -1025,11 +1040,19 @@ struct PacketTransport {
     uint64_t get_recv_oldest_timestamp() const { return consumed_recv_oldest_timestamp_ns_; }
     uint64_t get_recv_latest_timestamp() const { return consumed_recv_latest_timestamp_ns_; }
     uint32_t get_recv_packet_count() const { return consumed_recv_packet_count_; }
+    uint64_t get_recv_oldest_bpf_entry_ns() const { return consumed_recv_oldest_bpf_entry_ns_; }
+    uint64_t get_recv_latest_bpf_entry_ns() const { return consumed_recv_latest_bpf_entry_ns_; }
+    uint64_t get_recv_oldest_poll_cycle() const { return consumed_recv_oldest_poll_cycle_; }
+    uint64_t get_recv_latest_poll_cycle() const { return consumed_recv_latest_poll_cycle_; }
 
     void reset_recv_stats() {
         consumed_recv_packet_count_ = 0;
         consumed_recv_oldest_timestamp_ns_ = 0;
         consumed_recv_latest_timestamp_ns_ = 0;
+        consumed_recv_oldest_bpf_entry_ns_ = 0;
+        consumed_recv_latest_bpf_entry_ns_ = 0;
+        consumed_recv_oldest_poll_cycle_ = 0;
+        consumed_recv_latest_poll_cycle_ = 0;
     }
 
     void reset_hw_timestamps() {
@@ -1052,6 +1075,9 @@ struct PacketTransport {
     // Hardware timestamp statistics
     uint32_t get_hw_timestamp_count() const { return hw_timestamp_count_; }
     uint64_t get_hw_timestamp_byte_count() const { return hw_timestamp_byte_ct_; }
+
+    // Pipeline integration: set conn_state for disconnect reason tracking
+    void set_conn_state(void* cs) { conn_state_ptr_ = cs; }
 
     PacketIO* get_packet_io() { return &pio_; }
     const userspace_stack::TCPParams& tcp_params() const { return tcp_params_; }
@@ -1076,9 +1102,9 @@ private:
     // RX Processing
     // ========================================================================
 
-    void poll_rx_and_process() {
+    size_t poll_rx_and_process() {
         [[maybe_unused]] uint64_t poll_enter_cycle = rdtsc();
-        pio_.process_rx_frames(SIZE_MAX, [this, poll_enter_cycle](uint32_t idx, websocket::xdp::PacketFrameDescriptor& desc) {
+        return pio_.process_rx_frames(SIZE_MAX, [this, poll_enter_cycle](uint32_t idx, websocket::xdp::PacketFrameDescriptor& desc) {
             uint32_t frame_idx = pio_.frame_ptr_to_idx(desc.frame_ptr);
             uint8_t* frame_data = reinterpret_cast<uint8_t*>(desc.frame_ptr);
             uint16_t frame_len = desc.frame_len;
@@ -1117,6 +1143,13 @@ private:
                         dbg_rx_syn_ack_++;
                     } else if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
                         dbg_rx_fin_++;
+                        { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                          fprintf(stderr, "[%ld.%06ld] [TCP-FIN] Connection closed by peer (graceful)\n",
+                                  _ts.tv_sec, _ts.tv_nsec / 1000); }
+                        if (conn_state_ptr_) {
+                            auto* cs = static_cast<websocket::pipeline::ConnStateShm*>(conn_state_ptr_);
+                            cs->set_disconnect(websocket::pipeline::DisconnectReason::TCP_FIN);
+                        }
                     } else if (parsed.payload_len > 0) {
                         dbg_rx_ooo_data_++;
                     }
@@ -1135,7 +1168,8 @@ private:
                         hw_timestamp_byte_ct_ += result.data_len;
                         uint64_t umem_addr = desc.frame_ptr;  // Use frame_ptr as umem_addr for compatibility
                         bool push_ok = recv_buffer_.push_frame(result.data, result.data_len,
-                                                               frame_idx, umem_addr, hw_timestamp_ns);
+                                                               frame_idx, umem_addr, hw_timestamp_ns,
+                                                               desc.bpf_entry_ns, desc.nic_frame_poll_cycle);
                         if (push_ok) {
                             frame_consumed = true;  // Don't mark_frame_consumed now, recv_buffer_ will do it
                         } else {
@@ -1148,6 +1182,14 @@ private:
 
                 case userspace_stack::TCPAction::CLOSED:
                     connected_ = false;
+                    { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                      fprintf(stderr, "[%ld.%06ld] [TCP-RST] Connection reset by peer\n",
+                              _ts.tv_sec, _ts.tv_nsec / 1000); }
+                    if (conn_state_ptr_) {
+                        auto* cs = static_cast<websocket::pipeline::ConnStateShm*>(conn_state_ptr_);
+                        cs->set_disconnect(websocket::pipeline::DisconnectReason::TCP_RST);
+                        cs->shutdown_all();
+                    }
                     break;
 
                 default:
@@ -1204,6 +1246,8 @@ private:
     // ========================================================================
 
     void check_retransmit() {
+        if (!connected_) return;
+
         uint64_t now_tsc = rdtsc();
         uint64_t rto_cycles = retransmit_queue_.get_rto_cycles();
 
@@ -1326,10 +1370,17 @@ private:
     uint32_t consumed_recv_packet_count_ = 0;
     uint64_t consumed_recv_oldest_timestamp_ns_ = 0;
     uint64_t consumed_recv_latest_timestamp_ns_ = 0;
+    uint64_t consumed_recv_oldest_bpf_entry_ns_ = 0;
+    uint64_t consumed_recv_latest_bpf_entry_ns_ = 0;
+    uint64_t consumed_recv_oldest_poll_cycle_ = 0;
+    uint64_t consumed_recv_latest_poll_cycle_ = 0;
 
     int poll_interval_us_ = 0;
     uint64_t tsc_freq_hz_ = 0;
     uint64_t timeout_cycles_ = 0;
+
+    // Pipeline integration
+    void* conn_state_ptr_ = nullptr;  // ConnStateShm* (avoid header dep)
 
     // Debug RX accounting (always active, negligible overhead)
     uint32_t dbg_rx_total_ = 0;        // Frames delivered from RAW_INBOX
@@ -1445,7 +1496,7 @@ template<typename T>
 concept UserspaceTransportConcept = TransportPolicyConcept<T> && requires(T transport,
                                                                            const char* ip,
                                                                            uint16_t port) {
-    { transport.poll() } -> std::same_as<void>;
+    { transport.poll() } -> std::same_as<size_t>;
     { transport.add_exchange_ip(ip) } -> std::same_as<void>;
     { transport.add_exchange_port(port) } -> std::same_as<void>;
 };

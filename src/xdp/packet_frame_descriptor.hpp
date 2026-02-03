@@ -28,7 +28,7 @@ enum FrameType : uint8_t {
  * PacketFrameDescriptor - Unified descriptor for all frame metadata
  *
  * This structure provides a uniform representation for frame metadata
- * in both TX and RX paths. It is 32-byte aligned for cache efficiency.
+ * in both TX and RX paths. It is 64-byte aligned for cache efficiency.
  *
  * For TX path:
  *   - frame_ptr: Points to data area (after headroom) where caller writes packet
@@ -42,15 +42,16 @@ enum FrameType : uint8_t {
  *   - nic_timestamp_ns: NIC hardware timestamp (nanoseconds)
  *   - consumed: Set by mark_frame_consumed() when processing done
  */
-struct alignas(32) PacketFrameDescriptor {
+struct alignas(64) PacketFrameDescriptor {
     uint64_t frame_ptr;              // Base address of frame data (after headroom)
     uint64_t nic_timestamp_ns;       // NIC hardware timestamp (ns), 0 if unavailable
     uint64_t nic_frame_poll_cycle;   // TSC cycle when frame was retrieved/claimed
+    uint64_t bpf_entry_ns;           // BPF entry bpf_ktime_get_ns() (CLOCK_MONOTONIC ns)
     uint16_t frame_len;              // Actual frame length (Ethernet + IP + TCP + payload)
     uint8_t  frame_type;             // FrameType enum (RX/TX_DATA/TX_ACK/TX_SYN/etc)
     uint8_t  consumed;               // For RX: set when frame processing done
     uint8_t  acked;                  // For TX: set when ACK received
-    uint8_t  _pad[3];                // Padding to 32 bytes
+    uint8_t  _pad[27];               // Padding to 64 bytes
 
     /**
      * Clear all fields to zero
@@ -74,8 +75,8 @@ struct alignas(32) PacketFrameDescriptor {
     }
 };
 
-static_assert(sizeof(PacketFrameDescriptor) == 32,
-              "PacketFrameDescriptor must be 32 bytes for cache alignment");
+static_assert(sizeof(PacketFrameDescriptor) == 64,
+              "PacketFrameDescriptor must be 64 bytes for cache alignment");
 
 }  // namespace xdp
 }  // namespace websocket

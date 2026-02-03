@@ -21,25 +21,32 @@
 #endif
 
 // Timestamp recording structure
-// Captures timing at 6 stages from network to application
+// Captures timing at multiple stages from NIC hardware to application callback
 typedef struct {
-    // Stage 1: NIC RX timestamps (CLOCK_MONOTONIC ns, 0 if unsupported)
-    // Multiple packets may arrive between event loop iterations, so we track:
+    // Stage 1: NIC HW timestamps (CLOCK_REALTIME converted to CLOCK_MONOTONIC ns)
     uint64_t hw_timestamp_oldest_ns;  // Oldest packet timestamp in queue (first arrival)
     uint64_t hw_timestamp_latest_ns;  // Latest packet timestamp in queue (most recent arrival)
     uint32_t hw_timestamp_count;      // Number of packets with timestamps found in queue
-                                      // If count > 1, indicates timestamp queue buildup (potential staleness)
     uint64_t hw_timestamp_byte_count; // Total bytes polled from NIC (for stats display)
 
-    uint64_t event_cycle;             // Stage 2: Event loop start (TSC cycles)
+    // Stage 1.5: BPF entry timestamps (CLOCK_MONOTONIC ns, from bpf_ktime_get_ns())
+    uint64_t bpf_entry_oldest_ns;     // BPF entry timestamp of first packet
+    uint64_t bpf_entry_latest_ns;     // BPF entry timestamp of latest packet
+
+    // Stage 2: XDP Poll cycles (TSC rdtscp when userspace polled packet)
+    uint64_t poll_cycle_oldest;       // XDP Poll rdtscp of first packet
+    uint64_t poll_cycle_latest;       // XDP Poll rdtscp of latest packet
+
+    // Stage 3-4: SSL read
     uint64_t recv_start_cycle;        // Stage 3: Before SSL_read/recv call (TSC cycles)
     uint64_t recv_end_cycle;          // Stage 4: When SSL_read/recv completed (TSC cycles)
     ssize_t ssl_read_bytes;           // Bytes returned by SSL_read (for stats display)
-    uint64_t frame_parsed_cycle;      // Stage 5: When frame parsing completed (TSC cycles)
-    // Stage 6: Implemented in user callback - records both CPU cycle and CLOCK_MONOTONIC
+
+    // Stage 5: Frame parsing
+    uint64_t frame_parsed_cycle;      // When frame parsing completed (TSC cycles)
+
     size_t payload_len;
     uint8_t opcode;                   // WebSocket frame opcode (0x01=text, 0x02=binary, 0x08=close, 0x09=ping, 0x0A=pong)
-                                      // Use this to distinguish between text and binary messages in callbacks
 } timing_record_t;
 
 // Per-message info in a batch callback
@@ -337,69 +344,60 @@ static inline void print_timing_record(const timing_record_t& tr, uint64_t tsc_f
     printf("  Payload length: %zu bytes, Opcode: 0x%02x\n", tr.payload_len, tr.opcode);
 
     if (tr.hw_timestamp_count > 0) {
-        printf("  [Stage 1] NIC/Kernel RX Timestamps:\n");
+        printf("  [Stage 1] NIC HW Timestamps:\n");
         printf("            Packets timestamped: %u\n", tr.hw_timestamp_count);
 
-        if (tr.hw_timestamp_count > 1) {
-            printf("            ⚠️  WARNING: %u packets queued (potential timestamp staleness)\n",
-                   tr.hw_timestamp_count);
-        }
-
-        // Print oldest timestamp
         if (tr.hw_timestamp_oldest_ns > 0) {
             printf("            Oldest packet:  %.6f s since boot\n",
                    tr.hw_timestamp_oldest_ns / 1e9);
         }
-
-        // Print latest timestamp
         if (tr.hw_timestamp_latest_ns > 0) {
             printf("            Latest packet:  %.6f s since boot\n",
                    tr.hw_timestamp_latest_ns / 1e9);
         }
-
-        // Show queue delay if multiple packets
         if (tr.hw_timestamp_count > 1 && tr.hw_timestamp_latest_ns > tr.hw_timestamp_oldest_ns) {
             uint64_t queue_delay_ns = tr.hw_timestamp_latest_ns - tr.hw_timestamp_oldest_ns;
-            printf("            Queue span:     %.3f μs (oldest→latest)\n",
+            printf("            Queue span:     %.3f us (oldest->latest)\n",
                    queue_delay_ns / 1000.0);
         }
     } else {
-        printf("  [Stage 1] NIC/Kernel RX timestamp: Not available\n");
-        printf("            (Hardware timestamping may not be supported or enabled)\n");
+        printf("  [Stage 1] NIC HW timestamp: Not available\n");
     }
 
-    printf("\n  [Stage 2] Event loop:   %lu cycles", tr.event_cycle);
-    if (tsc_freq_hz > 0 && tr.event_cycle > 0) {
-        // Use floating point division to avoid overflow with large absolute cycle values
-        double stage2_time_s = (double)tr.event_cycle / (double)tsc_freq_hz;
-        printf(" (%.6f s since boot)\n", stage2_time_s);
-    } else {
-        printf("\n");
+    if (tr.bpf_entry_latest_ns > 0) {
+        printf("  [Stage 1.5] BPF entry:  %.6f s (MONOTONIC)\n",
+               tr.bpf_entry_latest_ns / 1e9);
     }
 
-    printf("  [Stage 3] Recv start:   %lu cycles", tr.recv_start_cycle);
-    if (tsc_freq_hz > 0 && tr.recv_start_cycle > 0 && tr.event_cycle > 0) {
-        uint64_t delta = tr.recv_start_cycle - tr.event_cycle;
-        printf(" → Δ%.3f μs\n", cycles_to_ns(delta, tsc_freq_hz) / 1000.0);
-    } else {
-        printf("\n");
+    if (tr.poll_cycle_latest > 0) {
+        printf("  [Stage 2] XDP Poll:     %lu cycles", tr.poll_cycle_latest);
+        if (tsc_freq_hz > 0) {
+            double stage2_time_s = (double)tr.poll_cycle_latest / (double)tsc_freq_hz;
+            printf(" (%.6f s since boot)\n", stage2_time_s);
+        } else {
+            printf("\n");
+        }
     }
 
-    printf("  [Stage 4] SSL read end: %lu cycles", tr.recv_end_cycle);
+    if (tsc_freq_hz > 0 && tr.poll_cycle_latest > 0 && tr.recv_start_cycle > tr.poll_cycle_latest) {
+        printf("  [Stage 2->3] Poll->Recv: %.3f us\n",
+               cycles_to_ns(tr.recv_start_cycle - tr.poll_cycle_latest, tsc_freq_hz) / 1000.0);
+    }
+
+    printf("  [Stage 3] Recv start:   %lu cycles\n", tr.recv_start_cycle);
+
     if (tsc_freq_hz > 0 && tr.recv_end_cycle > 0 && tr.recv_start_cycle > 0) {
-        uint64_t delta = tr.recv_end_cycle - tr.recv_start_cycle;
-        printf(" → Δ%.3f μs (SSL decryption)\n", cycles_to_ns(delta, tsc_freq_hz) / 1000.0);
-    } else {
-        printf("\n");
+        printf("  [Stage 3->4] SSL decrypt: %.3f us\n",
+               cycles_to_ns(tr.recv_end_cycle - tr.recv_start_cycle, tsc_freq_hz) / 1000.0);
     }
 
-    printf("  [Stage 5] Frame parsed: %lu cycles", tr.frame_parsed_cycle);
+    printf("  [Stage 4] SSL read end: %lu cycles\n", tr.recv_end_cycle);
+
     if (tsc_freq_hz > 0 && tr.frame_parsed_cycle > 0 && tr.recv_end_cycle > 0) {
-        uint64_t delta = tr.frame_parsed_cycle - tr.recv_end_cycle;
-        printf(" → Δ%.3f μs (WebSocket parsing)\n", cycles_to_ns(delta, tsc_freq_hz) / 1000.0);
-    } else {
-        printf("\n");
+        printf("  [Stage 4->5] WS parse:   %.3f us\n",
+               cycles_to_ns(tr.frame_parsed_cycle - tr.recv_end_cycle, tsc_freq_hz) / 1000.0);
     }
 
+    printf("  [Stage 5] Frame parsed: %lu cycles\n", tr.frame_parsed_cycle);
     printf("  [Stage 6] Callback:     Implemented in user callback\n");
 }
