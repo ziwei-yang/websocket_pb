@@ -174,6 +174,27 @@ uint64_t parse_event_time(const uint8_t* payload, size_t len) {
     return 0;
 }
 
+// ============================================================================
+// Frame Recording (NIC-to-message latency)
+// ============================================================================
+
+static constexpr size_t MAX_FRAME_RECORDS = 65536;
+
+void dump_frame_records(const WSFrameInfo* records, size_t count, const char* tag) {
+    if (count == 0) return;
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/%s_frame_records_%d.bin", tag, getpid());
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "Failed to create %s\n", path); return; }
+    uint32_t n = static_cast<uint32_t>(count);
+    uint32_t sz = static_cast<uint32_t>(sizeof(WSFrameInfo));
+    fwrite(&n, 4, 1, f);
+    fwrite(&sz, 4, 1, f);
+    fwrite(records, sizeof(WSFrameInfo), count, f);
+    fclose(f);
+    printf("[FRAME-RECORDS] Saved %u records to %s\n", n, path);
+}
+
 }  // namespace
 
 // ============================================================================
@@ -587,6 +608,14 @@ public:
         int64_t last_sequence = -1;
         bool sequence_error = false;
 
+        // Frame recording for latency analysis
+        std::vector<WSFrameInfo> frame_records;
+        frame_records.reserve(MAX_FRAME_RECORDS);
+        uint64_t tsc_freq = conn_state_->tsc_freq_hz;
+
+        uint64_t prev_publish_mono_ns = 0;
+        uint64_t prev_latest_poll_cycle = 0;
+
         auto start_time = std::chrono::steady_clock::now();
         auto stream_end = start_time + std::chrono::milliseconds(g_timeout_ms);
 
@@ -609,6 +638,13 @@ public:
             bool end_of_batch;
             while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
                 total_frames++;
+                frame.print_timeline(tsc_freq, prev_publish_mono_ns, prev_latest_poll_cycle);
+                prev_publish_mono_ns = frame.publish_time_ts;
+                prev_latest_poll_cycle = frame.latest_poll_cycle;
+
+                if (frame_records.size() < MAX_FRAME_RECORDS) {
+                    frame_records.push_back(frame);
+                }
 
                 // Verify sequence ordering
                 int64_t current_seq = ws_frame_cons.sequence();
@@ -619,7 +655,7 @@ public:
                 }
                 last_sequence = current_seq;
 
-                // Count by opcode
+                // Count by opcode (no per-frame printing)
                 switch (frame.opcode) {
                     case 0x01:  // TEXT
                         text_frames++;
@@ -627,23 +663,6 @@ public:
                             const uint8_t* payload = msg_inbox_->data_at(frame.msg_inbox_offset);
                             if (is_valid_trade_json(reinterpret_cast<const char*>(payload), frame.payload_len)) {
                                 valid_trades++;
-
-                                // Parse "E" field for exchange latency
-                                uint64_t event_time_ms = parse_event_time(payload, frame.payload_len);
-                                if (event_time_ms > 0) {
-                                    struct timespec ts;
-                                    clock_gettime(CLOCK_REALTIME, &ts);
-                                    uint64_t local_time_ms = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-                                    int64_t exchange_latency_ms = (int64_t)local_time_ms - (int64_t)event_time_ms;
-
-                                    if (run_forever || valid_trades <= 3) {
-                                        printf("\n[MSG #%lu] %.*s\n",
-                                               valid_trades,
-                                               (int)std::min(static_cast<uint32_t>(200), frame.payload_len),
-                                               reinterpret_cast<const char*>(payload));
-                                        printf("  Exchange latency: %ld ms\n", exchange_latency_ms);
-                                    }
-                                }
                             }
                         }
                         break;
@@ -654,7 +673,6 @@ public:
 
                     case 0x09:  // PING
                         ping_frames++;
-                        printf("[PING] Received PING #%lu\n", ping_frames);
                         break;
 
                     case 0x0A:  // PONG
@@ -663,7 +681,6 @@ public:
 
                     case 0x08:  // CLOSE
                         close_frames++;
-                        printf("[CLOSE] Received CLOSE frame\n");
                         break;
 
                     default:
@@ -687,6 +704,12 @@ public:
                 WSFrameInfo frame;
                 while (ws_frame_cons.try_consume(frame)) {
                     total_frames++;
+                    frame.print_timeline(tsc_freq, prev_publish_mono_ns, prev_latest_poll_cycle);
+                    prev_publish_mono_ns = frame.publish_time_ts;
+                    prev_latest_poll_cycle = frame.latest_poll_cycle;
+                    if (frame_records.size() < MAX_FRAME_RECORDS) {
+                        frame_records.push_back(frame);
+                    }
                     if (frame.opcode == 0x01) {
                         text_frames++;
                         if (frame.payload_len > 0) {
@@ -714,6 +737,45 @@ public:
         printf("  CLOSE frames:    %lu\n", close_frames);
         printf("  Valid trades:    %lu\n", valid_trades);
         printf("  Sequence errors: %s\n", sequence_error ? "YES" : "none");
+
+        // --- NIC-to-message latency stats (qualifying: 1-pkt, 1-ssl, TEXT, >=100B) ---
+        {
+            std::vector<double> msg_latencies_us;
+            for (const auto& r : frame_records) {
+                if (r.opcode == 0x01 &&
+                    !r.is_fragmented &&
+                    r.ssl_read_ct == 1 &&
+                    r.nic_packet_ct == 1 &&
+                    r.first_poll_cycle > 0 &&
+                    r.ws_frame_publish_cycle > r.first_poll_cycle &&
+                    r.payload_len >= 100) {
+                    uint64_t lat_ns = cycles_to_ns(
+                        r.ws_frame_publish_cycle - r.first_poll_cycle, tsc_freq);
+                    msg_latencies_us.push_back(static_cast<double>(lat_ns) / 1000.0);
+                }
+            }
+            if (!msg_latencies_us.empty()) {
+                std::sort(msg_latencies_us.begin(), msg_latencies_us.end());
+                size_t n = msg_latencies_us.size();
+                auto pctile = [&](double p) -> double {
+                    return msg_latencies_us[static_cast<size_t>(p / 100.0 * (n - 1))];
+                };
+                double sum = 0;
+                for (double v : msg_latencies_us) sum += v;
+                printf("\n=== NIC-to-Message Latency (poll->publish, 1-pkt 1-ssl TEXT) (N=%zu) ===\n", n);
+                printf("  Min:    %.2f us\n", msg_latencies_us.front());
+                printf("  P50:    %.2f us\n", pctile(50));
+                printf("  P90:    %.2f us\n", pctile(90));
+                printf("  P99:    %.2f us\n", pctile(99));
+                printf("  Max:    %.2f us\n", msg_latencies_us.back());
+                printf("  Mean:   %.2f us\n", sum / n);
+            } else {
+                printf("\n=== NIC-to-Message Latency: No qualifying samples ===\n");
+            }
+        }
+
+        // Dump all frame records to binary file
+        dump_frame_records(frame_records.data(), frame_records.size(), "binance_96");
 
         // Verify ring buffer status
         printf("\n--- Ring Buffer Status ---\n");

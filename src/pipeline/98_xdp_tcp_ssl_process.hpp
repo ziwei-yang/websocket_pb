@@ -217,6 +217,17 @@ public:
         }
         printf("[UNIFIED-SSL] WebSocket upgrade complete\n");
 
+        // Extract TLS record keys for direct AES-CTR decryption
+        websocket::crypto::TLSRecordKeys tls_keys;
+        if (ssl_.extract_record_keys(tls_keys)) {
+            transport_.set_tls_record_keys(tls_keys);
+            if (tls_keys.is_tls13) {
+                transport_.set_tls_seq_num(ssl_.get_server_record_count());
+            }
+            printf("[UNIFIED-SSL] Direct AES-CTR decryption enabled (seq=%lu)\n",
+                   tls_keys.is_tls13 ? ssl_.get_server_record_count() : 0UL);
+        }
+
         // Reset stats before message streaming
         transport_.reset_hw_timestamps();
         transport_.reset_recv_stats();
@@ -252,7 +263,15 @@ public:
             if (linear_space > 16384) linear_space = 16384;  // Limit read size
 
             timing.recv_start_cycle = rdtsc();
-            ssize_t read_len = ssl_.read(msg_inbox_->write_ptr(), linear_space);
+            ssize_t read_len;
+            if (transport_.has_tls_record_keys()) {
+                read_len = transport_.ssl_read_by_chunk(
+                    msg_inbox_->write_ptr(), linear_space,
+                    [](const uint8_t*, size_t) {});
+                if (read_len == -1) read_len = 0;
+            } else {
+                read_len = ssl_.read(msg_inbox_->write_ptr(), linear_space);
+            }
             timing.recv_end_cycle = rdtscp();
 
             if (read_len > 0) {
@@ -278,21 +297,27 @@ public:
                 msg_inbox_->advance_write(static_cast<uint32_t>(read_len));
 
                 // 4. Publish MsgMetadata
-                publish_metadata(write_offset, static_cast<uint32_t>(read_len), timing);
+                bool tls_boundary = transport_.has_tls_record_keys()
+                                    ? transport_.tls_record_boundary() : false;
+                publish_metadata(write_offset, static_cast<uint32_t>(read_len), timing, tls_boundary);
 
-                // 5. Print timing breakdown (if Profiling)
+                // 5. Print timing breakdown (if Profiling and DEBUG)
+#if DEBUG
                 if constexpr (Profiling) {
                     print_timing_breakdown(static_cast<uint32_t>(read_len), timing);
                 }
+#endif
 
                 // Reset timestamps for next batch
                 transport_.reset_recv_stats();
 
                 ssl_read_count_++;
 
-            } else if (read_len < 0 && errno != EAGAIN) {
-                fprintf(stderr, "[UNIFIED-SSL] SSL read error: %s\n", strerror(errno));
-                break;
+            } else if (read_len < 0) {
+                if (!transport_.has_tls_record_keys() && errno != EAGAIN) {
+                    fprintf(stderr, "[UNIFIED-SSL] SSL read error: %s\n", strerror(errno));
+                    break;
+                }
             }
 
             // Pure busy-poll for lowest latency
@@ -414,7 +439,8 @@ private:
     // MsgMetadata Publishing
     // ========================================================================
 
-    void publish_metadata(uint32_t write_offset, uint32_t len, timing_record_t& timing) {
+    void publish_metadata(uint32_t write_offset, uint32_t len,
+                          timing_record_t& timing, bool tls_record_end) {
         int64_t seq = msg_metadata_prod_->try_claim();
         if (seq < 0) {
             fprintf(stderr, "[UNIFIED-SSL] FATAL: MSG_METADATA full\n");
@@ -434,7 +460,10 @@ private:
         meta.msg_inbox_offset = write_offset;
         meta.decrypted_len = len;
         meta.nic_packet_ct = timing.hw_timestamp_count;
+        meta.ssl_last_op_cycle = last_op_cycle_;
+        meta.tls_record_end = tls_record_end;
         msg_metadata_prod_->publish(seq);
+        last_op_cycle_ = rdtscp();
     }
 
     // ========================================================================
@@ -571,6 +600,7 @@ private:
 
     // Timing
     uint64_t tsc_freq_hz_ = 0;
+    uint64_t last_op_cycle_ = 0;
 
     // Last-valid SSL read timestamps (for packets=0 case)
     uint64_t last_valid_ssl_start_cycle_ = 0;

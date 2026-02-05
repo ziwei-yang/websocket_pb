@@ -526,6 +526,13 @@ struct XDPTransport {
         for (uint32_t i = 0; i < nb_pkts && processed < max_frames; i++) {
             const struct xdp_desc* rx_desc = xsk_ring_cons__rx_desc(&rx_ring_, idx_rx + i);
 
+            // Prefetch next frame's UMEM data (metadata + Ethernet header)
+            if (i + 1 < nb_pkts) {
+                const struct xdp_desc* next_desc = xsk_ring_cons__rx_desc(&rx_ring_, idx_rx + i + 1);
+                __builtin_prefetch(static_cast<uint8_t*>(umem_area_) + next_desc->addr - 16, 0, 3);
+                __builtin_prefetch(static_cast<uint8_t*>(umem_area_) + next_desc->addr, 0, 3);
+            }
+
             // Setup descriptor
             PacketFrameDescriptor desc;
             desc.clear();
@@ -540,11 +547,19 @@ struct XDPTransport {
             desc.nic_frame_poll_cycle = poll_cycle;
             desc.frame_type = FRAME_TYPE_RX;
 
-            // Read hardware timestamp from metadata area (8 bytes before packet data)
-            if constexpr (HEADROOM >= 8) {
-                uint64_t* ts_ptr = reinterpret_cast<uint64_t*>(
-                    static_cast<uint8_t*>(umem_area_) + rx_desc->addr - 8);
-                desc.nic_timestamp_ns = *ts_ptr;
+            // Read XDP metadata from headroom (16 bytes before packet data)
+            // Layout: [xdp_user_metadata (16 bytes)][packet data]
+            //         ^                              ^
+            //         data_meta                      data (rx_desc->addr)
+            if constexpr (HEADROOM >= 16) {
+                struct xdp_user_metadata {
+                    uint64_t rx_timestamp_ns;
+                    uint64_t bpf_entry_ns;
+                };
+                auto* meta = reinterpret_cast<xdp_user_metadata*>(
+                    static_cast<uint8_t*>(umem_area_) + rx_desc->addr - sizeof(xdp_user_metadata));
+                desc.nic_timestamp_ns = meta->rx_timestamp_ns;
+                desc.bpf_entry_ns = meta->bpf_entry_ns;
             }
 
             // Store frame info for later mark_frame_consumed()
@@ -820,6 +835,7 @@ struct XDPTransport {
             tx_desc->len = desc.frame_len;
             tx_desc->options = 0;
 
+#if DEBUG
             // Log TX commit with TCP details
             const uint8_t* pkt = static_cast<const uint8_t*>(umem_area_) + addr + HEADROOM;
             uint16_t plen = desc.frame_len;
@@ -846,6 +862,7 @@ struct XDPTransport {
                             ts.tv_sec, ts.tv_nsec / 1000, plen, tseq, tack, fs, payload);
                 }
             }
+#endif
         }
 
         xsk_ring_prod__submit(&tx_ring_, count);

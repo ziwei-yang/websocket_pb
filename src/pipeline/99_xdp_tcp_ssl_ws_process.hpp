@@ -207,6 +207,17 @@ public:
         }
         printf("[UNIFIED] WebSocket upgrade complete\n");
 
+        // Extract TLS record keys for direct AES-CTR decryption
+        websocket::crypto::TLSRecordKeys tls_keys;
+        if (ssl_.extract_record_keys(tls_keys)) {
+            transport_.set_tls_record_keys(tls_keys);
+            if (tls_keys.is_tls13) {
+                transport_.set_tls_seq_num(ssl_.get_server_record_count());
+            }
+            printf("[UNIFIED] Direct AES-CTR decryption enabled (seq=%lu)\n",
+                   tls_keys.is_tls13 ? ssl_.get_server_record_count() : 0UL);
+        }
+
         // Reset stats before message streaming
         transport_.reset_hw_timestamps();
         transport_.reset_recv_stats();
@@ -227,6 +238,7 @@ public:
         // Timing record for latency breakdown
         timing_record_t timing;
         memset(&timing, 0, sizeof(timing));
+        memset(&accum_first_timing_, 0, sizeof(accum_first_timing_));
 
         while (running_ && check_running()) {
             // Poll transport (handles TX completions, etc.)
@@ -235,14 +247,24 @@ public:
             // Stage 3: Before SSL read
             timing.recv_start_cycle = rdtsc();
 
-            // Read from SSL
-            ssize_t read_len = ssl_.read(frame_buffer_ + buffer_offset_,
-                                          sizeof(frame_buffer_) - buffer_offset_);
+            // Read from SSL (or direct AES-CTR decryption)
+            ssize_t read_len;
+            if (transport_.has_tls_record_keys()) {
+                read_len = transport_.ssl_read_by_chunk(
+                    frame_buffer_ + buffer_offset_,
+                    sizeof(frame_buffer_) - buffer_offset_,
+                    [](const uint8_t*, size_t) {});
+                if (read_len == -1) read_len = 0;
+            } else {
+                read_len = ssl_.read(frame_buffer_ + buffer_offset_,
+                                      sizeof(frame_buffer_) - buffer_offset_);
+            }
 
             // Stage 4: After SSL read
             timing.recv_end_cycle = rdtscp();
 
             if (read_len > 0) {
+#ifdef DEBUG_SSL_IO
                 struct timespec ts;
                 clock_gettime(CLOCK_MONOTONIC, &ts);
                 const uint8_t* rd = reinterpret_cast<const uint8_t*>(frame_buffer_ + buffer_offset_);
@@ -254,7 +276,35 @@ public:
                     else fprintf(stderr, "\\x%02x", c);
                 }
                 fprintf(stderr, "\"\n");
+#endif
                 buffer_offset_ += read_len;
+
+                // Capture transport timestamps into timing (before parsing)
+                timing.hw_timestamp_count = transport_.get_recv_packet_count();
+                if (timing.hw_timestamp_count > 0) {
+                    timing.hw_timestamp_oldest_ns = transport_.get_recv_oldest_timestamp();
+                    timing.hw_timestamp_latest_ns = transport_.get_recv_latest_timestamp();
+                } else {
+                    timing.hw_timestamp_oldest_ns = 0;
+                    timing.hw_timestamp_latest_ns = 0;
+                }
+                timing.bpf_entry_oldest_ns = transport_.get_recv_oldest_bpf_entry_ns();
+                timing.bpf_entry_latest_ns = transport_.get_recv_latest_bpf_entry_ns();
+                timing.poll_cycle_oldest = transport_.get_recv_oldest_poll_cycle();
+                timing.poll_cycle_latest = transport_.get_recv_latest_poll_cycle();
+
+                // Accumulate SSL read stats for multi-read WS frames
+                accum_ssl_read_ct_++;
+                accum_nic_pkt_ct_ += timing.hw_timestamp_count;
+                if (accum_ssl_read_ct_ == 1) {
+                    accum_first_ssl_start_ = timing.recv_start_cycle;
+                    accum_first_ssl_end_ = timing.recv_end_cycle;
+                    accum_first_timing_ = timing;
+                }
+
+                // Compute TLS record boundary flag
+                bool tls_boundary = transport_.has_tls_record_keys()
+                                    ? transport_.tls_record_boundary() : false;
 
                 // Parse all complete frames in buffer
                 batch_frame_num_ = 0;
@@ -270,11 +320,14 @@ public:
                     uint64_t parse_cycle = rdtscp();
                     size_t total_frame_size = frame.header_len + frame.payload_len;
 
+                    consumed += total_frame_size;
+                    pending_tls_record_end_ = tls_boundary && (consumed >= buffer_offset_);
+
                     // Handle frame by opcode
                     handle_frame(frame, parse_cycle, timing);
-
-                    consumed += total_frame_size;
                 }
+
+                ssl_last_op_cycle_ = timing.recv_end_cycle;
 
                 // Shift remaining data to front of buffer
                 if (consumed > 0 && consumed < buffer_offset_) {
@@ -284,13 +337,22 @@ public:
                     buffer_offset_ = 0;
                 }
 
+                if (buffer_offset_ == 0) {
+                    // All data consumed — reset accumulation for next batch
+                    accum_ssl_read_ct_ = 0;
+                    accum_nic_pkt_ct_ = 0;
+                }
+                // If buffer has remaining partial data, accumulation continues to next SSL read
+
                 // Reset timestamps for next batch and increment SSL read counter
                 transport_.reset_recv_stats();
                 ssl_read_count_++;
 
-            } else if (read_len < 0 && errno != EAGAIN) {
-                fprintf(stderr, "[UNIFIED] SSL read error: %s\n", strerror(errno));
-                break;
+            } else if (read_len < 0) {
+                if (!transport_.has_tls_record_keys() && errno != EAGAIN) {
+                    fprintf(stderr, "[UNIFIED] SSL read error: %s\n", strerror(errno));
+                    break;
+                }
             }
 
             // Pure busy-poll for lowest latency
@@ -372,10 +434,12 @@ private:
             transport_.poll();
             ssize_t sent = ssl_.write(upgrade_req + total_sent, req_len - total_sent);
             if (sent > 0) {
+#ifdef DEBUG_SSL_IO
                 struct timespec ts;
                 clock_gettime(CLOCK_MONOTONIC, &ts);
                 fprintf(stderr, "[%ld.%06ld] [SSL-WRITE] %zd bytes\n",
                         ts.tv_sec, ts.tv_nsec / 1000, sent);
+#endif
                 total_sent += sent;
             } else if (sent < 0 && errno != EAGAIN) {
                 fprintf(stderr, "[UNIFIED] Failed to send upgrade request\n");
@@ -396,10 +460,12 @@ private:
             ssize_t received = ssl_.read(response_buf, sizeof(response_buf));
 
             if (received > 0) {
+#ifdef DEBUG_SSL_IO
                 struct timespec ts;
                 clock_gettime(CLOCK_MONOTONIC, &ts);
                 fprintf(stderr, "[%ld.%06ld] [SSL-READ] %zd bytes\n",
                         ts.tv_sec, ts.tv_nsec / 1000, received);
+#endif
                 if (validate_http_upgrade_response(response_buf, received)) {
                     printf("[UNIFIED] HTTP 101 Switching Protocols validated\n");
                     response_validated = true;
@@ -423,20 +489,6 @@ private:
 
     void handle_frame(const WebSocketFrame& frame, uint64_t parse_cycle,
                       timing_record_t& timing) {
-        // Capture timestamps from transport
-        timing.hw_timestamp_count = transport_.get_recv_packet_count();
-        if (timing.hw_timestamp_count > 0) {
-            timing.hw_timestamp_oldest_ns = transport_.get_recv_oldest_timestamp();
-            timing.hw_timestamp_latest_ns = transport_.get_recv_latest_timestamp();
-        } else {
-            timing.hw_timestamp_oldest_ns = 0;
-            timing.hw_timestamp_latest_ns = 0;
-        }
-        timing.bpf_entry_oldest_ns = transport_.get_recv_oldest_bpf_entry_ns();
-        timing.bpf_entry_latest_ns = transport_.get_recv_latest_bpf_entry_ns();
-        timing.poll_cycle_oldest = transport_.get_recv_oldest_poll_cycle();
-        timing.poll_cycle_latest = transport_.get_recv_latest_poll_cycle();
-
         switch (frame.opcode) {
             case 0x01:  // TEXT
             case 0x02:  // BINARY
@@ -472,13 +524,12 @@ private:
         // Publish WSFrameInfo
         publish_ws_frame_info(frame, inbox_offset, parse_cycle, timing, false);
 
-        // Reset recv stats for next batch
-        transport_.reset_recv_stats();
-
         // Print timing breakdown
+#if DEBUG
         if constexpr (Profiling) {
             print_timing_breakdown(frame, parse_cycle, timing);
         }
+#endif
     }
 
     void handle_ping(const WebSocketFrame& frame, uint64_t parse_cycle,
@@ -528,10 +579,12 @@ private:
             ssize_t pong_sent_bytes = ssl_.write(pong_buffer + pong_total,
                                                   pong_len - pong_total);
             if (pong_sent_bytes > 0) {
+#ifdef DEBUG_SSL_IO
                 struct timespec ts;
                 clock_gettime(CLOCK_MONOTONIC, &ts);
                 fprintf(stderr, "[%ld.%06ld] [SSL-WRITE] %zd bytes\n",
                         ts.tv_sec, ts.tv_nsec / 1000, pong_sent_bytes);
+#endif
                 pong_total += pong_sent_bytes;
             }
             usleep(100);
@@ -557,25 +610,30 @@ private:
         info.is_fragmented = false;
         info.is_last_fragment = false;
 
-        // Timestamps
-        info.first_byte_ts = timing.hw_timestamp_oldest_ns;
+        // Use accumulated "first" timing, current "latest" timing
+        info.first_byte_ts = accum_first_timing_.hw_timestamp_oldest_ns;
         info.last_byte_ts = timing.hw_timestamp_latest_ns;
-        info.first_bpf_entry_ns = timing.bpf_entry_oldest_ns;
+        info.first_bpf_entry_ns = accum_first_timing_.bpf_entry_oldest_ns;
         info.latest_bpf_entry_ns = timing.bpf_entry_latest_ns;
-        info.first_poll_cycle = timing.poll_cycle_oldest;
+        info.first_poll_cycle = accum_first_timing_.poll_cycle_oldest;
         info.latest_poll_cycle = timing.poll_cycle_latest;
-        info.first_ssl_read_start_cycle = timing.recv_start_cycle;
-        info.first_ssl_read_end_cycle = timing.recv_end_cycle;
-        info.latest_ssl_read_start_cycle = timing.recv_start_cycle;
+        info.first_ssl_read_start_cycle = accum_first_ssl_start_;
+        info.ssl_last_op_cycle = ssl_last_op_cycle_;
         info.latest_ssl_read_end_cycle = timing.recv_end_cycle;
-        info.ssl_read_ct = 1;
+        info.ssl_read_ct = static_cast<uint8_t>(accum_ssl_read_ct_);
+        info.is_tls_record_end = pending_tls_record_end_;
+        info.nic_packet_ct = accum_nic_pkt_ct_;
         info.ssl_read_batch_num = ++batch_frame_num_;
         info.ssl_read_total_bytes = current_ssl_read_bytes_;
         info.ws_last_op_cycle = last_op_cycle_;
-        info.nic_packet_ct = static_cast<uint16_t>(timing.hw_timestamp_count);
         info.ws_parse_cycle = parse_cycle;
 
         info.ws_frame_publish_cycle = rdtscp();
+        {
+            struct timespec _ts;
+            clock_gettime(CLOCK_MONOTONIC, &_ts);
+            info.publish_time_ts = _ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+        }
         ws_frame_info_prod_->publish(seq);
         last_op_cycle_ = rdtscp();
     }
@@ -720,10 +778,21 @@ private:
     uint64_t msg_count_ = 0;
     uint64_t ssl_read_count_ = 0;
     uint64_t last_op_cycle_ = 0;
+    uint64_t ssl_last_op_cycle_ = 0;
     uint64_t ping_count_ = 0;
     uint64_t pong_count_ = 0;
     uint32_t batch_frame_num_ = 0;
     uint32_t current_ssl_read_bytes_ = 0;
+
+    // TLS record boundary tracking
+    bool pending_tls_record_end_ = false;
+
+    // SSL read accumulation for multi-read WS frames
+    uint16_t accum_ssl_read_ct_ = 0;
+    uint16_t accum_nic_pkt_ct_ = 0;
+    uint64_t accum_first_ssl_start_ = 0;
+    uint64_t accum_first_ssl_end_ = 0;
+    timing_record_t accum_first_timing_;
 };
 
 }  // namespace websocket::pipeline

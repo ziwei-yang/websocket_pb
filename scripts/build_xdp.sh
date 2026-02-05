@@ -279,8 +279,28 @@ map_test_source() {
     local filename
     filename=$(basename "$source")
 
-    # Remove .cpp extension
+    # Remove .cpp extension for matching
     local base="${filename%.cpp}"
+
+    # Resolve actual source file in test/pipeline/ (exact match or prefix glob)
+    local search_dir="$PROJECT_DIR/test/pipeline"
+    if [[ -f "$search_dir/$filename" ]]; then
+        : # exact match, use as-is
+    else
+        # Try prefix glob: e.g. "98_websocket_binance.cpp" -> "98_websocket_binance_*.cpp"
+        local matches
+        matches=$(cd "$search_dir" && ls ${base}*.cpp 2>/dev/null || true)
+        local count
+        count=$(echo "$matches" | wc -w)
+        if [[ $count -eq 1 ]]; then
+            filename="$matches"
+            base="${filename%.cpp}"
+        elif [[ $count -gt 1 ]]; then
+            log_error "Multiple files match '$source': $matches"
+            exit 1
+        fi
+        # If count == 0, fall through to case (may be a non-pipeline target like xdp_binance)
+    fi
 
     # Map to binary name and make target
     case "$base" in
@@ -320,15 +340,15 @@ map_test_source() {
             TEST_BIN="build/test_xdp_okx_integration"
             MAKE_TARGET="build/test_xdp_okx_integration"
             ;;
-        99_websocket_binance)
+        99_websocket_binance_1_proc|99_websocket_binance)
             TEST_BIN="build/test_pipeline_99_websocket_binance"
             MAKE_TARGET="build-test-pipeline-unified_binance"
             ;;
-        98_websocket_binance)
+        98_websocket_binance_piotransport_ws|98_websocket_binance)
             TEST_BIN="build/test_pipeline_98_websocket_binance"
             MAKE_TARGET="build-test-pipeline-98_websocket_binance"
             ;;
-        96_websocket_binance)
+        96_websocket_binance_xdp_piotransport_ws|96_websocket_binance)
             TEST_BIN="build/test_pipeline_96_websocket_binance"
             MAKE_TARGET="build-test-pipeline-96_websocket_binance"
             ;;

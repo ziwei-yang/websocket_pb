@@ -19,8 +19,8 @@ FIELD_NAMES = [
     'first_byte_ts', 'last_byte_ts',
     'first_bpf_entry_ns', 'latest_bpf_entry_ns',
     'first_poll_cycle', 'latest_poll_cycle',
-    'first_ssl_read_start', 'first_ssl_read_end',
-    'latest_ssl_read_start', 'latest_ssl_read_end',
+    'first_ssl_read_start', 'publish_time_ts',
+    'ssl_last_op_cycle', 'latest_ssl_read_end',
     'ssl_read_batch_num', 'ssl_read_total_bytes', 'ws_last_op_cycle',
     'ws_parse_cycle', 'ws_frame_publish_cycle',
 ]
@@ -223,8 +223,8 @@ def pct(sorted_vals, p):
 # --- Stage definitions ---
 STAGES = [
     ("Poll → SSL Read Start",      'first_ssl_read_start', 'first_poll_cycle'),
-    ("SSL Read (decrypt)",          'first_ssl_read_end',   'first_ssl_read_start'),
-    ("SSL Read End → WS Parse",    'ws_parse_cycle',       'first_ssl_read_end'),
+    ("SSL Read (decrypt)",          'latest_ssl_read_end',   'first_ssl_read_start'),
+    ("SSL Read End → WS Parse",    'ws_parse_cycle',       'latest_ssl_read_end'),
     ("WS Parse → Frame Publish",   'ws_frame_publish_cycle', 'ws_parse_cycle'),
     ("Full: Poll → WS Parse",      'ws_parse_cycle',       'first_poll_cycle'),
     ("Full: Poll → Frame Publish", 'ws_frame_publish_cycle', 'first_poll_cycle'),
@@ -276,7 +276,7 @@ def main():
         tsc_chain = [
             r['first_poll_cycle'],
             r['first_ssl_read_start'],
-            r['first_ssl_read_end'],
+            r['latest_ssl_read_end'],
             r['ws_parse_cycle'],
             r['ws_frame_publish_cycle'],
         ]
@@ -341,7 +341,7 @@ def main():
     busy_stage3 = [] # SSL Read End → WS Parse (us) for busy records
     for r in qualifying:
         last_op = r['ws_last_op_cycle']
-        ssl_end = r['first_ssl_read_end']
+        ssl_end = r['latest_ssl_read_end']
         s3_us = (r['ws_parse_cycle'] - ssl_end) * tsc_to_us
         if last_op > ssl_end:
             busy_wait.append((last_op - ssl_end) * tsc_to_us)
@@ -364,8 +364,8 @@ def main():
             print(f" Note: {n_no_op} records have ws_last_op_cycle=0 (first frame, no prior op)")
         print(f" Busy: {n_busy}/{n_total} ({n_busy / n_total * 100:.1f}%)  "
               f"Idle: {n_idle}/{n_total} ({n_idle / n_total * 100:.1f}%)")
-        print(f"   Busy = ws_last_op_cycle > first_ssl_read_end (data waited in ring)")
-        print(f"   Idle = ws_last_op_cycle <= first_ssl_read_end (WS was waiting)")
+        print(f"   Busy = ws_last_op_cycle > latest_ssl_read_end (data waited in ring)")
+        print(f"   Idle = ws_last_op_cycle <= latest_ssl_read_end (WS was waiting)")
 
         if n_busy > 0:
             busy_wait.sort()
@@ -391,9 +391,91 @@ def main():
             print_histogram(busy_stage3, "SSL Read End → WS Parse (busy)", unit="us")
             print_histogram(idle_stage3, "SSL Read End → WS Parse (idle)", unit="us")
 
+    # --- Process Lateness Analysis ---
+    # Detect model: if ssl_last_op_cycle == ws_last_op_cycle for most records → single-process
+    n_same = sum(1 for r in qualifying
+                 if r['ssl_last_op_cycle'] == r['ws_last_op_cycle'] and r['ssl_last_op_cycle'] > 0)
+    n_with_ssl_op = sum(1 for r in qualifying if r['ssl_last_op_cycle'] > 0)
+    is_single_process = (n_with_ssl_op > 0 and n_same / n_with_ssl_op > 0.9)
+
+    print(f"\n Process Lateness Analysis")
+    print(f" {'─' * 68}")
+    if n_with_ssl_op == 0:
+        print(" No records with ssl_last_op_cycle data.")
+    else:
+        model = "single-process" if is_single_process else "multi-process"
+        print(f" Detected model: {model} (ssl==ws: {n_same}/{n_with_ssl_op})")
+
+        # to_time(cycle) = first_bpf_entry_ns + (cycle - first_poll_cycle) * ns_per_cycle
+        ns_per_cycle = 1e9 / tsc_freq
+
+        def compute_late_us(records, name, cycle_field, ref='bpf'):
+            """Compute lateness values in us. ref='bpf' uses to_time-bpf, ref='ssl_end' uses TSC diff."""
+            vals = []
+            for r in records:
+                cyc = r[cycle_field]
+                if cyc == 0:
+                    continue
+                if ref == 'bpf':
+                    if r['first_poll_cycle'] == 0 or r['first_bpf_entry_ns'] == 0:
+                        continue
+                    late_ns = (cyc - r['first_poll_cycle']) * ns_per_cycle
+                    vals.append(late_ns / 1000.0)
+                elif ref == 'ssl_end':
+                    ssl_end = r['latest_ssl_read_end']
+                    if ssl_end == 0:
+                        continue
+                    late_ns = (cyc - ssl_end) * ns_per_cycle
+                    vals.append(late_ns / 1000.0)
+            return vals
+
+        def print_late_table(name, vals):
+            if not vals:
+                print(f"\n {name}: NO DATA")
+                return
+            vals_sorted = sorted(vals)
+            n_v = len(vals_sorted)
+            n_late = sum(1 for v in vals_sorted if v > 0)
+            n_idle = n_v - n_late
+            mean = sum(vals_sorted) / n_v
+            print(f"\n {name}  N={n_v}")
+            print(f" {'─' * 68}")
+            ptiles = [('Min', 0), ('P50', 50), ('P90', 90), ('P95', 95),
+                      ('P99', 99), ('Max', 100)]
+            p50_val = pct(vals_sorted, 50)
+            vfmt = '7.3f' if abs(p50_val) < 0.5 else '7.2f' if abs(p50_val) < 6.0 else '7.1f'
+            header = f" {'':12s}"
+            for plabel, _ in ptiles:
+                header += f" {plabel:>7s}"
+            header += f" {'Mean':>7s}"
+            print(header)
+            line = f" {'Lateness':12s}"
+            for _, p in ptiles:
+                val = pct(vals_sorted, p)
+                line += f" {val:{vfmt}}"
+            line += f" {mean:{vfmt}}"
+            print(line)
+            print(f" Late: {n_late}/{n_v} ({n_late / n_v * 100:.1f}%) — process was busy when pkt arrived")
+            print(f" Idle: {n_idle}/{n_v} ({n_idle / n_v * 100:.1f}%) — process was waiting")
+
+        # main_late = (ws_last_op_cycle - first_poll_cycle) in us
+        main_vals = [v for v in compute_late_us(qualifying, 'main_late', 'ws_last_op_cycle', ref='bpf') if v >= 0]
+        print_late_table("main_late (us) — main loop lateness", main_vals)
+        print_histogram(main_vals, "main_late", unit="us")
+
+        # ssl_late = (ssl_last_op_cycle - first_poll_cycle) in us
+        ssl_vals = [v for v in compute_late_us(qualifying, 'ssl_late', 'ssl_last_op_cycle', ref='bpf') if v >= 0]
+        print_late_table("ssl_late (us) — transport process lateness", ssl_vals)
+        print_histogram(ssl_vals, "ssl_late", unit="us")
+
+        # ws_late = (ws_last_op_cycle - latest_ssl_read_end) in us
+        ws_vals = [v for v in compute_late_us(qualifying, 'ws_late', 'ws_last_op_cycle', ref='ssl_end') if v >= 0]
+        print_late_table("ws_late (us) — WS process lateness", ws_vals)
+        print_histogram(ws_vals, "ws_late", unit="us")
+
     # --- Print qualifying samples (timeline format, skip ws_late) ---
     idle_samples = [r for r in qualifying
-                    if r['ws_last_op_cycle'] <= r['first_ssl_read_end']]
+                    if r['ws_last_op_cycle'] <= r['latest_ssl_read_end']]
     late_count = len(qualifying) - len(idle_samples)
     print(f"\n Qualifying Samples ({len(idle_samples)} idle, {late_count} ws_late skipped)")
     print(f" {'─' * 100}")
@@ -416,16 +498,16 @@ def main():
                 return f"{us / 1000.0:6.2f}ms"
 
         p0, p1 = fmt_range(us_ago(r['first_poll_cycle']), us_ago(r['latest_poll_cycle']))
-        s0, s1 = fmt_range(us_ago(r['first_ssl_read_start']), us_ago(r['first_ssl_read_end']))
+        s0, s1 = fmt_range(us_ago(r['first_ssl_read_start']), us_ago(r['latest_ssl_read_end']))
         sz = f"{r['payload_len']}/{r['ssl_read_total_bytes']}B"
         parse = fmt(us_ago(r['ws_parse_cycle']))
-        pub = fmt(us_ago(r['ws_frame_publish_cycle']))
+        total = fmt(us_ago(r['first_poll_cycle']))
         batch = r['ssl_read_batch_num']
 
         print(f" | poll {r['nic_packet_ct']:2d} pkt {p0} ~ {p1:>8s} "
               f"| ssl {r['ssl_read_ct']:2d} x {sz:<10s} {s0} ~ {s1:>8s} "
               f"| parse {batch:03d} {parse:>8s} "
-              f"| pub {pub:>8s} |")
+              f"| total {total:>8s} |")
 
 
 if __name__ == "__main__":

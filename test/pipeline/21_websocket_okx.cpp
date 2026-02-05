@@ -100,11 +100,14 @@ ConnStateShm* g_conn_state = nullptr;  // Set after setup, used by signal handle
 
 void signal_handler(int sig) {
     g_shutdown.store(true, std::memory_order_release);
-    // Notify all processes to stop immediately
     if (g_conn_state) {
         g_conn_state->shutdown_all();
     }
-    fprintf(stderr, "\n[SIGNAL] Received signal %d, initiating graceful shutdown...\n", sig);
+    // write() is async-signal-safe; fprintf is NOT (deadlocks if signal
+    // interrupts printf, which is the common case during timeline printing)
+    const char msg[] = "\n[SIGNAL] Shutting down...\n";
+    (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)sig;
 }
 
 // Pin current process to specified CPU core with SCHED_FIFO priority
@@ -197,6 +200,180 @@ void dump_frame_records(const WSFrameInfo* records, size_t count, const char* ta
     fwrite(records, sizeof(WSFrameInfo), count, f);
     fclose(f);
     printf("[FRAME-RECORDS] Saved %u records to %s\n", n, path);
+}
+
+// Write shutdown summary to a file that survives broken pipes (tee + Ctrl+C)
+// Also writes to /dev/tty for immediate visibility if stdout pipe is dead
+void write_summary(const char* tag,
+                   int64_t duration_ms,
+                   uint64_t total_frames, uint64_t partial_events,
+                   uint64_t text_frames, uint64_t binary_frames,
+                   uint64_t ping_frames, uint64_t pong_frames, uint64_t close_frames,
+                   uint64_t valid_updates, bool sequence_error, int64_t pong_deficit,
+                   const std::vector<WSFrameInfo>& frame_records, uint64_t tsc_freq,
+                   const char* dump_path,
+                   int64_t ws_frame_prod, int64_t ws_frame_cons_seq,
+                   int64_t meta_prod, int64_t meta_cons,
+                   int64_t outbox_prod, int64_t outbox_cons,
+                   int64_t pongs_prod, int64_t pongs_cons) {
+    char buf[16384];
+    int pos = 0;
+
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n=== Shutting down ===\n");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n=== Test Results ===\n");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Duration:        %ld ms\n", duration_ms);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Total events:    %lu (ring events incl. partial)\n", total_frames);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Partial events:  %lu\n", partial_events);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  TEXT frames:     %lu\n", text_frames);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  BINARY frames:   %lu\n", binary_frames);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  PING frames:     %lu\n", ping_frames);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  PONG frames:     %lu\n", pong_frames);
+    if (pong_deficit > 0) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "  PONG DEFICIT:    %ld (PINGs received but PONGs not queued - INVESTIGATE!)\n", pong_deficit);
+    } else {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "  PONG balance:    OK (all PINGs have corresponding PONGs queued)\n");
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  CLOSE frames:    %lu\n", close_frames);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Valid updates:   %lu\n", valid_updates);
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  Sequence errors: %s\n", sequence_error ? "YES" : "none");
+
+    // NIC-to-message latency stats
+    {
+        std::vector<double> msg_latencies_us;
+        for (const auto& r : frame_records) {
+            if (r.opcode == 0x01 &&
+                !r.is_fragmented &&
+                r.ssl_read_ct == 1 &&
+                r.nic_packet_ct == 1 &&
+                r.first_poll_cycle > 0 &&
+                r.ws_frame_publish_cycle > r.first_poll_cycle &&
+                r.payload_len >= 100) {
+                uint64_t lat_ns = cycles_to_ns(
+                    r.ws_frame_publish_cycle - r.first_poll_cycle, tsc_freq);
+                msg_latencies_us.push_back(static_cast<double>(lat_ns) / 1000.0);
+            }
+        }
+        if (!msg_latencies_us.empty()) {
+            std::sort(msg_latencies_us.begin(), msg_latencies_us.end());
+            size_t n = msg_latencies_us.size();
+            auto pctile = [&](double p) -> double {
+                return msg_latencies_us[static_cast<size_t>(p / 100.0 * (n - 1))];
+            };
+            double sum = 0;
+            for (double v : msg_latencies_us) sum += v;
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "\n=== NIC-to-Message Latency (poll->publish, 1-pkt 1-ssl TEXT) (N=%zu) ===\n", n);
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  Min:    %.2f us\n", msg_latencies_us.front());
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  P50:    %.2f us\n", pctile(50));
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  P90:    %.2f us\n", pctile(90));
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  P99:    %.2f us\n", pctile(99));
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  Max:    %.2f us\n", msg_latencies_us.back());
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  Mean:   %.2f us\n", sum / n);
+        } else {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "\n=== NIC-to-Message Latency: No qualifying samples ===\n");
+        }
+    }
+
+    // ssl_late + ws_late (multi-process)
+    {
+        std::vector<double> ssl_late_us, ws_late_us;
+        for (const auto& r : frame_records) {
+            if (r.opcode == 0x01 &&
+                !r.is_fragmented &&
+                r.ssl_read_ct == 1 &&
+                r.nic_packet_ct == 1 &&
+                r.first_poll_cycle > 0 &&
+                r.first_bpf_entry_ns > 0 &&
+                r.payload_len >= 100 &&
+                tsc_freq > 0) {
+                double ns_per_cycle = 1e9 / static_cast<double>(tsc_freq);
+                if (r.ssl_last_op_cycle > 0) {
+                    double late_ns = static_cast<double>(
+                        static_cast<int64_t>(r.ssl_last_op_cycle - r.first_poll_cycle)) * ns_per_cycle;
+                    if (late_ns >= 0.0) ssl_late_us.push_back(late_ns / 1000.0);
+                }
+                if (r.ws_last_op_cycle > 0 && r.latest_ssl_read_end_cycle > 0) {
+                    double late_ns = static_cast<double>(
+                        static_cast<int64_t>(r.ws_last_op_cycle - r.latest_ssl_read_end_cycle)) * ns_per_cycle;
+                    if (late_ns >= 0.0) ws_late_us.push_back(late_ns / 1000.0);
+                }
+            }
+        }
+        auto print_late = [&](const char* name, std::vector<double>& vals) {
+            if (vals.empty()) {
+                pos += snprintf(buf + pos, sizeof(buf) - pos, "\n=== %s: No qualifying samples ===\n", name);
+                return;
+            }
+            std::sort(vals.begin(), vals.end());
+            size_t n = vals.size();
+            auto pctile = [&](double p) -> double {
+                return vals[static_cast<size_t>(p / 100.0 * (n - 1))];
+            };
+            double sum = 0;
+            for (double v : vals) sum += v;
+            size_t n_late = 0, n_idle = 0;
+            for (double v : vals) { if (v > 0) n_late++; else n_idle++; }
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "\n=== %s (1-pkt 1-ssl TEXT) (N=%zu) ===\n", name, n);
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  Min:    %.2f us\n", vals.front());
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  P50:    %.2f us\n", pctile(50));
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  P90:    %.2f us\n", pctile(90));
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  P99:    %.2f us\n", pctile(99));
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  Max:    %.2f us\n", vals.back());
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  Mean:   %.2f us\n", sum / n);
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  Late:   %zu/%zu (%.1f%%)\n", n_late, n, n > 0 ? 100.0 * n_late / n : 0.0);
+            pos += snprintf(buf + pos, sizeof(buf) - pos, "  Idle:   %zu/%zu (%.1f%%)\n", n_idle, n, n > 0 ? 100.0 * n_idle / n : 0.0);
+        };
+        print_late("ssl_late", ssl_late_us);
+        print_late("ws_late", ws_late_us);
+    }
+
+    if (dump_path) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "[FRAME-RECORDS] %s\n", dump_path);
+    }
+
+    // Ring buffer status
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Ring Buffer Status ---\n");
+    bool ws_caught = ws_frame_cons_seq >= ws_frame_prod;
+    bool meta_caught = meta_cons >= meta_prod - 1;
+    bool outbox_caught = outbox_cons >= outbox_prod;
+    bool pongs_caught = pongs_cons >= pongs_prod;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  WS_FRAME_INFO producer: %ld, consumer: %ld (%s)\n",
+        ws_frame_prod, ws_frame_cons_seq, ws_caught ? "ok" : "NO - FAIL");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  MSG_METADATA  producer: %ld, consumer: %ld (%s)\n",
+        meta_prod, meta_cons, meta_caught ? "ok" : "NO - FAIL");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  MSG_OUTBOX    producer: %ld, consumer: %ld (%s)\n",
+        outbox_prod, outbox_cons, outbox_caught ? "ok" : "NO - FAIL");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  PONGS         producer: %ld, consumer: %ld (%s)\n",
+        pongs_prod, pongs_cons, pongs_caught ? "ok" : "NO - FAIL");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "====================\n");
+
+    // Flush stdio before raw write to avoid reordering
+    fflush(stdout);
+    fflush(stderr);
+
+    // 1. Try stdout (works when pipe is alive / normal timeout exit)
+    ssize_t wr = write(STDOUT_FILENO, buf, pos);
+
+    // 2. If stdout write failed (broken pipe from tee + Ctrl+C), write to /dev/tty
+    if (wr <= 0) {
+        int tty_fd = open("/dev/tty", O_WRONLY);
+        if (tty_fd >= 0) {
+            (void)write(tty_fd, buf, pos);
+            close(tty_fd);
+        }
+    }
+
+    // 3. Always write summary to a file alongside the frame records dump
+    char summary_path[256];
+    snprintf(summary_path, sizeof(summary_path), "/tmp/%s_summary_%d.txt", tag, getpid());
+    int sfd = open(summary_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (sfd >= 0) {
+        (void)write(sfd, buf, pos);
+        close(sfd);
+    }
 }
 
 }  // namespace
@@ -791,6 +968,9 @@ public:
         frame_records.reserve(MAX_FRAME_RECORDS);
         uint64_t tsc_freq = conn_state_->tsc_freq_hz;
 
+        uint64_t prev_publish_mono_ns = 0;
+        uint64_t prev_latest_poll_cycle = 0;
+
         auto start_time = std::chrono::steady_clock::now();
         auto stream_end = start_time + std::chrono::milliseconds(g_timeout_ms);
 
@@ -799,6 +979,9 @@ public:
         // Main streaming loop
         while (run_forever || std::chrono::steady_clock::now() < stream_end) {
             if (g_shutdown.load(std::memory_order_acquire)) {
+                // Ignore further signals so second Ctrl+C doesn't kill before dump
+                signal(SIGINT, SIG_IGN);
+                signal(SIGQUIT, SIG_IGN);
                 printf("[WSS] Shutdown signal received\n");
                 break;
             }
@@ -813,7 +996,9 @@ public:
             bool end_of_batch;
             while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
                 total_frames++;
-                frame.print_timeline(tsc_freq);
+                frame.print_timeline(tsc_freq, prev_publish_mono_ns, prev_latest_poll_cycle);
+                prev_publish_mono_ns = frame.publish_time_ts;
+                prev_latest_poll_cycle = frame.latest_poll_cycle;
 
                 if (frame_records.size() < MAX_FRAME_RECORDS) {
                     frame_records.push_back(frame);
@@ -891,28 +1076,23 @@ public:
             __builtin_ia32_pause();
         }
 
-        // Final drain (skip in forever mode since we're exiting on signal)
-        if (!run_forever) {
-            printf("[WSS] Final %dms drain...\n", FINAL_DRAIN_MS);
-            auto drain_start = std::chrono::steady_clock::now();
-
-            while (true) {
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - drain_start).count();
-                if (elapsed_ms >= FINAL_DRAIN_MS) break;
-
-                WSFrameInfo frame;
-                while (ws_frame_cons.try_consume(frame)) {
-                    total_frames++;
-                    frame.print_timeline(tsc_freq);
-                    if (frame_records.size() < MAX_FRAME_RECORDS) {
-                        frame_records.push_back(frame);
-                    }
-                    if (frame.is_fragmented && !frame.is_last_fragment) {
-                        partial_events++;
-                        continue;
-                    }
-                    if (frame.opcode == 0x01) {
+        // Drain remaining frames from ring before killing children
+        {
+            WSFrameInfo frame;
+            while (ws_frame_cons.try_consume(frame)) {
+                total_frames++;
+                frame.print_timeline(tsc_freq, prev_publish_mono_ns, prev_latest_poll_cycle);
+                prev_publish_mono_ns = frame.publish_time_ts;
+                prev_latest_poll_cycle = frame.latest_poll_cycle;
+                if (frame_records.size() < MAX_FRAME_RECORDS) {
+                    frame_records.push_back(frame);
+                }
+                if (frame.is_fragmented && !frame.is_last_fragment) {
+                    partial_events++;
+                    continue;
+                }
+                switch (frame.opcode) {
+                    case 0x01:
                         text_frames++;
                         if (frame.payload_len > 0) {
                             const uint8_t* payload = msg_inbox_->data_at(frame.msg_inbox_offset);
@@ -920,160 +1100,92 @@ public:
                                 valid_updates++;
                             }
                         }
-                    }
+                        break;
+                    case 0x02: binary_frames++; break;
+                    case 0x09: ping_frames++; break;
+                    case 0x0A: pong_frames++; break;
+                    case 0x08: close_frames++; break;
+                    default: break;
                 }
-                usleep(1000);
             }
         }
 
         auto actual_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start_time).count();
 
-        printf("\n=== Test Results ===\n");
-        printf("  Duration:        %ld ms\n", actual_duration);
-        printf("  Total events:    %lu (ring events incl. partial)\n", total_frames);
-        printf("  Partial events:  %lu\n", partial_events);
-        printf("  TEXT frames:     %lu\n", text_frames);
-        printf("  BINARY frames:   %lu\n", binary_frames);
-        printf("  PING frames:     %lu\n", ping_frames);
-        printf("  PONG frames:     %lu\n", pong_frames);
-        // PONG deficit check: compare PINGs received with PONGs queued
-        {
-            int64_t pongs_queued = pongs_region_->producer_published()->load(std::memory_order_acquire) + 1;  // +1 for 0-based
-            int64_t deficit = static_cast<int64_t>(ping_frames) - pongs_queued;
-            if (deficit > 0) {
-                printf("  PONG DEFICIT:    %ld (PINGs received but PONGs not queued - INVESTIGATE!)\n", deficit);
-            } else {
-                printf("  PONG balance:    OK (all PINGs have corresponding PONGs queued)\n");
-            }
-        }
-        printf("  CLOSE frames:    %lu\n", close_frames);
-        printf("  Valid updates:   %lu\n", valid_updates);
-        printf("  Sequence errors: %s\n", sequence_error ? "YES" : "none");
-
-        // --- NIC-to-message latency stats (qualifying: 1-pkt, 1-ssl, TEXT, >=100B) ---
-        {
-            std::vector<double> msg_latencies_us;
-            for (const auto& r : frame_records) {
-                if (r.opcode == 0x01 &&
-                    !r.is_fragmented &&
-                    r.ssl_read_ct == 1 &&
-                    r.nic_packet_ct == 1 &&
-                    r.first_poll_cycle > 0 &&
-                    r.ws_frame_publish_cycle > r.first_poll_cycle &&
-                    r.payload_len >= 100) {
-                    uint64_t lat_ns = cycles_to_ns(
-                        r.ws_frame_publish_cycle - r.first_poll_cycle, tsc_freq);
-                    msg_latencies_us.push_back(static_cast<double>(lat_ns) / 1000.0);
+        // Shutdown children (with timeout to avoid blocking on SSL_shutdown)
+        conn_state_->shutdown_all();
+        auto shutdown_child = [](pid_t& pid, const char* name) {
+            if (pid <= 0) return;
+            kill(pid, SIGTERM);
+            auto wait_start = std::chrono::steady_clock::now();
+            while (true) {
+                int wstatus;
+                pid_t ret = waitpid(pid, &wstatus, WNOHANG);
+                if (ret == pid || ret < 0) break;
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - wait_start).count();
+                if (elapsed > 2000) {
+                    kill(pid, SIGKILL);
+                    waitpid(pid, nullptr, 0);
+                    break;
                 }
+                usleep(1000);
             }
-            if (!msg_latencies_us.empty()) {
-                std::sort(msg_latencies_us.begin(), msg_latencies_us.end());
-                size_t n = msg_latencies_us.size();
-                auto pctile = [&](double p) -> double {
-                    return msg_latencies_us[static_cast<size_t>(p / 100.0 * (n - 1))];
-                };
-                double sum = 0;
-                for (double v : msg_latencies_us) sum += v;
-                printf("\n=== NIC-to-Message Latency (poll->publish, 1-pkt 1-ssl TEXT) (N=%zu) ===\n", n);
-                printf("  Min:    %.2f us\n", msg_latencies_us.front());
-                printf("  P50:    %.2f us\n", pctile(50));
-                printf("  P90:    %.2f us\n", pctile(90));
-                printf("  P99:    %.2f us\n", pctile(99));
-                printf("  Max:    %.2f us\n", msg_latencies_us.back());
-                printf("  Mean:   %.2f us\n", sum / n);
-            } else {
-                printf("\n=== NIC-to-Message Latency: No qualifying samples ===\n");
-            }
-        }
+            pid = 0;
+        };
+        shutdown_child(xdp_pid_, "XDP-Poll");
+        shutdown_child(transport_pid_, "Transport");
+        shutdown_child(websocket_pid_, "WebSocket");
+
+        // Save profiling data
+        save_profiling_data();
 
         // Dump all frame records to binary file
         dump_frame_records(frame_records.data(), frame_records.size(),
                            "okx");
 
-        // Verify ring buffer status
-        printf("\n--- Ring Buffer Status ---\n");
+        // Build dump path string for summary
+        char dump_path[256];
+        snprintf(dump_path, sizeof(dump_path), "/tmp/okx_frame_records_%d.bin", getpid());
 
-        // WS_FRAME_INFO
+        // Ring buffer status
         int64_t ws_frame_prod = ws_frame_info_region_->producer_published()->load(std::memory_order_acquire);
         int64_t ws_frame_cons_seq = ws_frame_cons.sequence();
-        bool ws_frame_caught_up = ws_frame_cons_seq >= ws_frame_prod;
-        printf("  WS_FRAME_INFO producer: %ld, consumer: %ld\n", ws_frame_prod, ws_frame_cons_seq);
-        printf("  Consumer caught up: %s\n", ws_frame_caught_up ? "yes" : "NO - FAIL");
-
-        // MSG_METADATA
         int64_t meta_prod = msg_metadata_region_->producer_published()->load(std::memory_order_acquire);
         int64_t meta_cons = msg_metadata_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-        bool meta_caught_up = meta_cons >= meta_prod - 1;  // Allow 1 pending
-        printf("  MSG_METADATA producer: %ld, consumer: %ld\n", meta_prod, meta_cons);
-        printf("  Consumer caught up: %s\n", meta_caught_up ? "yes" : "NO - FAIL");
-
-        // MSG_OUTBOX
         int64_t outbox_prod = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
         int64_t outbox_cons = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-        bool outbox_caught_up = outbox_cons >= outbox_prod;
-        printf("  MSG_OUTBOX producer: %ld, consumer: %ld\n", outbox_prod, outbox_cons);
-        printf("  Consumer caught up: %s\n", outbox_caught_up ? "yes" : "NO - FAIL");
+        int64_t pongs_prod_seq = pongs_region_->producer_published()->load(std::memory_order_acquire);
+        int64_t pongs_cons_seq = pongs_region_->consumer_sequence(0)->load(std::memory_order_acquire);
 
-        // PONGS
-        int64_t pongs_prod = pongs_region_->producer_published()->load(std::memory_order_acquire);
-        int64_t pongs_cons = pongs_region_->consumer_sequence(0)->load(std::memory_order_acquire);
-        bool pongs_caught_up = pongs_cons >= pongs_prod;
-        printf("  PONGS producer: %ld, consumer: %ld\n", pongs_prod, pongs_cons);
-        printf("  Consumer caught up: %s\n", pongs_caught_up ? "yes" : "NO - FAIL");
+        // PONG deficit
+        int64_t pongs_queued = pongs_prod_seq + 1;  // +1 for 0-based
+        int64_t pong_deficit = static_cast<int64_t>(ping_frames) - pongs_queued;
 
-        printf("====================\n");
-        fflush(stdout);
+        // Write pipe-resilient summary (survives broken pipes from tee + Ctrl+C)
+        write_summary("okx", actual_duration,
+                      total_frames, partial_events,
+                      text_frames, binary_frames, ping_frames, pong_frames, close_frames,
+                      valid_updates, sequence_error, pong_deficit,
+                      frame_records, tsc_freq,
+                      frame_records.empty() ? nullptr : dump_path,
+                      ws_frame_prod, ws_frame_cons_seq,
+                      meta_prod, meta_cons,
+                      outbox_prod, outbox_cons,
+                      pongs_prod_seq, pongs_cons_seq);
 
-        // Signal children to stop and wait
-        conn_state_->shutdown_all();
-        if (xdp_pid_ > 0) waitpid(xdp_pid_, nullptr, 0);
-        if (transport_pid_ > 0) waitpid(transport_pid_, nullptr, 0);
-        if (websocket_pid_ > 0) waitpid(websocket_pid_, nullptr, 0);
-        xdp_pid_ = 0;
-        transport_pid_ = 0;
-        websocket_pid_ = 0;
-
-        // Save profiling data
-        save_profiling_data();
-
-        // === FAILURE CONDITIONS ===
-
-        // In forever mode, always pass if we got frames (was killed by timeout command or Ctrl+C)
+        // In forever mode, always pass
         if (run_forever) {
-            printf("\nFOREVER MODE: Received %lu orderbook updates over %ld ms\n",
-                   valid_updates, actual_duration);
-            printf("PASS: Forever mode completed (terminated by signal)\n");
             return true;
         }
 
-        // 1. Check we received WebSocket frames
-        if (total_frames == 0) {
-            printf("\nFAIL: No WebSocket frames received\n");
-            return false;
-        }
-
-        // 2. Check we received orderbook data
-        if (valid_updates < static_cast<uint64_t>(MIN_EXPECTED_UPDATES)) {
-            printf("\nFAIL: Only %lu orderbook updates received (expected %d+)\n",
-                   valid_updates, MIN_EXPECTED_UPDATES);
-            return false;
-        }
-
-        // 3. Check ringbuffer consumer caught up
-        if (!ws_frame_caught_up) {
-            printf("\nFAIL: WS_FRAME_INFO consumer did not catch up with producer\n");
-            return false;
-        }
-
-        // 4. Check for sequence errors
-        if (sequence_error) {
-            printf("\nFAIL: Out-of-order frame delivery detected\n");
-            return false;
-        }
-
-        printf("\nPASS: WebSocket process working, received %lu orderbook updates in %ld ms\n",
-               valid_updates, actual_duration);
+        // Failure conditions
+        bool ws_frame_caught_up = ws_frame_cons_seq >= ws_frame_prod;
+        if (total_frames == 0) return false;
+        if (valid_updates < static_cast<uint64_t>(MIN_EXPECTED_UPDATES)) return false;
+        if (!ws_frame_caught_up) return false;
+        if (sequence_error) return false;
         return true;
     }
 
@@ -1353,6 +1465,8 @@ int main(int argc, char* argv[]) {
     // Install signal handlers
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGQUIT, signal_handler);
+    signal(SIGPIPE, SIG_IGN);  // Ignore SIGPIPE so tee dying doesn't kill us
 
     printf("==============================================\n");
     printf("  WebSocket OKX Test                          \n");

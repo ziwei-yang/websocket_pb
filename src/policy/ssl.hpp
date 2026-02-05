@@ -41,9 +41,13 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <unistd.h>  // usleep() for DPDK handshake polling
+#include <string>
+#include <vector>
 
 #include "../pipeline/pipeline_config.hpp"  // NIC_MTU, PIPELINE_TCP_MSS, MAX_TLS_RECORD_PAYLOAD
+#include "../core/aes_ctr.hpp"              // TLSRecordKeys for extract_record_keys()
 
 // ============================================================================
 // Library Detection and Headers
@@ -64,6 +68,8 @@
     #include <openssl/ssl.h>
     #include <openssl/err.h>
     #include <openssl/bio.h>
+    #include <openssl/kdf.h>
+    #include <openssl/evp.h>
 #endif
 
 // Forward declaration for userspace transport BIO
@@ -278,7 +284,15 @@ struct OpenSSLPolicy {
         // SSL_CTX_set_options(ctx_, SSL_OP_ENABLE_KTLS);  // DISABLED for timestamp access
         #endif
         #endif
+
+        // Register keylog callback for TLS key extraction (ssl_read_by_chunk)
+        SSL_CTX_set_keylog_callback(ctx_, keylog_callback);
+
+        // Register msg_callback for TLS record counting (seq_num tracking)
+        SSL_CTX_set_msg_callback(ctx_, record_count_callback);
     }
+
+    uint64_t get_server_record_count() const { return server_record_count_; }
 
     /**
      * Perform TLS handshake
@@ -291,6 +305,8 @@ struct OpenSSLPolicy {
         if (!ctx_) {
             init();
         }
+
+        keylog_lines_.clear();
 
         ssl_ = SSL_new(ctx_);
         if (!ssl_) {
@@ -306,6 +322,9 @@ struct OpenSSLPolicy {
         if (!ssl_) {
             throw std::runtime_error("SSL_new() failed");
         }
+
+        // Store policy pointer in SSL ex_data for keylog callback
+        SSL_set_ex_data(ssl_, get_ex_data_index(), this);
 
         // Associate socket with SSL object
         if (SSL_set_fd(ssl_, fd) != 1) {
@@ -335,6 +354,9 @@ struct OpenSSLPolicy {
             // Both send and receive kTLS enabled
         }
         #endif
+
+        // Reset server record counter — only count post-handshake records
+        server_record_count_ = 0;
     }
 
     /**
@@ -358,6 +380,8 @@ struct OpenSSLPolicy {
             init();
         }
 
+        keylog_lines_.clear();
+
         ssl_ = SSL_new(ctx_);
         if (!ssl_) {
             // ctx_ might be stale after reconnect, try reinitializing
@@ -375,6 +399,9 @@ struct OpenSSLPolicy {
             ERR_error_string_n(err, err_buf, sizeof(err_buf));
             throw std::runtime_error(std::string("SSL_new() failed: ") + err_buf);
         }
+
+        // Store policy pointer in SSL ex_data for keylog callback
+        SSL_set_ex_data(ssl_, get_ex_data_index(), this);
 
         // Set SNI hostname for virtual hosting
         if (hostname) {
@@ -414,6 +441,8 @@ struct OpenSSLPolicy {
                 // Handshake successful - stop trickle thread, switch to inline trickle
                 transport->stop_rx_trickle_thread();
                 ktls_enabled_ = false;
+                // Reset server record counter — only count post-handshake records
+                server_record_count_ = 0;
                 return;
             }
 
@@ -705,6 +734,56 @@ struct OpenSSLPolicy {
     }
 
     // ========================================================================
+    // TLS Key Extraction (for ssl_read_by_chunk)
+    // ========================================================================
+
+    /**
+     * Extract server record keys for direct AES-CTR decryption.
+     * Must be called after handshake completes.
+     * Returns true if keys were extracted (AES-GCM cipher), false otherwise.
+     */
+    bool extract_record_keys(websocket::crypto::TLSRecordKeys& keys) {
+        if (!ssl_ || !SSL_is_init_finished(ssl_)) return false;
+
+        // Determine TLS version
+        int version = SSL_version(ssl_);
+        bool is_tls13 = (version == TLS1_3_VERSION);
+
+        // Check cipher is AES-GCM
+        const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl_);
+        if (!cipher) return false;
+
+        const char* cipher_name = SSL_CIPHER_get_name(cipher);
+        if (!cipher_name) return false;
+
+        // Determine key length from cipher name
+        uint8_t key_len = 0;
+        if (strstr(cipher_name, "AES128") || strstr(cipher_name, "AES_128")) {
+            key_len = 16;
+        } else if (strstr(cipher_name, "AES256") || strstr(cipher_name, "AES_256")) {
+            key_len = 32;
+        } else {
+            // Not AES-GCM (e.g., ChaCha20)
+            return false;
+        }
+
+        // Also verify it's GCM
+        if (!strstr(cipher_name, "GCM")) {
+            return false;
+        }
+
+        keys.key_len = key_len;
+        keys.is_tls13 = is_tls13;
+
+        // Parse keylog lines to find the server traffic secret
+        if (is_tls13) {
+            return extract_tls13_keys(keys);
+        } else {
+            return extract_tls12_keys(keys);
+        }
+    }
+
+    // ========================================================================
 
     /**
      * Shutdown SSL connection (keeps ctx_ for reconnection)
@@ -719,6 +798,7 @@ struct OpenSSLPolicy {
         // Clear zero-copy state
         clear_encrypted_view();
         clear_encrypted_output();
+        keylog_lines_.clear();
         // Note: ctx_, bio_method_, zc_bio_method_ kept for reconnection, freed in destructor
         ktls_enabled_ = false;
     }
@@ -851,6 +931,241 @@ private:
         return 1;
     }
 
+    // ========================================================================
+    // Keylog callback and key extraction helpers
+    // ========================================================================
+
+    static int get_ex_data_index() {
+        static int idx = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+        return idx;
+    }
+
+    static void keylog_callback(const SSL* ssl, const char* line) {
+        auto* self = static_cast<OpenSSLPolicy*>(SSL_get_ex_data(ssl, get_ex_data_index()));
+        if (self && line) {
+            self->keylog_lines_.emplace_back(line);
+        }
+    }
+
+    static void record_count_callback(int write_p, int version, int content_type,
+                                       const void* buf, size_t len, SSL* ssl, void* arg) {
+        (void)version; (void)content_type; (void)buf; (void)len; (void)arg;
+        if (write_p == 0) {  // 0 = read (server->client)
+            auto* self = static_cast<OpenSSLPolicy*>(SSL_get_ex_data(ssl, get_ex_data_index()));
+            if (self) self->server_record_count_++;
+        }
+    }
+
+    // Parse hex string into bytes. Returns number of bytes written.
+    static size_t hex_to_bytes(const char* hex, uint8_t* out, size_t max_out) {
+        size_t len = strlen(hex);
+        size_t bytes = len / 2;
+        if (bytes > max_out) bytes = max_out;
+        for (size_t i = 0; i < bytes; i++) {
+            unsigned int val;
+            if (sscanf(hex + i * 2, "%02x", &val) != 1) return i;
+            out[i] = static_cast<uint8_t>(val);
+        }
+        return bytes;
+    }
+
+    // TLS 1.3: Find SERVER_TRAFFIC_SECRET_0 in keylog, derive key + IV via HKDF
+    bool extract_tls13_keys(websocket::crypto::TLSRecordKeys& keys) {
+        // Get client random to match keylog line
+        uint8_t client_random[32];
+        SSL_get_client_random(ssl_, client_random, 32);
+
+        // Format client random as hex for matching
+        char client_random_hex[65];
+        for (int i = 0; i < 32; i++) {
+            sprintf(client_random_hex + i * 2, "%02x", client_random[i]);
+        }
+        client_random_hex[64] = '\0';
+
+        // Find SERVER_TRAFFIC_SECRET_0 line
+        std::string server_secret_hex;
+        for (const auto& line : keylog_lines_) {
+            if (line.find("SERVER_TRAFFIC_SECRET_0") == 0) {
+                // Format: "SERVER_TRAFFIC_SECRET_0 <client_random_hex> <secret_hex>"
+                // Find the secret (third field)
+                size_t first_space = line.find(' ');
+                if (first_space == std::string::npos) continue;
+                size_t second_space = line.find(' ', first_space + 1);
+                if (second_space == std::string::npos) continue;
+                server_secret_hex = line.substr(second_space + 1);
+                break;
+            }
+        }
+
+        if (server_secret_hex.empty()) return false;
+
+        // Parse secret
+        uint8_t secret[48];  // SHA-256 = 32 bytes, SHA-384 = 48 bytes
+        size_t secret_len = hex_to_bytes(server_secret_hex.c_str(), secret, sizeof(secret));
+        if (secret_len == 0) return false;
+
+        // Determine hash algorithm from cipher
+        const EVP_MD* md = (keys.key_len == 32) ? EVP_sha384() : EVP_sha256();
+
+        // HKDF-Expand-Label(secret, "key", "", key_len)
+        if (!hkdf_expand_label(md, secret, secret_len, "key", keys.key, keys.key_len)) {
+            return false;
+        }
+
+        // HKDF-Expand-Label(secret, "iv", "", 12)
+        if (!hkdf_expand_label(md, secret, secret_len, "iv", keys.iv, 12)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // TLS 1.2: Find CLIENT_RANDOM line, derive keys from master secret
+    bool extract_tls12_keys(websocket::crypto::TLSRecordKeys& keys) {
+        // Get client random
+        uint8_t client_random[32];
+        SSL_get_client_random(ssl_, client_random, 32);
+
+        char client_random_hex[65];
+        for (int i = 0; i < 32; i++) {
+            sprintf(client_random_hex + i * 2, "%02x", client_random[i]);
+        }
+        client_random_hex[64] = '\0';
+
+        // Find CLIENT_RANDOM line
+        std::string master_secret_hex;
+        for (const auto& line : keylog_lines_) {
+            if (line.find("CLIENT_RANDOM") == 0) {
+                size_t first_space = line.find(' ');
+                if (first_space == std::string::npos) continue;
+                size_t second_space = line.find(' ', first_space + 1);
+                if (second_space == std::string::npos) continue;
+
+                // Verify client random matches
+                std::string line_random = line.substr(first_space + 1, second_space - first_space - 1);
+                // Case-insensitive compare
+                bool match = (line_random.size() == 64);
+                if (match) {
+                    for (size_t i = 0; i < 64; i++) {
+                        if (tolower(line_random[i]) != tolower(client_random_hex[i])) {
+                            match = false;
+                            break;
+                        }
+                    }
+                }
+                if (match) {
+                    master_secret_hex = line.substr(second_space + 1);
+                    break;
+                }
+            }
+        }
+
+        if (master_secret_hex.empty()) return false;
+
+        uint8_t master_secret[48];
+        size_t ms_len = hex_to_bytes(master_secret_hex.c_str(), master_secret, 48);
+        if (ms_len != 48) return false;
+
+        // TLS 1.2 key expansion: PRF(master_secret, "key expansion", server_random + client_random)
+        uint8_t server_random[32];
+        SSL_get_server_random(ssl_, server_random, 32);
+
+        // key_block = PRF(master_secret, "key expansion", server_random || client_random)
+        // For AES-GCM: client_write_key(key_len) + server_write_key(key_len) + client_write_IV(4) + server_write_IV(4)
+        size_t key_block_len = 2 * keys.key_len + 2 * 4;  // AES-GCM uses 4-byte implicit IV
+        uint8_t key_block[104];  // Max: 2*32 + 2*4 = 72
+
+        // Use TLS PRF via EVP_PKEY_derive
+        uint8_t seed[64];
+        memcpy(seed, server_random, 32);
+        memcpy(seed + 32, client_random, 32);
+
+        if (!tls12_prf(EVP_sha256(), master_secret, 48,
+                       "key expansion", seed, 64,
+                       key_block, key_block_len)) {
+            // Try SHA-384 for AES-256
+            if (keys.key_len == 32) {
+                if (!tls12_prf(EVP_sha384(), master_secret, 48,
+                               "key expansion", seed, 64,
+                               key_block, key_block_len)) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        // Extract server_write_key and server_write_IV
+        // Layout: client_key(key_len) | server_key(key_len) | client_iv(4) | server_iv(4)
+        memcpy(keys.key, key_block + keys.key_len, keys.key_len);   // server_write_key
+        memcpy(keys.iv, key_block + 2 * keys.key_len + 4, 4);      // server_write_IV (4 bytes implicit)
+
+        return true;
+    }
+
+public:
+    // TLS 1.3 HKDF-Expand-Label (public: shared with LibreSSLPolicy)
+    static bool hkdf_expand_label(const EVP_MD* md,
+                                   const uint8_t* secret, size_t secret_len,
+                                   const char* label,
+                                   uint8_t* out, size_t out_len) {
+        // Build HkdfLabel structure:
+        //   uint16 length = out_len
+        //   opaque label<7..255> = "tls13 " + label
+        //   opaque context<0..255> = ""
+        std::string full_label = std::string("tls13 ") + label;
+
+        uint8_t hkdf_label[256];
+        size_t pos = 0;
+        hkdf_label[pos++] = static_cast<uint8_t>(out_len >> 8);
+        hkdf_label[pos++] = static_cast<uint8_t>(out_len);
+        hkdf_label[pos++] = static_cast<uint8_t>(full_label.size());
+        memcpy(hkdf_label + pos, full_label.data(), full_label.size());
+        pos += full_label.size();
+        hkdf_label[pos++] = 0;  // Empty context
+
+        EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
+        if (!pctx) return false;
+
+        bool ok = false;
+        size_t actual_len = out_len;
+        if (EVP_PKEY_derive_init(pctx) > 0 &&
+            EVP_PKEY_CTX_hkdf_mode(pctx, EVP_PKEY_HKDEF_MODE_EXPAND_ONLY) > 0 &&
+            EVP_PKEY_CTX_set_hkdf_md(pctx, md) > 0 &&
+            EVP_PKEY_CTX_set1_hkdf_key(pctx, secret, static_cast<int>(secret_len)) > 0 &&
+            EVP_PKEY_CTX_add1_hkdf_info(pctx, hkdf_label, static_cast<int>(pos)) > 0 &&
+            EVP_PKEY_derive(pctx, out, &actual_len) > 0) {
+            ok = (actual_len == out_len);
+        }
+
+        EVP_PKEY_CTX_free(pctx);
+        return ok;
+    }
+
+    // TLS 1.2 PRF (P_SHA256 or P_SHA384)
+    static bool tls12_prf(const EVP_MD* md,
+                           const uint8_t* secret, size_t secret_len,
+                           const char* label,
+                           const uint8_t* seed, size_t seed_len,
+                           uint8_t* out, size_t out_len) {
+        EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_TLS1_PRF, nullptr);
+        if (!pctx) return false;
+
+        bool ok = false;
+        size_t actual_len = out_len;
+        if (EVP_PKEY_derive_init(pctx) > 0 &&
+            EVP_PKEY_CTX_set_tls1_prf_md(pctx, md) > 0 &&
+            EVP_PKEY_CTX_set1_tls1_prf_secret(pctx, secret, static_cast<int>(secret_len)) > 0 &&
+            EVP_PKEY_CTX_add1_tls1_prf_seed(pctx, reinterpret_cast<const unsigned char*>(label), static_cast<int>(strlen(label))) > 0 &&
+            EVP_PKEY_CTX_add1_tls1_prf_seed(pctx, seed, static_cast<int>(seed_len)) > 0 &&
+            EVP_PKEY_derive(pctx, out, &actual_len) > 0) {
+            ok = (actual_len == out_len);
+        }
+
+        EVP_PKEY_CTX_free(pctx);
+        return ok;
+    }
+
 public:
     SSL_CTX* ctx_;
     SSL* ssl_;
@@ -868,6 +1183,12 @@ public:
     uint8_t* out_buf_ = nullptr;
     size_t out_buf_capacity_ = 0;
     size_t out_buf_len_ = 0;
+
+    // Keylog lines captured during handshake (for key extraction)
+    std::vector<std::string> keylog_lines_;
+
+    // Server record counter (post-handshake, for TLS 1.3 seq_num tracking)
+    uint64_t server_record_count_ = 0;
 };
 
 #endif // SSL_POLICY_OPENSSL
@@ -965,7 +1286,15 @@ struct LibreSSLPolicy {
         // Disable verification for simplicity
         // In production, you should verify certificates!
         SSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);
+
+        // Register keylog callback for TLS key extraction (ssl_read_by_chunk)
+        SSL_CTX_set_keylog_callback(ctx_, libressl_keylog_callback);
+
+        // Register msg_callback for TLS record counting (seq_num tracking)
+        SSL_CTX_set_msg_callback(ctx_, libressl_record_count_callback);
     }
+
+    uint64_t get_server_record_count() const { return server_record_count_; }
 
     /**
      * Perform TLS handshake
@@ -978,6 +1307,8 @@ struct LibreSSLPolicy {
         if (!ctx_) {
             init();
         }
+
+        keylog_lines_.clear();
 
         ssl_ = SSL_new(ctx_);
         if (!ssl_) {
@@ -997,6 +1328,9 @@ struct LibreSSLPolicy {
             throw std::runtime_error(std::string("SSL_new() failed: ") + err_buf);
         }
 
+        // Store policy pointer in SSL ex_data for keylog callback
+        SSL_set_ex_data(ssl_, libressl_get_ex_data_index(), this);
+
         // Associate socket with SSL object
         if (SSL_set_fd(ssl_, fd) != 1) {
             throw std::runtime_error("SSL_set_fd() failed");
@@ -1010,6 +1344,9 @@ struct LibreSSLPolicy {
             ERR_error_string_n(err, err_buf, sizeof(err_buf));
             throw std::runtime_error(std::string("SSL_connect() failed: ") + err_buf);
         }
+
+        // Reset server record counter — only count post-handshake records
+        server_record_count_ = 0;
     }
 
     /**
@@ -1033,6 +1370,8 @@ struct LibreSSLPolicy {
             init();
         }
 
+        keylog_lines_.clear();
+
         ssl_ = SSL_new(ctx_);
         if (!ssl_) {
             // ctx_ might be stale after reconnect, try reinitializing
@@ -1050,6 +1389,9 @@ struct LibreSSLPolicy {
             ERR_error_string_n(err, err_buf, sizeof(err_buf));
             throw std::runtime_error(std::string("SSL_new() failed: ") + err_buf);
         }
+
+        // Store policy pointer in SSL ex_data for keylog callback
+        SSL_set_ex_data(ssl_, libressl_get_ex_data_index(), this);
 
         // Set SNI hostname for virtual hosting
         if (hostname) {
@@ -1087,6 +1429,8 @@ struct LibreSSLPolicy {
 
             if (ret == 1) {
                 // Handshake successful
+                // Reset server record counter — only count post-handshake records
+                server_record_count_ = 0;
                 return;
             }
 
@@ -1347,6 +1691,48 @@ struct LibreSSLPolicy {
     }
 
     // ========================================================================
+    // TLS Key Extraction (for ssl_read_by_chunk)
+    // ========================================================================
+
+    /**
+     * Extract server record keys for direct AES-CTR decryption.
+     * Uses same keylog callback approach as OpenSSLPolicy.
+     * Returns true if keys were extracted (AES-GCM cipher), false otherwise.
+     */
+    bool extract_record_keys(websocket::crypto::TLSRecordKeys& keys) {
+        if (!ssl_ || !SSL_is_init_finished(ssl_)) return false;
+
+        int version = SSL_version(ssl_);
+        bool is_tls13 = (version == TLS1_3_VERSION);
+
+        const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl_);
+        if (!cipher) return false;
+
+        const char* cipher_name = SSL_CIPHER_get_name(cipher);
+        if (!cipher_name) return false;
+
+        uint8_t key_len = 0;
+        if (strstr(cipher_name, "AES128") || strstr(cipher_name, "AES_128")) {
+            key_len = 16;
+        } else if (strstr(cipher_name, "AES256") || strstr(cipher_name, "AES_256")) {
+            key_len = 32;
+        } else {
+            return false;  // Not AES-GCM
+        }
+
+        if (!strstr(cipher_name, "GCM")) return false;
+
+        keys.key_len = key_len;
+        keys.is_tls13 = is_tls13;
+
+        if (is_tls13) {
+            return libressl_extract_tls13_keys(keys);
+        } else {
+            return libressl_extract_tls12_keys(keys);
+        }
+    }
+
+    // ========================================================================
 
     void shutdown() {
         if (ssl_) {
@@ -1356,6 +1742,7 @@ struct LibreSSLPolicy {
         }
         clear_encrypted_view();
         clear_encrypted_output();
+        keylog_lines_.clear();
     }
 
     void cleanup() {
@@ -1474,6 +1861,149 @@ private:
         return 1;
     }
 
+    // ========================================================================
+    // Keylog callback and key extraction helpers
+    // ========================================================================
+
+    static int libressl_get_ex_data_index() {
+        static int idx = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+        return idx;
+    }
+
+    static void libressl_keylog_callback(const SSL* ssl, const char* line) {
+        auto* self = static_cast<LibreSSLPolicy*>(SSL_get_ex_data(ssl, libressl_get_ex_data_index()));
+        if (self && line) {
+            self->keylog_lines_.emplace_back(line);
+        }
+    }
+
+    static void libressl_record_count_callback(int write_p, int version, int content_type,
+                                                const void* buf, size_t len, SSL* ssl, void* arg) {
+        (void)version; (void)content_type; (void)buf; (void)len; (void)arg;
+        if (write_p == 0) {  // 0 = read (server->client)
+            auto* self = static_cast<LibreSSLPolicy*>(SSL_get_ex_data(ssl, libressl_get_ex_data_index()));
+            if (self) self->server_record_count_++;
+        }
+    }
+
+    static size_t libressl_hex_to_bytes(const char* hex, uint8_t* out, size_t max_out) {
+        size_t len = strlen(hex);
+        size_t bytes = len / 2;
+        if (bytes > max_out) bytes = max_out;
+        for (size_t i = 0; i < bytes; i++) {
+            unsigned int val;
+            if (sscanf(hex + i * 2, "%02x", &val) != 1) return i;
+            out[i] = static_cast<uint8_t>(val);
+        }
+        return bytes;
+    }
+
+    // TLS 1.3 key extraction (same approach as OpenSSL)
+    bool libressl_extract_tls13_keys(websocket::crypto::TLSRecordKeys& keys) {
+        uint8_t client_random[32];
+        SSL_get_client_random(ssl_, client_random, 32);
+
+        std::string server_secret_hex;
+        for (const auto& line : keylog_lines_) {
+            if (line.find("SERVER_TRAFFIC_SECRET_0") == 0) {
+                size_t first_space = line.find(' ');
+                if (first_space == std::string::npos) continue;
+                size_t second_space = line.find(' ', first_space + 1);
+                if (second_space == std::string::npos) continue;
+                server_secret_hex = line.substr(second_space + 1);
+                break;
+            }
+        }
+
+        if (server_secret_hex.empty()) return false;
+
+        uint8_t secret[48];
+        size_t secret_len = libressl_hex_to_bytes(server_secret_hex.c_str(), secret, sizeof(secret));
+        if (secret_len == 0) return false;
+
+        const EVP_MD* md = (keys.key_len == 32) ? EVP_sha384() : EVP_sha256();
+
+        // Use OpenSSL-compatible HKDF (shared implementation from OpenSSLPolicy)
+        if (!OpenSSLPolicy::hkdf_expand_label(md, secret, secret_len, "key", keys.key, keys.key_len)) {
+            return false;
+        }
+        if (!OpenSSLPolicy::hkdf_expand_label(md, secret, secret_len, "iv", keys.iv, 12)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // TLS 1.2 key extraction
+    bool libressl_extract_tls12_keys(websocket::crypto::TLSRecordKeys& keys) {
+        uint8_t client_random[32];
+        SSL_get_client_random(ssl_, client_random, 32);
+
+        char client_random_hex[65];
+        for (int i = 0; i < 32; i++) {
+            sprintf(client_random_hex + i * 2, "%02x", client_random[i]);
+        }
+        client_random_hex[64] = '\0';
+
+        std::string master_secret_hex;
+        for (const auto& line : keylog_lines_) {
+            if (line.find("CLIENT_RANDOM") == 0) {
+                size_t first_space = line.find(' ');
+                if (first_space == std::string::npos) continue;
+                size_t second_space = line.find(' ', first_space + 1);
+                if (second_space == std::string::npos) continue;
+                std::string line_random = line.substr(first_space + 1, second_space - first_space - 1);
+                bool match = (line_random.size() == 64);
+                if (match) {
+                    for (size_t i = 0; i < 64; i++) {
+                        if (tolower(line_random[i]) != tolower(client_random_hex[i])) {
+                            match = false;
+                            break;
+                        }
+                    }
+                }
+                if (match) {
+                    master_secret_hex = line.substr(second_space + 1);
+                    break;
+                }
+            }
+        }
+
+        if (master_secret_hex.empty()) return false;
+
+        uint8_t master_secret[48];
+        size_t ms_len = libressl_hex_to_bytes(master_secret_hex.c_str(), master_secret, 48);
+        if (ms_len != 48) return false;
+
+        uint8_t server_random[32];
+        SSL_get_server_random(ssl_, server_random, 32);
+
+        size_t key_block_len = 2 * keys.key_len + 2 * 4;
+        uint8_t key_block[104];
+        uint8_t seed[64];
+        memcpy(seed, server_random, 32);
+        memcpy(seed + 32, client_random, 32);
+
+        if (!OpenSSLPolicy::tls12_prf(EVP_sha256(), master_secret, 48,
+                                       "key expansion", seed, 64,
+                                       key_block, key_block_len)) {
+            if (keys.key_len == 32) {
+                if (!OpenSSLPolicy::tls12_prf(EVP_sha384(), master_secret, 48,
+                                               "key expansion", seed, 64,
+                                               key_block, key_block_len)) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        memcpy(keys.key, key_block + keys.key_len, keys.key_len);
+        memcpy(keys.iv, key_block + 2 * keys.key_len + 4, 4);
+
+        return true;
+    }
+
 public:
     SSL_CTX* ctx_;
     SSL* ssl_;
@@ -1490,6 +2020,12 @@ public:
     uint8_t* out_buf_ = nullptr;
     size_t out_buf_capacity_ = 0;
     size_t out_buf_len_ = 0;
+
+    // Keylog lines captured during handshake
+    std::vector<std::string> keylog_lines_;
+
+    // Server record counter (post-handshake, for TLS 1.3 seq_num tracking)
+    uint64_t server_record_count_ = 0;
 };
 
 #endif // SSL_POLICY_LIBRESSL
@@ -1632,6 +2168,8 @@ struct WolfSSLPolicy {
         fprintf(stderr, "[TLS] WolfSSL initialized with AES-128-GCM preferred\n");
     }
 
+    uint64_t get_server_record_count() const { return server_record_count_; }
+
     /**
      * Perform TLS handshake
      *
@@ -1681,6 +2219,9 @@ struct WolfSSLPolicy {
         fprintf(stderr, "[TLS] Handshake SUCCESS (BSD socket)\n");
         fprintf(stderr, "[TLS]   Version: %s\n", tls_version ? tls_version : "unknown");
         fprintf(stderr, "[TLS]   Cipher:  %s\n", cipher_name ? cipher_name : "unknown");
+
+        // Reset server record counter — only count post-handshake records
+        server_record_count_ = 0;
     }
 
     /**
@@ -1756,6 +2297,8 @@ struct WolfSSLPolicy {
 
                 // Stop trickle thread, switch to inline trickle
                 transport->stop_rx_trickle_thread();
+                // Reset server record counter — only count post-handshake records
+                server_record_count_ = 0;
                 return;
             }
 
@@ -1805,6 +2348,7 @@ struct WolfSSLPolicy {
         int n = wolfSSL_read(ssl_, buf, len);
 
         if (n > 0) {
+            server_record_count_++;  // Track records for seq_num
             return n;  // Success
         } else if (n == 0) {
             return 0;  // Connection closed
@@ -1876,6 +2420,82 @@ struct WolfSSLPolicy {
     int get_fd() const {
         if (!ssl_) return -1;
         return wolfSSL_get_fd(ssl_);
+    }
+
+    // ========================================================================
+    // TLS Key Extraction (for ssl_read_by_chunk)
+    // ========================================================================
+
+    /**
+     * Extract server record keys for direct AES-CTR decryption.
+     * WolfSSL provides direct access to key material via wolfSSL_get_keys().
+     * Returns true if keys were extracted (AES-GCM cipher), false otherwise.
+     */
+    bool extract_record_keys(websocket::crypto::TLSRecordKeys& keys) {
+        if (!ssl_ || !wolfSSL_is_init_finished(ssl_)) return false;
+
+        // Check cipher is AES-GCM
+        const char* cipher_name = wolfSSL_get_cipher(ssl_);
+        if (!cipher_name) return false;
+
+        uint8_t key_len = 0;
+        if (strstr(cipher_name, "AES128") || strstr(cipher_name, "AES_128") ||
+            strstr(cipher_name, "AES-128")) {
+            key_len = 16;
+        } else if (strstr(cipher_name, "AES256") || strstr(cipher_name, "AES_256") ||
+                   strstr(cipher_name, "AES-256")) {
+            key_len = 32;
+        } else {
+            return false;  // Not AES
+        }
+
+        if (!strstr(cipher_name, "GCM")) return false;
+
+        // Determine TLS version
+        const char* version_str = wolfSSL_get_version(ssl_);
+        bool is_tls13 = version_str && strstr(version_str, "TLSv1.3");
+
+        keys.key_len = key_len;
+        keys.is_tls13 = is_tls13;
+
+        // Use wolfSSL_get_keys() to access key material directly
+        unsigned int suite_len = 0, key_sz = 0, iv_sz = 0;
+        const unsigned char* ms = nullptr;
+        const unsigned char* sr = nullptr;
+        const unsigned char* cr = nullptr;
+
+        int ret = wolfSSL_get_keys(ssl_, &ms, &suite_len, &sr, &key_sz, &cr, &iv_sz);
+        if (ret != 0 || !ms) {
+            // wolfSSL_get_keys not available or failed
+            // Fallback: try to use exported keying material
+            return false;
+        }
+
+        // For TLS 1.3, wolfSSL_get_keys returns traffic secrets
+        // For TLS 1.2, it returns the key material directly
+        if (is_tls13) {
+            // In TLS 1.3, we need the server traffic key and IV
+            // wolfSSL stores these internally after handshake
+            // With --enable-opensslall, we can access them
+            // The key material pointers from wolfSSL_get_keys in TLS 1.3 mode
+            // contain the derived keys directly
+            if (key_sz >= key_len && iv_sz >= 12) {
+                // sr points to server write key, cr points to server write IV
+                memcpy(keys.key, sr, key_len);
+                memcpy(keys.iv, cr, 12);
+                return true;
+            }
+            return false;
+        } else {
+            // TLS 1.2: key material from PRF expansion
+            // Layout depends on WolfSSL internals
+            if (key_sz >= key_len && iv_sz >= 4) {
+                memcpy(keys.key, sr, key_len);
+                memcpy(keys.iv, cr, 4);  // 4-byte implicit IV for TLS 1.2 AES-GCM
+                return true;
+            }
+            return false;
+        }
     }
 
     // ========================================================================
@@ -2077,6 +2697,9 @@ public:
     WOLFSSL_CTX* ctx_;
     WOLFSSL* ssl_;
 
+    // Server record counter (post-handshake, for TLS 1.3 seq_num tracking)
+    uint64_t server_record_count_ = 0;
+
 private:
     // Zero-copy RX state (ring buffer)
     ViewSegment in_views_[VIEW_RING_SIZE];
@@ -2242,6 +2865,10 @@ struct NoSSLPolicy {
     bool ktls_enabled() const { return false; }
     int get_fd() const { return -1; }
     size_t pending() const { return (in_view_tail_ != in_view_head_) ? 1 : 0; }  // Non-zero if data available
+
+    // No encryption - key extraction not applicable
+    bool extract_record_keys(websocket::crypto::TLSRecordKeys&) { return false; }
+    uint64_t get_server_record_count() const { return 0; }
 
     // ========================================================================
     // Zero-Copy Methods (for pipeline operation)

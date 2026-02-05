@@ -905,7 +905,7 @@ test-pipeline-websocket-okx: $(PIPELINE_WEBSOCKET_OKX_BIN) bpf
 # Tests unified pipeline: all layers in one process, outputs to IPC rings
 # ============================================================================
 
-PIPELINE_UNIFIED_BINANCE_SRC := test/pipeline/99_websocket_binance.cpp
+PIPELINE_UNIFIED_BINANCE_SRC := test/pipeline/99_websocket_binance_1_proc.cpp
 PIPELINE_UNIFIED_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_99_websocket_binance
 
 $(PIPELINE_UNIFIED_BINANCE_BIN): $(PIPELINE_UNIFIED_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/99_xdp_tcp_ssl_ws_process.hpp | $(BUILD_DIR)
@@ -934,7 +934,7 @@ test-pipeline-unified-binance: $(PIPELINE_UNIFIED_BINANCE_BIN) bpf
 # Two processes: UnifiedSSL (XDP+TCP+SSL) + WebSocket (frame parsing)
 # ============================================================================
 
-PIPELINE_98_BINANCE_SRC := test/pipeline/98_websocket_binance.cpp
+PIPELINE_98_BINANCE_SRC := test/pipeline/98_websocket_binance_piotransport_ws.cpp
 PIPELINE_98_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_98_websocket_binance
 
 $(PIPELINE_98_BINANCE_BIN): $(PIPELINE_98_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/98_xdp_tcp_ssl_process.hpp src/pipeline/20_ws_process.hpp | $(BUILD_DIR)
@@ -963,7 +963,7 @@ test-pipeline-98-binance: $(PIPELINE_98_BINANCE_BIN) bpf
 # Three processes: XDP Poll + PIO Transport (TCP+SSL via DisruptorPacketIO) + WebSocket
 # ============================================================================
 
-PIPELINE_96_BINANCE_SRC := test/pipeline/96_websocket_binance.cpp
+PIPELINE_96_BINANCE_SRC := test/pipeline/96_websocket_binance_xdp_piotransport_ws.cpp
 PIPELINE_96_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_96_websocket_binance
 
 $(PIPELINE_96_BINANCE_BIN): $(PIPELINE_96_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/00_xdp_poll_process.hpp src/pipeline/10_tcp_ssl_process.hpp src/pipeline/disruptor_packet_io.hpp src/pipeline/20_ws_process.hpp | $(BUILD_DIR)

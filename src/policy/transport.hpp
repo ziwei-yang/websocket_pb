@@ -54,6 +54,7 @@
 #include <chrono>
 #include <thread>
 #include "../core/timing.hpp"  // rdtsc(), calibrate_tsc_freq()
+#include "../core/aes_ctr.hpp" // AES-CTR decryptor for ssl_read_by_chunk()
 
 // macOS doesn't have MSG_NOSIGNAL, define as 0
 #ifndef MSG_NOSIGNAL
@@ -500,6 +501,27 @@ namespace transport {
 // Use PacketTransport<XDPPacketIO> instead (see below).
 
 // ============================================================================
+// TLS Record Parser State (for ssl_read_by_chunk)
+// ============================================================================
+
+enum class TLSRecordState : uint8_t {
+    NEED_HEADER,   // Waiting for 5-byte TLS record header
+    NEED_PAYLOAD,  // Decrypting ciphertext payload
+    NEED_TAG       // Skipping 16-byte AEAD tag
+};
+
+struct TLSRecordParser {
+    TLSRecordState state = TLSRecordState::NEED_HEADER;
+    uint8_t  content_type = 0;
+    uint16_t record_length = 0;       // From header (includes tag for TLS 1.3, or explicit_nonce + tag for TLS 1.2)
+    uint16_t ciphertext_length = 0;   // Actual payload to decrypt (record_length minus overhead)
+    uint16_t payload_consumed = 0;    // Bytes of ciphertext consumed so far in this record
+    uint16_t tag_consumed = 0;        // Bytes of tag consumed so far
+    uint32_t block_counter = 0;       // AES-CTR counter within this record (starts at 2)
+    uint8_t  nonce[12] = {};          // Derived nonce for current record
+};
+
+// ============================================================================
 // PacketTransport<PacketIO> - Policy-based Transport Abstraction
 // ============================================================================
 //
@@ -897,26 +919,7 @@ struct PacketTransport {
         }
 
         if (result > 0) {
-            const auto& stats = recv_buffer_.get_last_read_stats();
-            consumed_recv_packet_count_ += stats.packet_count;
-            if (consumed_recv_oldest_timestamp_ns_ == 0 && stats.oldest_timestamp_ns > 0) {
-                consumed_recv_oldest_timestamp_ns_ = stats.oldest_timestamp_ns;
-            }
-            if (stats.latest_timestamp_ns > 0) {
-                consumed_recv_latest_timestamp_ns_ = stats.latest_timestamp_ns;
-            }
-            if (consumed_recv_oldest_bpf_entry_ns_ == 0 && stats.oldest_bpf_entry_ns > 0) {
-                consumed_recv_oldest_bpf_entry_ns_ = stats.oldest_bpf_entry_ns;
-            }
-            if (stats.latest_bpf_entry_ns > 0) {
-                consumed_recv_latest_bpf_entry_ns_ = stats.latest_bpf_entry_ns;
-            }
-            if (consumed_recv_oldest_poll_cycle_ == 0 && stats.oldest_poll_cycle > 0) {
-                consumed_recv_oldest_poll_cycle_ = stats.oldest_poll_cycle;
-            }
-            if (stats.latest_poll_cycle > 0) {
-                consumed_recv_latest_poll_cycle_ = stats.latest_poll_cycle;
-            }
+            accumulate_recv_stats();
         }
 
         return result;
@@ -1021,6 +1024,254 @@ struct PacketTransport {
     int get_fd() const { return -1; }
 
     // ========================================================================
+    // Direct AES-CTR Decryption (ssl_read_by_chunk)
+    // ========================================================================
+
+    // Set TLS record keys for direct decryption. Called once after handshake.
+    // Copies key material and runs AES key expansion.
+    void set_tls_record_keys(const crypto::TLSRecordKeys& keys) {
+        tls_keys_ = keys;
+        crypto::expand_keys(tls_keys_);
+        tls_parser_ = TLSRecordParser{};  // Reset parser
+        tls_seq_num_ = 0;
+        tls_keys_valid_ = true;
+    }
+
+    bool has_tls_record_keys() const { return tls_keys_valid_; }
+
+    bool tls_record_boundary() const {
+        return tls_parser_.state == TLSRecordState::NEED_HEADER;
+    }
+
+    void set_tls_seq_num(uint64_t seq) { tls_seq_num_ = seq; }
+
+    // Decrypt TLS application data directly via AES-CTR, bypassing SSL_read().
+    // Calls callback(data_ptr, len) for each decrypted chunk.
+    // Returns total decrypted bytes written to dest, or -1 on non-app-data record.
+    //
+    // Chunks are decrypted as soon as complete AES blocks (16 bytes) arrive.
+    // When available ciphertext < chunk_size but >= 16 bytes, decrypts what's
+    // available rather than waiting.
+    template<typename ChunkCallback>
+    int ssl_read_by_chunk(uint8_t* dest, size_t chunk_size, ChunkCallback&& callback) {
+        if (!tls_keys_valid_) return 0;
+
+        int offset = 0;
+
+        for (;;) {
+            switch (tls_parser_.state) {
+
+            case TLSRecordState::NEED_HEADER: {
+                if (recv_buffer_.available() < 5) return offset;
+
+                // Read and parse 5-byte TLS record header
+                uint8_t hdr[5];
+                recv_buffer_.read(hdr, 5);
+                accumulate_recv_stats();
+
+                tls_parser_.content_type = hdr[0];
+                tls_parser_.record_length = (static_cast<uint16_t>(hdr[3]) << 8) | hdr[4];
+                tls_parser_.payload_consumed = 0;
+                tls_parser_.tag_consumed = 0;
+
+                if (tls_keys_.is_tls13) {
+                    // TLS 1.3: record_length = ciphertext + inner_content_type(1) + tag(16)
+                    // But we decrypt ciphertext+inner_content_type together, then strip
+                    tls_parser_.ciphertext_length = tls_parser_.record_length - 16;
+                } else {
+                    // TLS 1.2: record_length = explicit_nonce(8) + ciphertext + tag(16)
+                    // Read explicit nonce
+                    if (recv_buffer_.available() < 8) {
+                        // Need to wait for explicit nonce bytes
+                        // Store partial state - we already consumed header
+                        tls_parser_.ciphertext_length = tls_parser_.record_length - 8 - 16;
+                        // We need the explicit nonce before we can proceed
+                        // For simplicity, wait until 8 bytes available
+                        return offset;
+                    }
+                    uint8_t explicit_nonce[8];
+                    recv_buffer_.read(explicit_nonce, 8);
+                    accumulate_recv_stats();
+                    crypto::derive_nonce_tls12(tls_keys_.iv, explicit_nonce, tls_parser_.nonce);
+                    tls_parser_.ciphertext_length = tls_parser_.record_length - 8 - 16;
+                }
+
+                // Derive nonce for TLS 1.3
+                if (tls_keys_.is_tls13) {
+                    crypto::derive_nonce_tls13(tls_keys_.iv, tls_seq_num_, tls_parser_.nonce);
+                }
+
+                tls_parser_.block_counter = 2;  // GCM convention
+
+                // Non-application data: skip entire record, increment seq
+                if (tls_parser_.content_type != 0x17) {
+                    // Skip ciphertext + tag
+                    uint16_t to_skip = tls_parser_.ciphertext_length + 16;
+                    if (tls_keys_.is_tls13) {
+                        // Already subtracted 16 for tag, so skip ciphertext_length + 16
+                    } else {
+                        // Already consumed explicit nonce, skip ciphertext_length + 16
+                    }
+                    size_t avail = recv_buffer_.available();
+                    size_t skip_now = (avail < to_skip) ? avail : to_skip;
+                    { uint8_t discard[256]; size_t skipped = 0;
+                      while (skipped < skip_now) {
+                          size_t chunk = (skip_now - skipped < sizeof(discard)) ? (skip_now - skipped) : sizeof(discard);
+                          recv_buffer_.read(discard, chunk);
+                          accumulate_recv_stats();
+                          skipped += chunk;
+                      }
+                    }
+                    if (skip_now < to_skip) {
+                        // Partial skip - need to come back and skip more
+                        // Use tag_consumed to track how much of the remaining we need to skip
+                        tls_parser_.payload_consumed = static_cast<uint16_t>(skip_now);
+                        tls_parser_.state = TLSRecordState::NEED_TAG;
+                        // Repurpose: total to skip = ciphertext_length + 16 - skip_now
+                        tls_parser_.tag_consumed = 0;
+                        tls_parser_.ciphertext_length = to_skip - static_cast<uint16_t>(skip_now);
+                        // NEED_TAG will skip remaining
+                        return offset;
+                    }
+                    tls_seq_num_++;
+                    tls_parser_.state = TLSRecordState::NEED_HEADER;
+                    // Return -1 to signal non-app-data if no app data processed yet
+                    if (offset == 0) return -1;
+                    continue;
+                }
+
+                tls_parser_.state = TLSRecordState::NEED_PAYLOAD;
+                continue;
+            }
+
+            case TLSRecordState::NEED_PAYLOAD: {
+                uint16_t payload_remaining = tls_parser_.ciphertext_length - tls_parser_.payload_consumed;
+
+                if (payload_remaining == 0) {
+                    tls_parser_.state = TLSRecordState::NEED_TAG;
+                    tls_parser_.tag_consumed = 0;
+                    continue;
+                }
+
+                size_t avail = recv_buffer_.available();
+                if (avail == 0) return offset;
+
+                size_t can_decrypt = chunk_size;
+                if (can_decrypt > payload_remaining) can_decrypt = payload_remaining;
+                if (can_decrypt > avail) can_decrypt = avail;
+
+                bool is_final = (can_decrypt >= payload_remaining);
+
+                if (!is_final) {
+                    // Round down to AES block boundary (16 bytes)
+                    can_decrypt = (can_decrypt / 16) * 16;
+                    if (can_decrypt == 0) return offset;  // Less than 1 block, wait
+                }
+
+                // Read ciphertext
+                uint8_t ct_buf[16384];  // Max TLS record payload
+                size_t read_ct = recv_buffer_.read(ct_buf, can_decrypt);
+                accumulate_recv_stats();
+                if (read_ct < can_decrypt) {
+                    can_decrypt = read_ct;
+                    is_final = false;
+                    can_decrypt = (can_decrypt / 16) * 16;
+                    if (can_decrypt == 0) return offset;
+                }
+
+                // Decrypt via AES-CTR
+                tls_parser_.block_counter = crypto::AESCTRDecryptor::decrypt(
+                    tls_keys_.round_keys, tls_keys_.num_rounds,
+                    tls_parser_.nonce, tls_parser_.block_counter,
+                    ct_buf, dest + offset, can_decrypt);
+                tls_parser_.payload_consumed += static_cast<uint16_t>(can_decrypt);
+
+                size_t chunk_len = can_decrypt;
+
+                // TLS 1.3: if this is the final chunk, strip inner content type + padding
+                if (is_final && tls_keys_.is_tls13 && chunk_len > 0) {
+                    // Find inner content type: scan backwards past zero padding
+                    uint8_t* chunk_start = dest + offset;
+                    size_t pos = chunk_len - 1;
+                    while (pos > 0 && chunk_start[pos] == 0) {
+                        pos--;
+                    }
+                    // chunk_start[pos] is the inner content type byte
+                    uint8_t inner_ct = chunk_start[pos];
+                    chunk_len = pos;  // Exclude content type byte
+
+                    // If inner content type is not application data (0x17),
+                    // this might be a KeyUpdate or alert
+                    if (inner_ct != 0x17) {
+                        // Signal non-app-data but still advance past it
+                        tls_parser_.state = TLSRecordState::NEED_TAG;
+                        tls_parser_.tag_consumed = 0;
+                        tls_seq_num_++;
+                        // Don't call callback for non-app-data
+                        // But we need to consume the tag
+                        continue;
+                    }
+                }
+
+                if (chunk_len > 0) {
+                    callback(dest + offset, chunk_len);
+                    offset += static_cast<int>(chunk_len);
+                }
+
+                if (tls_parser_.payload_consumed >= tls_parser_.ciphertext_length) {
+                    tls_parser_.state = TLSRecordState::NEED_TAG;
+                    tls_parser_.tag_consumed = 0;
+                }
+                continue;
+            }
+
+            case TLSRecordState::NEED_TAG: {
+                // For non-app-data records that were being skipped,
+                // ciphertext_length was repurposed as remaining bytes to skip
+                if (tls_parser_.content_type != 0x17) {
+                    uint16_t remaining = tls_parser_.ciphertext_length;
+                    if (remaining > 0) {
+                        size_t avail = recv_buffer_.available();
+                        size_t skip_now = (avail < remaining) ? avail : remaining;
+                        { uint8_t discard[256]; size_t skipped = 0;
+                          while (skipped < skip_now) {
+                              size_t chunk = (skip_now - skipped < sizeof(discard)) ? (skip_now - skipped) : sizeof(discard);
+                              recv_buffer_.read(discard, chunk);
+                              accumulate_recv_stats();
+                              skipped += chunk;
+                          }
+                        }
+                        tls_parser_.ciphertext_length -= static_cast<uint16_t>(skip_now);
+                        if (tls_parser_.ciphertext_length > 0) return offset;
+                    }
+                    tls_seq_num_++;
+                    tls_parser_.state = TLSRecordState::NEED_HEADER;
+                    continue;
+                }
+
+                // Read and discard 16-byte AEAD tag (not verified)
+                uint16_t tag_remaining = 16 - tls_parser_.tag_consumed;
+                size_t avail = recv_buffer_.available();
+                size_t skip_now = (avail < tag_remaining) ? avail : tag_remaining;
+                { uint8_t discard[16];
+                  recv_buffer_.read(discard, skip_now);
+                  accumulate_recv_stats();
+                }
+                tls_parser_.tag_consumed += static_cast<uint16_t>(skip_now);
+
+                if (tls_parser_.tag_consumed >= 16) {
+                    tls_seq_num_++;
+                    tls_parser_.state = TLSRecordState::NEED_HEADER;
+                    continue;
+                }
+                return offset;  // Need more data for tag
+            }
+
+            } // switch
+        } // for
+    }
+
+    // ========================================================================
     // BPF Configuration
     // ========================================================================
 
@@ -1096,6 +1347,27 @@ private:
         config.interface = interface;
         config.bpf_path = bpf_path;
         config.zero_copy = zero_copy;
+    }
+
+    // ========================================================================
+    // Stats Accumulation
+    // ========================================================================
+
+    void accumulate_recv_stats() {
+        const auto& stats = recv_buffer_.get_last_read_stats();
+        consumed_recv_packet_count_ += stats.packet_count;
+        if (consumed_recv_oldest_timestamp_ns_ == 0 && stats.oldest_timestamp_ns > 0)
+            consumed_recv_oldest_timestamp_ns_ = stats.oldest_timestamp_ns;
+        if (stats.latest_timestamp_ns > 0)
+            consumed_recv_latest_timestamp_ns_ = stats.latest_timestamp_ns;
+        if (consumed_recv_oldest_bpf_entry_ns_ == 0 && stats.oldest_bpf_entry_ns > 0)
+            consumed_recv_oldest_bpf_entry_ns_ = stats.oldest_bpf_entry_ns;
+        if (stats.latest_bpf_entry_ns > 0)
+            consumed_recv_latest_bpf_entry_ns_ = stats.latest_bpf_entry_ns;
+        if (consumed_recv_oldest_poll_cycle_ == 0 && stats.oldest_poll_cycle > 0)
+            consumed_recv_oldest_poll_cycle_ = stats.oldest_poll_cycle;
+        if (stats.latest_poll_cycle > 0)
+            consumed_recv_latest_poll_cycle_ = stats.latest_poll_cycle;
     }
 
     // ========================================================================
@@ -1381,6 +1653,12 @@ private:
 
     // Pipeline integration
     void* conn_state_ptr_ = nullptr;  // ConnStateShm* (avoid header dep)
+
+    // Direct AES-CTR decryption state (ssl_read_by_chunk)
+    crypto::TLSRecordKeys  tls_keys_{};
+    TLSRecordParser        tls_parser_{};
+    uint64_t               tls_seq_num_ = 0;
+    bool                   tls_keys_valid_ = false;
 
     // Debug RX accounting (always active, negligible overhead)
     uint32_t dbg_rx_total_ = 0;        // Frames delivered from RAW_INBOX

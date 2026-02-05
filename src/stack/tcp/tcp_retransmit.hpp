@@ -336,6 +336,69 @@ struct ZeroCopyReceiveBuffer {
         return total;
     }
 
+    // Read up to MaxLen bytes without consuming (non-destructive peek)
+    // Walks frames from head_ respecting offset, copies to output.
+    // Does NOT advance head_, offset, or release frames.
+    // MaxLen capped at 64 — larger peeks contradict zero-copy design.
+    template <size_t MaxLen>
+    size_t peek(uint8_t* output) const {
+        static_assert(MaxLen <= 64, "peek MaxLen must be <= 64 (use zero-copy read for larger)");
+        if (count_ == 0) return 0;
+
+        size_t total_read = 0;
+        size_t idx = head_;
+        size_t remaining_frames = count_;
+
+        // Start from current offset of head frame
+        size_t frame_pos = frames_[idx].offset;
+
+        while (total_read < MaxLen && remaining_frames > 0) {
+            const FrameRef& frame = frames_[idx];
+            size_t avail = frame.len - frame_pos;
+            size_t to_copy = (MaxLen - total_read < avail) ? (MaxLen - total_read) : avail;
+
+            std::memcpy(output + total_read, frame.data + frame_pos, to_copy);
+            total_read += to_copy;
+            frame_pos += to_copy;
+
+            if (frame_pos >= frame.len) {
+                idx = (idx + 1) % MAX_FRAMES;
+                remaining_frames--;
+                frame_pos = 0;  // Next frame starts at offset 0
+            }
+        }
+
+        return total_read;
+    }
+
+    // Consume N bytes without copying (advance offset, release fully consumed frames)
+    // Used after ssl_read_by_chunk() has already processed the data via peek().
+    void skip(size_t n) {
+        size_t remaining = n;
+
+        while (remaining > 0 && count_ > 0) {
+            FrameRef& frame = frames_[head_];
+            size_t avail = frame.len - frame.offset;
+
+            if (remaining >= avail) {
+                // Consume entire remaining frame
+                remaining -= avail;
+
+                // Release frame back to FILL ring
+                if (release_cb_) {
+                    release_cb_(frame.frame_idx, release_user_data_);
+                }
+
+                head_ = (head_ + 1) % MAX_FRAMES;
+                count_--;
+            } else {
+                // Partial consume within frame
+                frame.offset += static_cast<uint16_t>(remaining);
+                remaining = 0;
+            }
+        }
+    }
+
     // Check if buffer has no data
     bool empty() const {
         return count_ == 0;

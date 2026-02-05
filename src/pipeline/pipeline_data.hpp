@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <atomic>
 #include <cstring>
+#include <cmath>
 #include <chrono>
 
 #include "../core/timing.hpp"
@@ -41,7 +42,7 @@ enum class DisconnectReason : uint8_t {
     TCP_RST,            // TCP RST received
     TCP_FIN,            // TCP FIN received (graceful close)
     WS_CLOSE,           // WebSocket CLOSE frame received
-    WS_PONG_TIMEOUT,    // Client PING got no PONG for 10s
+    WS_PONG_TIMEOUT,    // Dual watchdog: server PING missing + client PONG missing
     SSL_READ_ERROR,     // SSL_read returned fatal error
     UNKNOWN             // Loop exited for unknown reason
 };
@@ -86,7 +87,11 @@ struct alignas(128) MsgMetadata {
     // Packet counting
     uint32_t nic_packet_ct;                // Number of NIC packets in this SSL_read batch
 
-    uint8_t _pad[44];                      // Padding to 128 bytes (84 data + 44 pad)
+    // Transport process last_op_cycle (TSC rdtscp before this SSL_read publish)
+    uint64_t ssl_last_op_cycle;            // Transport's last_op_cycle_ before publish
+
+    bool tls_record_end;                   // true if ssl_read ended at TLS record boundary
+    uint8_t _pad[31];                      // Padding to 128 bytes
 
     void clear() {
         first_nic_timestamp_ns = 0;
@@ -101,6 +106,8 @@ struct alignas(128) MsgMetadata {
         msg_inbox_offset = 0;
         decrypted_len = 0;
         nic_packet_ct = 0;
+        ssl_last_op_cycle = 0;
+        tls_record_end = false;
     }
 };
 static_assert(sizeof(MsgMetadata) == 128, "MsgMetadata must be 128 bytes");
@@ -117,9 +124,10 @@ static_assert(sizeof(MsgMetadata) == 128, "MsgMetadata must be 128 bytes");
 //   offset  9: bool     is_fin               (1)
 //   offset 10: bool     is_fragmented        (1)
 //   offset 11: bool     is_last_fragment     (1)
-//   offset 12: uint16_t ssl_read_ct          (2)
+//   offset 12: uint8_t  ssl_read_ct          (1)
+//   offset 13: bool     is_tls_record_end   (1)
 //   offset 14: uint16_t nic_packet_ct        (2)
-//   offset 16: [10 x uint64_t timestamps]   (80)
+//   offset 16: [10 x uint64_t fields]       (80) — publish_time_ts replaces first_ssl_read_end_cycle
 //   offset 96: uint32_t ssl_read_batch_num  (4)
 //   offset100: uint32_t ssl_read_total_bytes(4)
 //   offset104: [3 x uint64_t timestamps]   (24)
@@ -146,7 +154,8 @@ struct alignas(64) WSFrameInfo {
     //   - is_fragmented=true, is_last_fragment=true: Final fragment (message complete)
 
     // Counts (packed into header area)
-    uint16_t ssl_read_ct;                  // Number of SSL_read calls for this frame
+    uint8_t  ssl_read_ct;                  // Number of SSL_read calls for this frame
+    bool     is_tls_record_end;            // true if last frame in TLS record batch
     uint16_t nic_packet_ct;                // Number of NIC packets for this frame
 
     // Stage 1: NIC HW timestamps
@@ -163,8 +172,8 @@ struct alignas(64) WSFrameInfo {
 
     // Stage 3-4: SSL read
     uint64_t first_ssl_read_start_cycle;   // Start cycle of first SSL_read for this frame
-    uint64_t first_ssl_read_end_cycle;     // End cycle of first SSL_read for this frame
-    uint64_t latest_ssl_read_start_cycle;  // Start cycle of latest SSL_read for this frame
+    uint64_t publish_time_ts;              // CLOCK_MONOTONIC ns at publish (for BPF comparison)
+    uint64_t ssl_last_op_cycle;            // Transport/SSL layer's last_op_cycle before this read
     uint64_t latest_ssl_read_end_cycle;    // End cycle of latest SSL_read for this frame
 
     // Batch correlation
@@ -186,6 +195,7 @@ struct alignas(64) WSFrameInfo {
         is_fragmented = false;
         is_last_fragment = false;
         ssl_read_ct = 0;
+        is_tls_record_end = false;
         nic_packet_ct = 0;
         first_byte_ts = 0;
         last_byte_ts = 0;
@@ -194,8 +204,8 @@ struct alignas(64) WSFrameInfo {
         first_poll_cycle = 0;
         latest_poll_cycle = 0;
         first_ssl_read_start_cycle = 0;
-        first_ssl_read_end_cycle = 0;
-        latest_ssl_read_start_cycle = 0;
+        publish_time_ts = 0;
+        ssl_last_op_cycle = 0;
         latest_ssl_read_end_cycle = 0;
         ssl_read_batch_num = 0;
         ssl_read_total_bytes = 0;
@@ -204,49 +214,154 @@ struct alignas(64) WSFrameInfo {
         ws_frame_publish_cycle = 0;
     }
 
-    void print_timeline(uint64_t tsc_freq_hz) const {
-        uint64_t now = rdtscp();
+    void print_timeline(uint64_t tsc_freq_hz,
+                        uint64_t prev_publish_mono_ns = 0,
+                        uint64_t prev_latest_poll_cycle = 0,
+                        const uint8_t* payload_data = nullptr) const {
+        uint64_t ref = ws_frame_publish_cycle;
+        if (ref == 0) return;
         double to_us = 1e6 / static_cast<double>(tsc_freq_hz);
-        auto us_ago = [&](uint64_t cycle) -> double {
-            return (cycle > 0 && now > cycle) ? static_cast<double>(now - cycle) * to_us : 0.0;
+        auto before_pub = [&](uint64_t cycle) -> double {
+            return (cycle > 0 && ref > cycle) ? static_cast<double>(ref - cycle) * to_us : 0.0;
         };
         // Range formatting: same unit (determined by larger value), unit only on second value
         auto fmt_range = [](char* b_first, char* b_last, double us_first, double us_last) {
             double larger = std::max(us_first, us_last);
             if (larger < 1000.0) {
-                std::snprintf(b_first, 16, "%6.1f",   us_first);
-                std::snprintf(b_last,  16, "%6.1fus",  us_last);
+                std::snprintf(b_first, 16, "%5.1f",   us_first);
+                std::snprintf(b_last,  16, "%5.1fus",  us_last);
+            } else if (larger < 1000000.0) {
+                std::snprintf(b_first, 16, "%5.1f",   us_first / 1000.0);
+                std::snprintf(b_last,  16, "%5.1fms",  us_last / 1000.0);
             } else {
-                std::snprintf(b_first, 16, "%6.2f",   us_first / 1000.0);
-                std::snprintf(b_last,  16, "%6.2fms",  us_last / 1000.0);
+                std::snprintf(b_first, 16, "%5.2f",   us_first / 1000000.0);
+                std::snprintf(b_last,  16, "%5.2fs",   us_last / 1000000.0);
             }
         };
         // Single value (with unit)
         auto fmt = [](char* b, double us) {
-            if (us < 1000.0) std::snprintf(b, 16, "%6.1fus", us);
-            else             std::snprintf(b, 16, "%6.2fms", us / 1000.0);
+            double a = std::fabs(us);
+            if (a < 1000.0)        std::snprintf(b, 16, "%5.1fus", us);
+            else if (a < 1000000.0) std::snprintf(b, 16, "%5.1fms", us / 1000.0);
+            else                    std::snprintf(b, 16, "%5.2fs",  us / 1000000.0);
         };
-        char t[6][16];
-        fmt_range(t[0], t[1], us_ago(first_poll_cycle), us_ago(latest_poll_cycle));
-        fmt_range(t[2], t[3], us_ago(first_ssl_read_start_cycle), us_ago(latest_ssl_read_end_cycle));
-        fmt(t[4], us_ago(ws_parse_cycle));
-        fmt(t[5], us_ago(ws_frame_publish_cycle));
-        char sz[24];
-        std::snprintf(sz, sizeof(sz), "%u/%uB", payload_len, ssl_read_total_bytes);
-        char late[24] = "";
-        if (ws_last_op_cycle > latest_ssl_read_end_cycle) {
-            double late_us = static_cast<double>(ws_last_op_cycle - latest_ssl_read_end_cycle) * to_us;
-            if (late_us < 1000.0) std::snprintf(late, sizeof(late), " ws_late %6.1fus", late_us);
-            else                  std::snprintf(late, sizeof(late), " ws_late %6.2fms", late_us / 1000.0);
+        char bpf_prefix[80] = "";
+        bool is_batch_continuation = (ssl_read_batch_num > 1);
+        bool is_chunk_mode = ssl_read_ct > 0 &&
+                             (ssl_read_total_bytes / ssl_read_ct) < NIC_MTU;
+        bool use_latest_ref = is_chunk_mode || nic_packet_ct > 1;
+        uint64_t bpf_ref_ns = (use_latest_ref && latest_bpf_entry_ns > 0)
+                               ? latest_bpf_entry_ns : first_bpf_entry_ns;
+        if (bpf_ref_ns > 0 && publish_time_ts > 0) {
+            double bpf_us = static_cast<double>(publish_time_ts - bpf_ref_ns) / 1000.0;
+
+            bool is_new_packet = (prev_latest_poll_cycle == 0 ||
+                                  latest_poll_cycle != prev_latest_poll_cycle);
+            if (is_new_packet && prev_publish_mono_ns > 0) {
+                double interval_us =
+                    static_cast<double>(static_cast<int64_t>(bpf_ref_ns - prev_publish_mono_ns)) / 1000.0;
+                char iv[16], bv[16];
+                fmt(bv, bpf_us);
+                if (interval_us >= 0) {
+                    fmt(iv, interval_us);
+                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "%7s empty| bpf %7s ", iv, bv);
+                } else {
+                    fmt(iv, -interval_us);
+                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "\033[31m%7s block\033[0m| bpf %7s ", iv, bv);
+                }
+            } else {
+                char bv[16];
+                fmt(bv, bpf_us);
+                std::snprintf(bpf_prefix, sizeof(bpf_prefix), "             | bpf %7s ", bv);
+            }
+        } else {
+            std::snprintf(bpf_prefix, sizeof(bpf_prefix), "             |             ");
         }
+
+        // Stages before publish: poll -> ssl -> parse -> publish(0)
+        char t[5][16];
+        fmt_range(t[0], t[1], before_pub(first_poll_cycle), before_pub(latest_poll_cycle));
+        fmt_range(t[2], t[3], before_pub(first_ssl_read_start_cycle), before_pub(latest_ssl_read_end_cycle));
+        fmt(t[4], before_pub(ws_parse_cycle));
+        // Total poll-to-publish latency
+        double total_us = use_latest_ref ? before_pub(latest_poll_cycle) : before_pub(first_poll_cycle);
+        char tot[16];
+        fmt(tot, total_us);
+        char sz[24];
+        int n = std::snprintf(sz, sizeof(sz), "%u/%u%s", payload_len, ssl_read_total_bytes,
+                              is_tls_record_end ? "\xe2\x88\x9a" : "");
+        // √ is 3 bytes UTF-8 but 1 display char; pad to 10 display chars
+        int display_len = n - (is_tls_record_end ? 2 : 0);
+        while (display_len < 10 && n < (int)sizeof(sz) - 1) {
+            sz[n++] = ' ';
+            display_len++;
+        }
+        sz[n] = '\0';
+        char late[160] = "";
+        int late_pos = 0;
+        double ns_per_cycle = (tsc_freq_hz > 0) ? 1e9 / static_cast<double>(tsc_freq_hz) : 0.0;
+        auto append_late = [&](const char* label, double us) {
+            char v[16];
+            fmt(v, us);
+            late_pos += std::snprintf(late + late_pos, sizeof(late) - late_pos,
+                " \033[31m%s %s\033[0m", label, v);
+        };
+        // main_late: to_time(ws_last_op_cycle) - poll_ref (skip for batch continuations)
+        uint64_t late_ref_cycle = is_chunk_mode ? latest_poll_cycle : first_poll_cycle;
+        if (!is_batch_continuation && ws_last_op_cycle > 0 && late_ref_cycle > 0 && first_bpf_entry_ns > 0 && ns_per_cycle > 0.0) {
+            double main_late_ns = static_cast<double>(static_cast<int64_t>(ws_last_op_cycle - late_ref_cycle)) * ns_per_cycle;
+            double main_late_us = main_late_ns / 1000.0;
+            if (main_late_us > 0.0) append_late("main_late", main_late_us);
+        }
+        // ssl_late: to_time(ssl_last_op_cycle) - poll_ref
+        if (ssl_last_op_cycle > 0 && late_ref_cycle > 0 && first_bpf_entry_ns > 0 && ns_per_cycle > 0.0) {
+            double ssl_late_ns = static_cast<double>(static_cast<int64_t>(ssl_last_op_cycle - late_ref_cycle)) * ns_per_cycle;
+            double ssl_late_us = ssl_late_ns / 1000.0;
+            if (ssl_late_us > 0.0) append_late("ssl_late", ssl_late_us);
+        }
+        // ws_late: ws_last_op_cycle - latest_ssl_read_end_cycle
+        if (!is_batch_continuation && ws_last_op_cycle > 0 && latest_ssl_read_end_cycle > 0 && ns_per_cycle > 0.0) {
+            double ws_late_ns = static_cast<double>(static_cast<int64_t>(ws_last_op_cycle - latest_ssl_read_end_cycle)) * ns_per_cycle;
+            double ws_late_us = ws_late_ns / 1000.0;
+            if (ws_late_us > 0.0) append_late("ws_late", ws_late_us);
+        }
+        // Parse Binance "E" (event time) from payload for clock skew display
+        char exch_diff[24] = "";
+        if (opcode == 0x01 && payload_data != nullptr && payload_len > 10) {
+            const char* p = reinterpret_cast<const char*>(payload_data);
+            const char* p_end = p + payload_len;
+            for (const char* s = p; s + 4 < p_end; ++s) {
+                if (s[0] == '"' && s[1] == 'E' && s[2] == '"' && s[3] == ':') {
+                    const char* d = s + 4;
+                    int64_t e_ms = 0;
+                    while (d < p_end && *d >= '0' && *d <= '9') {
+                        e_ms = e_ms * 10 + (*d - '0');
+                        ++d;
+                    }
+                    if (e_ms > 1000000000000LL) {  // sanity: after 2001
+                        struct timespec rts;
+                        clock_gettime(CLOCK_REALTIME, &rts);
+                        int64_t local_ms = static_cast<int64_t>(rts.tv_sec) * 1000LL
+                                         + rts.tv_nsec / 1000000LL;
+                        int64_t diff = local_ms - e_ms;
+                        std::snprintf(exch_diff, sizeof(exch_diff), " %+ldms", diff);
+                    }
+                    break;
+                }
+            }
+        }
+        const char* line_color = is_tls_record_end ? "\033[34m" : "";
+        const char* line_reset = is_tls_record_end ? "\033[0m" : "";
         fprintf(stderr,
-                "| poll %2u pkt %6s ~ %8s "
-                "| ssl %2u x %-10s %6s ~ %8s "
-                "| parse %03u %8s "
-                "| pub %8s |%s\n",
+                "%s%s"
+                "| poll %u pkt %5s ~ %7s "
+                "| ssl %u %s %5s ~ %7s "
+                "| WS %3u %7s "
+                "| TTL %7s |%s%s%s\n",
+                line_color, bpf_prefix,
                 nic_packet_ct, t[0], t[1],
                 ssl_read_ct, sz, t[2], t[3],
-                ssl_read_batch_num, t[4], t[5], late);
+                ssl_read_batch_num, t[4], tot, late, exch_diff, line_reset);
     }
 };
 static_assert(sizeof(WSFrameInfo) == 128, "WSFrameInfo must be 128 bytes");
@@ -991,6 +1106,14 @@ struct IPCRingConsumer {
         for (int64_t seq = next; seq <= end; ++seq) {
             T& event = data[seq & element_mask_];
             bool is_end = (seq == end);
+
+            // Prefetch next ring element into L1
+            if (seq + 1 <= end) {
+                __builtin_prefetch(&data[(seq + 1) & element_mask_], 0, 3);
+                if constexpr (sizeof(T) > 64) {
+                    __builtin_prefetch(reinterpret_cast<const char*>(&data[(seq + 1) & element_mask_]) + 64, 0, 3);
+                }
+            }
 
             // Support multiple handler signatures:
             // 1. (T&, int64_t, bool) -> bool  (3-param with stop control)

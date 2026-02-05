@@ -243,6 +243,13 @@ public:
         ssl_.handshake_userspace_transport(&transport_, parsed_url_.host.c_str());
         printf("[TRANSPORT] SSL handshake complete\n");
 
+        // Extract TLS record keys for direct AES-CTR decryption
+        websocket::crypto::TLSRecordKeys tls_keys;
+        if (ssl_.extract_record_keys(tls_keys)) {
+            transport_.set_tls_record_keys(tls_keys);
+            printf("[TRANSPORT] Direct AES-CTR decryption enabled (seq=0)\n");
+        }
+
         // Signal TLS ready for downstream process
         if (conn_state_) {
             conn_state_->set_handshake_tls_ready();
@@ -289,10 +296,10 @@ public:
 
             if (ssl_bytes < 0) break;  // Fatal error
 
-            // Op 3: Process LOW_MSG_OUTBOX (IDLE only — when SSL read returned no data)
-            bool idle = (ssl_bytes <= 0);
+            // Op 3: Process LOW_MSG_OUTBOX (always — PING/PONG must not be
+            // starved by continuous SSL reads or the PONG watchdog triggers)
             profile_op<Profiling>(
-                [this]{ return process_low_prio_outbox(); }, slot, 3, idle);
+                [this]{ return process_low_prio_outbox(); }, slot, 3);
 
             // Commit profiling sample
             if constexpr (Profiling) {
@@ -325,7 +332,7 @@ public:
             case DisconnectReason::TCP_RST:         reason_str = "TCP RST (connection reset by peer)"; break;
             case DisconnectReason::TCP_FIN:         reason_str = "TCP FIN (graceful close by peer)"; break;
             case DisconnectReason::WS_CLOSE:        reason_str = "WebSocket CLOSE frame"; break;
-            case DisconnectReason::WS_PONG_TIMEOUT: reason_str = "WebSocket PONG timeout (10s)"; break;
+            case DisconnectReason::WS_PONG_TIMEOUT: reason_str = "WebSocket watchdog (PING+PONG missing)"; break;
             case DisconnectReason::SSL_READ_ERROR:  reason_str = "SSL read error"; break;
             default:                                reason_str = "Unknown"; break;
         }
@@ -397,7 +404,8 @@ private:
     // MsgMetadata Publishing
     // ========================================================================
 
-    void publish_metadata(uint32_t write_offset, uint32_t len, timing_record_t& timing) {
+    void publish_metadata(uint32_t write_offset, uint32_t len,
+                          timing_record_t& timing, bool tls_record_end) {
         int64_t seq = msg_metadata_prod_->try_claim();
         if (seq < 0) {
             fprintf(stderr, "[TRANSPORT] FATAL: MSG_METADATA full\n");
@@ -417,7 +425,10 @@ private:
         meta.msg_inbox_offset = write_offset;
         meta.decrypted_len = len;
         meta.nic_packet_ct = timing.hw_timestamp_count;
+        meta.ssl_last_op_cycle = last_op_cycle_;
+        meta.tls_record_end = tls_record_end;
         msg_metadata_prod_->publish(seq);
+        last_op_cycle_ = rdtscp();
     }
 
     // ========================================================================
@@ -430,7 +441,17 @@ private:
         if (linear_space > 16384) linear_space = 16384;
 
         timing.recv_start_cycle = rdtsc();
-        ssize_t read_len = ssl_.read(msg_inbox_->write_ptr(), linear_space);
+        ssize_t read_len;
+        if (transport_.has_tls_record_keys()) {
+            // Direct AES-CTR decryption — bypass SSL library
+            read_len = transport_.ssl_read_by_chunk(
+                msg_inbox_->write_ptr(), linear_space,
+                [](const uint8_t*, size_t) {});
+            if (read_len == -1) read_len = 0;  // non-app-data skipped
+        } else {
+            // Fallback to SSL library (non-AES-GCM cipher)
+            read_len = ssl_.read(msg_inbox_->write_ptr(), linear_space);
+        }
         timing.recv_end_cycle = rdtscp();
 
         if (read_len > 0) {
@@ -453,19 +474,24 @@ private:
             uint32_t write_offset = msg_inbox_->current_write_pos();
             msg_inbox_->advance_write(static_cast<uint32_t>(read_len));
 
-            publish_metadata(write_offset, static_cast<uint32_t>(read_len), timing);
+            bool tls_boundary = transport_.has_tls_record_keys()
+                                ? transport_.tls_record_boundary() : false;
+            publish_metadata(write_offset, static_cast<uint32_t>(read_len), timing, tls_boundary);
 
             transport_.reset_recv_stats();
             ssl_read_count_++;
             return static_cast<int32_t>(read_len);
 
-        } else if (read_len < 0 && errno != EAGAIN) {
-            fprintf(stderr, "[TRANSPORT] Read error: %s\n", strerror(errno));
-            if (conn_state_) {
-                conn_state_->set_disconnect(DisconnectReason::SSL_READ_ERROR, 0, strerror(errno));
+        } else if (read_len < 0) {
+            if (!transport_.has_tls_record_keys() && errno != EAGAIN) {
+                // Only SSL library path can set errno
+                fprintf(stderr, "[TRANSPORT] Read error: %s\n", strerror(errno));
+                if (conn_state_) {
+                    conn_state_->set_disconnect(DisconnectReason::SSL_READ_ERROR, 0, strerror(errno));
+                }
+                running_ = false;
+                return -1;
             }
-            running_ = false;
-            return -1;
         }
 
         return 0;  // No data (EAGAIN)
@@ -640,6 +666,7 @@ private:
 
     // Timing
     uint64_t tsc_freq_hz_ = 0;
+    uint64_t last_op_cycle_ = 0;
 
     // Last-valid SSL read timestamps (for packets=0 case)
     uint64_t last_valid_ssl_start_cycle_ = 0;

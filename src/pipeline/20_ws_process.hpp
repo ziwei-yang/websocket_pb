@@ -626,6 +626,10 @@ private:
         (void)sequence;
         (void)end_of_batch;
 
+        // Prefetch MSG_INBOX data that we'll parse shortly
+        __builtin_prefetch(msg_inbox_->data_at(meta.msg_inbox_offset), 0, 3);
+        __builtin_prefetch(msg_inbox_->data_at(meta.msg_inbox_offset) + 64, 0, 3);
+
         // Accumulate metadata for timestamp recovery
         if (!has_pending_frame_) {
             // Starting fresh - record start offset and reset accumulators
@@ -743,6 +747,10 @@ private:
                     first_packet_metadata_ = accumulated_metadata_[0];
                 }
 
+                // Is this the last frame parsed from current data?
+                bool is_last_in_data = (parse_offset_ + consumed >= data_accumulated_);
+                pending_tls_record_end_ = is_last_in_data && current_metadata_.tls_record_end;
+
                 // Handle complete frame
                 handle_complete_frame();
 
@@ -789,9 +797,15 @@ private:
 
         // Timestamps from accumulated metadata
         populate_timestamps(info);
+        info.is_tls_record_end = false;
         info.ws_parse_cycle = rdtscp();
 
         info.ws_frame_publish_cycle = rdtscp();
+        {
+            struct timespec _ts;
+            clock_gettime(CLOCK_MONOTONIC, &_ts);
+            info.publish_time_ts = _ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+        }
         ws_frame_info_prod_->publish(seq);
     }
 
@@ -908,10 +922,66 @@ private:
 
         pongs_prod_->publish(pong_seq);
 
+        {
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            char payload_str[128] = {0};
+            size_t plen = std::min(static_cast<size_t>(pending_ping_.payload_len),
+                                   sizeof(payload_str) - 1);
+            if (plen > 0)
+                std::memcpy(payload_str, ping_payload, plen);
+            fprintf(stderr, "[%ld.%06ld] [WS-PONG-TX] Sent PONG reply len=%u payload=\"%s\"\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, pending_ping_.payload_len, payload_str);
+        }
+
         has_pending_ping_ = false;
     }
 
     void handle_ping(uint64_t payload_len, [[maybe_unused]] uint32_t frame_total_len, uint64_t parse_cycle) {
+        {
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            char payload_str[128] = {0};
+            size_t plen = std::min(payload_len, static_cast<uint64_t>(sizeof(payload_str) - 1));
+            if (plen > 0)
+                std::memcpy(payload_str, msg_inbox_->data_at(current_payload_offset_), plen);
+            fprintf(stderr, "[%ld.%06ld] [WS-PING] Received server PING len=%lu payload=\"%s\"\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, (unsigned long)payload_len, payload_str);
+        }
+
+        // Server PING interval learning
+        {
+            uint64_t now_cycle = rdtscp();
+            last_server_ping_cycle_ = now_cycle;
+
+            uint32_t idx = server_ping_count_;
+            if (idx < PING_LEARN_SAMPLES) {
+                server_ping_cycles_[idx] = now_cycle;
+            }
+            server_ping_count_++;
+
+            // Once we have >= 2 samples, compute/refine interval
+            if (server_ping_count_ >= 2) {
+                server_ping_missing_ = false;  // Server is alive
+
+                uint32_t n = std::min(server_ping_count_, PING_LEARN_SAMPLES);
+                uint64_t total_delta = server_ping_cycles_[n - 1] - server_ping_cycles_[0];
+                uint64_t avg_delta = total_delta / (n - 1);
+                learned_interval_cycles_ = avg_delta;
+
+                uint64_t tsc_freq = conn_state_->tsc_freq_hz;
+                uint64_t avg_ms = (avg_delta * 1000ULL) / tsc_freq;
+                learned_interval_ms_ = ((avg_ms + 50) / 100) * 100;
+
+                if (server_ping_count_ <= PING_LEARN_SAMPLES) {
+                    fprintf(stderr, "[WS-WATCHDOG] Server PING interval: %lums "
+                            "(avg %lums, %u/%u samples)\n",
+                            (unsigned long)learned_interval_ms_,
+                            (unsigned long)avg_ms, n, PING_LEARN_SAMPLES);
+                }
+            } else {
+                // First PING — no interval yet, keep server_ping_missing_=true
+            }
+        }
+
         // Publish WSFrameInfo for PING
         int64_t ws_seq = ws_frame_info_prod_->try_claim();
         if (ws_seq < 0) {
@@ -933,6 +1003,11 @@ private:
         info.ws_parse_cycle = parse_cycle;
 
         info.ws_frame_publish_cycle = rdtscp();
+        {
+            struct timespec _ts;
+            clock_gettime(CLOCK_MONOTONIC, &_ts);
+            info.publish_time_ts = _ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+        }
         ws_frame_info_prod_->publish(ws_seq);
 
         // If we already have a pending PING, flush it first (new PING arrived)
@@ -970,9 +1045,34 @@ private:
     }
 
     void handle_pong(uint64_t payload_len) {
-        (void)payload_len;
-        // Clear watchdog — PONG received
-        awaiting_client_pong_ = false;
+        last_ping_got_pong_ = true;
+        server_pong_missing_ = false;
+
+        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+        char payload_str[128] = {0};
+        size_t plen = std::min(payload_len, static_cast<uint64_t>(sizeof(payload_str) - 1));
+        if (plen > 0) {
+            std::memcpy(payload_str, msg_inbox_->data_at(current_payload_offset_), plen);
+        }
+
+        // Check if payload is a unix-ms timestamp for RTT calculation
+        bool is_ts = (plen >= 12 && plen <= 14);
+        for (size_t i = 0; is_ts && i < plen; i++)
+            is_ts = (payload_str[i] >= '0' && payload_str[i] <= '9');
+
+        if (is_ts) {
+            int64_t ping_ms = 0;
+            for (size_t i = 0; i < plen; i++)
+                ping_ms = ping_ms * 10 + (payload_str[i] - '0');
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            int64_t rtt_ms = now_ms - ping_ms;
+            fprintf(stderr, "[%ld.%06ld] [WS-PONG] Received PONG payload=\"%s\" RTT=%ldms\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, payload_str, rtt_ms);
+        } else {
+            fprintf(stderr, "[%ld.%06ld] [WS-PONG] Received PONG len=%lu payload=\"%s\"\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, (unsigned long)payload_len, payload_str);
+        }
     }
 
     void maybe_send_client_ping() {
@@ -985,27 +1085,44 @@ private:
             return;
         }
 
-        // Check if 1 second has elapsed since last PING
-        // NOTE: Use direct cycle comparison instead of cycles_to_ns() to avoid
-        // uint64_t overflow in (cycles * 1e9) which wraps at ~7.4s on 2.5GHz TSC
+        // Rate limit: 1 PING per second
         uint64_t elapsed_cycles = now_cycle - last_client_ping_cycle_;
         if (elapsed_cycles < tsc_freq) return;  // < 1 second
 
-        // If awaiting PONG from previous PING
-        if (awaiting_client_pong_) {
-            uint64_t since_ping_s = elapsed_cycles / tsc_freq;
+        // Score the previous PING
+        if (last_ping_got_pong_) {
+            consecutive_unanswered_ = 0;
+        } else {
+            consecutive_unanswered_++;
+        }
 
-            // Graceful shutdown after 10s with no PONG
-            if (since_ping_s >= 10) {
-                struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
-                fprintf(stderr, "[%ld.%06ld] [WS-CLIENT-PING] FATAL: no PONG for 10s, disconnecting\n",
-                        _ts.tv_sec, _ts.tv_nsec / 1000);
-                conn_state_->set_disconnect(DisconnectReason::WS_PONG_TIMEOUT);
-                conn_state_->shutdown_all();
-                return;
+        // Update PONG watchdog: 3 consecutive unanswered -> server_pong_missing
+        server_pong_missing_ = (consecutive_unanswered_ >= 3);
+
+        // Server PING watchdog: check if server stopped sending PINGs
+        if (learned_interval_cycles_ > 0 && last_server_ping_cycle_ > 0) {
+            uint64_t since_last = now_cycle - last_server_ping_cycle_;
+            if (since_last > 2 * learned_interval_cycles_) {
+                server_ping_missing_ = true;
             }
+        }
 
-            return;  // Don't send new PING while awaiting PONG
+        // Dual-condition abort
+        if (server_ping_missing_ && server_pong_missing_) {
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            uint64_t ping_gap_ms = (last_server_ping_cycle_ > 0)
+                ? ((now_cycle - last_server_ping_cycle_) * 1000ULL) / tsc_freq : 0;
+            fprintf(stderr,
+                    "[%ld.%06ld] [WS-WATCHDOG] FATAL: connection dead\n"
+                    "  server PING missing: last %lums ago (threshold %lums)\n"
+                    "  server PONG missing: %u consecutive client PINGs unanswered\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000,
+                    (unsigned long)ping_gap_ms,
+                    (unsigned long)(learned_interval_ms_ * 2),
+                    consecutive_unanswered_);
+            conn_state_->set_disconnect(DisconnectReason::WS_PONG_TIMEOUT);
+            conn_state_->shutdown_all();
+            return;
         }
 
         // Build payload: current system_clock -> Unix-ms -> ASCII string
@@ -1034,9 +1151,15 @@ private:
 
         pongs_prod_->publish(seq);
 
+        {
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            fprintf(stderr, "[%ld.%06ld] [WS-CLIENT-PING] Sent PING payload=\"%s\"\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, payload_ascii);
+        }
+
         // Update state
         last_client_ping_cycle_ = now_cycle;
-        awaiting_client_pong_ = true;
+        last_ping_got_pong_ = false;
     }
 
     void publish_frame_info(uint8_t opcode, uint64_t payload_len,
@@ -1059,9 +1182,15 @@ private:
         info.is_last_fragment = is_last_fragment;
 
         populate_timestamps(info);
+        info.is_tls_record_end = pending_tls_record_end_;
         info.ws_parse_cycle = parse_cycle;
 
         info.ws_frame_publish_cycle = rdtscp();
+        {
+            struct timespec _ts;
+            clock_gettime(CLOCK_MONOTONIC, &_ts);
+            info.publish_time_ts = _ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+        }
         ws_frame_info_prod_->publish(seq);
 
         // Reset accumulator for next message
@@ -1079,16 +1208,15 @@ private:
             info.first_bpf_entry_ns = first_meta.first_bpf_entry_ns;
             info.first_poll_cycle = first_meta.first_nic_frame_poll_cycle;
             info.first_ssl_read_start_cycle = first_meta.ssl_read_start_cycle;
-            info.first_ssl_read_end_cycle = first_meta.ssl_read_end_cycle;
+            info.ssl_last_op_cycle = first_meta.ssl_last_op_cycle;
         }
 
         info.ws_last_op_cycle = last_op_cycle_;
         info.last_byte_ts = current_metadata_.latest_nic_timestamp_ns;
         info.latest_bpf_entry_ns = current_metadata_.latest_bpf_entry_ns;
         info.latest_poll_cycle = current_metadata_.latest_nic_frame_poll_cycle;
-        info.latest_ssl_read_start_cycle = current_metadata_.ssl_read_start_cycle;
         info.latest_ssl_read_end_cycle = current_metadata_.ssl_read_end_cycle;
-        info.ssl_read_ct = static_cast<uint16_t>(accumulated_metadata_count_);
+        info.ssl_read_ct = static_cast<uint8_t>(accumulated_metadata_count_);
 
         // Sum packet counts from all accumulated metadata
         uint32_t total_nic_packets = 0;
@@ -1147,6 +1275,7 @@ private:
     // Partial frame parsing state
     PartialWebSocketFrame pending_frame_;
     bool has_pending_frame_ = false;
+    bool pending_tls_record_end_ = false;
     uint32_t current_payload_offset_ = 0;
 
     // Wrap-around buffer for WS headers spanning MSG_INBOX wrap point
@@ -1181,7 +1310,20 @@ private:
 
     // Client-initiated PING state
     uint64_t last_client_ping_cycle_ = 0;   // TSC of last client PING sent
-    bool     awaiting_client_pong_ = false;  // true after PING sent, cleared on PONG receipt
+    bool     last_ping_got_pong_ = true;     // did the most recent PING get a PONG?
+    uint32_t consecutive_unanswered_ = 0;    // consecutive PINGs with no PONG
+
+    // Server PING interval learning (progressive: usable after 2 samples, final at 5)
+    static constexpr uint32_t PING_LEARN_SAMPLES = 5;
+    uint64_t server_ping_cycles_[PING_LEARN_SAMPLES]; // TSC of each server PING
+    uint32_t server_ping_count_ = 0;                  // How many server PINGs received (caps at LEARN_SAMPLES for array, keeps counting)
+    uint64_t learned_interval_cycles_ = 0;            // Current average interval (recomputed each PING until 5)
+    uint64_t learned_interval_ms_ = 0;                // Rounded to 100ms, for display
+
+    // Watchdog flags
+    uint64_t last_server_ping_cycle_ = 0;
+    bool     server_ping_missing_ = true;   // Start true — no server PING seen yet
+    bool     server_pong_missing_ = false;  // Becomes true after 3 consecutive unanswered client PINGs
 };
 
 }  // namespace websocket::pipeline
