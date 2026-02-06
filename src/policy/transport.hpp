@@ -1168,9 +1168,8 @@ struct PacketTransport {
                     if (can_decrypt == 0) return offset;  // Less than 1 block, wait
                 }
 
-                // Read ciphertext
-                uint8_t ct_buf[16384];  // Max TLS record payload
-                size_t read_ct = recv_buffer_.read(ct_buf, can_decrypt);
+                // Read ciphertext directly into dest buffer
+                size_t read_ct = recv_buffer_.read(dest + offset, can_decrypt);
                 accumulate_recv_stats();
                 if (read_ct < can_decrypt) {
                     can_decrypt = read_ct;
@@ -1179,11 +1178,11 @@ struct PacketTransport {
                     if (can_decrypt == 0) return offset;
                 }
 
-                // Decrypt via AES-CTR
+                // Decrypt in-place via AES-CTR
                 tls_parser_.block_counter = crypto::AESCTRDecryptor::decrypt(
                     tls_keys_.round_keys, tls_keys_.num_rounds,
                     tls_parser_.nonce, tls_parser_.block_counter,
-                    ct_buf, dest + offset, can_decrypt);
+                    dest + offset, dest + offset, can_decrypt);
                 tls_parser_.payload_consumed += static_cast<uint16_t>(can_decrypt);
 
                 size_t chunk_len = can_decrypt;
@@ -1295,6 +1294,8 @@ struct PacketTransport {
     uint64_t get_recv_latest_bpf_entry_ns() const { return consumed_recv_latest_bpf_entry_ns_; }
     uint64_t get_recv_oldest_poll_cycle() const { return consumed_recv_oldest_poll_cycle_; }
     uint64_t get_recv_latest_poll_cycle() const { return consumed_recv_latest_poll_cycle_; }
+    uint16_t get_recv_oldest_pkt_mem_idx() const { return consumed_recv_oldest_pkt_mem_idx_; }
+    uint16_t get_recv_latest_pkt_mem_idx() const { return consumed_recv_latest_pkt_mem_idx_; }
 
     void reset_recv_stats() {
         consumed_recv_packet_count_ = 0;
@@ -1304,6 +1305,8 @@ struct PacketTransport {
         consumed_recv_latest_bpf_entry_ns_ = 0;
         consumed_recv_oldest_poll_cycle_ = 0;
         consumed_recv_latest_poll_cycle_ = 0;
+        consumed_recv_oldest_pkt_mem_idx_ = 0;
+        consumed_recv_latest_pkt_mem_idx_ = 0;
     }
 
     void reset_hw_timestamps() {
@@ -1368,6 +1371,10 @@ private:
             consumed_recv_oldest_poll_cycle_ = stats.oldest_poll_cycle;
         if (stats.latest_poll_cycle > 0)
             consumed_recv_latest_poll_cycle_ = stats.latest_poll_cycle;
+        if (consumed_recv_oldest_pkt_mem_idx_ == 0 && stats.oldest_pkt_mem_idx > 0)
+            consumed_recv_oldest_pkt_mem_idx_ = stats.oldest_pkt_mem_idx;
+        if (stats.latest_pkt_mem_idx > 0)
+            consumed_recv_latest_pkt_mem_idx_ = stats.latest_pkt_mem_idx;
     }
 
     // ========================================================================
@@ -1646,6 +1653,8 @@ private:
     uint64_t consumed_recv_latest_bpf_entry_ns_ = 0;
     uint64_t consumed_recv_oldest_poll_cycle_ = 0;
     uint64_t consumed_recv_latest_poll_cycle_ = 0;
+    uint16_t consumed_recv_oldest_pkt_mem_idx_ = 0;
+    uint16_t consumed_recv_latest_pkt_mem_idx_ = 0;
 
     int poll_interval_us_ = 0;
     uint64_t tsc_freq_hz_ = 0;

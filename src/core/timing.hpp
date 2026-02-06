@@ -37,6 +37,10 @@ typedef struct {
     uint64_t poll_cycle_oldest;       // XDP Poll rdtscp of first packet
     uint64_t poll_cycle_latest;       // XDP Poll rdtscp of latest packet
 
+    // UMEM frame indices (0..32767)
+    uint16_t oldest_pkt_mem_idx;      // UMEM frame index of oldest packet
+    uint16_t latest_pkt_mem_idx;      // UMEM frame index of latest packet
+
     // Stage 3-4: SSL read
     uint64_t recv_start_cycle;        // Stage 3: Before SSL_read/recv call (TSC cycles)
     uint64_t recv_end_cycle;          // Stage 4: When SSL_read/recv completed (TSC cycles)

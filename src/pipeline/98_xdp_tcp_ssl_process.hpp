@@ -292,6 +292,8 @@ public:
                 timing.bpf_entry_latest_ns = transport_.get_recv_latest_bpf_entry_ns();
                 timing.poll_cycle_oldest = transport_.get_recv_oldest_poll_cycle();
                 timing.poll_cycle_latest = transport_.get_recv_latest_poll_cycle();
+                timing.oldest_pkt_mem_idx = transport_.get_recv_oldest_pkt_mem_idx();
+                timing.latest_pkt_mem_idx = transport_.get_recv_latest_pkt_mem_idx();
 
                 uint32_t write_offset = msg_inbox_->current_write_pos();
                 msg_inbox_->advance_write(static_cast<uint32_t>(read_len));
@@ -462,6 +464,8 @@ private:
         meta.nic_packet_ct = timing.hw_timestamp_count;
         meta.ssl_last_op_cycle = last_op_cycle_;
         meta.tls_record_end = tls_record_end;
+        meta.first_pkt_mem_idx = timing.oldest_pkt_mem_idx;
+        meta.last_pkt_mem_idx = timing.latest_pkt_mem_idx;
         msg_metadata_prod_->publish(seq);
         last_op_cycle_ = rdtscp();
     }

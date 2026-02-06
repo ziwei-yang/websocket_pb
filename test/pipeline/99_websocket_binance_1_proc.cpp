@@ -181,7 +181,7 @@ void write_summary(const char* tag,
     std::vector<double> msg_latencies_us;
     for (const auto& r : frame_records) {
         if (r.opcode == 0x01 &&
-            !r.is_fragmented &&
+            !r.is_fragmented() &&
             r.ssl_read_ct == 1 &&
             r.nic_packet_ct == 1 &&
             r.first_poll_cycle > 0 &&
@@ -218,7 +218,7 @@ void write_summary(const char* tag,
         std::vector<double> main_late_us;
         for (const auto& r : frame_records) {
             if (r.opcode == 0x01 &&
-                !r.is_fragmented &&
+                !r.is_fragmented() &&
                 r.ssl_read_ct == 1 &&
                 r.nic_packet_ct == 1 &&
                 r.first_poll_cycle > 0 &&

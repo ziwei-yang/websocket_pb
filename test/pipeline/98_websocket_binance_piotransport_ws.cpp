@@ -207,7 +207,7 @@ void write_summary(const char* tag,
     std::vector<double> msg_latencies_us;
     for (const auto& r : frame_records) {
         if (r.opcode == 0x01 &&
-            !r.is_fragmented &&
+            !r.is_fragmented() &&
             r.ssl_read_ct == 1 &&
             r.nic_packet_ct == 1 &&
             r.first_poll_cycle > 0 &&
@@ -244,7 +244,7 @@ void write_summary(const char* tag,
         std::vector<double> ssl_late_us, ws_late_us;
         for (const auto& r : frame_records) {
             if (r.opcode == 0x01 &&
-                !r.is_fragmented &&
+                !r.is_fragmented() &&
                 r.ssl_read_ct == 1 &&
                 r.nic_packet_ct == 1 &&
                 r.first_poll_cycle > 0 &&
@@ -699,7 +699,7 @@ public:
             while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
                 total_frames++;
                 frame.print_timeline(tsc_freq, prev_publish_mono_ns, prev_latest_poll_cycle);
-                prev_publish_mono_ns = frame.publish_time_ts;
+                prev_publish_mono_ns = frame.ssl_read_end_mono_ns(tsc_freq);
                 prev_latest_poll_cycle = frame.latest_poll_cycle;
 
                 if (frame_records.size() < MAX_FRAME_RECORDS) {
@@ -765,7 +765,7 @@ public:
                 while (ws_frame_cons.try_consume(frame)) {
                     total_frames++;
                     frame.print_timeline(tsc_freq, prev_publish_mono_ns, prev_latest_poll_cycle);
-                    prev_publish_mono_ns = frame.publish_time_ts;
+                    prev_publish_mono_ns = frame.ssl_read_end_mono_ns(tsc_freq);
                     prev_latest_poll_cycle = frame.latest_poll_cycle;
                     if (frame_records.size() < MAX_FRAME_RECORDS) {
                         frame_records.push_back(frame);
@@ -793,7 +793,7 @@ public:
             while (ws_frame_cons.try_consume(frame)) {
                 total_frames++;
                 frame.print_timeline(tsc_freq, prev_publish_mono_ns, prev_latest_poll_cycle);
-                prev_publish_mono_ns = frame.publish_time_ts;
+                prev_publish_mono_ns = frame.ssl_read_end_mono_ns(tsc_freq);
                 prev_latest_poll_cycle = frame.latest_poll_cycle;
                 if (frame_records.size() < MAX_FRAME_RECORDS) {
                     frame_records.push_back(frame);

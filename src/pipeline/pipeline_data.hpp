@@ -91,7 +91,11 @@ struct alignas(128) MsgMetadata {
     uint64_t ssl_last_op_cycle;            // Transport's last_op_cycle_ before publish
 
     bool tls_record_end;                   // true if ssl_read ended at TLS record boundary
-    uint8_t _pad[31];                      // Padding to 128 bytes
+
+    uint8_t _pad1[1];                      // Padding for alignment
+    uint16_t first_pkt_mem_idx;            // UMEM frame index of first packet
+    uint16_t last_pkt_mem_idx;             // UMEM frame index of last packet
+    uint8_t _pad[26];                      // Padding to 128 bytes
 
     void clear() {
         first_nic_timestamp_ns = 0;
@@ -108,6 +112,8 @@ struct alignas(128) MsgMetadata {
         nic_packet_ct = 0;
         ssl_last_op_cycle = 0;
         tls_record_end = false;
+        first_pkt_mem_idx = 0;
+        last_pkt_mem_idx = 0;
     }
 };
 static_assert(sizeof(MsgMetadata) == 128, "MsgMetadata must be 128 bytes");
@@ -121,14 +127,14 @@ static_assert(sizeof(MsgMetadata) == 128, "MsgMetadata must be 128 bytes");
 //   offset  0: uint32_t msg_inbox_offset     (4)
 //   offset  4: uint32_t payload_len          (4)
 //   offset  8: uint8_t  opcode               (1)
-//   offset  9: bool     is_fin               (1)
-//   offset 10: bool     is_fragmented        (1)
-//   offset 11: bool     is_last_fragment     (1)
-//   offset 12: uint8_t  ssl_read_ct          (1)
-//   offset 13: bool     is_tls_record_end   (1)
-//   offset 14: uint16_t nic_packet_ct        (2)
+//   offset  9: uint8_t  flags                (1)  — is_fin:0, is_fragmented:1, is_last_fragment:2, is_tls_record_end:3
+//   offset 10: uint8_t  ssl_read_ct          (1)
+//   offset 11: uint8_t  nic_packet_ct        (1)
+//   offset 12: uint16_t first_pkt_mem_idx    (2)
+//   offset 14: uint16_t last_pkt_mem_idx     (2)
 //   offset 16: [10 x uint64_t fields]       (80) — publish_time_ts replaces first_ssl_read_end_cycle
-//   offset 96: uint32_t ssl_read_batch_num  (4)
+//   offset 96: uint16_t ssl_read_batch_num  (2)
+//   offset 98: uint16_t _pad0               (2)
 //   offset100: uint32_t ssl_read_total_bytes(4)
 //   offset104: [3 x uint64_t timestamps]   (24)
 //   offset128: total                        (128)
@@ -141,22 +147,23 @@ struct alignas(64) WSFrameInfo {
 
     // WebSocket frame info
     uint8_t  opcode;                       // WS opcode (TEXT=1, BINARY=2, PING=9, etc.)
-    bool     is_fin;                       // FIN bit from WS header
-    bool     is_fragmented;                // True if partial frame OR fragmented WS message
-    bool     is_last_fragment;             // True if this is the final fragment/part
+    uint8_t  flags;                        // Bit 0: is_fin, Bit 1: is_fragmented, Bit 2: is_last_fragment, Bit 3: is_tls_record_end
 
     // Each fragment generates a separate WSFrameInfo event immediately.
     // This allows AppClient to process fragments incrementally for lower latency.
     //
     // Fragment/partial handling:
-    //   - is_fragmented=false: Complete single-frame message
-    //   - is_fragmented=true, is_last_fragment=false: Partial frame or intermediate fragment
-    //   - is_fragmented=true, is_last_fragment=true: Final fragment (message complete)
+    //   - is_fragmented()=false: Complete single-frame message
+    //   - is_fragmented()=true, is_last_fragment()=false: Partial frame or intermediate fragment
+    //   - is_fragmented()=true, is_last_fragment()=true: Final fragment (message complete)
 
     // Counts (packed into header area)
     uint8_t  ssl_read_ct;                  // Number of SSL_read calls for this frame
-    bool     is_tls_record_end;            // true if last frame in TLS record batch
-    uint16_t nic_packet_ct;                // Number of NIC packets for this frame
+    uint8_t  nic_packet_ct;                // Number of NIC packets for this frame (max 255)
+
+    // UMEM frame indices (0..32767)
+    uint16_t first_pkt_mem_idx;            // UMEM frame index of first packet
+    uint16_t last_pkt_mem_idx;             // UMEM frame index of last packet
 
     // Stage 1: NIC HW timestamps
     uint64_t first_byte_ts;                // NIC HW timestamp (first packet)
@@ -177,7 +184,8 @@ struct alignas(64) WSFrameInfo {
     uint64_t latest_ssl_read_end_cycle;    // End cycle of latest SSL_read for this frame
 
     // Batch correlation
-    uint32_t ssl_read_batch_num;           // 1-based index of this WS frame within SSL_read batch
+    uint16_t ssl_read_batch_num;           // 1-based index of this WS frame within SSL_read batch
+    uint16_t _pad0;                        // Padding
     uint32_t ssl_read_total_bytes;         // Total decrypted bytes from the SSL_read batch
     uint64_t ws_last_op_cycle;             // WS process rdtscp after previous operation completed
 
@@ -187,16 +195,25 @@ struct alignas(64) WSFrameInfo {
     // Stage 6: WS frame publish (stamped just before ring publish)
     uint64_t ws_frame_publish_cycle;       // rdtscp() immediately before publish()
 
+    // Flag accessors
+    bool is_fin() const { return flags & 0x01; }
+    bool is_fragmented() const { return flags & 0x02; }
+    bool is_last_fragment() const { return flags & 0x04; }
+    bool is_tls_record_end() const { return flags & 0x08; }
+    void set_fin(bool v) { if (v) flags |= 0x01; else flags &= ~0x01; }
+    void set_fragmented(bool v) { if (v) flags |= 0x02; else flags &= ~0x02; }
+    void set_last_fragment(bool v) { if (v) flags |= 0x04; else flags &= ~0x04; }
+    void set_tls_record_end(bool v) { if (v) flags |= 0x08; else flags &= ~0x08; }
+
     void clear() {
         msg_inbox_offset = 0;
         payload_len = 0;
         opcode = 0;
-        is_fin = false;
-        is_fragmented = false;
-        is_last_fragment = false;
+        flags = 0;
         ssl_read_ct = 0;
-        is_tls_record_end = false;
         nic_packet_ct = 0;
+        first_pkt_mem_idx = 0;
+        last_pkt_mem_idx = 0;
         first_byte_ts = 0;
         last_byte_ts = 0;
         first_bpf_entry_ns = 0;
@@ -208,10 +225,26 @@ struct alignas(64) WSFrameInfo {
         ssl_last_op_cycle = 0;
         latest_ssl_read_end_cycle = 0;
         ssl_read_batch_num = 0;
+        _pad0 = 0;
         ssl_read_total_bytes = 0;
         ws_last_op_cycle = 0;
         ws_parse_cycle = 0;
         ws_frame_publish_cycle = 0;
+    }
+
+    // Reconstruct CLOCK_MONOTONIC ns of latest SSL read end,
+    // using publish-time as TSC↔MONO anchor.
+    // For multi-process mode block/empty interval calculation.
+    uint64_t ssl_read_end_mono_ns(uint64_t tsc_freq_hz) const {
+        if (latest_ssl_read_end_cycle > 0 &&
+            ws_frame_publish_cycle > latest_ssl_read_end_cycle &&
+            tsc_freq_hz > 0 && publish_time_ts > 0) {
+            double ns_per_cycle = 1e9 / static_cast<double>(tsc_freq_hz);
+            uint64_t delta_ns = static_cast<uint64_t>(
+                static_cast<double>(ws_frame_publish_cycle - latest_ssl_read_end_cycle) * ns_per_cycle);
+            return publish_time_ts - delta_ns;
+        }
+        return publish_time_ts;  // fallback
     }
 
     void print_timeline(uint64_t tsc_freq_hz,
@@ -289,9 +322,9 @@ struct alignas(64) WSFrameInfo {
         fmt(tot, total_us);
         char sz[24];
         int n = std::snprintf(sz, sizeof(sz), "%u/%u%s", payload_len, ssl_read_total_bytes,
-                              is_tls_record_end ? "\xe2\x88\x9a" : "");
+                              is_tls_record_end() ? "\xe2\x88\x9a" : "");
         // √ is 3 bytes UTF-8 but 1 display char; pad to 10 display chars
-        int display_len = n - (is_tls_record_end ? 2 : 0);
+        int display_len = n - (is_tls_record_end() ? 2 : 0);
         while (display_len < 10 && n < (int)sizeof(sz) - 1) {
             sz[n++] = ' ';
             display_len++;
@@ -350,16 +383,16 @@ struct alignas(64) WSFrameInfo {
                 }
             }
         }
-        const char* line_color = is_tls_record_end ? "\033[34m" : "";
-        const char* line_reset = is_tls_record_end ? "\033[0m" : "";
+        const char* line_color = (ssl_read_batch_num == 1) ? "\033[34m" : "";
+        const char* line_reset = (ssl_read_batch_num == 1) ? "\033[0m" : "";
         fprintf(stderr,
                 "%s%s"
-                "| poll %u pkt %5s ~ %7s "
+                "| %u pkt %5u %5s ~ %7s "
                 "| ssl %u %s %5s ~ %7s "
                 "| WS %3u %7s "
                 "| TTL %7s |%s%s%s\n",
                 line_color, bpf_prefix,
-                nic_packet_ct, t[0], t[1],
+                nic_packet_ct, last_pkt_mem_idx, t[0], t[1],
                 ssl_read_ct, sz, t[2], t[3],
                 ssl_read_batch_num, t[4], tot, late, exch_diff, line_reset);
     }

@@ -225,6 +225,8 @@ struct ReadStats {
     uint64_t latest_bpf_entry_ns = 0; // Latest BPF entry timestamp
     uint64_t oldest_poll_cycle = 0;   // Oldest XDP Poll rdtscp cycle
     uint64_t latest_poll_cycle = 0;   // Latest XDP Poll rdtscp cycle
+    uint16_t oldest_pkt_mem_idx = 0;  // UMEM frame index of oldest packet
+    uint16_t latest_pkt_mem_idx = 0;  // UMEM frame index of latest packet
 };
 
 struct ZeroCopyReceiveBuffer {
@@ -296,11 +298,22 @@ struct ZeroCopyReceiveBuffer {
                     }
                     last_read_stats_.latest_poll_cycle = frame.poll_cycle;
                 }
+                if (last_read_stats_.oldest_pkt_mem_idx == 0) {
+                    last_read_stats_.oldest_pkt_mem_idx = static_cast<uint16_t>(frame.frame_idx);
+                }
+                last_read_stats_.latest_pkt_mem_idx = static_cast<uint16_t>(frame.frame_idx);
             }
 
             // How much left in this frame?
             size_t remaining = frame.len - frame.offset;
             size_t to_read = remaining < (max_len - total_read) ? remaining : (max_len - total_read);
+
+            // Prefetch next UMEM frame when current frame about to be exhausted
+            if (to_read >= remaining && count_ > 1) {
+                const FrameRef& next = frames_[(head_ + 1) % MAX_FRAMES];
+                __builtin_prefetch(next.data, 0, 0);
+                __builtin_prefetch(next.data + 64, 0, 0);
+            }
 
             // Copy from UMEM to output (only copy)
             std::memcpy(output + total_read, frame.data + frame.offset, to_read);

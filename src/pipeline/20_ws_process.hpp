@@ -791,13 +791,13 @@ private:
         info.msg_inbox_offset = (data_start_offset_ + pending_frame_.expected_header_len) % MSG_INBOX_SIZE;
         info.payload_len = static_cast<uint32_t>(pending_frame_.payload_bytes_received);
         info.opcode = pending_frame_.opcode;
-        info.is_fin = pending_frame_.fin;
-        info.is_fragmented = true;       // Partial frame
-        info.is_last_fragment = false;   // More data needed
+        info.set_fin(pending_frame_.fin);
+        info.set_fragmented(true);       // Partial frame
+        info.set_last_fragment(false);   // More data needed
 
         // Timestamps from accumulated metadata
         populate_timestamps(info);
-        info.is_tls_record_end = false;
+        info.set_tls_record_end(false);
         info.ws_parse_cycle = rdtscp();
 
         info.ws_frame_publish_cycle = rdtscp();
@@ -995,9 +995,9 @@ private:
         info.msg_inbox_offset = current_payload_offset_;
         info.payload_len = static_cast<uint32_t>(payload_len);
         info.opcode = static_cast<uint8_t>(websocket::http::WebSocketOpcode::PING);
-        info.is_fin = true;
-        info.is_fragmented = false;
-        info.is_last_fragment = false;
+        info.set_fin(true);
+        info.set_fragmented(false);
+        info.set_last_fragment(false);
 
         populate_timestamps(info);
         info.ws_parse_cycle = parse_cycle;
@@ -1177,12 +1177,12 @@ private:
         info.msg_inbox_offset = current_payload_offset_;
         info.payload_len = static_cast<uint32_t>(payload_len);
         info.opcode = opcode;
-        info.is_fin = !is_fragmented || is_last_fragment;
-        info.is_fragmented = is_fragmented;
-        info.is_last_fragment = is_last_fragment;
+        info.set_fin(!is_fragmented || is_last_fragment);
+        info.set_fragmented(is_fragmented);
+        info.set_last_fragment(is_last_fragment);
 
         populate_timestamps(info);
-        info.is_tls_record_end = pending_tls_record_end_;
+        info.set_tls_record_end(pending_tls_record_end_);
         info.ws_parse_cycle = parse_cycle;
 
         info.ws_frame_publish_cycle = rdtscp();
@@ -1209,6 +1209,7 @@ private:
             info.first_poll_cycle = first_meta.first_nic_frame_poll_cycle;
             info.first_ssl_read_start_cycle = first_meta.ssl_read_start_cycle;
             info.ssl_last_op_cycle = first_meta.ssl_last_op_cycle;
+            info.first_pkt_mem_idx = first_meta.first_pkt_mem_idx;
         }
 
         info.ws_last_op_cycle = last_op_cycle_;
@@ -1217,16 +1218,17 @@ private:
         info.latest_poll_cycle = current_metadata_.latest_nic_frame_poll_cycle;
         info.latest_ssl_read_end_cycle = current_metadata_.ssl_read_end_cycle;
         info.ssl_read_ct = static_cast<uint8_t>(accumulated_metadata_count_);
+        info.last_pkt_mem_idx = current_metadata_.last_pkt_mem_idx;
 
         // Sum packet counts from all accumulated metadata
         uint32_t total_nic_packets = 0;
         for (size_t i = 0; i < accumulated_metadata_count_; ++i) {
             total_nic_packets += accumulated_metadata_[i].nic_packet_ct;
         }
-        info.nic_packet_ct = static_cast<uint16_t>(total_nic_packets);
+        info.nic_packet_ct = static_cast<uint8_t>(total_nic_packets);
 
         // Batch correlation
-        info.ssl_read_batch_num = ++batch_frame_num_;
+        info.ssl_read_batch_num = static_cast<uint16_t>(++batch_frame_num_);
 
         uint32_t total_bytes = 0;
         for (size_t i = 0; i < accumulated_metadata_count_; ++i) {

@@ -293,9 +293,16 @@ public:
                 timing.poll_cycle_oldest = transport_.get_recv_oldest_poll_cycle();
                 timing.poll_cycle_latest = transport_.get_recv_latest_poll_cycle();
 
+                timing.oldest_pkt_mem_idx = transport_.get_recv_oldest_pkt_mem_idx();
+                timing.latest_pkt_mem_idx = transport_.get_recv_latest_pkt_mem_idx();
+
                 // Accumulate SSL read stats for multi-read WS frames
                 accum_ssl_read_ct_++;
                 accum_nic_pkt_ct_ += timing.hw_timestamp_count;
+                if (accum_first_pkt_mem_idx_ == 0 && timing.oldest_pkt_mem_idx > 0)
+                    accum_first_pkt_mem_idx_ = timing.oldest_pkt_mem_idx;
+                if (timing.latest_pkt_mem_idx > 0)
+                    accum_last_pkt_mem_idx_ = timing.latest_pkt_mem_idx;
                 if (accum_ssl_read_ct_ == 1) {
                     accum_first_ssl_start_ = timing.recv_start_cycle;
                     accum_first_ssl_end_ = timing.recv_end_cycle;
@@ -341,6 +348,8 @@ public:
                     // All data consumed — reset accumulation for next batch
                     accum_ssl_read_ct_ = 0;
                     accum_nic_pkt_ct_ = 0;
+                    accum_first_pkt_mem_idx_ = 0;
+                    accum_last_pkt_mem_idx_ = 0;
                 }
                 // If buffer has remaining partial data, accumulation continues to next SSL read
 
@@ -606,9 +615,9 @@ private:
         info.msg_inbox_offset = inbox_offset;
         info.payload_len = static_cast<uint32_t>(frame.payload_len);
         info.opcode = frame.opcode;
-        info.is_fin = true;
-        info.is_fragmented = false;
-        info.is_last_fragment = false;
+        info.set_fin(true);
+        info.set_fragmented(false);
+        info.set_last_fragment(false);
 
         // Use accumulated "first" timing, current "latest" timing
         info.first_byte_ts = accum_first_timing_.hw_timestamp_oldest_ns;
@@ -621,9 +630,11 @@ private:
         info.ssl_last_op_cycle = ssl_last_op_cycle_;
         info.latest_ssl_read_end_cycle = timing.recv_end_cycle;
         info.ssl_read_ct = static_cast<uint8_t>(accum_ssl_read_ct_);
-        info.is_tls_record_end = pending_tls_record_end_;
-        info.nic_packet_ct = accum_nic_pkt_ct_;
-        info.ssl_read_batch_num = ++batch_frame_num_;
+        info.set_tls_record_end(pending_tls_record_end_);
+        info.nic_packet_ct = static_cast<uint8_t>(accum_nic_pkt_ct_);
+        info.first_pkt_mem_idx = accum_first_pkt_mem_idx_;
+        info.last_pkt_mem_idx = accum_last_pkt_mem_idx_;
+        info.ssl_read_batch_num = static_cast<uint16_t>(++batch_frame_num_);
         info.ssl_read_total_bytes = current_ssl_read_bytes_;
         info.ws_last_op_cycle = last_op_cycle_;
         info.ws_parse_cycle = parse_cycle;
@@ -790,6 +801,8 @@ private:
     // SSL read accumulation for multi-read WS frames
     uint16_t accum_ssl_read_ct_ = 0;
     uint16_t accum_nic_pkt_ct_ = 0;
+    uint16_t accum_first_pkt_mem_idx_ = 0;
+    uint16_t accum_last_pkt_mem_idx_ = 0;
     uint64_t accum_first_ssl_start_ = 0;
     uint64_t accum_first_ssl_end_ = 0;
     timing_record_t accum_first_timing_;
