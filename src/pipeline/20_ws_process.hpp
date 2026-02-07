@@ -365,9 +365,12 @@ template<typename MsgMetadataCons,     // IPCRingConsumer<MsgMetadata>
          typename WSFrameInfoProd,     // IPCRingProducer<WSFrameInfo>
          typename PongsProd,           // IPCRingProducer<PongFrameAligned>
          typename MsgOutboxProd,       // IPCRingProducer<MsgOutboxEvent>
+         bool EnableAB = false,
          bool Profiling = false>
 struct WebSocketProcess {
 public:
+    static constexpr size_t NUM_CONN = EnableAB ? 2 : 1;
+
     // ========================================================================
     // Initialization
     // ========================================================================
@@ -377,22 +380,31 @@ public:
               WSFrameInfoProd* ws_frame_info_prod,
               PongsProd* pongs_prod,
               MsgOutboxProd* msg_outbox_prod,
-              ConnStateShm* conn_state) {
+              ConnStateShm* conn_state,
+              MsgInbox* msg_inbox_b = nullptr,
+              MsgMetadataCons* msg_metadata_cons_b = nullptr) {
 
-        msg_inbox_ = msg_inbox;
-        msg_metadata_cons_ = msg_metadata_cons;
+        msg_inbox_[0] = msg_inbox;
+        msg_metadata_cons_[0] = msg_metadata_cons;
         ws_frame_info_prod_ = ws_frame_info_prod;
         pongs_prod_ = pongs_prod;
         msg_outbox_prod_ = msg_outbox_prod;
         conn_state_ = conn_state;
 
-        pending_frame_.clear();
-        reset_accumulator();
-        reset_fragment_state();
+        if constexpr (EnableAB) {
+            msg_inbox_[1] = msg_inbox_b;
+            msg_metadata_cons_[1] = msg_metadata_cons_b;
+        }
 
-        has_pending_ping_ = false;
+        for (size_t i = 0; i < NUM_CONN; i++) {
+            pending_frame_[i].clear();
+            has_pending_frame_[i] = false;
+            reset_accumulator(i);
+            reset_fragment_state(i);
+            has_pending_ping_[i] = false;
+        }
 
-        printf("[WS-PROCESS] Initialized\n");
+        printf("[WS-PROCESS] Initialized%s\n", EnableAB ? " (Dual A/B)" : "");
         return true;
     }
 
@@ -420,22 +432,30 @@ public:
         }
         printf("[WS-PROCESS] TLS ready, sending HTTP upgrade\n");
 
-        // Step 2: Send HTTP upgrade request
-        send_http_upgrade_request();
-
-        // Step 3: Wait for and validate HTTP 101 response
-        if (!recv_http_upgrade_response()) {
-            fprintf(stderr, "[WS-PROCESS] HTTP upgrade failed\n");
+        // Connection A: HTTP upgrade + subscription
+        send_http_upgrade_request(0);
+        if (!recv_http_upgrade_response(0)) {
+            fprintf(stderr, "[WS-PROCESS] HTTP upgrade failed (conn A)\n");
             return false;
         }
-        printf("[WS-PROCESS] HTTP 101 received, sending subscription\n");
+        printf("[WS-PROCESS] HTTP 101 received (conn A), sending subscription\n");
+        send_subscription_message(0);
 
-        // Step 4: Send subscription message
-        send_subscription_message();
+        if constexpr (EnableAB) {
+            // Connection B: HTTP upgrade + subscription
+            send_http_upgrade_request(1);
+            if (!recv_http_upgrade_response(1)) {
+                fprintf(stderr, "[WS-PROCESS] HTTP upgrade failed (conn B)\n");
+                return false;
+            }
+            printf("[WS-PROCESS] HTTP 101 received (conn B), sending subscription\n");
+            send_subscription_message(1);
+        }
 
-        // Step 5: Signal ws_ready
+        // Signal ws_ready
         conn_state_->set_handshake_ws_ready();
-        printf("[WS-PROCESS] Handshake complete, ws_ready signaled\n");
+        printf("[WS-PROCESS] Handshake complete%s, ws_ready signaled\n",
+               EnableAB ? " (both A/B)" : "");
 
         return true;
     }
@@ -445,7 +465,7 @@ public:
     // ========================================================================
 
     void run() {
-        printf("[WS-PROCESS] Running main loop\n");
+        printf("[WS-PROCESS] Running main loop%s\n", EnableAB ? " (Dual A/B)" : "");
         conn_state_->set_ready(PROC_WEBSOCKET);
 
         while (conn_state_->is_running(PROC_WEBSOCKET)) {
@@ -454,10 +474,10 @@ public:
                 slot = profiling_data_->next_slot();
             }
 
-            // Op 0: metadata consume + commit
+            // Op 0: metadata consume + commit (connection A / single)
             int32_t processed = profile_op<Profiling>([this]() -> int32_t {
                 [[maybe_unused]] bool first_meta = true;
-                size_t p = msg_metadata_cons_->process_manually(
+                size_t p = msg_metadata_cons_[0]->process_manually(
                     [this, &first_meta](MsgMetadata& meta, int64_t seq, bool end_of_batch) {
                         if constexpr (Profiling) {
                             if (first_meta) {
@@ -465,21 +485,46 @@ public:
                                 first_meta = false;
                             }
                         }
-                        on_event(meta, seq, end_of_batch);
+                        on_event(0, meta, seq, end_of_batch);
                         return true;
                     }, MAX_ACCUMULATED_METADATA);
                 if (p > 0) {
-                    msg_metadata_cons_->commit_manually();
+                    msg_metadata_cons_[0]->commit_manually();
                     last_op_cycle_ = rdtscp();
                 }
                 return static_cast<int32_t>(p);
             }, slot, 0);
 
-            // Op 1: ping/pong (idle only)
+            // Op 1: ping/pong for connection A (idle only)
             bool idle = (processed == 0);
+
+            if constexpr (EnableAB) {
+                // Op 2: metadata consume + commit (connection B)
+                int32_t processed_b = profile_op<Profiling>([this]() -> int32_t {
+                    size_t p = msg_metadata_cons_[1]->process_manually(
+                        [this](MsgMetadata& meta, int64_t seq, bool end_of_batch) {
+                            on_event(1, meta, seq, end_of_batch);
+                            return true;
+                        }, MAX_ACCUMULATED_METADATA);
+                    if (p > 0) {
+                        msg_metadata_cons_[1]->commit_manually();
+                        last_op_cycle_ = rdtscp();
+                    }
+                    return static_cast<int32_t>(p);
+                }, slot, 2);
+
+                idle = idle && (processed_b == 0);
+            }
+
+            // Ping/pong for all connections (idle only)
             profile_op<Profiling>([this]() -> int32_t {
                 int32_t count = 0;
-                if (has_pending_ping_) { flush_pending_pong(); count = 1; }
+                for (size_t ci = 0; ci < NUM_CONN; ci++) {
+                    if (has_pending_ping_[ci]) {
+                        flush_pending_pong(static_cast<uint8_t>(ci));
+                        count++;
+                    }
+                }
                 maybe_send_client_ping();
                 if (count > 0) last_op_cycle_ = rdtscp();
                 return count;
@@ -494,7 +539,9 @@ public:
                 profiling_data_->commit();
             }
         }
-        flush_pending_pong();
+        for (size_t ci = 0; ci < NUM_CONN; ci++) {
+            flush_pending_pong(static_cast<uint8_t>(ci));
+        }
         printf("[WS-PROCESS] Exiting main loop\n");
     }
 
@@ -519,7 +566,7 @@ private:
     // Handshake Helpers
     // ========================================================================
 
-    void send_http_upgrade_request() {
+    void send_http_upgrade_request(uint8_t ci) {
         char request_buf[4096];
         std::vector<std::pair<std::string, std::string>> custom_headers;
 
@@ -531,7 +578,7 @@ private:
             sizeof(request_buf)
         );
 
-        // Publish to MSG_OUTBOX
+        // Publish to MSG_OUTBOX with connection_id
         int64_t seq = msg_outbox_prod_->try_claim();
         if (seq < 0) {
             fprintf(stderr, "[WS-PROCESS] FATAL: MSG_OUTBOX full during handshake\n");
@@ -542,11 +589,12 @@ private:
         std::memcpy(event.data, request_buf, request_len);
         event.data_len = static_cast<uint16_t>(request_len);
         event.msg_type = MSG_TYPE_DATA;
+        event.connection_id = ci;
 
         msg_outbox_prod_->publish(seq);
     }
 
-    bool recv_http_upgrade_response() {
+    bool recv_http_upgrade_response(uint8_t ci) {
         PartialHttpResponse response;
         response.clear();
 
@@ -558,15 +606,15 @@ private:
                 return false;
             }
             if (rdtscp() - start_cycle > timeout_cycles) {
-                fprintf(stderr, "[WS-PROCESS] Timeout waiting for HTTP response\n");
+                fprintf(stderr, "[WS-PROCESS] Timeout waiting for HTTP response (conn %u)\n", ci);
                 return false;
             }
 
-            // Poll for metadata events
+            // Poll for metadata events from this connection
             MsgMetadata meta;
-            if (msg_metadata_cons_->try_consume(meta)) {
+            if (msg_metadata_cons_[ci]->try_consume(meta)) {
                 if (meta.decrypted_len > 0) {
-                    const uint8_t* data = msg_inbox_->data_at(meta.msg_inbox_offset);
+                    const uint8_t* data = msg_inbox_[ci]->data_at(meta.msg_inbox_offset);
                     size_t to_copy = std::min(static_cast<size_t>(meta.decrypted_len),
                                               sizeof(response.buffer) - response.accumulated);
                     std::memcpy(response.buffer + response.accumulated, data, to_copy);
@@ -574,6 +622,15 @@ private:
                     response.try_complete();
                 }
             } else {
+                // When EnableAB, also drain other connection's metadata during handshake
+                // to avoid ring buffer backup
+                if constexpr (EnableAB) {
+                    uint8_t other = ci ^ 1;
+                    MsgMetadata other_meta;
+                    while (msg_metadata_cons_[other]->try_consume(other_meta)) {
+                        // Drain but don't process (handshake phase)
+                    }
+                }
                 __builtin_ia32_pause();
             }
         }
@@ -582,7 +639,7 @@ private:
         return websocket::http::validate_http_upgrade_response(response.buffer, response.accumulated);
     }
 
-    void send_subscription_message() {
+    void send_subscription_message(uint8_t ci) {
         const char* json = conn_state_->subscription_json;
         size_t json_len = std::strlen(json);
 
@@ -613,61 +670,65 @@ private:
 
         event.data_len = static_cast<uint16_t>(frame_len);
         event.msg_type = MSG_TYPE_DATA;
+        event.connection_id = ci;
 
         msg_outbox_prod_->publish(seq);
-        printf("[WS-PROCESS] Subscription sent (%zu bytes)\n", json_len);
+        printf("[WS-PROCESS] Subscription sent (conn %u, %zu bytes)\n", ci, json_len);
     }
 
     // ========================================================================
     // Event Handler (satisfies disruptor::event_handler_concept)
     // ========================================================================
 
-    void on_event(MsgMetadata& meta, int64_t sequence, bool end_of_batch) {
+    void on_event(uint8_t ci, MsgMetadata& meta, int64_t sequence, bool end_of_batch) {
         (void)sequence;
         (void)end_of_batch;
 
+        auto& ps = parse_state_[ci];
+        auto* inbox = msg_inbox_[ci];
+
         // Prefetch MSG_INBOX data that we'll parse shortly
-        __builtin_prefetch(msg_inbox_->data_at(meta.msg_inbox_offset), 0, 3);
-        __builtin_prefetch(msg_inbox_->data_at(meta.msg_inbox_offset) + 64, 0, 3);
+        __builtin_prefetch(inbox->data_at(meta.msg_inbox_offset), 0, 3);
+        __builtin_prefetch(inbox->data_at(meta.msg_inbox_offset) + 64, 0, 3);
 
         // Accumulate metadata for timestamp recovery
-        if (!has_pending_frame_) {
+        if (!has_pending_frame_[ci]) {
             // Starting fresh - record start offset and reset accumulators
-            data_start_offset_ = meta.msg_inbox_offset;
-            data_accumulated_ = 0;
-            parse_offset_ = 0;
-            accumulated_metadata_count_ = 0;
-            batch_frame_num_ = 0;
+            ps.data_start_offset = meta.msg_inbox_offset;
+            ps.data_accumulated = 0;
+            ps.parse_offset = 0;
+            ps.accumulated_metadata_count = 0;
+            ps.batch_frame_num = 0;
         }
 
         // Accumulate this SSL_read's data
-        data_accumulated_ += meta.decrypted_len;
+        ps.data_accumulated += meta.decrypted_len;
 
         // Add metadata to array (if space available)
-        if (accumulated_metadata_count_ < MAX_ACCUMULATED_METADATA) {
-            accumulated_metadata_[accumulated_metadata_count_++] = meta;
+        if (ps.accumulated_metadata_count < MAX_ACCUMULATED_METADATA) {
+            ps.accumulated_metadata[ps.accumulated_metadata_count++] = meta;
         }
 
         // Store current metadata for latest timestamps
-        current_metadata_ = meta;
+        ps.current_metadata = meta;
 
         // Parse WebSocket frames from accumulated data
-        while (parse_offset_ < data_accumulated_) {
-            uint32_t offset = (data_start_offset_ + parse_offset_) % MSG_INBOX_SIZE;
-            const uint8_t* data = msg_inbox_->data_at(offset);
-            size_t available = data_accumulated_ - parse_offset_;
+        while (ps.parse_offset < ps.data_accumulated) {
+            uint32_t offset = (ps.data_start_offset + ps.parse_offset) % MSG_INBOX_SIZE;
+            const uint8_t* data = inbox->data_at(offset);
+            size_t available = ps.data_accumulated - ps.parse_offset;
 
             // Handle MSG_INBOX wrap-around (linear available bytes)
             size_t linear_avail = std::min(available, static_cast<size_t>(MSG_INBOX_SIZE - offset));
 
             // Handle header spanning wrap point - copy to contiguous buffer
-            if (linear_avail < available && linear_avail < sizeof(ws_header_wrap_buffer_)) {
+            if (linear_avail < available && linear_avail < sizeof(ps.ws_header_wrap_buffer)) {
                 size_t first_part = MSG_INBOX_SIZE - offset;
                 size_t second_part = std::min(available - first_part,
-                                              sizeof(ws_header_wrap_buffer_) - first_part);
-                std::memcpy(ws_header_wrap_buffer_, data, first_part);
-                std::memcpy(ws_header_wrap_buffer_ + first_part, msg_inbox_->data_at(0), second_part);
-                data = ws_header_wrap_buffer_;
+                                              sizeof(ps.ws_header_wrap_buffer) - first_part);
+                std::memcpy(ps.ws_header_wrap_buffer, data, first_part);
+                std::memcpy(ps.ws_header_wrap_buffer + first_part, inbox->data_at(0), second_part);
+                data = ps.ws_header_wrap_buffer;
                 linear_avail = first_part + second_part;
             }
 
@@ -675,109 +736,94 @@ private:
             size_t consumed = 0;
             bool frame_complete = false;
 
-            if (has_pending_frame_) {
+            if (has_pending_frame_[ci]) {
                 // Continue parsing partial frame
-                consumed = continue_partial_frame(pending_frame_, data, linear_avail);
+                consumed = continue_partial_frame(pending_frame_[ci], data, linear_avail);
 
-                if (!pending_frame_.header_complete) {
-                    // Header still incomplete - DEFER
-                    parse_offset_ += consumed;
+                if (!pending_frame_[ci].header_complete) {
+                    ps.parse_offset += consumed;
                     return;
                 }
 
-                // FIX: Update payload_bytes_received with newly available data
-                // After header continuation, remaining data in this chunk is payload
                 size_t available_for_payload = linear_avail - consumed;
-                uint64_t payload_remaining = pending_frame_.payload_len - pending_frame_.payload_bytes_received;
+                uint64_t payload_remaining = pending_frame_[ci].payload_len - pending_frame_[ci].payload_bytes_received;
                 size_t payload_in_chunk = std::min(available_for_payload, static_cast<size_t>(payload_remaining));
-                pending_frame_.payload_bytes_received += payload_in_chunk;
+                pending_frame_[ci].payload_bytes_received += payload_in_chunk;
                 consumed += payload_in_chunk;
 
-                // Check if payload complete
-                uint64_t total_needed = pending_frame_.expected_header_len + pending_frame_.payload_len;
-                uint64_t total_received = pending_frame_.header_bytes_received + pending_frame_.payload_bytes_received;
+                uint64_t total_needed = pending_frame_[ci].expected_header_len + pending_frame_[ci].payload_len;
+                uint64_t total_received = pending_frame_[ci].header_bytes_received + pending_frame_[ci].payload_bytes_received;
 
                 if (total_received < total_needed) {
-                    // Header complete but payload incomplete - publish partial WSFrameInfo
-                    publish_partial_frame_info();
-                    parse_offset_ += consumed;
+                    publish_partial_frame_info(ci);
+                    ps.parse_offset += consumed;
                     return;
                 }
 
                 frame_complete = true;
             } else {
                 // Start parsing new frame
-                consumed = start_parse_frame(pending_frame_, data, linear_avail);
-                has_pending_frame_ = true;
+                consumed = start_parse_frame(pending_frame_[ci], data, linear_avail);
+                has_pending_frame_[ci] = true;
 
-                if (!pending_frame_.header_complete) {
-                    // Header incomplete - DEFER
-                    parse_offset_ += consumed;
+                if (!pending_frame_[ci].header_complete) {
+                    ps.parse_offset += consumed;
                     return;
                 }
 
-                // Check if we have complete payload
-                uint64_t total_needed = pending_frame_.expected_header_len + pending_frame_.payload_len;
+                uint64_t total_needed = pending_frame_[ci].expected_header_len + pending_frame_[ci].payload_len;
                 size_t total_available = consumed + (linear_avail - consumed);
 
                 if (total_available < total_needed) {
-                    // Track payload bytes received so far
-                    size_t payload_in_this_chunk = linear_avail - pending_frame_.expected_header_len;
-                    pending_frame_.payload_bytes_received = payload_in_this_chunk;
+                    size_t payload_in_this_chunk = linear_avail - pending_frame_[ci].expected_header_len;
+                    pending_frame_[ci].payload_bytes_received = payload_in_this_chunk;
 
-                    // Header complete but payload incomplete - publish partial WSFrameInfo
-                    publish_partial_frame_info();
-                    parse_offset_ += linear_avail;
+                    publish_partial_frame_info(ci);
+                    ps.parse_offset += linear_avail;
                     return;
                 }
 
-                // Frame complete in single chunk
-                pending_frame_.payload_bytes_received = pending_frame_.payload_len;
+                pending_frame_[ci].payload_bytes_received = pending_frame_[ci].payload_len;
                 frame_complete = true;
-                consumed = pending_frame_.expected_header_len + pending_frame_.payload_len;
+                consumed = pending_frame_[ci].expected_header_len + pending_frame_[ci].payload_len;
             }
 
             if (frame_complete) {
-                // Calculate payload offset in MSG_INBOX
-                current_payload_offset_ = (data_start_offset_ + parse_offset_ +
-                                          pending_frame_.expected_header_len) % MSG_INBOX_SIZE;
+                ps.current_payload_offset = (ps.data_start_offset + ps.parse_offset +
+                                            pending_frame_[ci].expected_header_len) % MSG_INBOX_SIZE;
 
-                // Recover first packet metadata
-                if (accumulated_metadata_count_ > 0) {
-                    first_packet_metadata_ = accumulated_metadata_[0];
+                if (ps.accumulated_metadata_count > 0) {
+                    ps.first_packet_metadata = ps.accumulated_metadata[0];
                 }
 
-                // Is this the last frame parsed from current data?
-                bool is_last_in_data = (parse_offset_ + consumed >= data_accumulated_);
-                pending_tls_record_end_ = is_last_in_data && current_metadata_.tls_record_end;
+                bool is_last_in_data = (ps.parse_offset + consumed >= ps.data_accumulated);
+                ps.pending_tls_record_end = is_last_in_data && ps.current_metadata.tls_record_end;
 
-                // Handle complete frame
-                handle_complete_frame();
+                handle_complete_frame(ci);
 
-                // Advance and reset
-                parse_offset_ += consumed;
-                has_pending_frame_ = false;
-                pending_frame_.clear();
+                ps.parse_offset += consumed;
+                has_pending_frame_[ci] = false;
+                pending_frame_[ci].clear();
 
-                // Reset metadata accumulator for next frame
-                accumulated_metadata_count_ = 0;
-                if (parse_offset_ < data_accumulated_) {
-                    // More data in batch - current meta is start of next frame
-                    accumulated_metadata_[accumulated_metadata_count_++] = current_metadata_;
+                ps.accumulated_metadata_count = 0;
+                if (ps.parse_offset < ps.data_accumulated) {
+                    ps.accumulated_metadata[ps.accumulated_metadata_count++] = ps.current_metadata;
                 }
             }
         }
 
         // All data consumed - reset for next batch
-        data_accumulated_ = 0;
-        parse_offset_ = 0;
+        ps.data_accumulated = 0;
+        ps.parse_offset = 0;
     }
 
     // ========================================================================
     // Partial Frame WSFrameInfo (header complete, payload incomplete)
     // ========================================================================
 
-    void publish_partial_frame_info() {
+    void publish_partial_frame_info(uint8_t ci) {
+        auto& ps = parse_state_[ci];
+
         int64_t seq = ws_frame_info_prod_->try_claim();
         if (seq < 0) {
             fprintf(stderr, "[WS-PROCESS] FATAL: WS_FRAME_INFO full\n");
@@ -787,16 +833,15 @@ private:
         auto& info = (*ws_frame_info_prod_)[seq];
         info.clear();
 
-        // Payload offset (after header)
-        info.msg_inbox_offset = (data_start_offset_ + pending_frame_.expected_header_len) % MSG_INBOX_SIZE;
-        info.payload_len = static_cast<uint32_t>(pending_frame_.payload_bytes_received);
-        info.opcode = pending_frame_.opcode;
-        info.set_fin(pending_frame_.fin);
-        info.set_fragmented(true);       // Partial frame
-        info.set_last_fragment(false);   // More data needed
+        info.msg_inbox_offset = (ps.data_start_offset + pending_frame_[ci].expected_header_len) % MSG_INBOX_SIZE;
+        info.payload_len = static_cast<uint32_t>(pending_frame_[ci].payload_bytes_received);
+        info.opcode = pending_frame_[ci].opcode;
+        info.set_fin(pending_frame_[ci].fin);
+        info.set_fragmented(true);
+        info.set_last_fragment(false);
+        info.connection_id = ci;
 
-        // Timestamps from accumulated metadata
-        populate_timestamps(info);
+        populate_timestamps(info, ps);
         info.set_tls_record_end(false);
         info.ws_parse_cycle = rdtscp();
 
@@ -813,90 +858,86 @@ private:
     // Complete Frame Handling
     // ========================================================================
 
-    void handle_complete_frame() {
+    void handle_complete_frame(uint8_t ci) {
+        auto& ps = parse_state_[ci];
         uint64_t parse_cycle = rdtscp();
 
-        uint8_t opcode = pending_frame_.opcode;
-        bool fin = pending_frame_.fin;
-        uint64_t payload_len = pending_frame_.payload_len;
-        uint32_t frame_total_len = pending_frame_.expected_header_len +
+        uint8_t opcode = pending_frame_[ci].opcode;
+        bool fin = pending_frame_[ci].fin;
+        uint64_t payload_len = pending_frame_[ci].payload_len;
+        uint32_t frame_total_len = pending_frame_[ci].expected_header_len +
                                    static_cast<uint32_t>(payload_len);
 
         switch (opcode) {
             case static_cast<uint8_t>(websocket::http::WebSocketOpcode::TEXT):
             case static_cast<uint8_t>(websocket::http::WebSocketOpcode::BINARY):
-                handle_data_frame(opcode, fin, payload_len, frame_total_len, parse_cycle);
+                handle_data_frame(ci, opcode, fin, payload_len, frame_total_len, parse_cycle);
                 break;
 
             case static_cast<uint8_t>(websocket::http::WebSocketOpcode::CONTINUATION):
-                handle_continuation_frame(fin, payload_len, frame_total_len, parse_cycle);
+                handle_continuation_frame(ci, fin, payload_len, frame_total_len, parse_cycle);
                 break;
 
             case static_cast<uint8_t>(websocket::http::WebSocketOpcode::PING):
-                handle_ping(payload_len, frame_total_len, parse_cycle);
+                handle_ping(ci, payload_len, frame_total_len, parse_cycle);
                 break;
 
             case static_cast<uint8_t>(websocket::http::WebSocketOpcode::PONG):
-                handle_pong(payload_len);
+                handle_pong(ci, payload_len);
                 break;
 
             case static_cast<uint8_t>(websocket::http::WebSocketOpcode::CLOSE):
-                handle_close(payload_len);
+                handle_close(ci, payload_len);
                 break;
 
             default:
-                fprintf(stderr, "[WS-PROCESS] Unknown opcode: 0x%02X\n", opcode);
+                fprintf(stderr, "[WS-PROCESS] Unknown opcode: 0x%02X (conn %u)\n", opcode, ci);
                 break;
         }
     }
 
-    void handle_data_frame(uint8_t opcode, bool fin, uint64_t payload_len,
+    void handle_data_frame(uint8_t ci, uint8_t opcode, bool fin, uint64_t payload_len,
                           uint32_t frame_total_len, uint64_t parse_cycle) {
+        auto& ps = parse_state_[ci];
         if (fin) {
-            // Complete single-frame message
-            publish_frame_info(opcode, payload_len, frame_total_len, parse_cycle,
+            publish_frame_info(ci, opcode, payload_len, frame_total_len, parse_cycle,
                               false, false);
         } else {
-            // First fragment of fragmented message
-            accumulating_fragments_ = true;
-            fragment_opcode_ = opcode;
-            fragment_start_offset_ = current_payload_offset_;
-            fragment_total_len_ = static_cast<uint32_t>(payload_len);
-            fragment_total_frame_len_ = frame_total_len;
-            fragment_first_metadata_ = first_packet_metadata_;
+            ps.accumulating_fragments = true;
+            ps.fragment_opcode = opcode;
+            ps.fragment_start_offset = ps.current_payload_offset;
+            ps.fragment_total_len = static_cast<uint32_t>(payload_len);
+            ps.fragment_total_frame_len = frame_total_len;
+            ps.fragment_first_metadata = ps.first_packet_metadata;
 
-            // Publish WSFrameInfo for first fragment immediately
-            publish_frame_info(opcode, payload_len, frame_total_len, parse_cycle,
+            publish_frame_info(ci, opcode, payload_len, frame_total_len, parse_cycle,
                               true, false);
         }
     }
 
-    void handle_continuation_frame(bool fin, uint64_t payload_len,
+    void handle_continuation_frame(uint8_t ci, bool fin, uint64_t payload_len,
                                    uint32_t frame_total_len, uint64_t parse_cycle) {
-        if (!accumulating_fragments_) {
-            fprintf(stderr, "[WS-PROCESS] Unexpected continuation frame\n");
+        auto& ps = parse_state_[ci];
+        if (!ps.accumulating_fragments) {
+            fprintf(stderr, "[WS-PROCESS] Unexpected continuation frame (conn %u)\n", ci);
             return;
         }
 
-        fragment_total_len_ += static_cast<uint32_t>(payload_len);
-        fragment_total_frame_len_ += frame_total_len;
+        ps.fragment_total_len += static_cast<uint32_t>(payload_len);
+        ps.fragment_total_frame_len += frame_total_len;
 
         if (!fin) {
-            // Intermediate fragment - publish immediately
-            publish_frame_info(fragment_opcode_, payload_len, frame_total_len, parse_cycle,
+            publish_frame_info(ci, ps.fragment_opcode, payload_len, frame_total_len, parse_cycle,
                               true, false);
         } else {
-            // Final fragment - publish with is_last_fragment=true
-            publish_frame_info(fragment_opcode_, payload_len, frame_total_len, parse_cycle,
+            publish_frame_info(ci, ps.fragment_opcode, payload_len, frame_total_len, parse_cycle,
                               true, true);
-
-            // Reset fragment state
-            reset_fragment_state();
+            reset_fragment_state(ci);
         }
     }
 
-    void flush_pending_pong() {
-        if (!has_pending_ping_) return;
+    void flush_pending_pong(uint8_t ci) {
+        if (!has_pending_ping_[ci]) return;
 
         int64_t pong_seq = pongs_prod_->try_claim();
         if (pong_seq < 0) {
@@ -908,47 +949,48 @@ private:
         pong.clear();
 
         // Build PONG frame now
-        const uint8_t* ping_payload = msg_inbox_->data_at(pending_ping_.payload_offset);
-        // Use non-zero mask key per RFC 6455 (some servers reject all-zero mask)
+        const uint8_t* ping_payload = msg_inbox_[ci]->data_at(pending_ping_[ci].payload_offset);
         uint8_t mask_key[4] = {0x12, 0x34, 0x56, 0x78};
 
-        size_t safe_payload_len = pending_ping_.payload_len;
+        size_t safe_payload_len = pending_ping_[ci].payload_len;
         if (safe_payload_len > 119) {
             safe_payload_len = 119;
         }
 
         pong.data_len = static_cast<uint8_t>(websocket::http::build_pong_frame(
             ping_payload, safe_payload_len, pong.data, mask_key));
+        pong.connection_id = ci;
 
         pongs_prod_->publish(pong_seq);
 
         {
             struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
             char payload_str[128] = {0};
-            size_t plen = std::min(static_cast<size_t>(pending_ping_.payload_len),
+            size_t plen = std::min(static_cast<size_t>(pending_ping_[ci].payload_len),
                                    sizeof(payload_str) - 1);
             if (plen > 0)
                 std::memcpy(payload_str, ping_payload, plen);
-            fprintf(stderr, "[%ld.%06ld] [WS-PONG-TX] Sent PONG reply len=%u payload=\"%s\"\n",
-                    _ts.tv_sec, _ts.tv_nsec / 1000, pending_ping_.payload_len, payload_str);
+            fprintf(stderr, "[%ld.%06ld] [WS-PONG-TX] Sent PONG reply (conn %u) len=%u payload=\"%s\"\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci, pending_ping_[ci].payload_len, payload_str);
         }
 
-        has_pending_ping_ = false;
+        has_pending_ping_[ci] = false;
     }
 
-    void handle_ping(uint64_t payload_len, [[maybe_unused]] uint32_t frame_total_len, uint64_t parse_cycle) {
+    void handle_ping(uint8_t ci, uint64_t payload_len, [[maybe_unused]] uint32_t frame_total_len, uint64_t parse_cycle) {
+        auto& ps = parse_state_[ci];
         {
             struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
             char payload_str[128] = {0};
             size_t plen = std::min(payload_len, static_cast<uint64_t>(sizeof(payload_str) - 1));
             if (plen > 0)
-                std::memcpy(payload_str, msg_inbox_->data_at(current_payload_offset_), plen);
-            fprintf(stderr, "[%ld.%06ld] [WS-PING] Received server PING len=%lu payload=\"%s\"\n",
-                    _ts.tv_sec, _ts.tv_nsec / 1000, (unsigned long)payload_len, payload_str);
+                std::memcpy(payload_str, msg_inbox_[ci]->data_at(ps.current_payload_offset), plen);
+            fprintf(stderr, "[%ld.%06ld] [WS-PING] Received server PING (conn %u) len=%lu payload=\"%s\"\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci, (unsigned long)payload_len, payload_str);
         }
 
-        // Server PING interval learning
-        {
+        // Server PING interval learning (use conn 0 for watchdog)
+        if (ci == 0) {
             uint64_t now_cycle = rdtscp();
             last_server_ping_cycle_ = now_cycle;
 
@@ -958,9 +1000,8 @@ private:
             }
             server_ping_count_++;
 
-            // Once we have >= 2 samples, compute/refine interval
             if (server_ping_count_ >= 2) {
-                server_ping_missing_ = false;  // Server is alive
+                server_ping_missing_ = false;
 
                 uint32_t n = std::min(server_ping_count_, PING_LEARN_SAMPLES);
                 uint64_t total_delta = server_ping_cycles_[n - 1] - server_ping_cycles_[0];
@@ -977,8 +1018,6 @@ private:
                             (unsigned long)learned_interval_ms_,
                             (unsigned long)avg_ms, n, PING_LEARN_SAMPLES);
                 }
-            } else {
-                // First PING — no interval yet, keep server_ping_missing_=true
             }
         }
 
@@ -992,14 +1031,15 @@ private:
         auto& info = (*ws_frame_info_prod_)[ws_seq];
         info.clear();
 
-        info.msg_inbox_offset = current_payload_offset_;
+        info.msg_inbox_offset = ps.current_payload_offset;
         info.payload_len = static_cast<uint32_t>(payload_len);
         info.opcode = static_cast<uint8_t>(websocket::http::WebSocketOpcode::PING);
         info.set_fin(true);
         info.set_fragmented(false);
         info.set_last_fragment(false);
+        info.connection_id = ci;
 
-        populate_timestamps(info);
+        populate_timestamps(info, ps);
         info.ws_parse_cycle = parse_cycle;
 
         info.ws_frame_publish_cycle = rdtscp();
@@ -1010,28 +1050,27 @@ private:
         }
         ws_frame_info_prod_->publish(ws_seq);
 
-        // If we already have a pending PING, flush it first (new PING arrived)
-        if (has_pending_ping_) {
-            flush_pending_pong();
+        // If we already have a pending PING for this conn, flush it first
+        if (has_pending_ping_[ci]) {
+            flush_pending_pong(ci);
         }
 
-        // Store pending PING (don't build PONG yet - deferred to idle)
-        pending_ping_.payload_offset = current_payload_offset_;
-        pending_ping_.payload_len = static_cast<uint16_t>(payload_len);
-        has_pending_ping_ = true;
+        // Store pending PING (deferred to idle)
+        pending_ping_[ci].payload_offset = ps.current_payload_offset;
+        pending_ping_[ci].payload_len = static_cast<uint16_t>(payload_len);
+        has_pending_ping_[ci] = true;
     }
 
-    void handle_close(uint64_t payload_len) {
-        // Extract CLOSE frame details
-        uint16_t close_code = 1005;  // RFC 6455: "No Status Rcvd" if no status code present
+    void handle_close(uint8_t ci, uint64_t payload_len) {
+        auto& ps = parse_state_[ci];
+        uint16_t close_code = 1005;
         const uint8_t* payload = nullptr;
 
         if (payload_len >= 2) {
-            payload = msg_inbox_->data_at(current_payload_offset_);
+            payload = msg_inbox_[ci]->data_at(ps.current_payload_offset);
             close_code = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
         }
 
-        // Extract reason text if present
         char close_reason[128] = {0};
         if (payload_len > 2 && payload != nullptr) {
             size_t reason_len = std::min(payload_len - 2, static_cast<uint64_t>(sizeof(close_reason) - 1));
@@ -1039,23 +1078,26 @@ private:
             close_reason[reason_len] = '\0';
         }
 
-        // Set disconnect reason and signal shutdown
         conn_state_->set_disconnect(DisconnectReason::WS_CLOSE, close_code, close_reason);
         conn_state_->shutdown_all();
     }
 
-    void handle_pong(uint64_t payload_len) {
-        last_ping_got_pong_ = true;
-        server_pong_missing_ = false;
+    void handle_pong(uint8_t ci, uint64_t payload_len) {
+        auto& ps = parse_state_[ci];
+
+        // Watchdog state from conn 0 only
+        if (ci == 0) {
+            last_ping_got_pong_ = true;
+            server_pong_missing_ = false;
+        }
 
         struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
         char payload_str[128] = {0};
         size_t plen = std::min(payload_len, static_cast<uint64_t>(sizeof(payload_str) - 1));
         if (plen > 0) {
-            std::memcpy(payload_str, msg_inbox_->data_at(current_payload_offset_), plen);
+            std::memcpy(payload_str, msg_inbox_[ci]->data_at(ps.current_payload_offset), plen);
         }
 
-        // Check if payload is a unix-ms timestamp for RTT calculation
         bool is_ts = (plen >= 12 && plen <= 14);
         for (size_t i = 0; is_ts && i < plen; i++)
             is_ts = (payload_str[i] >= '0' && payload_str[i] <= '9');
@@ -1067,11 +1109,11 @@ private:
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
             int64_t rtt_ms = now_ms - ping_ms;
-            fprintf(stderr, "[%ld.%06ld] [WS-PONG] Received PONG payload=\"%s\" RTT=%ldms\n",
-                    _ts.tv_sec, _ts.tv_nsec / 1000, payload_str, rtt_ms);
+            fprintf(stderr, "[%ld.%06ld] [WS-PONG] Received PONG (conn %u) payload=\"%s\" RTT=%ldms\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci, payload_str, rtt_ms);
         } else {
-            fprintf(stderr, "[%ld.%06ld] [WS-PONG] Received PONG len=%lu payload=\"%s\"\n",
-                    _ts.tv_sec, _ts.tv_nsec / 1000, (unsigned long)payload_len, payload_str);
+            fprintf(stderr, "[%ld.%06ld] [WS-PONG] Received PONG (conn %u) len=%lu payload=\"%s\"\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci, (unsigned long)payload_len, payload_str);
         }
     }
 
@@ -1148,6 +1190,7 @@ private:
             reinterpret_cast<const uint8_t*>(payload_ascii),
             static_cast<size_t>(payload_len),
             frame.data, mask_key));
+        frame.connection_id = 0;  // Client PINGs always on conn 0
 
         pongs_prod_->publish(seq);
 
@@ -1162,9 +1205,11 @@ private:
         last_ping_got_pong_ = false;
     }
 
-    void publish_frame_info(uint8_t opcode, uint64_t payload_len,
+    void publish_frame_info(uint8_t ci, uint8_t opcode, uint64_t payload_len,
                            [[maybe_unused]] uint32_t frame_total_len,
                            uint64_t parse_cycle, bool is_fragmented, bool is_last_fragment) {
+        auto& ps = parse_state_[ci];
+
         int64_t seq = ws_frame_info_prod_->try_claim();
         if (seq < 0) {
             fprintf(stderr, "[WS-PROCESS] FATAL: WS_FRAME_INFO full\n");
@@ -1174,15 +1219,16 @@ private:
         auto& info = (*ws_frame_info_prod_)[seq];
         info.clear();
 
-        info.msg_inbox_offset = current_payload_offset_;
+        info.msg_inbox_offset = ps.current_payload_offset;
         info.payload_len = static_cast<uint32_t>(payload_len);
         info.opcode = opcode;
         info.set_fin(!is_fragmented || is_last_fragment);
         info.set_fragmented(is_fragmented);
         info.set_last_fragment(is_last_fragment);
+        info.connection_id = ci;
 
-        populate_timestamps(info);
-        info.set_tls_record_end(pending_tls_record_end_);
+        populate_timestamps(info, ps);
+        info.set_tls_record_end(ps.pending_tls_record_end);
         info.ws_parse_cycle = parse_cycle;
 
         info.ws_frame_publish_cycle = rdtscp();
@@ -1193,17 +1239,19 @@ private:
         }
         ws_frame_info_prod_->publish(seq);
 
-        // Reset accumulator for next message
-        reset_accumulator();
+        reset_accumulator(ci);
     }
 
     // ========================================================================
     // Timestamp Helpers
     // ========================================================================
 
-    void populate_timestamps(WSFrameInfo& info) {
-        if (accumulated_metadata_count_ > 0) {
-            const auto& first_meta = accumulated_metadata_[0];
+    // Forward declaration for PerConnParseState (defined below)
+    struct PerConnParseState;
+
+    void populate_timestamps(WSFrameInfo& info, PerConnParseState& ps) {
+        if (ps.accumulated_metadata_count > 0) {
+            const auto& first_meta = ps.accumulated_metadata[0];
             info.first_byte_ts = first_meta.first_nic_timestamp_ns;
             info.first_bpf_entry_ns = first_meta.first_bpf_entry_ns;
             info.first_poll_cycle = first_meta.first_nic_frame_poll_cycle;
@@ -1213,26 +1261,24 @@ private:
         }
 
         info.ws_last_op_cycle = last_op_cycle_;
-        info.last_byte_ts = current_metadata_.latest_nic_timestamp_ns;
-        info.latest_bpf_entry_ns = current_metadata_.latest_bpf_entry_ns;
-        info.latest_poll_cycle = current_metadata_.latest_nic_frame_poll_cycle;
-        info.latest_ssl_read_end_cycle = current_metadata_.ssl_read_end_cycle;
-        info.ssl_read_ct = static_cast<uint8_t>(accumulated_metadata_count_);
-        info.last_pkt_mem_idx = current_metadata_.last_pkt_mem_idx;
+        info.last_byte_ts = ps.current_metadata.latest_nic_timestamp_ns;
+        info.latest_bpf_entry_ns = ps.current_metadata.latest_bpf_entry_ns;
+        info.latest_poll_cycle = ps.current_metadata.latest_nic_frame_poll_cycle;
+        info.latest_ssl_read_end_cycle = ps.current_metadata.ssl_read_end_cycle;
+        info.ssl_read_ct = static_cast<uint8_t>(ps.accumulated_metadata_count);
+        info.last_pkt_mem_idx = ps.current_metadata.last_pkt_mem_idx;
 
-        // Sum packet counts from all accumulated metadata
         uint32_t total_nic_packets = 0;
-        for (size_t i = 0; i < accumulated_metadata_count_; ++i) {
-            total_nic_packets += accumulated_metadata_[i].nic_packet_ct;
+        for (size_t i = 0; i < ps.accumulated_metadata_count; ++i) {
+            total_nic_packets += ps.accumulated_metadata[i].nic_packet_ct;
         }
         info.nic_packet_ct = static_cast<uint8_t>(total_nic_packets);
 
-        // Batch correlation
-        info.ssl_read_batch_num = static_cast<uint16_t>(++batch_frame_num_);
+        info.ssl_read_batch_num = static_cast<uint16_t>(++ps.batch_frame_num);
 
         uint32_t total_bytes = 0;
-        for (size_t i = 0; i < accumulated_metadata_count_; ++i) {
-            total_bytes += accumulated_metadata_[i].decrypted_len;
+        for (size_t i = 0; i < ps.accumulated_metadata_count; ++i) {
+            total_bytes += ps.accumulated_metadata[i].decrypted_len;
         }
         info.ssl_read_total_bytes = total_bytes;
     }
@@ -1241,25 +1287,73 @@ private:
     // State Management
     // ========================================================================
 
-    void reset_accumulator() {
-        accumulated_metadata_count_ = 0;
+    void reset_accumulator(uint8_t ci) {
+        parse_state_[ci].accumulated_metadata_count = 0;
     }
 
-    void reset_fragment_state() {
-        accumulating_fragments_ = false;
-        fragment_opcode_ = 0;
-        fragment_start_offset_ = 0;
-        fragment_total_len_ = 0;
-        fragment_total_frame_len_ = 0;
+    void reset_fragment_state(uint8_t ci) {
+        auto& ps = parse_state_[ci];
+        ps.accumulating_fragments = false;
+        ps.fragment_opcode = 0;
+        ps.fragment_start_offset = 0;
+        ps.fragment_total_len = 0;
+        ps.fragment_total_frame_len = 0;
     }
+
+    // ========================================================================
+    // Per-Connection Parse State
+    // ========================================================================
+
+    struct PendingPing {
+        uint32_t payload_offset;   // MSG_INBOX offset of PING payload
+        uint16_t payload_len;      // PING payload length
+    };
+
+    struct PerConnParseState {
+        // Partial frame accumulation
+        uint32_t data_start_offset = 0;
+        uint32_t data_accumulated = 0;
+        uint32_t parse_offset = 0;
+
+        // Timestamp accumulation
+        std::array<MsgMetadata, MAX_ACCUMULATED_METADATA> accumulated_metadata;
+        size_t accumulated_metadata_count = 0;
+        MsgMetadata first_packet_metadata;
+        MsgMetadata current_metadata;
+
+        // Payload offset for current frame
+        uint32_t current_payload_offset = 0;
+        bool pending_tls_record_end = false;
+
+        // Wrap-around buffer for WS headers spanning MSG_INBOX wrap point
+        uint8_t ws_header_wrap_buffer[64];
+
+        // Frame counter within batch
+        uint32_t batch_frame_num = 0;
+
+        // Fragment state (for fragmented WebSocket messages)
+        bool accumulating_fragments = false;
+        uint8_t fragment_opcode = 0;
+        uint32_t fragment_start_offset = 0;
+        uint32_t fragment_total_len = 0;
+        uint32_t fragment_total_frame_len = 0;
+        MsgMetadata fragment_first_metadata;
+    };
 
     // ========================================================================
     // Member Variables
     // ========================================================================
 
-    // Ring buffer interfaces
-    MsgInbox* msg_inbox_ = nullptr;
-    MsgMetadataCons* msg_metadata_cons_ = nullptr;
+    // Per-connection state
+    MsgInbox* msg_inbox_[NUM_CONN]{};
+    MsgMetadataCons* msg_metadata_cons_[NUM_CONN]{};
+    PerConnParseState parse_state_[NUM_CONN]{};
+    PartialWebSocketFrame pending_frame_[NUM_CONN]{};
+    bool has_pending_frame_[NUM_CONN]{};
+    PendingPing pending_ping_[NUM_CONN]{};
+    bool has_pending_ping_[NUM_CONN]{};
+
+    // Shared ring buffer interfaces
     WSFrameInfoProd* ws_frame_info_prod_ = nullptr;
     PongsProd* pongs_prod_ = nullptr;
     MsgOutboxProd* msg_outbox_prod_ = nullptr;
@@ -1269,48 +1363,11 @@ private:
     CycleSampleBuffer* profiling_data_ = nullptr;
     uint64_t first_consumed_poll_cycle_ = 0;
     uint64_t last_op_cycle_ = 0;
-    uint32_t batch_frame_num_ = 0;
 public:
     void set_profiling_data(CycleSampleBuffer* data) { profiling_data_ = data; }
 private:
 
-    // Partial frame parsing state
-    PartialWebSocketFrame pending_frame_;
-    bool has_pending_frame_ = false;
-    bool pending_tls_record_end_ = false;
-    uint32_t current_payload_offset_ = 0;
-
-    // Wrap-around buffer for WS headers spanning MSG_INBOX wrap point
-    uint8_t ws_header_wrap_buffer_[64];
-
-    // Partial frame accumulation
-    uint32_t data_start_offset_ = 0;
-    uint32_t data_accumulated_ = 0;
-    uint32_t parse_offset_ = 0;
-
-    // Timestamp accumulation
-    std::array<MsgMetadata, MAX_ACCUMULATED_METADATA> accumulated_metadata_;
-    size_t accumulated_metadata_count_ = 0;
-    MsgMetadata first_packet_metadata_;
-    MsgMetadata current_metadata_;
-
-    // Fragment state (for fragmented WebSocket messages)
-    bool accumulating_fragments_ = false;
-    uint8_t fragment_opcode_ = 0;
-    uint32_t fragment_start_offset_ = 0;
-    uint32_t fragment_total_len_ = 0;
-    uint32_t fragment_total_frame_len_ = 0;
-    MsgMetadata fragment_first_metadata_;
-
-    // Pending PING info (PONG built later when flushing, not on hot path)
-    struct PendingPing {
-        uint32_t payload_offset;   // MSG_INBOX offset of PING payload
-        uint16_t payload_len;      // PING payload length
-    };
-    PendingPing pending_ping_;
-    bool has_pending_ping_ = false;
-
-    // Client-initiated PING state
+    // Client-initiated PING state (conn 0 only for watchdog)
     uint64_t last_client_ping_cycle_ = 0;   // TSC of last client PING sent
     bool     last_ping_got_pong_ = true;     // did the most recent PING get a PONG?
     uint32_t consecutive_unanswered_ = 0;    // consecutive PINGs with no PONG
@@ -1318,11 +1375,11 @@ private:
     // Server PING interval learning (progressive: usable after 2 samples, final at 5)
     static constexpr uint32_t PING_LEARN_SAMPLES = 5;
     uint64_t server_ping_cycles_[PING_LEARN_SAMPLES]; // TSC of each server PING
-    uint32_t server_ping_count_ = 0;                  // How many server PINGs received (caps at LEARN_SAMPLES for array, keeps counting)
-    uint64_t learned_interval_cycles_ = 0;            // Current average interval (recomputed each PING until 5)
+    uint32_t server_ping_count_ = 0;                  // How many server PINGs received
+    uint64_t learned_interval_cycles_ = 0;            // Current average interval
     uint64_t learned_interval_ms_ = 0;                // Rounded to 100ms, for display
 
-    // Watchdog flags
+    // Watchdog flags (conn 0 only)
     uint64_t last_server_ping_cycle_ = 0;
     bool     server_ping_missing_ = true;   // Start true — no server PING seen yet
     bool     server_pong_missing_ = false;  // Becomes true after 3 consecutive unanswered client PINGs

@@ -477,8 +477,12 @@ public:
         // Transport <-> WebSocket rings
         if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
                          sizeof(MsgOutboxEvent), 1)) return false;
-        if (!create_ring("msg_metadata", MSG_METADATA_SIZE * sizeof(MsgMetadata),
+        if (!create_ring("msg_metadata_a", MSG_METADATA_SIZE * sizeof(MsgMetadata),
                          sizeof(MsgMetadata), 1)) return false;
+#ifdef ENABLE_AB
+        if (!create_ring("msg_metadata_b", MSG_METADATA_SIZE * sizeof(MsgMetadata),
+                         sizeof(MsgMetadata), 1)) return false;
+#endif
         if (!create_ring("pongs", PONGS_SIZE * sizeof(PongFrameAligned),
                          sizeof(PongFrameAligned), 1)) return false;
 
@@ -496,7 +500,7 @@ public:
         std::string base = "/dev/shm/hft/" + ipc_ring_dir_;
         const char* ring_names[] = {
             "raw_inbox", "raw_outbox",
-            "msg_outbox", "msg_metadata", "pongs", "ws_frame_info"
+            "msg_outbox", "msg_metadata_a", "msg_metadata_b", "pongs", "ws_frame_info"
         };
 
         for (const char* name : ring_names) {
@@ -618,6 +622,13 @@ bool get_default_gateway(const char* interface, std::string& gateway_out) {
 static constexpr bool PROFILING_ENABLED = true;
 static constexpr bool DEBUG_TCP_ENABLED = true;  // TCP debug mode for retransmit detection
 
+// Dual A/B connection mode (compile-time toggle)
+#ifdef ENABLE_AB
+static constexpr bool AB_ENABLED = true;
+#else
+static constexpr bool AB_ENABLED = false;
+#endif
+
 // XDP Poll Process types (with profiling enabled)
 // Note: XDPCopyProcess is available but experimental - use XDPPollProcess for production
 using XDPPollType = XDPPollProcess<
@@ -626,20 +637,25 @@ using XDPPollType = XDPPollProcess<
     true,                                   // TrickleEnabled
     PROFILING_ENABLED>;                     // Profiling
 
-// Transport Process types (with SSL and profiling enabled)
+// Transport Process types
 using TransportType = TransportProcess<
     SSLPolicyType,
     IPCRingProducer<MsgMetadata>,
     IPCRingConsumer<PongFrameAligned>,
-    PROFILING_ENABLED>;
+    AB_ENABLED,                             // EnableAB
+    PROFILING_ENABLED>;                     // Profiling
 
-// WebSocket Process types (with profiling enabled)
+// WebSocket Process types
 using WebSocketType = WebSocketProcess<
     IPCRingConsumer<MsgMetadata>,          // MsgMetadataCons
     IPCRingProducer<WSFrameInfo>,          // WSFrameInfoProd
     IPCRingProducer<PongFrameAligned>,     // PongsProd
     IPCRingProducer<MsgOutboxEvent>,       // MsgOutboxProd
-    PROFILING_ENABLED>;                    // Profiling
+    AB_ENABLED,                             // EnableAB
+    PROFILING_ENABLED>;                     // Profiling
+
+// Number of connections
+static constexpr size_t NUM_CONN = AB_ENABLED ? 2 : 1;
 
 // ============================================================================
 // Test Class
@@ -730,18 +746,20 @@ public:
         }
         printf("UMEM: %p (%zu bytes)\n", umem_area_, umem_size_);
 
-        // Allocate MsgInbox (shared)
-        msg_inbox_ = static_cast<MsgInbox*>(
-            mmap(nullptr, sizeof(MsgInbox),
-                 PROT_READ | PROT_WRITE,
-                 MAP_SHARED | MAP_ANONYMOUS,
-                 -1, 0));
-        if (msg_inbox_ == MAP_FAILED) {
-            fprintf(stderr, "FAIL: Cannot allocate MsgInbox\n");
-            return false;
+        // Allocate MsgInbox (shared) — one per connection
+        for (size_t i = 0; i < NUM_CONN; i++) {
+            msg_inbox_[i] = static_cast<MsgInbox*>(
+                mmap(nullptr, sizeof(MsgInbox),
+                     PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_ANONYMOUS,
+                     -1, 0));
+            if (msg_inbox_[i] == MAP_FAILED) {
+                fprintf(stderr, "FAIL: Cannot allocate MsgInbox[%zu]\n", i);
+                return false;
+            }
+            msg_inbox_[i]->init();
+            printf("MsgInbox[%zu]: %p\n", i, msg_inbox_[i]);
         }
-        msg_inbox_->init();
-        printf("MsgInbox: %p\n", msg_inbox_);
 
         // Allocate ConnStateShm (shared)
         conn_state_ = static_cast<ConnStateShm*>(
@@ -796,7 +814,10 @@ public:
             raw_inbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_inbox"));
             raw_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_outbox"));
             msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
-            msg_metadata_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata"));
+            msg_metadata_region_[0] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_a"));
+            if constexpr (AB_ENABLED) {
+                msg_metadata_region_[1] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_b"));
+            }
             pongs_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pongs"));
             ws_frame_info_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("ws_frame_info"));
         } catch (const std::exception& e) {
@@ -837,15 +858,17 @@ public:
         delete raw_inbox_region_;
         delete raw_outbox_region_;
         delete msg_outbox_region_;
-        delete msg_metadata_region_;
+        for (size_t i = 0; i < NUM_CONN; i++) delete msg_metadata_region_[i];
         delete pongs_region_;
         delete ws_frame_info_region_;
 
         if (conn_state_ && conn_state_ != MAP_FAILED) {
             munmap(conn_state_, sizeof(ConnStateShm));
         }
-        if (msg_inbox_ && msg_inbox_ != MAP_FAILED) {
-            munmap(msg_inbox_, sizeof(MsgInbox));
+        for (size_t i = 0; i < NUM_CONN; i++) {
+            if (msg_inbox_[i] && msg_inbox_[i] != MAP_FAILED) {
+                munmap(msg_inbox_[i], sizeof(MsgInbox));
+            }
         }
         if (profiling_ && profiling_ != MAP_FAILED) {
             munmap(profiling_, sizeof(ProfilingShm));
@@ -970,8 +993,13 @@ public:
         frame_records.reserve(MAX_FRAME_RECORDS);
         uint64_t tsc_freq = conn_state_->tsc_freq_hz;
 
-        uint64_t prev_publish_mono_ns = 0;
-        uint64_t prev_latest_poll_cycle = 0;
+#ifdef ENABLE_AB
+        constexpr size_t NUM_CONN = 2;
+#else
+        constexpr size_t NUM_CONN = 1;
+#endif
+        uint64_t prev_publish_mono_ns[NUM_CONN] = {};
+        uint64_t prev_latest_poll_cycle[NUM_CONN] = {};
 
         auto start_time = std::chrono::steady_clock::now();
         auto stream_end = start_time + std::chrono::milliseconds(g_timeout_ms);
@@ -998,10 +1026,11 @@ public:
             bool end_of_batch;
             while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
                 total_frames++;
-                frame.print_timeline(tsc_freq, prev_publish_mono_ns, prev_latest_poll_cycle,
-                                     msg_inbox_->data_at(frame.msg_inbox_offset));
-                prev_publish_mono_ns = frame.ssl_read_end_mono_ns(tsc_freq);
-                prev_latest_poll_cycle = frame.latest_poll_cycle;
+                uint8_t ci = frame.connection_id;
+                frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci], prev_latest_poll_cycle[ci],
+                                     msg_inbox_[ci]->data_at(frame.msg_inbox_offset));
+                prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);
+                prev_latest_poll_cycle[ci] = frame.latest_poll_cycle;
 
                 if (frame_records.size() < MAX_FRAME_RECORDS) {
                     frame_records.push_back(frame);
@@ -1029,7 +1058,7 @@ public:
                         text_frames++;
                         // Validate JSON trade data
                         if (frame.payload_len > 0) {
-                            const uint8_t* payload = msg_inbox_->data_at(frame.msg_inbox_offset);
+                            const uint8_t* payload = msg_inbox_[frame.connection_id]->data_at(frame.msg_inbox_offset);
                             if (is_valid_trade_json(reinterpret_cast<const char*>(payload), frame.payload_len)) {
                                 valid_trades++;
                             }
@@ -1076,10 +1105,11 @@ public:
                 WSFrameInfo frame;
                 while (ws_frame_cons.try_consume(frame)) {
                     total_frames++;
-                    frame.print_timeline(tsc_freq, prev_publish_mono_ns, prev_latest_poll_cycle,
-                                         msg_inbox_->data_at(frame.msg_inbox_offset));
-                    prev_publish_mono_ns = frame.ssl_read_end_mono_ns(tsc_freq);
-                    prev_latest_poll_cycle = frame.latest_poll_cycle;
+                    uint8_t ci = frame.connection_id;
+                    frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci], prev_latest_poll_cycle[ci],
+                                         msg_inbox_[ci]->data_at(frame.msg_inbox_offset));
+                    prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);
+                    prev_latest_poll_cycle[ci] = frame.latest_poll_cycle;
                     if (frame_records.size() < MAX_FRAME_RECORDS) {
                         frame_records.push_back(frame);
                     }
@@ -1090,7 +1120,7 @@ public:
                     if (frame.opcode == 0x01) {
                         text_frames++;
                         if (frame.payload_len > 0) {
-                            const uint8_t* payload = msg_inbox_->data_at(frame.msg_inbox_offset);
+                            const uint8_t* payload = msg_inbox_[ci]->data_at(frame.msg_inbox_offset);
                             if (is_valid_trade_json(reinterpret_cast<const char*>(payload), frame.payload_len)) {
                                 valid_trades++;
                             }
@@ -1106,10 +1136,11 @@ public:
             WSFrameInfo frame;
             while (ws_frame_cons.try_consume(frame)) {
                 total_frames++;
-                frame.print_timeline(tsc_freq, prev_publish_mono_ns, prev_latest_poll_cycle,
-                                     msg_inbox_->data_at(frame.msg_inbox_offset));
-                prev_publish_mono_ns = frame.ssl_read_end_mono_ns(tsc_freq);
-                prev_latest_poll_cycle = frame.latest_poll_cycle;
+                uint8_t ci = frame.connection_id;
+                frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci], prev_latest_poll_cycle[ci],
+                                     msg_inbox_[ci]->data_at(frame.msg_inbox_offset));
+                prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);
+                prev_latest_poll_cycle[ci] = frame.latest_poll_cycle;
                 if (frame_records.size() < MAX_FRAME_RECORDS) {
                     frame_records.push_back(frame);
                 }
@@ -1121,7 +1152,7 @@ public:
                     case 0x01:
                         text_frames++;
                         if (frame.payload_len > 0) {
-                            const uint8_t* payload = msg_inbox_->data_at(frame.msg_inbox_offset);
+                            const uint8_t* payload = msg_inbox_[ci]->data_at(frame.msg_inbox_offset);
                             if (is_valid_trade_json(reinterpret_cast<const char*>(payload), frame.payload_len)) {
                                 valid_trades++;
                             }
@@ -1178,8 +1209,8 @@ public:
         // Ring buffer status
         int64_t ws_frame_prod = ws_frame_info_region_->producer_published()->load(std::memory_order_acquire);
         int64_t ws_frame_cons_seq = ws_frame_cons.sequence();
-        int64_t meta_prod = msg_metadata_region_->producer_published()->load(std::memory_order_acquire);
-        int64_t meta_cons = msg_metadata_region_->consumer_sequence(0)->load(std::memory_order_acquire);
+        int64_t meta_prod = msg_metadata_region_[0]->producer_published()->load(std::memory_order_acquire);
+        int64_t meta_cons = msg_metadata_region_[0]->consumer_sequence(0)->load(std::memory_order_acquire);
         int64_t outbox_prod = msg_outbox_region_->producer_published()->load(std::memory_order_acquire);
         int64_t outbox_cons = msg_outbox_region_->consumer_sequence(0)->load(std::memory_order_acquire);
         int64_t pongs_prod_seq = pongs_region_->producer_published()->load(std::memory_order_acquire);
@@ -1341,7 +1372,7 @@ private:
 
         IPCRingConsumer<PacketFrameDescriptor> raw_inbox_cons(*raw_inbox_region_);
         IPCRingProducer<PacketFrameDescriptor> raw_outbox_prod(*raw_outbox_region_);
-        IPCRingProducer<MsgMetadata> msg_metadata_prod(*msg_metadata_region_);
+        IPCRingProducer<MsgMetadata> msg_metadata_prod_a(*msg_metadata_region_[0]);
         IPCRingConsumer<PongFrameAligned> pongs_cons(*pongs_region_);
         IPCRingConsumer<MsgOutboxEvent> msg_outbox_cons(*msg_outbox_region_);
 
@@ -1349,25 +1380,48 @@ private:
         char url[512];
         snprintf(url, sizeof(url), "wss://%s:%u%s", WSS_HOST, WSS_PORT, WSS_PATH);
 
-        TransportType transport(
-            url, umem_area_, FRAME_SIZE,
-            &raw_inbox_cons, &raw_outbox_prod,
-            msg_inbox_, &msg_metadata_prod, &pongs_cons,
-            conn_state_, &msg_outbox_cons);
+        if constexpr (AB_ENABLED) {
+            IPCRingProducer<MsgMetadata> msg_metadata_prod_b(*msg_metadata_region_[1]);
 
-        // Wire up transport profiling data
-        if constexpr (PROFILING_ENABLED) {
-            transport.set_profiling_data(&profiling_->transport);
+            TransportType transport(
+                url, umem_area_, FRAME_SIZE,
+                &raw_inbox_cons, &raw_outbox_prod,
+                msg_inbox_[0], &msg_metadata_prod_a, &pongs_cons,
+                conn_state_, &msg_outbox_cons,
+                msg_inbox_[1], &msg_metadata_prod_b);
+
+            if constexpr (PROFILING_ENABLED) {
+                transport.set_profiling_data(&profiling_->transport);
+            }
+
+            if (!transport.init()) {
+                fprintf(stderr, "[TRANSPORT] init() failed\n");
+                conn_state_->shutdown_all();
+                return;
+            }
+
+            transport.run();
+            transport.cleanup();
+        } else {
+            TransportType transport(
+                url, umem_area_, FRAME_SIZE,
+                &raw_inbox_cons, &raw_outbox_prod,
+                msg_inbox_[0], &msg_metadata_prod_a, &pongs_cons,
+                conn_state_, &msg_outbox_cons);
+
+            if constexpr (PROFILING_ENABLED) {
+                transport.set_profiling_data(&profiling_->transport);
+            }
+
+            if (!transport.init()) {
+                fprintf(stderr, "[TRANSPORT] init() failed\n");
+                conn_state_->shutdown_all();
+                return;
+            }
+
+            transport.run();
+            transport.cleanup();
         }
-
-        if (!transport.init()) {
-            fprintf(stderr, "[TRANSPORT] init() failed\n");
-            conn_state_->shutdown_all();
-            return;
-        }
-
-        transport.run();
-        transport.cleanup();
     }
 
     // WebSocket child process
@@ -1375,7 +1429,7 @@ private:
         pin_to_cpu(WEBSOCKET_CPU_CORE);
 
         // Create ring adapters in child process
-        IPCRingConsumer<MsgMetadata> msg_metadata_cons(*msg_metadata_region_);
+        IPCRingConsumer<MsgMetadata> msg_metadata_cons_a(*msg_metadata_region_[0]);
         IPCRingProducer<WSFrameInfo> ws_frame_info_prod(*ws_frame_info_region_);
         IPCRingProducer<MsgOutboxEvent> msg_outbox_prod(*msg_outbox_region_);
         IPCRingProducer<PongFrameAligned> pongs_prod(*pongs_region_);
@@ -1387,22 +1441,43 @@ private:
             ws_process.set_profiling_data(&profiling_->ws_process);
         }
 
-        bool ok = ws_process.init(
-            msg_inbox_,
-            &msg_metadata_cons,
-            &ws_frame_info_prod,
-            &pongs_prod,
-            &msg_outbox_prod,
-            conn_state_);
+        if constexpr (AB_ENABLED) {
+            IPCRingConsumer<MsgMetadata> msg_metadata_cons_b(*msg_metadata_region_[1]);
 
-        if (!ok) {
-            fprintf(stderr, "[WS-PROCESS] init() failed\n");
-            conn_state_->shutdown_all();
-            return;
+            bool ok = ws_process.init(
+                msg_inbox_[0],
+                &msg_metadata_cons_a,
+                &ws_frame_info_prod,
+                &pongs_prod,
+                &msg_outbox_prod,
+                conn_state_,
+                msg_inbox_[1],
+                &msg_metadata_cons_b);
+
+            if (!ok) {
+                fprintf(stderr, "[WS-PROCESS] init() failed\n");
+                conn_state_->shutdown_all();
+                return;
+            }
+
+            ws_process.run_with_handshake();
+        } else {
+            bool ok = ws_process.init(
+                msg_inbox_[0],
+                &msg_metadata_cons_a,
+                &ws_frame_info_prod,
+                &pongs_prod,
+                &msg_outbox_prod,
+                conn_state_);
+
+            if (!ok) {
+                fprintf(stderr, "[WS-PROCESS] init() failed\n");
+                conn_state_->shutdown_all();
+                return;
+            }
+
+            ws_process.run_with_handshake();
         }
-
-        // Run with handshake (performs HTTP upgrade, subscription, then main loop)
-        ws_process.run_with_handshake();
     }
 
     const char* interface_;
@@ -1418,14 +1493,14 @@ private:
     std::string local_ip_;
     std::string gateway_ip_;
 
-    MsgInbox* msg_inbox_ = nullptr;
+    MsgInbox* msg_inbox_[NUM_CONN]{};
     ConnStateShm* conn_state_ = nullptr;
     ProfilingShm* profiling_ = nullptr;
 
     disruptor::ipc::shared_region* raw_inbox_region_ = nullptr;
     disruptor::ipc::shared_region* raw_outbox_region_ = nullptr;
     disruptor::ipc::shared_region* msg_outbox_region_ = nullptr;
-    disruptor::ipc::shared_region* msg_metadata_region_ = nullptr;
+    disruptor::ipc::shared_region* msg_metadata_region_[NUM_CONN]{};
     disruptor::ipc::shared_region* pongs_region_ = nullptr;
     disruptor::ipc::shared_region* ws_frame_info_region_ = nullptr;
 

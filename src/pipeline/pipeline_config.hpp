@@ -123,6 +123,9 @@ inline constexpr size_t TLS13_OVERHEAD = TLS_RECORD_HEADER + TLS_MAC_SIZE;  // 5
 // Max TLS record payload to fit in single TCP segment
 inline constexpr size_t MAX_TLS_RECORD_PAYLOAD = PIPELINE_TCP_MSS - TLS13_OVERHEAD;
 
+// Max bytes returned per ssl_read_by_chunk() call (limits burst latency)
+inline constexpr size_t SSL_DECRYPT_CHUNK_SIZE = 2048;
+
 // ============================================================================
 // Batch Sizes
 // ============================================================================

@@ -10,6 +10,11 @@ ifdef DEBUG
     CXXFLAGS += -DDEBUG
 endif
 
+# Dual A/B connection mode
+ifdef ENABLE_AB
+    CXXFLAGS += -DENABLE_AB
+endif
+
 # Build directory
 BUILD_DIR := ./build
 TEST_DIR := ./test/unittest

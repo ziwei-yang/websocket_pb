@@ -2459,15 +2459,19 @@ struct WolfSSLPolicy {
         keys.is_tls13 = is_tls13;
 
         // Use wolfSSL_get_keys() to access key material directly
+        // Requires wolfSSL built with OPENSSL_EXTRA
         unsigned int suite_len = 0, key_sz = 0, iv_sz = 0;
-        const unsigned char* ms = nullptr;
-        const unsigned char* sr = nullptr;
-        const unsigned char* cr = nullptr;
+        unsigned char* ms = nullptr;
+        unsigned char* sr = nullptr;
+        unsigned char* cr = nullptr;
 
+#ifdef OPENSSL_EXTRA
         int ret = wolfSSL_get_keys(ssl_, &ms, &suite_len, &sr, &key_sz, &cr, &iv_sz);
+#else
+        int ret = -1;  // wolfSSL_get_keys not available without OPENSSL_EXTRA
+#endif
         if (ret != 0 || !ms) {
             // wolfSSL_get_keys not available or failed
-            // Fallback: try to use exported keying material
             return false;
         }
 

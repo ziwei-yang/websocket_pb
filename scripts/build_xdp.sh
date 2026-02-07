@@ -38,6 +38,7 @@ set -e
 INTERFACE="enp108s0"
 RELOAD_DRIVER=false
 SKIP_CLOCK_SYNC=false
+ENABLE_AB_FLAG=false
 TEST_SOURCE=""
 
 # Paths
@@ -99,13 +100,14 @@ Usage: $0 [OPTIONS] <test_source>
 
 Options:
   -i, --interface IFACE   Network interface (default: enp108s0)
+  --enable-ab             Enable dual A/B connection mode (-DENABLE_AB)
   --reload                Reload NIC driver before setup
   --skip-clock-sync       Skip NIC clock synchronization
   -h, --help              Show help
 
 Examples:
   $0 20_websocket_binance.cpp
-  $0 xdp_binance.cpp
+  $0 --enable-ab 20_websocket_binance.cpp
   $0 -i enp108s0 00_xdp_poll.cpp
 
 After running this script, you can run the test manually:
@@ -131,6 +133,10 @@ parse_args() {
             -i|--interface)
                 INTERFACE="$2"
                 shift 2
+                ;;
+            --enable-ab)
+                ENABLE_AB_FLAG=true
+                shift
                 ;;
             --reload)
                 RELOAD_DRIVER=true
@@ -394,8 +400,18 @@ build_test() {
         make bpf USE_XDP=1 XDP_INTERFACE="$INTERFACE" || die "Failed to build BPF program"
     fi
 
+    # Dual A/B connection mode (via --enable-ab flag or ENABLE_AB env var)
+    local AB_FLAGS=""
+    if [[ "$ENABLE_AB_FLAG" == "true" ]] || [[ -n "$ENABLE_AB" ]]; then
+        AB_FLAGS="ENABLE_AB=1"
+        log_info "Dual A/B connection mode enabled (ENABLE_AB=1)"
+    fi
+
+    # Remove existing binary to force rebuild (make doesn't track flag changes like ENABLE_AB)
+    rm -f "$TEST_BIN"
+
     # Build test binary (as normal user, no sudo)
-    make "$MAKE_TARGET" USE_XDP=1 XDP_INTERFACE="$INTERFACE" $SSL_FLAGS || die "Failed to build test: $MAKE_TARGET"
+    make "$MAKE_TARGET" USE_XDP=1 XDP_INTERFACE="$INTERFACE" $SSL_FLAGS $AB_FLAGS || die "Failed to build test: $MAKE_TARGET"
 
     log_ok "Test binary built: $TEST_BIN"
 }

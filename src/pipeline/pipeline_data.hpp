@@ -134,7 +134,8 @@ static_assert(sizeof(MsgMetadata) == 128, "MsgMetadata must be 128 bytes");
 //   offset 14: uint16_t last_pkt_mem_idx     (2)
 //   offset 16: [10 x uint64_t fields]       (80) — publish_time_ts replaces first_ssl_read_end_cycle
 //   offset 96: uint16_t ssl_read_batch_num  (2)
-//   offset 98: uint16_t _pad0               (2)
+//   offset 97: uint8_t  connection_id        (1)
+//   offset 98: uint8_t  _pad0               (1)
 //   offset100: uint32_t ssl_read_total_bytes(4)
 //   offset104: [3 x uint64_t timestamps]   (24)
 //   offset128: total                        (128)
@@ -185,7 +186,8 @@ struct alignas(64) WSFrameInfo {
 
     // Batch correlation
     uint16_t ssl_read_batch_num;           // 1-based index of this WS frame within SSL_read batch
-    uint16_t _pad0;                        // Padding
+    uint8_t  connection_id;                // 0=A, 1=B (for dual A/B connections)
+    uint8_t  _pad0;                        // Padding
     uint32_t ssl_read_total_bytes;         // Total decrypted bytes from the SSL_read batch
     uint64_t ws_last_op_cycle;             // WS process rdtscp after previous operation completed
 
@@ -225,6 +227,7 @@ struct alignas(64) WSFrameInfo {
         ssl_last_op_cycle = 0;
         latest_ssl_read_end_cycle = 0;
         ssl_read_batch_num = 0;
+        connection_id = 0;
         _pad0 = 0;
         ssl_read_total_bytes = 0;
         ws_last_op_cycle = 0;
@@ -261,22 +264,23 @@ struct alignas(64) WSFrameInfo {
         auto fmt_range = [](char* b_first, char* b_last, double us_first, double us_last) {
             double larger = std::max(us_first, us_last);
             if (larger < 1000.0) {
-                std::snprintf(b_first, 16, "%5.1f",   us_first);
-                std::snprintf(b_last,  16, "%5.1fus",  us_last);
+                std::snprintf(b_first, 16, us_first >= 100.0 ? "%4.0f" : "%4.1f", us_first);
+                std::snprintf(b_last,  16, us_last  >= 100.0 ? "%4.0fus" : "%4.1fus", us_last);
             } else if (larger < 1000000.0) {
-                std::snprintf(b_first, 16, "%5.1f",   us_first / 1000.0);
-                std::snprintf(b_last,  16, "%5.1fms",  us_last / 1000.0);
+                double f = us_first / 1000.0, l = us_last / 1000.0;
+                std::snprintf(b_first, 16, f >= 100.0 ? "%4.0f" : "%4.1f", f);
+                std::snprintf(b_last,  16, l >= 100.0 ? "%4.0fms" : "%4.1fms", l);
             } else {
-                std::snprintf(b_first, 16, "%5.2f",   us_first / 1000000.0);
-                std::snprintf(b_last,  16, "%5.2fs",   us_last / 1000000.0);
+                std::snprintf(b_first, 16, "%4.2f",   us_first / 1000000.0);
+                std::snprintf(b_last,  16, "%4.2fs",   us_last / 1000000.0);
             }
         };
         // Single value (with unit)
         auto fmt = [](char* b, double us) {
             double a = std::fabs(us);
-            if (a < 1000.0)        std::snprintf(b, 16, "%5.1fus", us);
-            else if (a < 1000000.0) std::snprintf(b, 16, "%5.1fms", us / 1000.0);
-            else                    std::snprintf(b, 16, "%5.2fs",  us / 1000000.0);
+            if (a < 1000.0)         std::snprintf(b, 16, a >= 100.0 ? "%4.0fus" : "%4.1fus", us);
+            else if (a < 1000000.0) { double v = us / 1000.0; std::snprintf(b, 16, std::fabs(v) >= 100.0 ? "%4.0fms" : "%4.1fms", v); }
+            else                    std::snprintf(b, 16, "%4.2fs",  us / 1000000.0);
         };
         char bpf_prefix[80] = "";
         bool is_batch_continuation = (ssl_read_batch_num > 1);
@@ -297,18 +301,18 @@ struct alignas(64) WSFrameInfo {
                 fmt(bv, bpf_us);
                 if (interval_us >= 0) {
                     fmt(iv, interval_us);
-                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "%7s empty| bpf %7s ", iv, bv);
+                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "%7s| bpf %6s |", iv, bv);
                 } else {
                     fmt(iv, -interval_us);
-                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "\033[31m%7s block\033[0m| bpf %7s ", iv, bv);
+                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "\033[31m%7s\033[0m| bpf %6s |", iv, bv);
                 }
             } else {
                 char bv[16];
                 fmt(bv, bpf_us);
-                std::snprintf(bpf_prefix, sizeof(bpf_prefix), "             | bpf %7s ", bv);
+                std::snprintf(bpf_prefix, sizeof(bpf_prefix), "       | bpf %6s |", bv);
             }
         } else {
-            std::snprintf(bpf_prefix, sizeof(bpf_prefix), "             |             ");
+            std::snprintf(bpf_prefix, sizeof(bpf_prefix), "       |            |");
         }
 
         // Stages before publish: poll -> ssl -> parse -> publish(0)
@@ -383,14 +387,21 @@ struct alignas(64) WSFrameInfo {
                 }
             }
         }
-        const char* line_color = (ssl_read_batch_num == 1) ? "\033[34m" : "";
-        const char* line_reset = (ssl_read_batch_num == 1) ? "\033[0m" : "";
+        const char* line_color;
+        const char* line_reset;
+        if (connection_id == 0) {
+            line_color = (ssl_read_batch_num == 1) ? "\033[34m" : "";
+            line_reset = (ssl_read_batch_num == 1) ? "\033[0m" : "";
+        } else {
+            line_color = (ssl_read_batch_num == 1) ? "\033[34;47m" : "\033[47m";
+            line_reset = "\033[0m";
+        }
         fprintf(stderr,
                 "%s%s"
-                "| %u pkt %5u %5s ~ %7s "
-                "| ssl %u %s %5s ~ %7s "
-                "| WS %3u %7s "
-                "| TTL %7s |%s%s%s\n",
+                " %u pkt %5u %4s~%6s |"
+                " ssl %u %s %4s~%6s |"
+                " WS %3u %6s |"
+                " \xce\xa3%6s |%s%s%s\n",
                 line_color, bpf_prefix,
                 nic_packet_ct, last_pkt_mem_idx, t[0], t[1],
                 ssl_read_ct, sz, t[2], t[3],
@@ -410,10 +421,12 @@ static_assert(sizeof(WSFrameInfo) == 128, "WSFrameInfo must be 128 bytes");
 struct alignas(64) PongFrameAligned {
     uint8_t  data[125];               // Pre-framed WS PONG (header + masked payload)
     uint8_t  data_len;                // Actual frame length (header + payload)
-    uint8_t  _pad[2];
+    uint8_t  connection_id;           // 0=A, 1=B (for dual A/B connections)
+    uint8_t  _pad[1];
 
     void clear() {
         data_len = 0;
+        connection_id = 0;
     }
 
     // Set pre-framed PONG data (already includes WS header and masking)
@@ -438,11 +451,12 @@ struct alignas(2048) MsgOutboxEvent {
     uint8_t  data[2044];              // Pre-framed data (fits within 2KB total)
     uint16_t data_len;                // Actual data length
     uint8_t  msg_type;                // MSG_TYPE_DATA or MSG_TYPE_CLOSE
-    uint8_t  _pad;
+    uint8_t  connection_id;           // 0=A, 1=B (for dual A/B connections)
 
     void clear() {
         data_len = 0;
         msg_type = MSG_TYPE_DATA;
+        connection_id = 0;
     }
 
     // Set pre-framed data (already includes protocol headers)

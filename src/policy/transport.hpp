@@ -568,6 +568,7 @@ template<typename PacketIO>
 struct PacketTransport {
     PacketTransport()
         : pio_()
+        , pio_ptr_(&pio_)
         , stack_()
         , state_(userspace_stack::TCPState::CLOSED)
         , connected_(false)
@@ -598,7 +599,7 @@ struct PacketTransport {
         // Use structured binding to set config if it's XDPPacketIOConfig-like
         init_packet_io_config(config, interface, bpf_path, zero_copy);
 
-        pio_.init(config);
+        pio().init(config);
 
         // Get local interface configuration
         uint8_t local_mac[6];
@@ -620,8 +621,8 @@ struct PacketTransport {
         tcp_params_.local_ip = local_ip;
 
         // Set local IP in BPF filter
-        if (pio_.is_bpf_enabled()) {
-            pio_.set_local_ip(local_ip_str);
+        if (pio().is_bpf_enabled()) {
+            pio().set_local_ip(local_ip_str);
         }
 
         // Set up zero-copy receive buffer callback
@@ -666,7 +667,7 @@ struct PacketTransport {
      */
     template<typename ConfigT>
     void init_with_pio_config(const ConfigT& config) {
-        pio_.init(config);
+        pio().init(config);
 
         // Get interface name from conn_state if available
         const char* interface = nullptr;
@@ -710,6 +711,50 @@ struct PacketTransport {
                local_mac[3], local_mac[4], local_mac[5]);
     }
 
+    /**
+     * Initialize stack only (no PIO init) — for connection B sharing A's PIO.
+     * Initializes UserspaceStack and tcp_params_.local_ip, recv_buffer callback.
+     * Caller must call set_shared_pio() before this.
+     */
+    template<typename ConfigT>
+    void init_stack_only(const ConfigT& config) {
+        // Get interface name from conn_state if available
+        const char* interface = nullptr;
+        if constexpr (requires { config.conn_state; }) {
+            if (config.conn_state && config.conn_state->interface_name[0] != '\0') {
+                interface = config.conn_state->interface_name;
+            }
+        }
+
+        if (!interface) {
+            throw std::runtime_error("No interface name in config (init_stack_only)");
+        }
+
+        // Get local interface configuration
+        uint8_t local_mac[6];
+        uint32_t local_ip, gateway_ip, netmask;
+
+        if (!get_interface_config(interface, local_mac, &local_ip, &gateway_ip, &netmask)) {
+            throw std::runtime_error("Failed to get interface configuration");
+        }
+
+        // Initialize stack
+        char local_ip_str[16], gateway_ip_str[16], netmask_str[16];
+        ip_to_string(local_ip, local_ip_str);
+        ip_to_string(gateway_ip, gateway_ip_str);
+        ip_to_string(netmask, netmask_str);
+
+        stack_.init(local_ip_str, gateway_ip_str, netmask_str, local_mac);
+
+        // Initialize TCP params
+        tcp_params_.local_ip = local_ip;
+
+        // Set up zero-copy receive buffer callback
+        recv_buffer_.set_release_callback(frame_release_callback, this);
+
+        printf("[PacketTransport] Initialized stack-only on %s (sharing PIO)\n", interface);
+    }
+
     // ========================================================================
     // Connection
     // ========================================================================
@@ -745,8 +790,8 @@ struct PacketTransport {
         inet_ntop(AF_INET, &in_addr_tmp, remote_ip_str, sizeof(remote_ip_str));
 
         // Ensure resolved IP is in BPF filter
-        if (pio_.is_bpf_enabled()) {
-            pio_.add_remote_ip(remote_ip_str);
+        if (pio().is_bpf_enabled()) {
+            pio().add_remote_ip(remote_ip_str);
         }
 
         printf("[PacketTransport] Connecting to %s:%u (%s) via userspace TCP...\n",
@@ -770,10 +815,10 @@ struct PacketTransport {
         // Send SYN using batch TX API
         uint32_t syn_frame_idx;
         size_t syn_len = 0;
-        uint32_t claimed = pio_.claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
-            syn_frame_idx = pio_.frame_ptr_to_idx(desc.frame_ptr);
+        uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+            syn_frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
             uint8_t* syn_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
-            syn_len = stack_.build_syn(syn_buffer, pio_.frame_capacity(), tcp_params_);
+            syn_len = stack_.build_syn(syn_buffer, pio().frame_capacity(), tcp_params_);
             desc.frame_len = static_cast<uint16_t>(syn_len);
         });
 
@@ -781,7 +826,7 @@ struct PacketTransport {
             throw std::runtime_error("Failed to allocate TX frame for SYN");
         }
 
-        pio_.commit_tx_frames(syn_frame_idx, syn_frame_idx);
+        pio().commit_tx_frames(syn_frame_idx, syn_frame_idx);
         state_ = userspace_stack::TCPState::SYN_SENT;
         fprintf(stderr, "[PacketTransport] SYN sent (seq=%u, frame_idx=%u, len=%zu)\n",
                 tcp_params_.snd_nxt - 1, syn_frame_idx, syn_len);
@@ -802,18 +847,18 @@ struct PacketTransport {
 
             if (elapsed_ms >= timeout_ms) {
                 fprintf(stderr, "[PacketTransport] Connection timeout - stats:\n");
-                pio_.print_stats();
+                pio().print_stats();
                 state_ = userspace_stack::TCPState::CLOSED;
                 throw std::runtime_error("Connection timeout");
             }
 
             if (handshake_debug_count < 5 && (elapsed_ms / 1000) > handshake_debug_count) {
                 fprintf(stderr, "[PacketTransport] Handshake %lds - stats:\n", elapsed_ms / 1000);
-                pio_.print_stats();
+                pio().print_stats();
                 handshake_debug_count++;
             }
 
-            pio_.poll_wait();
+            pio().poll_wait();
             poll_rx_and_process();
             check_retransmit();
 
@@ -858,10 +903,10 @@ struct PacketTransport {
 
             uint32_t frame_idx;
             size_t frame_len = 0;
-            uint32_t claimed = pio_.claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
-                frame_idx = pio_.frame_ptr_to_idx(desc.frame_ptr);
+            uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+                frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
                 uint8_t* frame_data = reinterpret_cast<uint8_t*>(desc.frame_ptr);
-                frame_len = stack_.build_data(frame_data, pio_.frame_capacity(),
+                frame_len = stack_.build_data(frame_data, pio().frame_capacity(),
                                               tcp_params_, data + sent, chunk_size);
                 desc.frame_len = static_cast<uint16_t>(frame_len);
             });
@@ -878,7 +923,7 @@ struct PacketTransport {
                 return -1;
             }
 
-            pio_.commit_tx_frames(frame_idx, frame_idx);
+            pio().commit_tx_frames(frame_idx, frame_idx);
 
             retransmit_queue_.add_ref(tcp_params_.snd_nxt,
                                       userspace_stack::TCP_FLAG_ACK | userspace_stack::TCP_FLAG_PSH,
@@ -905,8 +950,7 @@ struct PacketTransport {
             return 0;
         }
 
-        pio_.poll_wait();
-        poll_rx_and_process();
+        poll();
 
         ssize_t result = recv_buffer_.read(static_cast<uint8_t*>(buf), len);
 
@@ -945,25 +989,33 @@ struct PacketTransport {
         uint64_t start_cycle = rdtsc();
 
         do {
-            pio_.poll_wait();
-            poll_rx_and_process();
+            poll();
 
             if (recv_buffer_.available() > 0) {
-                check_retransmit();
                 return 1;
             }
         } while (timeout_cycles_ == 0 || (rdtsc() - start_cycle) < timeout_cycles_);
 
-        check_retransmit();
         return 0;
     }
 
     size_t poll() {
-        pio_.poll_wait();
+        // If poll_override_ is set (AB mode), use demuxed poll instead
+        if (poll_override_) {
+            return poll_override_(poll_override_ctx_);
+        }
+        pio().poll_wait();
         size_t n = poll_rx_and_process();
         check_retransmit();
         // Note: FIFO release now happens automatically in mark_frame_acked()
         return n;
+    }
+
+    // Set a poll override (used by PacketTransportAB for demuxed polling)
+    using PollOverrideFn = size_t(*)(void*);
+    void set_poll_override(PollOverrideFn fn, void* ctx) {
+        poll_override_ = fn;
+        poll_override_ctx_ = ctx;
     }
 
     // ========================================================================
@@ -978,15 +1030,15 @@ struct PacketTransport {
         if (state_ == userspace_stack::TCPState::ESTABLISHED) {
             uint32_t fin_frame_idx;
             size_t fin_len = 0;
-            uint32_t claimed = pio_.claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
-                fin_frame_idx = pio_.frame_ptr_to_idx(desc.frame_ptr);
+            uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+                fin_frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
                 uint8_t* fin_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
-                fin_len = stack_.build_fin(fin_buffer, pio_.frame_capacity(), tcp_params_);
+                fin_len = stack_.build_fin(fin_buffer, pio().frame_capacity(), tcp_params_);
                 desc.frame_len = static_cast<uint16_t>(fin_len);
             });
 
             if (claimed > 0 && fin_len > 0) {
-                pio_.commit_tx_frames(fin_frame_idx, fin_frame_idx);
+                pio().commit_tx_frames(fin_frame_idx, fin_frame_idx);
                 retransmit_queue_.add_ref(tcp_params_.snd_nxt,
                                           userspace_stack::TCP_FLAG_FIN | userspace_stack::TCP_FLAG_ACK,
                                           fin_frame_idx, static_cast<uint16_t>(fin_len), 0);
@@ -1012,7 +1064,257 @@ struct PacketTransport {
         connected_ = false;
         retransmit_queue_.clear();
         recv_buffer_.clear();
-        pio_.close();
+        if (owns_pio_) {
+            pio().close();
+        }
+    }
+
+    // ========================================================================
+    // Public RX Frame Processing (for PacketTransportAB demux)
+    // ========================================================================
+
+    /**
+     * Process a single RX frame — extracted from poll_rx_and_process() lambda.
+     * Called by PacketTransportAB's demuxed poll loop.
+     */
+    void process_rx_frame(uint32_t idx, websocket::xdp::PacketFrameDescriptor& desc) {
+        uint32_t frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
+        uint8_t* frame_data = reinterpret_cast<uint8_t*>(desc.frame_ptr);
+        uint16_t frame_len = desc.frame_len;
+        uint64_t hw_timestamp_ns = desc.nic_timestamp_ns;
+
+        dbg_rx_total_++;
+
+        if (hw_timestamp_ns > 0) {
+            if (hw_timestamp_count_ == 0) {
+                oldest_rx_hw_timestamp_ns_ = hw_timestamp_ns;
+            }
+            latest_rx_hw_timestamp_ns_ = hw_timestamp_ns;
+            hw_timestamp_count_++;
+        }
+
+        auto parsed = stack_.parse_tcp(frame_data, frame_len,
+                                       tcp_params_.local_port,
+                                       tcp_params_.remote_ip,
+                                       tcp_params_.remote_port);
+
+        bool frame_consumed = false;
+
+        if (parsed.valid) {
+            dbg_rx_valid_++;
+            if (parsed.payload_len > 0) dbg_rx_has_payload_++;
+            auto result = stack_.process_tcp(state_, tcp_params_, parsed);
+
+            if (result.state_changed) {
+                state_ = result.new_state;
+            }
+
+            switch (result.action) {
+            case userspace_stack::TCPAction::SEND_ACK:
+                dbg_rx_send_ack_++;
+                if (parsed.flags & userspace_stack::TCP_FLAG_SYN) {
+                    dbg_rx_syn_ack_++;
+                } else if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
+                    dbg_rx_fin_++;
+                    { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                      fprintf(stderr, "[%ld.%06ld] [TCP-FIN] Connection closed by peer (graceful)\n",
+                              _ts.tv_sec, _ts.tv_nsec / 1000); }
+                    if (conn_state_ptr_) {
+                        auto* cs = static_cast<websocket::pipeline::ConnStateShm*>(conn_state_ptr_);
+                        cs->set_disconnect(websocket::pipeline::DisconnectReason::TCP_FIN);
+                    }
+                } else if (parsed.payload_len > 0) {
+                    dbg_rx_ooo_data_++;
+                }
+                if (parsed.flags & userspace_stack::TCP_FLAG_SYN) {
+                    tcp_params_.rcv_nxt = parsed.seq + 1;
+                } else if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
+                    tcp_params_.rcv_nxt++;
+                }
+                send_ack();
+                break;
+
+            case userspace_stack::TCPAction::DATA_RECEIVED:
+                dbg_rx_data_++;
+                if (result.data && result.data_len > 0) {
+                    dbg_rx_data_bytes_ += result.data_len;
+                    hw_timestamp_byte_ct_ += result.data_len;
+                    uint64_t umem_addr = desc.frame_ptr;
+                    bool push_ok = recv_buffer_.push_frame(result.data, result.data_len,
+                                                           frame_idx, umem_addr, hw_timestamp_ns,
+                                                           desc.bpf_entry_ns, desc.nic_frame_poll_cycle);
+                    if (push_ok) {
+                        frame_consumed = true;
+                    } else {
+                        dbg_rx_push_fail_++;
+                    }
+                    tcp_params_.rcv_nxt += result.data_len;
+                    send_ack();
+                }
+                break;
+
+            case userspace_stack::TCPAction::CLOSED:
+                connected_ = false;
+                { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                  fprintf(stderr, "[%ld.%06ld] [TCP-RST] Connection reset by peer\n",
+                          _ts.tv_sec, _ts.tv_nsec / 1000); }
+                if (conn_state_ptr_) {
+                    auto* cs = static_cast<websocket::pipeline::ConnStateShm*>(conn_state_ptr_);
+                    cs->set_disconnect(websocket::pipeline::DisconnectReason::TCP_RST);
+                    cs->shutdown_all();
+                }
+                break;
+
+            default:
+                dbg_rx_other_action_++;
+                break;
+            }
+
+            if (parsed.flags & userspace_stack::TCP_FLAG_ACK) {
+                dbg_rx_has_ack_flag_++;
+                if (userspace_stack::seq_gt(parsed.ack, tcp_params_.snd_una)) {
+                    dbg_rx_ack_advance_++;
+                    uint32_t released_frames[256];
+                    size_t released_count = retransmit_queue_.remove_acked(parsed.ack,
+                                                                            released_frames, 256);
+                    for (size_t i = 0; i < released_count; i++) {
+                        pio().mark_frame_acked(released_frames[i]);
+                    }
+                    tcp_params_.snd_una = parsed.ack;
+                }
+            }
+
+            tcp_params_.snd_wnd = parsed.window;
+        } else {
+            dbg_rx_invalid_++;
+        }
+
+        if (!frame_consumed) {
+            pio().mark_frame_consumed(frame_idx);
+        }
+    }
+
+    // ========================================================================
+    // Non-blocking Connect (for PacketTransportAB)
+    // ========================================================================
+
+    /**
+     * Phase 1 of connect: resolve, setup TCP params, send SYN.
+     * Non-blocking — returns immediately after SYN is sent.
+     * Use handshake_complete() to check if ESTABLISHED.
+     */
+    void initiate_connect(const char* host, uint16_t port) {
+        if (connected_) {
+            throw std::runtime_error("Already connected");
+        }
+
+        // Resolve hostname
+        struct addrinfo hints = {};
+        struct addrinfo* result = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        int ret = getaddrinfo(host, nullptr, &hints, &result);
+        if (ret != 0 || !result || !result->ai_addr) {
+            if (result) freeaddrinfo(result);
+            throw std::runtime_error(std::string("Failed to resolve host: ") + host);
+        }
+
+        auto* addr = reinterpret_cast<struct sockaddr_in*>(result->ai_addr);
+        uint32_t remote_ip = ntohl(addr->sin_addr.s_addr);
+        freeaddrinfo(result);
+
+        char remote_ip_str[INET_ADDRSTRLEN];
+        struct in_addr in_addr_tmp;
+        in_addr_tmp.s_addr = htonl(remote_ip);
+        inet_ntop(AF_INET, &in_addr_tmp, remote_ip_str, sizeof(remote_ip_str));
+
+        if (pio().is_bpf_enabled()) {
+            pio().add_remote_ip(remote_ip_str);
+        }
+
+        printf("[PacketTransport] Initiating connect to %s:%u (%s)...\n",
+               host, port, remote_ip_str);
+
+        // Setup TCP parameters
+        tcp_params_.remote_ip = remote_ip;
+        tcp_params_.remote_port = port;
+        tcp_params_.local_port = userspace_stack::UserspaceStack::generate_port();
+        tcp_params_.snd_una = tcp_params_.snd_nxt = userspace_stack::UserspaceStack::generate_isn();
+        tcp_params_.rcv_nxt = 0;
+        tcp_params_.snd_wnd = userspace_stack::TCP_MAX_WINDOW;
+        tcp_params_.rcv_wnd = userspace_stack::TCP_MAX_WINDOW;
+
+        if (tsc_freq_hz_ == 0) {
+            tsc_freq_hz_ = calibrate_tsc_freq();
+        }
+        retransmit_queue_.init(tsc_freq_hz_, timers_.rto);
+
+        // Send SYN
+        uint32_t syn_frame_idx;
+        size_t syn_len = 0;
+        uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+            syn_frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
+            uint8_t* syn_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
+            syn_len = stack_.build_syn(syn_buffer, pio().frame_capacity(), tcp_params_);
+            desc.frame_len = static_cast<uint16_t>(syn_len);
+        });
+
+        if (claimed == 0 || syn_len == 0) {
+            throw std::runtime_error("Failed to allocate TX frame for SYN");
+        }
+
+        pio().commit_tx_frames(syn_frame_idx, syn_frame_idx);
+        state_ = userspace_stack::TCPState::SYN_SENT;
+
+        retransmit_queue_.add_ref(tcp_params_.snd_nxt, userspace_stack::TCP_FLAG_SYN,
+                                  syn_frame_idx, static_cast<uint16_t>(syn_len), 0);
+        tcp_params_.snd_nxt++;
+
+        fprintf(stderr, "[PacketTransport] SYN sent (local_port=%u)\n", tcp_params_.local_port);
+    }
+
+    /**
+     * Check if TCP handshake completed (ESTABLISHED state).
+     */
+    bool handshake_complete() const {
+        return state_ == userspace_stack::TCPState::ESTABLISHED;
+    }
+
+    /**
+     * Mark connection as connected after handshake (for AB wrapper).
+     */
+    void set_connected() {
+        connected_ = true;
+    }
+
+    // ========================================================================
+    // Retransmit Handling (public for PacketTransportAB)
+    // ========================================================================
+
+    void check_retransmit() {
+        if (state_ == userspace_stack::TCPState::CLOSED) return;
+
+        uint64_t now_tsc = rdtsc();
+        uint64_t rto_cycles = retransmit_queue_.get_rto_cycles();
+
+        retransmit_queue_.for_each_expired(now_tsc, rto_cycles,
+            [this, now_tsc](userspace_stack::RetransmitSegmentRef& ref) -> bool {
+                ssize_t sent = pio().retransmit_frame(ref.frame_idx, ref.frame_len);
+                if (sent > 0) {
+                    retransmit_queue_.mark_retransmitted(ref.seq, now_tsc);
+                }
+                return true;
+            });
+
+        if (retransmit_queue_.has_failed_segment()) {
+            struct timespec ts_fatal;
+            clock_gettime(CLOCK_MONOTONIC, &ts_fatal);
+            fprintf(stderr, "[%ld.%06ld] [RETX] FATAL: Segment exceeded max retransmits, closing connection\n",
+                    ts_fatal.tv_sec, ts_fatal.tv_nsec / 1000);
+            state_ = userspace_stack::TCPState::CLOSED;
+            connected_ = false;
+        }
     }
 
     // ========================================================================
@@ -1056,9 +1358,17 @@ struct PacketTransport {
     int ssl_read_by_chunk(uint8_t* dest, size_t chunk_size, ChunkCallback&& callback) {
         if (!tls_keys_valid_) return 0;
 
+        // Cap chunk_size to global limit
+        if (chunk_size > websocket::pipeline::SSL_DECRYPT_CHUNK_SIZE)
+            chunk_size = websocket::pipeline::SSL_DECRYPT_CHUNK_SIZE;
+
         int offset = 0;
 
         for (;;) {
+            // Stop if we've reached the per-call decrypt limit
+            if (static_cast<size_t>(offset) >= websocket::pipeline::SSL_DECRYPT_CHUNK_SIZE)
+                return offset;
+
             switch (tls_parser_.state) {
 
             case TLSRecordState::NEED_HEADER: {
@@ -1156,7 +1466,9 @@ struct PacketTransport {
                 size_t avail = recv_buffer_.available();
                 if (avail == 0) return offset;
 
+                size_t budget = websocket::pipeline::SSL_DECRYPT_CHUNK_SIZE - static_cast<size_t>(offset);
                 size_t can_decrypt = chunk_size;
+                if (can_decrypt > budget) can_decrypt = budget;
                 if (can_decrypt > payload_remaining) can_decrypt = payload_remaining;
                 if (can_decrypt > avail) can_decrypt = avail;
 
@@ -1274,14 +1586,14 @@ struct PacketTransport {
     // BPF Configuration
     // ========================================================================
 
-    void add_exchange_ip(const char* ip) { pio_.add_remote_ip(ip); }
-    void add_exchange_port(uint16_t port) { pio_.add_remote_port(port); }
+    void add_exchange_ip(const char* ip) { pio().add_remote_ip(ip); }
+    void add_exchange_port(uint16_t port) { pio().add_remote_port(port); }
 
     // ========================================================================
     // Statistics
     // ========================================================================
 
-    void print_bpf_stats() const { pio_.print_stats(); }
+    void print_bpf_stats() const { pio().print_stats(); }
 
     // ========================================================================
     // Hardware Timestamps
@@ -1320,11 +1632,11 @@ struct PacketTransport {
     // Accessors
     // ========================================================================
 
-    const char* get_xdp_mode() const { return pio_.get_mode(); }
-    const char* get_interface() const { return pio_.get_interface(); }
-    uint32_t get_queue_id() const { return pio_.get_queue_id(); }
-    bool is_bpf_enabled() const { return pio_.is_bpf_enabled(); }
-    void stop_rx_trickle_thread() { pio_.stop_rx_trickle_thread(); }
+    const char* get_xdp_mode() const { return pio().get_mode(); }
+    const char* get_interface() const { return pio().get_interface(); }
+    uint32_t get_queue_id() const { return pio().get_queue_id(); }
+    bool is_bpf_enabled() const { return pio().is_bpf_enabled(); }
+    void stop_rx_trickle_thread() { pio().stop_rx_trickle_thread(); }
 
     // Hardware timestamp statistics
     uint32_t get_hw_timestamp_count() const { return hw_timestamp_count_; }
@@ -1333,10 +1645,21 @@ struct PacketTransport {
     // Pipeline integration: set conn_state for disconnect reason tracking
     void set_conn_state(void* cs) { conn_state_ptr_ = cs; }
 
-    PacketIO* get_packet_io() { return &pio_; }
+    PacketIO* get_packet_io() { return pio_ptr_; }
+    PacketIO& pio() { return *pio_ptr_; }
+    const PacketIO& pio() const { return *pio_ptr_; }
+    void set_shared_pio(PacketIO* p) { pio_ptr_ = p; owns_pio_ = false; }
+
     const userspace_stack::TCPParams& tcp_params() const { return tcp_params_; }
+    userspace_stack::TCPParams& tcp_params() { return tcp_params_; }
     const uint8_t* get_local_mac() const { return stack_.get_local_mac(); }
     const uint8_t* get_gateway_mac() const { return stack_.get_gateway_mac(); }
+
+    // Debug accessors (for AB diagnostics)
+    size_t recv_buffer_available() const { return recv_buffer_.available(); }
+    uint32_t dbg_rx_total() const { return dbg_rx_total_; }
+    uint32_t dbg_rx_data_count() const { return dbg_rx_data_; }
+    uint32_t dbg_rx_valid_count() const { return dbg_rx_valid_; }
 
 private:
     // ========================================================================
@@ -1382,124 +1705,10 @@ private:
     // ========================================================================
 
     size_t poll_rx_and_process() {
-        [[maybe_unused]] uint64_t poll_enter_cycle = rdtsc();
-        return pio_.process_rx_frames(SIZE_MAX, [this, poll_enter_cycle](uint32_t idx, websocket::xdp::PacketFrameDescriptor& desc) {
-            uint32_t frame_idx = pio_.frame_ptr_to_idx(desc.frame_ptr);
-            uint8_t* frame_data = reinterpret_cast<uint8_t*>(desc.frame_ptr);
-            uint16_t frame_len = desc.frame_len;
-            uint64_t hw_timestamp_ns = desc.nic_timestamp_ns;
-
-            dbg_rx_total_++;
-
-            if (hw_timestamp_ns > 0) {
-                if (hw_timestamp_count_ == 0) {
-                    oldest_rx_hw_timestamp_ns_ = hw_timestamp_ns;
-                }
-                latest_rx_hw_timestamp_ns_ = hw_timestamp_ns;
-                hw_timestamp_count_++;
-            }
-
-            auto parsed = stack_.parse_tcp(frame_data, frame_len,
-                                           tcp_params_.local_port,
-                                           tcp_params_.remote_ip,
-                                           tcp_params_.remote_port);
-
-            bool frame_consumed = false;  // Track if frame was pushed to recv_buffer_
-
-            if (parsed.valid) {
-                dbg_rx_valid_++;
-                if (parsed.payload_len > 0) dbg_rx_has_payload_++;
-                auto result = stack_.process_tcp(state_, tcp_params_, parsed);
-
-                if (result.state_changed) {
-                    state_ = result.new_state;
-                }
-
-                switch (result.action) {
-                case userspace_stack::TCPAction::SEND_ACK:
-                    dbg_rx_send_ack_++;
-                    if (parsed.flags & userspace_stack::TCP_FLAG_SYN) {
-                        dbg_rx_syn_ack_++;
-                    } else if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
-                        dbg_rx_fin_++;
-                        { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
-                          fprintf(stderr, "[%ld.%06ld] [TCP-FIN] Connection closed by peer (graceful)\n",
-                                  _ts.tv_sec, _ts.tv_nsec / 1000); }
-                        if (conn_state_ptr_) {
-                            auto* cs = static_cast<websocket::pipeline::ConnStateShm*>(conn_state_ptr_);
-                            cs->set_disconnect(websocket::pipeline::DisconnectReason::TCP_FIN);
-                        }
-                    } else if (parsed.payload_len > 0) {
-                        dbg_rx_ooo_data_++;
-                    }
-                    if (parsed.flags & userspace_stack::TCP_FLAG_SYN) {
-                        tcp_params_.rcv_nxt = parsed.seq + 1;
-                    } else if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
-                        tcp_params_.rcv_nxt++;
-                    }
-                    send_ack();
-                    break;
-
-                case userspace_stack::TCPAction::DATA_RECEIVED:
-                    dbg_rx_data_++;
-                    if (result.data && result.data_len > 0) {
-                        dbg_rx_data_bytes_ += result.data_len;
-                        hw_timestamp_byte_ct_ += result.data_len;
-                        uint64_t umem_addr = desc.frame_ptr;  // Use frame_ptr as umem_addr for compatibility
-                        bool push_ok = recv_buffer_.push_frame(result.data, result.data_len,
-                                                               frame_idx, umem_addr, hw_timestamp_ns,
-                                                               desc.bpf_entry_ns, desc.nic_frame_poll_cycle);
-                        if (push_ok) {
-                            frame_consumed = true;  // Don't mark_frame_consumed now, recv_buffer_ will do it
-                        } else {
-                            dbg_rx_push_fail_++;
-                        }
-                        tcp_params_.rcv_nxt += result.data_len;
-                        send_ack();
-                    }
-                    break;
-
-                case userspace_stack::TCPAction::CLOSED:
-                    connected_ = false;
-                    { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
-                      fprintf(stderr, "[%ld.%06ld] [TCP-RST] Connection reset by peer\n",
-                              _ts.tv_sec, _ts.tv_nsec / 1000); }
-                    if (conn_state_ptr_) {
-                        auto* cs = static_cast<websocket::pipeline::ConnStateShm*>(conn_state_ptr_);
-                        cs->set_disconnect(websocket::pipeline::DisconnectReason::TCP_RST);
-                        cs->shutdown_all();
-                    }
-                    break;
-
-                default:
-                    dbg_rx_other_action_++;
-                    break;
-                }
-
-                if (parsed.flags & userspace_stack::TCP_FLAG_ACK) {
-                    dbg_rx_has_ack_flag_++;
-                    if (userspace_stack::seq_gt(parsed.ack, tcp_params_.snd_una)) {
-                        dbg_rx_ack_advance_++;
-                        uint32_t released_frames[256];
-                        size_t released_count = retransmit_queue_.remove_acked(parsed.ack,
-                                                                                released_frames, 256);
-                        for (size_t i = 0; i < released_count; i++) {
-                            pio_.mark_frame_acked(released_frames[i]);
-                        }
-                        tcp_params_.snd_una = parsed.ack;
-                    }
-                }
-
-                tcp_params_.snd_wnd = parsed.window;
-            } else {
-                dbg_rx_invalid_++;
-            }
-
-            // Mark frame consumed if not pushed to recv_buffer_ (which manages its own release)
-            if (!frame_consumed) {
-                pio_.mark_frame_consumed(frame_idx);
-            }
-        });
+        return pio().process_rx_frames(SIZE_MAX,
+            [this](uint32_t idx, websocket::xdp::PacketFrameDescriptor& desc) {
+                process_rx_frame(idx, desc);
+            });
     }
 
     // ========================================================================
@@ -1509,43 +1718,14 @@ private:
     void send_ack() {
         // Pure ACKs go through ACK_OUTBOX (separate from data path)
         // This avoids congestion control tracking issues - ACKs don't need retransmit
-        uint32_t frame_idx = pio_.commit_ack_frame([this](websocket::xdp::PacketFrameDescriptor& desc) {
+        uint32_t frame_idx = pio().commit_ack_frame([this](websocket::xdp::PacketFrameDescriptor& desc) {
             uint8_t* ack_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
             desc.frame_len = static_cast<uint16_t>(
-                stack_.build_ack(ack_buffer, pio_.frame_capacity(), tcp_params_));
+                stack_.build_ack(ack_buffer, pio().frame_capacity(), tcp_params_));
         });
 
         if (frame_idx == 0) {
             fprintf(stderr, "[TRANSPORT] WARNING: Failed to send ACK (ACK_OUTBOX full?)\n");
-        }
-    }
-
-    // ========================================================================
-    // Retransmit Handling
-    // ========================================================================
-
-    void check_retransmit() {
-        if (!connected_) return;
-
-        uint64_t now_tsc = rdtsc();
-        uint64_t rto_cycles = retransmit_queue_.get_rto_cycles();
-
-        retransmit_queue_.for_each_expired(now_tsc, rto_cycles,
-            [this, now_tsc](userspace_stack::RetransmitSegmentRef& ref) -> bool {
-                ssize_t sent = pio_.retransmit_frame(ref.frame_idx, ref.frame_len);
-                if (sent > 0) {
-                    retransmit_queue_.mark_retransmitted(ref.seq, now_tsc);
-                }
-                return true;
-            });
-
-        if (retransmit_queue_.has_failed_segment()) {
-            struct timespec ts_fatal;
-            clock_gettime(CLOCK_MONOTONIC, &ts_fatal);
-            fprintf(stderr, "[%ld.%06ld] [RETX] FATAL: Segment exceeded max retransmits, closing connection\n",
-                    ts_fatal.tv_sec, ts_fatal.tv_nsec / 1000);
-            state_ = userspace_stack::TCPState::CLOSED;
-            connected_ = false;
         }
     }
 
@@ -1623,7 +1803,7 @@ private:
 
     static void frame_release_callback(uint32_t frame_idx, void* user_data) {
         auto* self = static_cast<PacketTransport*>(user_data);
-        self->pio_.mark_frame_consumed(frame_idx);
+        self->pio().mark_frame_consumed(frame_idx);
     }
 
     // ========================================================================
@@ -1631,6 +1811,10 @@ private:
     // ========================================================================
 
     PacketIO pio_;
+    PacketIO* pio_ptr_;  // Defaults to &pio_, redirectable via set_shared_pio()
+    bool owns_pio_ = true;  // false when sharing another transport's PIO
+    PollOverrideFn poll_override_ = nullptr;    // AB mode: demuxed poll
+    void* poll_override_ctx_ = nullptr;
     userspace_stack::UserspaceStack stack_;
 
     userspace_stack::TCPState state_;
