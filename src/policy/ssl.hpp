@@ -155,9 +155,9 @@ struct OpenSSLPolicy {
     /**
      * Initialize SSL context
      *
-     * @throws std::runtime_error if initialization fails
+     * @return 0 on success, -1 on failure
      */
-    void init() {
+    int init() {
         // Initialize OpenSSL library (OpenSSL 1.1.0+ does this automatically)
         #if OPENSSL_VERSION_NUMBER < 0x10100000L
         SSL_library_init();
@@ -170,7 +170,8 @@ struct OpenSSLPolicy {
         ctx_ = SSL_CTX_new(method);
 
         if (!ctx_) {
-            throw std::runtime_error("SSL_CTX_new() failed");
+            fprintf(stderr, "[TLS] SSL_CTX_new() failed\n");
+            return -1;
         }
 
         // Set TLS version range: 1.2 minimum, 1.3 maximum
@@ -290,6 +291,7 @@ struct OpenSSLPolicy {
 
         // Register msg_callback for TLS record counting (seq_num tracking)
         SSL_CTX_set_msg_callback(ctx_, record_count_callback);
+        return 0;
     }
 
     uint64_t get_server_record_count() const { return server_record_count_; }
@@ -303,7 +305,7 @@ struct OpenSSLPolicy {
     void handshake(int fd) {
         // If ctx_ is null, initialize (first connection or after full cleanup)
         if (!ctx_) {
-            init();
+            if (init() != 0) throw std::runtime_error("OpenSSL init() failed");
         }
 
         keylog_lines_.clear();
@@ -315,7 +317,7 @@ struct OpenSSLPolicy {
                 SSL_CTX_free(ctx_);
                 ctx_ = nullptr;
             }
-            init();
+            if (init() != 0) throw std::runtime_error("SSL init() failed");
             ssl_ = SSL_new(ctx_);
         }
 
@@ -367,17 +369,18 @@ struct OpenSSLPolicy {
      *
      * @param transport Transport policy instance
      * @param hostname  Optional hostname for SNI (Server Name Indication)
-     * @throws std::runtime_error on handshake failure
+     * @return 0 on success, -1 on failure
      */
     template<typename TransportPolicy>
-    void handshake_userspace_transport(TransportPolicy* transport, const char* hostname = nullptr) {
+    int handshake_userspace_transport(TransportPolicy* transport, const char* hostname = nullptr) {
         if (!transport) {
-            throw std::runtime_error("Transport is null");
+            fprintf(stderr, "[TLS] Transport is null in handshake_userspace_transport\n");
+            return -1;
         }
 
         // If ctx_ is null, initialize (first connection or after full cleanup)
         if (!ctx_) {
-            init();
+            if (init() != 0) return -1;
         }
 
         keylog_lines_.clear();
@@ -389,7 +392,7 @@ struct OpenSSLPolicy {
                 SSL_CTX_free(ctx_);
                 ctx_ = nullptr;
             }
-            init();
+            if (init() != 0) return -1;
             ssl_ = SSL_new(ctx_);
         }
 
@@ -397,7 +400,8 @@ struct OpenSSLPolicy {
             unsigned long err = ERR_get_error();
             char err_buf[256];
             ERR_error_string_n(err, err_buf, sizeof(err_buf));
-            throw std::runtime_error(std::string("SSL_new() failed: ") + err_buf);
+            fprintf(stderr, "[TLS] SSL_new() failed: %s\n", err_buf);
+            return -1;
         }
 
         // Store policy pointer in SSL ex_data for keylog callback
@@ -412,13 +416,17 @@ struct OpenSSLPolicy {
         bio_method_ = websocket::policy::UserspaceTransportBIO<TransportPolicy>::create_bio_method();
         if (!bio_method_) {
             SSL_free(ssl_);
-            throw std::runtime_error("Failed to create userspace transport BIO method");
+            ssl_ = nullptr;
+            fprintf(stderr, "[TLS] Failed to create userspace transport BIO method\n");
+            return -1;
         }
 
         BIO* bio = websocket::policy::UserspaceTransportBIO<TransportPolicy>::create_bio(bio_method_, transport);
         if (!bio) {
             SSL_free(ssl_);
-            throw std::runtime_error("Failed to create userspace transport BIO");
+            ssl_ = nullptr;
+            fprintf(stderr, "[TLS] Failed to create userspace transport BIO\n");
+            return -1;
         }
 
         // Associate BIO with SSL object
@@ -443,7 +451,7 @@ struct OpenSSLPolicy {
                 ktls_enabled_ = false;
                 // Reset server record counter — only count post-handshake records
                 server_record_count_ = 0;
-                return;
+                return 0;
             }
 
             int err = SSL_get_error(ssl_, ret);
@@ -469,15 +477,25 @@ struct OpenSSLPolicy {
             // Fatal error
             char err_buf[256];
             ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
+            fprintf(stderr, "[TLS] SSL handshake failed: %s\n", err_buf);
             SSL_free(ssl_);
             ssl_ = nullptr;
-            throw std::runtime_error(std::string("SSL handshake failed: ") + err_buf);
+            return -1;
         }
 
+        fprintf(stderr, "[TLS] SSL handshake timeout\n");
         SSL_free(ssl_);
         ssl_ = nullptr;
-        throw std::runtime_error("SSL handshake timeout");
+        return -1;
     }
+
+    // Non-blocking handshake stubs (OpenSSL: delegate to blocking for now)
+    enum class HandshakeResult : uint8_t { IN_PROGRESS = 0, SUCCESS = 1, ERROR = 2 };
+    template<typename TransportPolicy>
+    int prepare_handshake(TransportPolicy* transport, const char* hostname) {
+        return handshake_userspace_transport(transport, hostname);
+    }
+    HandshakeResult step_handshake() { return HandshakeResult::SUCCESS; }
 
     /**
      * Read decrypted data from SSL connection
@@ -575,7 +593,7 @@ struct OpenSSLPolicy {
      */
     void init_zero_copy_bio() {
         if (!ctx_) {
-            init();
+            if (init() != 0) throw std::runtime_error("SSL init() failed");
         }
 
         ssl_ = SSL_new(ctx_);
@@ -1251,9 +1269,9 @@ struct LibreSSLPolicy {
     /**
      * Initialize SSL context
      *
-     * @throws std::runtime_error if initialization fails
+     * @return 0 on success, -1 on failure
      */
-    void init() {
+    int init() {
         // Initialize LibreSSL library
         #if OPENSSL_VERSION_NUMBER < 0x10100000L
         SSL_library_init();
@@ -1266,7 +1284,8 @@ struct LibreSSLPolicy {
         ctx_ = SSL_CTX_new(method);
 
         if (!ctx_) {
-            throw std::runtime_error("SSL_CTX_new() failed");
+            fprintf(stderr, "[TLS] SSL_CTX_new() failed\n");
+            return -1;
         }
 
         // Set TLS version range: 1.2 minimum, 1.3 maximum
@@ -1292,6 +1311,7 @@ struct LibreSSLPolicy {
 
         // Register msg_callback for TLS record counting (seq_num tracking)
         SSL_CTX_set_msg_callback(ctx_, libressl_record_count_callback);
+        return 0;
     }
 
     uint64_t get_server_record_count() const { return server_record_count_; }
@@ -1305,7 +1325,7 @@ struct LibreSSLPolicy {
     void handshake(int fd) {
         // If ctx_ is null, initialize (first connection or after full cleanup)
         if (!ctx_) {
-            init();
+            if (init() != 0) throw std::runtime_error("LibreSSL init() failed");
         }
 
         keylog_lines_.clear();
@@ -1317,7 +1337,7 @@ struct LibreSSLPolicy {
                 SSL_CTX_free(ctx_);
                 ctx_ = nullptr;
             }
-            init();
+            if (init() != 0) throw std::runtime_error("SSL init() failed");
             ssl_ = SSL_new(ctx_);
         }
 
@@ -1357,17 +1377,18 @@ struct LibreSSLPolicy {
      *
      * @param transport Transport policy instance
      * @param hostname  Optional hostname for SNI (Server Name Indication)
-     * @throws std::runtime_error on handshake failure
+     * @return 0 on success, -1 on failure
      */
     template<typename TransportPolicy>
-    void handshake_userspace_transport(TransportPolicy* transport, const char* hostname = nullptr) {
+    int handshake_userspace_transport(TransportPolicy* transport, const char* hostname = nullptr) {
         if (!transport) {
-            throw std::runtime_error("Transport is null");
+            fprintf(stderr, "[TLS] Transport is null in handshake_userspace_transport\n");
+            return -1;
         }
 
         // If ctx_ is null, initialize (first connection or after full cleanup)
         if (!ctx_) {
-            init();
+            if (init() != 0) return -1;
         }
 
         keylog_lines_.clear();
@@ -1379,7 +1400,7 @@ struct LibreSSLPolicy {
                 SSL_CTX_free(ctx_);
                 ctx_ = nullptr;
             }
-            init();
+            if (init() != 0) return -1;
             ssl_ = SSL_new(ctx_);
         }
 
@@ -1387,7 +1408,8 @@ struct LibreSSLPolicy {
             unsigned long err = ERR_get_error();
             char err_buf[256];
             ERR_error_string_n(err, err_buf, sizeof(err_buf));
-            throw std::runtime_error(std::string("SSL_new() failed: ") + err_buf);
+            fprintf(stderr, "[TLS] SSL_new() failed: %s\n", err_buf);
+            return -1;
         }
 
         // Store policy pointer in SSL ex_data for keylog callback
@@ -1402,13 +1424,17 @@ struct LibreSSLPolicy {
         bio_method_ = websocket::policy::UserspaceTransportBIO<TransportPolicy>::create_bio_method();
         if (!bio_method_) {
             SSL_free(ssl_);
-            throw std::runtime_error("Failed to create userspace transport BIO method");
+            ssl_ = nullptr;
+            fprintf(stderr, "[TLS] Failed to create userspace transport BIO method\n");
+            return -1;
         }
 
         BIO* bio = websocket::policy::UserspaceTransportBIO<TransportPolicy>::create_bio(bio_method_, transport);
         if (!bio) {
             SSL_free(ssl_);
-            throw std::runtime_error("Failed to create userspace transport BIO");
+            ssl_ = nullptr;
+            fprintf(stderr, "[TLS] Failed to create userspace transport BIO\n");
+            return -1;
         }
 
         // Associate BIO with SSL object
@@ -1431,7 +1457,7 @@ struct LibreSSLPolicy {
                 // Handshake successful
                 // Reset server record counter — only count post-handshake records
                 server_record_count_ = 0;
-                return;
+                return 0;
             }
 
             int err = SSL_get_error(ssl_, ret);
@@ -1457,15 +1483,25 @@ struct LibreSSLPolicy {
             // Fatal error
             char err_buf[256];
             ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
+            fprintf(stderr, "[TLS] SSL handshake failed: %s\n", err_buf);
             SSL_free(ssl_);
             ssl_ = nullptr;
-            throw std::runtime_error(std::string("SSL handshake failed: ") + err_buf);
+            return -1;
         }
 
+        fprintf(stderr, "[TLS] SSL handshake timeout\n");
         SSL_free(ssl_);
         ssl_ = nullptr;
-        throw std::runtime_error("SSL handshake timeout");
+        return -1;
     }
+
+    // Non-blocking handshake stubs (LibreSSL: delegate to blocking for now)
+    enum class HandshakeResult : uint8_t { IN_PROGRESS = 0, SUCCESS = 1, ERROR = 2 };
+    template<typename TransportPolicy>
+    int prepare_handshake(TransportPolicy* transport, const char* hostname) {
+        return handshake_userspace_transport(transport, hostname);
+    }
+    HandshakeResult step_handshake() { return HandshakeResult::SUCCESS; }
 
     /**
      * Read decrypted data from SSL connection
@@ -1563,7 +1599,7 @@ struct LibreSSLPolicy {
      */
     void init_zero_copy_bio() {
         if (!ctx_) {
-            init();
+            if (init() != 0) throw std::runtime_error("SSL init() failed");
         }
 
         ssl_ = SSL_new(ctx_);
@@ -2131,21 +2167,23 @@ struct WolfSSLPolicy {
     /**
      * Initialize WolfSSL context
      *
-     * @throws std::runtime_error if initialization fails
+     * @return 0 on success, -1 on failure
      */
-    void init() {
+    int init() {
         wolfSSL_Init();
 
         // Create flexible TLS client method (supports TLS 1.2 and 1.3)
         // TLS 1.3 ClientHello is handled by TCP segmentation in tls_handshake_send_from_buffer()
         WOLFSSL_METHOD* method = wolfSSLv23_client_method();
         if (!method) {
-            throw std::runtime_error("wolfSSLv23_client_method() failed");
+            fprintf(stderr, "[TLS] wolfSSLv23_client_method() failed\n");
+            return -1;
         }
 
         ctx_ = wolfSSL_CTX_new(method);
         if (!ctx_) {
-            throw std::runtime_error("wolfSSL_CTX_new() failed");
+            fprintf(stderr, "[TLS] wolfSSL_CTX_new() failed\n");
+            return -1;
         }
 
         // Set minimum TLS version to 1.2
@@ -2166,6 +2204,7 @@ struct WolfSSLPolicy {
         wolfSSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);
 
         fprintf(stderr, "[TLS] WolfSSL initialized with AES-128-GCM preferred\n");
+        return 0;
     }
 
     uint64_t get_server_record_count() const { return server_record_count_; }
@@ -2179,7 +2218,7 @@ struct WolfSSLPolicy {
     void handshake(int fd) {
         // If ctx_ is null, initialize (first connection or after full cleanup)
         if (!ctx_) {
-            init();
+            if (init() != 0) throw std::runtime_error("wolfSSL init() failed");
         }
 
         ssl_ = wolfSSL_new(ctx_);
@@ -2189,7 +2228,7 @@ struct WolfSSLPolicy {
                 wolfSSL_CTX_free(ctx_);
                 ctx_ = nullptr;
             }
-            init();
+            if (init() != 0) throw std::runtime_error("wolfSSL init() failed");
             ssl_ = wolfSSL_new(ctx_);
         }
 
@@ -2231,17 +2270,18 @@ struct WolfSSLPolicy {
      * Example: XDPUserspaceTransport, or any custom userspace TCP stack.
      *
      * @param transport Transport policy instance
-     * @throws std::runtime_error on handshake failure
+     * @return 0 on success, -1 on failure
      */
     template<typename TransportPolicy>
-    void handshake_userspace_transport(TransportPolicy* transport, const char* hostname = nullptr) {
+    int handshake_userspace_transport(TransportPolicy* transport, const char* hostname = nullptr) {
         if (!transport) {
-            throw std::runtime_error("Transport is null");
+            fprintf(stderr, "[TLS] Transport is null in handshake_userspace_transport\n");
+            return -1;
         }
 
         // If ctx_ is null, initialize (first connection or after full cleanup)
         if (!ctx_) {
-            init();
+            if (init() != 0) return -1;
         }
 
         // Register native I/O callbacks BEFORE creating SSL object
@@ -2256,7 +2296,7 @@ struct WolfSSLPolicy {
                 wolfSSL_CTX_free(ctx_);
                 ctx_ = nullptr;
             }
-            init();
+            if (init() != 0) return -1;
             // Re-register callbacks on new context
             wolfSSL_CTX_SetIORecv(ctx_, WolfSSLUserspaceIO<TransportPolicy>::recv_cb);
             wolfSSL_CTX_SetIOSend(ctx_, WolfSSLUserspaceIO<TransportPolicy>::send_cb);
@@ -2264,7 +2304,8 @@ struct WolfSSLPolicy {
         }
 
         if (!ssl_) {
-            throw std::runtime_error("wolfSSL_new() failed");
+            fprintf(stderr, "[TLS] wolfSSL_new() failed in handshake_userspace_transport\n");
+            return -1;
         }
 
         // Set SNI hostname for virtual hosting
@@ -2299,7 +2340,7 @@ struct WolfSSLPolicy {
                 transport->stop_rx_trickle_thread();
                 // Reset server record counter — only count post-handshake records
                 server_record_count_ = 0;
-                return;
+                return 0;
             }
 
             int err = wolfSSL_get_error(ssl_, ret);
@@ -2325,14 +2366,113 @@ struct WolfSSLPolicy {
             // Fatal error
             char err_buf[256];
             wolfSSL_ERR_error_string(err, err_buf);
+            fprintf(stderr, "[TLS] SSL handshake failed: %s\n", err_buf);
             wolfSSL_free(ssl_);
             ssl_ = nullptr;
-            throw std::runtime_error(std::string("SSL handshake failed: ") + err_buf);
+            return -1;
         }
 
+        fprintf(stderr, "[TLS] SSL handshake timeout\n");
         wolfSSL_free(ssl_);
         ssl_ = nullptr;
-        throw std::runtime_error("SSL handshake timeout");
+        return -1;
+    }
+
+    // ========================================================================
+    // Non-blocking TLS Handshake (for state-machine-based reconnect)
+    // ========================================================================
+
+    enum class HandshakeResult : uint8_t {
+        IN_PROGRESS = 0,
+        SUCCESS = 1,
+        ERROR = 2,
+    };
+
+    /**
+     * One-time setup: create SSL object, set SNI, set I/O context.
+     * Call once before calling step_handshake() in a loop.
+     *
+     * @return 0 on success, -1 on failure
+     */
+    template<typename TransportPolicy>
+    int prepare_handshake(TransportPolicy* transport, const char* hostname) {
+        if (!transport) {
+            fprintf(stderr, "[TLS] Transport is null in prepare_handshake\n");
+            return -1;
+        }
+
+        // If ctx_ is null, initialize
+        if (!ctx_) {
+            if (init() != 0) return -1;
+        }
+
+        // Register native I/O callbacks
+        wolfSSL_CTX_SetIORecv(ctx_, WolfSSLUserspaceIO<TransportPolicy>::recv_cb);
+        wolfSSL_CTX_SetIOSend(ctx_, WolfSSLUserspaceIO<TransportPolicy>::send_cb);
+
+        ssl_ = wolfSSL_new(ctx_);
+        if (!ssl_) {
+            if (ctx_) { wolfSSL_CTX_free(ctx_); ctx_ = nullptr; }
+            if (init() != 0) return -1;
+            wolfSSL_CTX_SetIORecv(ctx_, WolfSSLUserspaceIO<TransportPolicy>::recv_cb);
+            wolfSSL_CTX_SetIOSend(ctx_, WolfSSLUserspaceIO<TransportPolicy>::send_cb);
+            ssl_ = wolfSSL_new(ctx_);
+        }
+        if (!ssl_) {
+            fprintf(stderr, "[TLS] wolfSSL_new() failed in prepare_handshake\n");
+            return -1;
+        }
+
+        if (hostname) {
+            wolfSSL_UseSNI(ssl_, WOLFSSL_SNI_HOST_NAME, hostname, (unsigned short)strlen(hostname));
+        }
+
+        wolfSSL_SetIOReadCtx(ssl_, transport);
+        wolfSSL_SetIOWriteCtx(ssl_, transport);
+        return 0;
+    }
+
+    /**
+     * Perform one step of the TLS handshake (single wolfSSL_connect() call).
+     * Returns IN_PROGRESS if not done, SUCCESS when handshake complete,
+     * ERROR on fatal failure.
+     *
+     * Caller must call transport->poll() before each call.
+     */
+    HandshakeResult step_handshake() {
+        if (!ssl_) return HandshakeResult::ERROR;
+
+        int ret = wolfSSL_connect(ssl_);
+
+        if (ret == SSL_SUCCESS) {
+            const char* cipher_name = wolfSSL_get_cipher(ssl_);
+            const char* tls_version = wolfSSL_get_version(ssl_);
+            fprintf(stderr, "[TLS] Handshake SUCCESS (non-blocking)\n");
+            fprintf(stderr, "[TLS]   Version: %s\n", tls_version ? tls_version : "unknown");
+            fprintf(stderr, "[TLS]   Cipher:  %s\n", cipher_name ? cipher_name : "unknown");
+            server_record_count_ = 0;
+            return HandshakeResult::SUCCESS;
+        }
+
+        int err = wolfSSL_get_error(ssl_, ret);
+
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            return HandshakeResult::IN_PROGRESS;
+        }
+
+        if (err == SSL_ERROR_SYSCALL) {
+            if (errno == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+                return HandshakeResult::IN_PROGRESS;
+            }
+        }
+
+        // Fatal error
+        char err_buf[256];
+        wolfSSL_ERR_error_string(err, err_buf);
+        fprintf(stderr, "[TLS] step_handshake() fatal error: %s\n", err_buf);
+        wolfSSL_free(ssl_);
+        ssl_ = nullptr;
+        return HandshakeResult::ERROR;
     }
 
     /**
@@ -2513,7 +2653,7 @@ struct WolfSSLPolicy {
      */
     void init_zero_copy_bio() {
         if (!ctx_) {
-            init();
+            if (init() != 0) throw std::runtime_error("SSL init() failed");
         }
 
         // Register zero-copy I/O callbacks
@@ -2787,8 +2927,9 @@ struct NoSSLPolicy {
     NoSSLPolicy(NoSSLPolicy&&) noexcept = default;
     NoSSLPolicy& operator=(NoSSLPolicy&&) noexcept = default;
 
-    void init() {
+    int init() {
         // No SSL context needed
+        return 0;
     }
 
     // BSD socket handshake (no-op for NoSSL)
@@ -2873,6 +3014,15 @@ struct NoSSLPolicy {
     // No encryption - key extraction not applicable
     bool extract_record_keys(websocket::crypto::TLSRecordKeys&) { return false; }
     uint64_t get_server_record_count() const { return 0; }
+
+    // Non-blocking handshake stubs (NoSSL: immediate success)
+    enum class HandshakeResult : uint8_t { IN_PROGRESS = 0, SUCCESS = 1, ERROR = 2 };
+    template<typename TransportPolicy>
+    int prepare_handshake(TransportPolicy* transport, const char* hostname) {
+        handshake_userspace_transport(transport, hostname);
+        return 0;
+    }
+    HandshakeResult step_handshake() { return HandshakeResult::SUCCESS; }
 
     // ========================================================================
     // Zero-Copy Methods (for pipeline operation)
@@ -3016,7 +3166,7 @@ using NoSSLPolicy = websocket::ssl::NoSSLPolicy;
 template<typename T>
 concept SSLPolicyConcept = requires(T ssl, int fd, void* buf, const uint8_t* cptr, uint8_t* ptr, size_t len) {
     // Basic interface
-    { ssl.init() } -> std::same_as<void>;
+    { ssl.init() } -> std::convertible_to<int>;
     { ssl.handshake(fd) } -> std::same_as<void>;
     { ssl.read(buf, len) } -> std::convertible_to<ssize_t>;
     { ssl.write(buf, len) } -> std::convertible_to<ssize_t>;

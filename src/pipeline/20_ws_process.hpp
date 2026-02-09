@@ -309,30 +309,32 @@ inline void generate_mask_key(uint8_t* mask_key) {
 // with event_processor pattern. The on_event() method handles each MsgMetadata
 // event from MSG_METADATA_INBOX.
 //
-// Two-Phase Operation:
-// - Phase 1 (Handshake): Manual polling, blocking until HTTP 101 received
-// - Phase 2 (Main Loop): event_processor.run() pattern via on_event() handler
+// Non-blocking state machine:
+//   DISCONNECTED  → waiting for TLS_CONNECTED event from Transport
+//   WS_UPGRADE_SENT → HTTP upgrade sent, accumulating 101 response
+//   ACTIVE         → normal WS frame parsing
+//
+// When AutoReconnect:
+//   Both initial connect and reconnect use the same state machine.
+//   WS starts in DISCONNECTED, Transport publishes TLS_CONNECTED when ready.
+//
+// When !AutoReconnect:
+//   perform_handshake() blocks waiting for tls_ready, then does blocking
+//   HTTP upgrade. Then run() enters main loop with all connections ACTIVE.
 //
 // Responsibilities:
-// 1. Wait for tls_ready from Transport
-// 2. Perform HTTP+WS handshake (upgrade request, validate 101, subscription)
-// 3. Signal ws_ready when handshake complete
-// 4. Consume MsgMetadata from MSG_METADATA ring via on_event()
-// 5. Parse WebSocket frames from MSG_INBOX data
-// 6. Handle control frames: PING -> PONGS + WSFrameInfo, CLOSE -> MSG_OUTBOX
-// 7. Publish WSFrameInfo for TEXT/BINARY to AppClient
-// 8. Track partial frames across SSL_read boundaries
-// 9. Publish WSFrameInfo immediately when header complete (partial frames)
+// 1. Consume MsgMetadata from MSG_METADATA ring via on_event()
+// 2. Dispatch on event_type and ws_phase (state machine)
+// 3. Parse WebSocket frames from MSG_INBOX data
+// 4. Handle control frames: PING -> PONGS + WSFrameInfo, CLOSE -> reconnect
+// 5. Publish WSFrameInfo for TEXT/BINARY to AppClient
+// 6. Track partial frames across SSL_read boundaries
 // ============================================================================
 
 // Maximum metadata entries to accumulate before forced commit
-// Value 64 is a practical optimization (reduced from 256):
-//   - Reduces cache footprint by 12 KB (MsgMetadata is 64 bytes each)
-//   - Still handles any realistic WebSocket frame (64 SSL_reads per frame is extreme)
-//   - Better cache locality = lower latency variance
 constexpr size_t MAX_ACCUMULATED_METADATA = 64;
 
-// Handshake timeout in milliseconds
+// Handshake timeout in milliseconds (for non-AutoReconnect blocking path)
 constexpr uint64_t HANDSHAKE_TIMEOUT_MS = 10000;
 
 // Partial HTTP response accumulation for handshake
@@ -360,12 +362,23 @@ struct PartialHttpResponse {
     }
 };
 
+// ============================================================================
+// WsConnPhase - Per-connection state for WebSocket process
+// ============================================================================
+
+enum class WsConnPhase : uint8_t {
+    ACTIVE = 0,          // Normal WS frame parsing
+    DISCONNECTED,        // Waiting for TLS_CONNECTED event from Transport
+    WS_UPGRADE_SENT,     // HTTP upgrade sent, accumulating 101 response
+};
+
 // Template parameters for each ring type used by WebSocketProcess
 template<typename MsgMetadataCons,     // IPCRingConsumer<MsgMetadata>
          typename WSFrameInfoProd,     // IPCRingProducer<WSFrameInfo>
          typename PongsProd,           // IPCRingProducer<PongFrameAligned>
          typename MsgOutboxProd,       // IPCRingProducer<MsgOutboxEvent>
          bool EnableAB = false,
+         bool AutoReconnect = false,
          bool Profiling = false>
 struct WebSocketProcess {
 public:
@@ -402,17 +415,31 @@ public:
             reset_accumulator(i);
             reset_fragment_state(i);
             has_pending_ping_[i] = false;
+
+            if constexpr (AutoReconnect) {
+                // AutoReconnect: start DISCONNECTED, wait for TLS_CONNECTED
+                ws_phase_[i] = WsConnPhase::DISCONNECTED;
+                http_response_[i].clear();
+            } else {
+                // Non-AutoReconnect: will be set ACTIVE after perform_handshake()
+                ws_phase_[i] = WsConnPhase::ACTIVE;
+            }
         }
 
-        printf("[WS-PROCESS] Initialized%s\n", EnableAB ? " (Dual A/B)" : "");
+        printf("[WS-PROCESS] Initialized%s%s\n",
+               EnableAB ? " (Dual A/B)" : "",
+               AutoReconnect ? " (AutoReconnect)" : "");
         return true;
     }
 
     // ========================================================================
-    // Phase 1: Handshake (blocking, before main loop)
+    // Phase 1: Blocking Handshake (non-AutoReconnect only)
     // ========================================================================
 
     bool perform_handshake() {
+        static_assert(!AutoReconnect,
+            "perform_handshake() should not be called with AutoReconnect");
+
         printf("[WS-PROCESS] Waiting for TLS ready...\n");
 
         // Step 1: Wait for tls_ready from Transport
@@ -434,7 +461,7 @@ public:
 
         // Connection A: HTTP upgrade + subscription
         send_http_upgrade_request(0);
-        if (!recv_http_upgrade_response(0)) {
+        if (!recv_http_upgrade_response_blocking(0)) {
             fprintf(stderr, "[WS-PROCESS] HTTP upgrade failed (conn A)\n");
             return false;
         }
@@ -444,7 +471,7 @@ public:
         if constexpr (EnableAB) {
             // Connection B: HTTP upgrade + subscription
             send_http_upgrade_request(1);
-            if (!recv_http_upgrade_response(1)) {
+            if (!recv_http_upgrade_response_blocking(1)) {
                 fprintf(stderr, "[WS-PROCESS] HTTP upgrade failed (conn B)\n");
                 return false;
             }
@@ -457,6 +484,11 @@ public:
         printf("[WS-PROCESS] Handshake complete%s, ws_ready signaled\n",
                EnableAB ? " (both A/B)" : "");
 
+        // All connections start ACTIVE
+        for (size_t i = 0; i < NUM_CONN; i++) {
+            ws_phase_[i] = WsConnPhase::ACTIVE;
+        }
+
         return true;
     }
 
@@ -465,7 +497,9 @@ public:
     // ========================================================================
 
     void run() {
-        printf("[WS-PROCESS] Running main loop%s\n", EnableAB ? " (Dual A/B)" : "");
+        printf("[WS-PROCESS] Running main loop%s%s\n",
+               EnableAB ? " (Dual A/B)" : "",
+               AutoReconnect ? " (AutoReconnect)" : "");
         conn_state_->set_ready(PROC_WEBSOCKET);
 
         while (conn_state_->is_running(PROC_WEBSOCKET)) {
@@ -474,8 +508,13 @@ public:
                 slot = profiling_data_->next_slot();
             }
 
+            // ── Consume metadata for ALL connections — ALWAYS ──
+            // Never let ring back up, even for DISCONNECTED connections.
+            // The on_event() dispatcher handles state-based routing.
+
             // Op 0: metadata consume + commit (connection A / single)
-            int32_t processed = profile_op<Profiling>([this]() -> int32_t {
+            int32_t processed = 0;
+            processed = profile_op<Profiling>([this]() -> int32_t {
                 [[maybe_unused]] bool first_meta = true;
                 size_t p = msg_metadata_cons_[0]->process_manually(
                     [this, &first_meta](MsgMetadata& meta, int64_t seq, bool end_of_batch) {
@@ -495,12 +534,13 @@ public:
                 return static_cast<int32_t>(p);
             }, slot, 0);
 
-            // Op 1: ping/pong for connection A (idle only)
+            // Op 1: ping/pong (idle only)
             bool idle = (processed == 0);
 
             if constexpr (EnableAB) {
                 // Op 2: metadata consume + commit (connection B)
-                int32_t processed_b = profile_op<Profiling>([this]() -> int32_t {
+                int32_t processed_b = 0;
+                processed_b = profile_op<Profiling>([this]() -> int32_t {
                     size_t p = msg_metadata_cons_[1]->process_manually(
                         [this](MsgMetadata& meta, int64_t seq, bool end_of_batch) {
                             on_event(1, meta, seq, end_of_batch);
@@ -525,7 +565,12 @@ public:
                         count++;
                     }
                 }
-                maybe_send_client_ping();
+                // Watchdog for all active connections
+                for (size_t ci = 0; ci < NUM_CONN; ci++) {
+                    if (ws_phase_[ci] == WsConnPhase::ACTIVE) {
+                        maybe_send_client_ping(static_cast<uint8_t>(ci));
+                    }
+                }
                 if (count > 0) last_op_cycle_ = rdtscp();
                 return count;
             }, slot, 1, idle);
@@ -554,9 +599,11 @@ public:
 
     // Combined init + handshake + run
     void run_with_handshake() {
-        if (!perform_handshake()) {
-            fprintf(stderr, "[WS-PROCESS] Handshake failed, exiting\n");
-            return;
+        if constexpr (!AutoReconnect) {
+            if (!perform_handshake()) {
+                fprintf(stderr, "[WS-PROCESS] Handshake failed, exiting\n");
+                return;
+            }
         }
         run();
     }
@@ -594,7 +641,11 @@ private:
         msg_outbox_prod_->publish(seq);
     }
 
-    bool recv_http_upgrade_response(uint8_t ci) {
+    /**
+     * Blocking HTTP upgrade response receive (non-AutoReconnect path only).
+     * Polls msg_metadata until HTTP 101 headers are complete.
+     */
+    bool recv_http_upgrade_response_blocking(uint8_t ci) {
         PartialHttpResponse response;
         response.clear();
 
@@ -622,13 +673,13 @@ private:
                     response.try_complete();
                 }
             } else {
-                // When EnableAB, also drain other connection's metadata during handshake
-                // to avoid ring buffer backup
+                // When EnableAB, drain other connection's metadata during the wait
+                // to avoid ring buffer backup (initial handshake phase only)
                 if constexpr (EnableAB) {
                     uint8_t other = ci ^ 1;
                     MsgMetadata other_meta;
                     while (msg_metadata_cons_[other]->try_consume(other_meta)) {
-                        // Drain but don't process (handshake phase)
+                        // Drain but don't process (initial handshake phase)
                     }
                 }
                 __builtin_ia32_pause();
@@ -684,6 +735,152 @@ private:
         (void)sequence;
         (void)end_of_batch;
 
+        auto event_type = static_cast<MetaEventType>(meta.event_type);
+
+        // ── Control events: TCP_DISCONNECTED and TLS_CONNECTED ──
+        if constexpr (AutoReconnect) {
+            if (event_type == MetaEventType::TCP_DISCONNECTED) {
+                on_tcp_disconnected(ci);
+                return;
+            }
+            if (event_type == MetaEventType::TLS_CONNECTED) {
+                on_tls_connected(ci);
+                return;
+            }
+        }
+
+        // ── DATA events ──
+
+        // DISCONNECTED: drain stale data (prevents ring backup)
+        if constexpr (AutoReconnect) {
+            if (ws_phase_[ci] == WsConnPhase::DISCONNECTED) {
+                return;
+            }
+        }
+
+        // WS_UPGRADE_SENT: accumulate HTTP response bytes
+        if constexpr (AutoReconnect) {
+            if (ws_phase_[ci] == WsConnPhase::WS_UPGRADE_SENT) {
+                on_http_response_data(ci, meta);
+                return;
+            }
+        }
+
+        // ACTIVE: normal WS frame parsing
+        on_ws_data(ci, meta);
+    }
+
+    // ========================================================================
+    // AutoReconnect State Machine Handlers
+    // ========================================================================
+
+    void on_tcp_disconnected(uint8_t ci) {
+        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+        fprintf(stderr, "[%ld.%06ld] [WS-RECONNECT] TCP_DISCONNECTED for conn %u\n",
+                _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+
+        ws_phase_[ci] = WsConnPhase::DISCONNECTED;
+
+        // Reset per-connection parse state
+        parse_state_[ci] = PerConnParseState{};
+        has_pending_frame_[ci] = false;
+        pending_frame_[ci].clear();
+        has_pending_ping_[ci] = false;
+        reset_accumulator(ci);
+        reset_fragment_state(ci);
+        http_response_[ci].clear();
+
+        // Reset watchdog for this connection
+        reset_watchdog_state(ci);
+    }
+
+    void on_tls_connected(uint8_t ci) {
+        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+        fprintf(stderr, "[%ld.%06ld] [WS-RECONNECT] TLS_CONNECTED for conn %u, sending HTTP upgrade\n",
+                _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+
+        // Send HTTP upgrade request via MSG_OUTBOX
+        send_http_upgrade_request(ci);
+        ws_phase_[ci] = WsConnPhase::WS_UPGRADE_SENT;
+        http_response_[ci].clear();
+    }
+
+    void on_http_response_data(uint8_t ci, MsgMetadata& meta) {
+        if (meta.decrypted_len == 0) return;
+
+        auto& resp = http_response_[ci];
+        const uint8_t* data = msg_inbox_[ci]->data_at(meta.msg_inbox_offset);
+        size_t to_copy = std::min(static_cast<size_t>(meta.decrypted_len),
+                                  sizeof(resp.buffer) - resp.accumulated);
+        std::memcpy(resp.buffer + resp.accumulated, data, to_copy);
+        resp.accumulated += to_copy;
+
+        if (!resp.try_complete()) {
+            return;  // Need more data
+        }
+
+        // HTTP headers complete — validate 101
+        bool upgrade_ok = websocket::http::validate_http_upgrade_response(
+            resp.buffer, resp.accumulated);
+
+        if (!upgrade_ok) {
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            fprintf(stderr, "[%ld.%06ld] [WS-RECONNECT] HTTP upgrade failed for conn %u, requesting reconnect\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+            // Request full reconnect cycle
+            ws_phase_[ci] = WsConnPhase::DISCONNECTED;
+            conn_state_->set_reconnect_request(ci);
+            return;
+        }
+
+        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+        fprintf(stderr, "[%ld.%06ld] [WS-RECONNECT] HTTP 101 received for conn %u, sending subscription\n",
+                _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+
+        // Send subscription message
+        send_subscription_message(ci);
+
+        // Signal Transport to switch to direct AES-CTR decrypt
+        conn_state_->set_ws_handshake_done(ci);
+
+        // Transition to ACTIVE
+        ws_phase_[ci] = WsConnPhase::ACTIVE;
+
+        // Reset parse state for clean start
+        parse_state_[ci] = PerConnParseState{};
+        has_pending_frame_[ci] = false;
+        pending_frame_[ci].clear();
+
+        // Reset + resume watchdog for this connection
+        reset_watchdog_state(ci);
+
+        // Signal ws_ready on first successful handshake (for startup)
+        if (!ws_ready_signaled_) {
+            // Check if all connections are ACTIVE before signaling
+            bool all_active = true;
+            for (size_t i = 0; i < NUM_CONN; i++) {
+                if (ws_phase_[i] != WsConnPhase::ACTIVE) {
+                    all_active = false;
+                    break;
+                }
+            }
+            if (all_active) {
+                conn_state_->set_handshake_ws_ready();
+                ws_ready_signaled_ = true;
+                fprintf(stderr, "[%ld.%06ld] [WS-RECONNECT] All connections ACTIVE, ws_ready signaled\n",
+                        _ts.tv_sec, _ts.tv_nsec / 1000);
+            }
+        }
+
+        fprintf(stderr, "[%ld.%06ld] [WS-RECONNECT] Connection %u fully restored\n",
+                _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+    }
+
+    // ========================================================================
+    // Normal WS Frame Parsing (ws_phase == ACTIVE)
+    // ========================================================================
+
+    void on_ws_data(uint8_t ci, MsgMetadata& meta) {
         auto& ps = parse_state_[ci];
         auto* inbox = msg_inbox_[ci];
 
@@ -939,6 +1136,14 @@ private:
     void flush_pending_pong(uint8_t ci) {
         if (!has_pending_ping_[ci]) return;
 
+        // Skip PONGs for connections that are not ACTIVE
+        if constexpr (AutoReconnect) {
+            if (ws_phase_[ci] != WsConnPhase::ACTIVE) {
+                has_pending_ping_[ci] = false;  // Discard — connection is dead
+                return;
+            }
+        }
+
         int64_t pong_seq = pongs_prod_->try_claim();
         if (pong_seq < 0) {
             fprintf(stderr, "[WS-PROCESS] FATAL: PONGS full\n");
@@ -989,34 +1194,33 @@ private:
                     _ts.tv_sec, _ts.tv_nsec / 1000, ci, (unsigned long)payload_len, payload_str);
         }
 
-        // Server PING interval learning (use conn 0 for watchdog)
-        if (ci == 0) {
+        // Server PING interval learning (per-connection)
+        {
+            auto& w = wd_[ci];
             uint64_t now_cycle = rdtscp();
-            last_server_ping_cycle_ = now_cycle;
+            w.last_server_ping_cycle = now_cycle;
 
-            uint32_t idx = server_ping_count_;
-            if (idx < PING_LEARN_SAMPLES) {
-                server_ping_cycles_[idx] = now_cycle;
+            uint32_t idx = w.server_ping_count;
+            if (idx < WatchdogState::PING_LEARN_SAMPLES) {
+                w.server_ping_cycles[idx] = now_cycle;
             }
-            server_ping_count_++;
+            w.server_ping_count++;
 
-            if (server_ping_count_ >= 2) {
-                server_ping_missing_ = false;
-
-                uint32_t n = std::min(server_ping_count_, PING_LEARN_SAMPLES);
-                uint64_t total_delta = server_ping_cycles_[n - 1] - server_ping_cycles_[0];
+            if (w.server_ping_count >= 2) {
+                uint32_t n = std::min(w.server_ping_count, WatchdogState::PING_LEARN_SAMPLES);
+                uint64_t total_delta = w.server_ping_cycles[n - 1] - w.server_ping_cycles[0];
                 uint64_t avg_delta = total_delta / (n - 1);
-                learned_interval_cycles_ = avg_delta;
+                w.learned_interval_cycles = avg_delta;
 
                 uint64_t tsc_freq = conn_state_->tsc_freq_hz;
                 uint64_t avg_ms = (avg_delta * 1000ULL) / tsc_freq;
-                learned_interval_ms_ = ((avg_ms + 50) / 100) * 100;
+                w.learned_interval_ms = ((avg_ms + 50) / 100) * 100;
 
-                if (server_ping_count_ <= PING_LEARN_SAMPLES) {
-                    fprintf(stderr, "[WS-WATCHDOG] Server PING interval: %lums "
+                if (w.server_ping_count <= WatchdogState::PING_LEARN_SAMPLES) {
+                    fprintf(stderr, "[WS-WATCHDOG] Server PING interval (conn %u): %lums "
                             "(avg %lums, %u/%u samples)\n",
-                            (unsigned long)learned_interval_ms_,
-                            (unsigned long)avg_ms, n, PING_LEARN_SAMPLES);
+                            ci, (unsigned long)w.learned_interval_ms,
+                            (unsigned long)avg_ms, n, WatchdogState::PING_LEARN_SAMPLES);
                 }
             }
         }
@@ -1078,18 +1282,22 @@ private:
             close_reason[reason_len] = '\0';
         }
 
-        conn_state_->set_disconnect(DisconnectReason::WS_CLOSE, close_code, close_reason);
-        conn_state_->shutdown_all();
+        if constexpr (AutoReconnect) {
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            fprintf(stderr, "[%ld.%06ld] [WS-CLOSE] Received CLOSE (conn %u, code=%u, reason=%s) — requesting reconnect\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci, close_code, close_reason);
+            conn_state_->set_reconnect_request(ci);
+        } else {
+            conn_state_->set_disconnect(DisconnectReason::WS_CLOSE, close_code, close_reason);
+            conn_state_->shutdown_all();
+        }
     }
 
     void handle_pong(uint8_t ci, uint64_t payload_len) {
         auto& ps = parse_state_[ci];
 
-        // Watchdog state from conn 0 only
-        if (ci == 0) {
-            last_ping_got_pong_ = true;
-            server_pong_missing_ = false;
-        }
+        // Per-connection watchdog state update
+        wd_[ci].last_pong_recv_cycle = rdtscp();
 
         struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
         char payload_str[128] = {0};
@@ -1117,92 +1325,73 @@ private:
         }
     }
 
-    void maybe_send_client_ping() {
+    void maybe_send_client_ping(uint8_t ci) {
+        auto& w = wd_[ci];
         uint64_t now_cycle = rdtscp();
         uint64_t tsc_freq = conn_state_->tsc_freq_hz;
 
-        // First call: initialize and skip (don't PING during handshake warmup)
-        if (last_client_ping_cycle_ == 0) {
-            last_client_ping_cycle_ = now_cycle;
+        // First call: init baseline and skip (handshake warmup)
+        if (w.last_client_ping_cycle == 0) {
+            w.last_client_ping_cycle = now_cycle;
+            w.last_pong_recv_cycle = now_cycle;  // Start timer from now
             return;
         }
 
         // Rate limit: 1 PING per second
-        uint64_t elapsed_cycles = now_cycle - last_client_ping_cycle_;
-        if (elapsed_cycles < tsc_freq) return;  // < 1 second
+        if ((now_cycle - w.last_client_ping_cycle) < tsc_freq) return;
 
-        // Score the previous PING
-        if (last_ping_got_pong_) {
-            consecutive_unanswered_ = 0;
-        } else {
-            consecutive_unanswered_++;
+        // ── Compute effective timeout (cycles) ──
+        bool interval_learned = (w.server_ping_count >= 2 && w.learned_interval_cycles > 0);
+        uint64_t pong_timeout_cycles = interval_learned
+            ? w.learned_interval_cycles
+            : (DEFAULT_PONG_TIMEOUT_MS * tsc_freq) / 1000;
+
+        // ── PONG timeout (time-based) ──
+        uint64_t since_last_pong = now_cycle - w.last_pong_recv_cycle;
+        bool server_pong_missing = (since_last_pong > pong_timeout_cycles);
+
+        // ── Server PING timeout (1.5x interval) ──
+        bool server_ping_missing = false;
+        if (interval_learned && w.last_server_ping_cycle > 0) {
+            uint64_t since_last_ping = now_cycle - w.last_server_ping_cycle;
+            uint64_t threshold = w.learned_interval_cycles + (w.learned_interval_cycles / 2);
+            server_ping_missing = (since_last_ping > threshold);
         }
 
-        // Update PONG watchdog: 3 consecutive unanswered -> server_pong_missing
-        server_pong_missing_ = (consecutive_unanswered_ >= 3);
+        // ── Reconnect decision ──
+        bool should_reconnect = interval_learned
+            ? (server_pong_missing && server_ping_missing)   // Post-learning: dual condition
+            : server_pong_missing;                            // Pre-learning: PONG timeout only
 
-        // Server PING watchdog: check if server stopped sending PINGs
-        if (learned_interval_cycles_ > 0 && last_server_ping_cycle_ > 0) {
-            uint64_t since_last = now_cycle - last_server_ping_cycle_;
-            if (since_last > 2 * learned_interval_cycles_) {
-                server_ping_missing_ = true;
-            }
-        }
-
-        // Dual-condition abort
-        if (server_ping_missing_ && server_pong_missing_) {
-            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
-            uint64_t ping_gap_ms = (last_server_ping_cycle_ > 0)
-                ? ((now_cycle - last_server_ping_cycle_) * 1000ULL) / tsc_freq : 0;
-            fprintf(stderr,
-                    "[%ld.%06ld] [WS-WATCHDOG] FATAL: connection dead\n"
-                    "  server PING missing: last %lums ago (threshold %lums)\n"
-                    "  server PONG missing: %u consecutive client PINGs unanswered\n",
-                    _ts.tv_sec, _ts.tv_nsec / 1000,
-                    (unsigned long)ping_gap_ms,
-                    (unsigned long)(learned_interval_ms_ * 2),
-                    consecutive_unanswered_);
-            conn_state_->set_disconnect(DisconnectReason::WS_PONG_TIMEOUT);
-            conn_state_->shutdown_all();
+        if (should_reconnect) {
+            trigger_watchdog_reconnect(ci, now_cycle, tsc_freq);
             return;
         }
 
-        // Build payload: current system_clock -> Unix-ms -> ASCII string
+        // ── Send client PING ──
         auto now = std::chrono::system_clock::now();
         int64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now.time_since_epoch()).count();
-
         char payload_ascii[16];
         int payload_len = snprintf(payload_ascii, sizeof(payload_ascii), "%ld", unix_ms);
 
-        // Build PING frame into PongFrameAligned (reuse same ring for control frames)
         int64_t seq = pongs_prod_->try_claim();
-        if (seq < 0) {
-            // Ring full — skip this PING, will retry next second
-            return;
-        }
+        if (seq < 0) return;  // Ring full, retry next second
 
         auto& frame = (*pongs_prod_)[seq];
         frame.clear();
-
         uint8_t mask_key[4] = {0x12, 0x34, 0x56, 0x78};
         frame.data_len = static_cast<uint8_t>(websocket::http::build_ping_frame(
             reinterpret_cast<const uint8_t*>(payload_ascii),
-            static_cast<size_t>(payload_len),
-            frame.data, mask_key));
-        frame.connection_id = 0;  // Client PINGs always on conn 0
-
+            static_cast<size_t>(payload_len), frame.data, mask_key));
+        frame.connection_id = ci;
         pongs_prod_->publish(seq);
 
-        {
-            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
-            fprintf(stderr, "[%ld.%06ld] [WS-CLIENT-PING] Sent PING payload=\"%s\"\n",
-                    _ts.tv_sec, _ts.tv_nsec / 1000, payload_ascii);
-        }
+        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+        fprintf(stderr, "[%ld.%06ld] [WS-CLIENT-PING] Sent PING (conn %u) payload=\"%s\"\n",
+                _ts.tv_sec, _ts.tv_nsec / 1000, ci, payload_ascii);
 
-        // Update state
-        last_client_ping_cycle_ = now_cycle;
-        last_ping_got_pong_ = false;
+        w.last_client_ping_cycle = now_cycle;
     }
 
     void publish_frame_info(uint8_t ci, uint8_t opcode, uint64_t payload_len,
@@ -1240,6 +1429,45 @@ private:
         ws_frame_info_prod_->publish(seq);
 
         reset_accumulator(ci);
+    }
+
+    // ========================================================================
+    // Watchdog Helpers
+    // ========================================================================
+
+    void trigger_watchdog_reconnect(uint8_t ci, uint64_t now_cycle, uint64_t tsc_freq) {
+        auto& w = wd_[ci];
+        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+        uint64_t pong_gap_ms = ((now_cycle - w.last_pong_recv_cycle) * 1000ULL) / tsc_freq;
+        uint64_t ping_gap_ms = (w.last_server_ping_cycle > 0)
+            ? ((now_cycle - w.last_server_ping_cycle) * 1000ULL) / tsc_freq : 0;
+        bool interval_learned = (w.server_ping_count >= 2 && w.learned_interval_cycles > 0);
+
+        fprintf(stderr, "[%ld.%06ld] [WS-WATCHDOG] %s: conn %u dead\n"
+                "  PONG missing: last %lums ago (threshold %lums)\n"
+                "  server PING missing: last %lums ago (threshold %lums)\n",
+                _ts.tv_sec, _ts.tv_nsec / 1000,
+                AutoReconnect ? "RECONNECT" : "FATAL", ci,
+                (unsigned long)pong_gap_ms,
+                (unsigned long)(interval_learned ? w.learned_interval_ms : DEFAULT_PONG_TIMEOUT_MS),
+                (unsigned long)ping_gap_ms,
+                (unsigned long)(interval_learned ? (w.learned_interval_ms * 3 / 2) : 0));
+
+        if constexpr (AutoReconnect) {
+            conn_state_->set_reconnect_request(ci);
+            // Soft reset: preserve learned_interval, reset baselines
+            w.server_ping_count = 0;
+            w.last_server_ping_cycle = now_cycle;
+            w.last_client_ping_cycle = 0;   // Skip first PING (warmup)
+            w.last_pong_recv_cycle = now_cycle;
+        } else {
+            conn_state_->set_disconnect(DisconnectReason::WS_PONG_TIMEOUT);
+            conn_state_->shutdown_all();
+        }
+    }
+
+    void reset_watchdog_state(uint8_t ci) {
+        wd_[ci] = WatchdogState{};
     }
 
     // ========================================================================
@@ -1353,11 +1581,18 @@ private:
     PendingPing pending_ping_[NUM_CONN]{};
     bool has_pending_ping_[NUM_CONN]{};
 
+    // Per-connection WS state machine (AutoReconnect)
+    WsConnPhase ws_phase_[NUM_CONN]{};
+    PartialHttpResponse http_response_[NUM_CONN]{};
+
     // Shared ring buffer interfaces
     WSFrameInfoProd* ws_frame_info_prod_ = nullptr;
     PongsProd* pongs_prod_ = nullptr;
     MsgOutboxProd* msg_outbox_prod_ = nullptr;
     ConnStateShm* conn_state_ = nullptr;
+
+    // AutoReconnect startup signal
+    bool ws_ready_signaled_ = false;
 
     // Profiling (compile-time gated via Profiling template param)
     CycleSampleBuffer* profiling_data_ = nullptr;
@@ -1367,22 +1602,22 @@ public:
     void set_profiling_data(CycleSampleBuffer* data) { profiling_data_ = data; }
 private:
 
-    // Client-initiated PING state (conn 0 only for watchdog)
-    uint64_t last_client_ping_cycle_ = 0;   // TSC of last client PING sent
-    bool     last_ping_got_pong_ = true;     // did the most recent PING get a PONG?
-    uint32_t consecutive_unanswered_ = 0;    // consecutive PINGs with no PONG
+    // Per-connection watchdog state
+    struct WatchdogState {
+        uint64_t last_client_ping_cycle = 0;   // TSC of last client PING sent
+        uint64_t last_pong_recv_cycle = 0;     // TSC of last PONG received
 
-    // Server PING interval learning (progressive: usable after 2 samples, final at 5)
-    static constexpr uint32_t PING_LEARN_SAMPLES = 5;
-    uint64_t server_ping_cycles_[PING_LEARN_SAMPLES]; // TSC of each server PING
-    uint32_t server_ping_count_ = 0;                  // How many server PINGs received
-    uint64_t learned_interval_cycles_ = 0;            // Current average interval
-    uint64_t learned_interval_ms_ = 0;                // Rounded to 100ms, for display
+        static constexpr uint32_t PING_LEARN_SAMPLES = 5;
+        uint64_t server_ping_cycles[PING_LEARN_SAMPLES]{};
+        uint32_t server_ping_count = 0;
+        uint64_t learned_interval_cycles = 0;
+        uint64_t learned_interval_ms = 0;
 
-    // Watchdog flags (conn 0 only)
-    uint64_t last_server_ping_cycle_ = 0;
-    bool     server_ping_missing_ = true;   // Start true — no server PING seen yet
-    bool     server_pong_missing_ = false;  // Becomes true after 3 consecutive unanswered client PINGs
+        uint64_t last_server_ping_cycle = 0;
+    };
+    WatchdogState wd_[NUM_CONN]{};
+
+    static constexpr uint64_t DEFAULT_PONG_TIMEOUT_MS = 5000;  // 5s pre-learning default
 };
 
 }  // namespace websocket::pipeline

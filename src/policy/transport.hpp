@@ -1019,6 +1019,46 @@ struct PacketTransport {
     }
 
     // ========================================================================
+    // Reconnect Support (AutoReconnect feature)
+    // ========================================================================
+
+    /**
+     * Reset transport state for reconnection. Distinct from close():
+     * - Does NOT send FIN
+     * - Does NOT close PIO
+     * - Resets TCP state, retransmit queue, recv buffer, TLS decrypt state
+     */
+    void reset_for_reconnect() {
+        state_ = userspace_stack::TCPState::CLOSED;
+        connected_ = false;
+        // Release all retransmit queue frames back to TX pool
+        retransmit_queue_.drain_all([this](uint32_t frame_idx) {
+            pio().mark_frame_acked(frame_idx);
+        });
+        recv_buffer_.clear();
+        // Reset TLS direct-decrypt state
+        tls_keys_valid_ = false;
+        tls_parser_ = TLSRecordParser{};
+        tls_seq_num_ = 0;
+        // Reset stats
+        reset_recv_stats();
+        reset_hw_timestamps();
+        // Clear reconnect flag
+        reconnect_needed_ = false;
+    }
+
+    /**
+     * Check if transport layer detected a connection failure (RST/FIN/retransmit failure).
+     * TransportProcess polls this when AutoReconnect is enabled.
+     */
+    bool needs_reconnect() const { return reconnect_needed_; }
+
+    /**
+     * Clear the reconnect flag after TransportProcess has initiated reconnection.
+     */
+    void clear_reconnect_flag() { reconnect_needed_ = false; }
+
+    // ========================================================================
     // Close
     // ========================================================================
 
@@ -1116,13 +1156,12 @@ struct PacketTransport {
                     dbg_rx_syn_ack_++;
                 } else if (parsed.flags & userspace_stack::TCP_FLAG_FIN) {
                     dbg_rx_fin_++;
+                    reconnect_needed_ = true;
                     { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
                       fprintf(stderr, "[%ld.%06ld] [TCP-FIN] Connection closed by peer (graceful)\n",
                               _ts.tv_sec, _ts.tv_nsec / 1000); }
-                    if (conn_state_ptr_) {
-                        auto* cs = static_cast<websocket::pipeline::ConnStateShm*>(conn_state_ptr_);
-                        cs->set_disconnect(websocket::pipeline::DisconnectReason::TCP_FIN);
-                    }
+                    // Don't call set_disconnect() here — let TransportProcess decide
+                    // based on AutoReconnect. It will check needs_reconnect().
                 } else if (parsed.payload_len > 0) {
                     dbg_rx_ooo_data_++;
                 }
@@ -1155,14 +1194,12 @@ struct PacketTransport {
 
             case userspace_stack::TCPAction::CLOSED:
                 connected_ = false;
+                reconnect_needed_ = true;
                 { struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
                   fprintf(stderr, "[%ld.%06ld] [TCP-RST] Connection reset by peer\n",
                           _ts.tv_sec, _ts.tv_nsec / 1000); }
-                if (conn_state_ptr_) {
-                    auto* cs = static_cast<websocket::pipeline::ConnStateShm*>(conn_state_ptr_);
-                    cs->set_disconnect(websocket::pipeline::DisconnectReason::TCP_RST);
-                    cs->shutdown_all();
-                }
+                // Don't call shutdown_all() here — let TransportProcess decide
+                // based on AutoReconnect. It will check needs_reconnect().
                 break;
 
             default:
@@ -1288,6 +1325,58 @@ struct PacketTransport {
         connected_ = true;
     }
 
+    /**
+     * Non-blocking reconnect: reuse cached remote IP, generate new port+ISN, send SYN.
+     * Does NOT do DNS resolution (uses tcp_params_.remote_ip from previous connection).
+     * Use after reset_for_reconnect() has been called.
+     *
+     * @return 0 on success, -1 on failure
+     */
+    int initiate_reconnect() {
+        if (connected_) {
+            fprintf(stderr, "[PacketTransport] initiate_reconnect: still connected\n");
+            return -1;
+        }
+
+        // Reuse existing remote_ip and remote_port from tcp_params_
+        tcp_params_.local_port = userspace_stack::UserspaceStack::generate_port();
+        tcp_params_.snd_una = tcp_params_.snd_nxt = userspace_stack::UserspaceStack::generate_isn();
+        tcp_params_.rcv_nxt = 0;
+        tcp_params_.snd_wnd = userspace_stack::TCP_MAX_WINDOW;
+        tcp_params_.rcv_wnd = userspace_stack::TCP_MAX_WINDOW;
+
+        if (tsc_freq_hz_ == 0) {
+            tsc_freq_hz_ = calibrate_tsc_freq();
+        }
+        retransmit_queue_.init(tsc_freq_hz_, timers_.rto);
+
+        // Send SYN
+        uint32_t syn_frame_idx;
+        size_t syn_len = 0;
+        uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+            syn_frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
+            uint8_t* syn_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
+            syn_len = stack_.build_syn(syn_buffer, pio().frame_capacity(), tcp_params_);
+            desc.frame_len = static_cast<uint16_t>(syn_len);
+        });
+
+        if (claimed == 0 || syn_len == 0) {
+            fprintf(stderr, "[PacketTransport] Failed to allocate TX frame for SYN (reconnect)\n");
+            return -1;
+        }
+
+        pio().commit_tx_frames(syn_frame_idx, syn_frame_idx);
+        state_ = userspace_stack::TCPState::SYN_SENT;
+
+        retransmit_queue_.add_ref(tcp_params_.snd_nxt, userspace_stack::TCP_FLAG_SYN,
+                                  syn_frame_idx, static_cast<uint16_t>(syn_len), 0);
+        tcp_params_.snd_nxt++;
+
+        fprintf(stderr, "[PacketTransport] SYN sent for reconnect (local_port=%u)\n",
+                tcp_params_.local_port);
+        return 0;
+    }
+
     // ========================================================================
     // Retransmit Handling (public for PacketTransportAB)
     // ========================================================================
@@ -1314,6 +1403,7 @@ struct PacketTransport {
                     ts_fatal.tv_sec, ts_fatal.tv_nsec / 1000);
             state_ = userspace_stack::TCPState::CLOSED;
             connected_ = false;
+            reconnect_needed_ = true;
         }
     }
 
@@ -1725,7 +1815,7 @@ private:
         });
 
         if (frame_idx == 0) {
-            fprintf(stderr, "[TRANSPORT] WARNING: Failed to send ACK (ACK_OUTBOX full?)\n");
+            fprintf(stderr, "[TRANSPORT] WARNING: Failed to send ACK (TX frame pool full)\n");
         }
     }
 
@@ -1824,6 +1914,7 @@ private:
     userspace_stack::ZeroCopyReceiveBuffer recv_buffer_;
 
     bool connected_;
+    bool reconnect_needed_ = false;  // Set by RST/FIN/retransmit failure, checked by TransportProcess
 
     uint64_t oldest_rx_hw_timestamp_ns_;
     uint64_t latest_rx_hw_timestamp_ns_;

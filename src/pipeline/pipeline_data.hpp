@@ -48,6 +48,17 @@ enum class DisconnectReason : uint8_t {
 };
 
 // ============================================================================
+// MetaEventType - Event types on MSG_METADATA ring
+// Transport notifies WS of TCP-level state changes via these events
+// ============================================================================
+
+enum class MetaEventType : uint8_t {
+    DATA = 0,               // Normal SSL-decrypted data (existing behavior)
+    TCP_DISCONNECTED = 1,   // Connection ci died (RST/FIN/retransmit failure)
+    TLS_CONNECTED = 2,      // TLS handshake complete, WS can start HTTP upgrade
+};
+
+// ============================================================================
 // UMEMFrameDescriptor - Type alias for PacketFrameDescriptor
 // Used in RAW_INBOX/OUTBOX rings. Size: 64 bytes (1 per cache line)
 // ============================================================================
@@ -92,7 +103,7 @@ struct alignas(128) MsgMetadata {
 
     bool tls_record_end;                   // true if ssl_read ended at TLS record boundary
 
-    uint8_t _pad1[1];                      // Padding for alignment
+    uint8_t event_type;                     // MetaEventType (0=DATA, 1=TCP_DISCONNECTED, 2=TLS_CONNECTED)
     uint16_t first_pkt_mem_idx;            // UMEM frame index of first packet
     uint16_t last_pkt_mem_idx;             // UMEM frame index of last packet
     uint8_t _pad[26];                      // Padding to 128 bytes
@@ -112,6 +123,7 @@ struct alignas(128) MsgMetadata {
         nic_packet_ct = 0;
         ssl_last_op_cycle = 0;
         tls_record_end = false;
+        event_type = 0;
         first_pkt_mem_idx = 0;
         last_pkt_mem_idx = 0;
     }
@@ -535,6 +547,17 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
     } disconnect;
 
     // ========================================================================
+    // Cache Line: Per-connection reconnect signaling (AutoReconnect feature)
+    // WS → Transport: reconnect_request[ci]  (please reconnect connection ci)
+    // WS → Transport: ws_handshake_done[ci]   (switch to direct decrypt)
+    // ========================================================================
+    alignas(CACHE_LINE_SIZE) struct {
+        std::atomic<bool> reconnect_request[2];   // WS → Transport: "please reconnect ci"
+        std::atomic<bool> ws_handshake_done[2];   // WS → Transport: "switch to direct decrypt"
+        uint8_t _pad[60];
+    } conn_reconnect;
+
+    // ========================================================================
     // Cache Line 6: Target URL + TSC frequency (set once, read-only after init)
     // ========================================================================
     alignas(CACHE_LINE_SIZE) char target_host[64];  // e.g., "stream.binance.com"
@@ -734,6 +757,32 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         return true;
     }
 
+    // ========================================================================
+    // Per-Connection Reconnect Signaling (AutoReconnect feature)
+    // ========================================================================
+
+    // WS → Transport: request reconnection of connection ci
+    bool get_reconnect_request(uint8_t ci) const {
+        return conn_reconnect.reconnect_request[ci].load(std::memory_order_acquire);
+    }
+    void set_reconnect_request(uint8_t ci) {
+        conn_reconnect.reconnect_request[ci].store(true, std::memory_order_release);
+    }
+    void clear_reconnect_request(uint8_t ci) {
+        conn_reconnect.reconnect_request[ci].store(false, std::memory_order_release);
+    }
+
+    // WS → Transport: WS handshake done, switch to direct decrypt
+    bool get_ws_handshake_done(uint8_t ci) const {
+        return conn_reconnect.ws_handshake_done[ci].load(std::memory_order_acquire);
+    }
+    void set_ws_handshake_done(uint8_t ci) {
+        conn_reconnect.ws_handshake_done[ci].store(true, std::memory_order_release);
+    }
+    void clear_ws_handshake_done(uint8_t ci) {
+        conn_reconnect.ws_handshake_done[ci].store(false, std::memory_order_release);
+    }
+
     void init() {
         // Initialize running flags
         for (int i = 0; i < PROC_COUNT; ++i) {
@@ -755,6 +804,12 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         disconnect.reason.store(static_cast<uint8_t>(DisconnectReason::NONE), std::memory_order_relaxed);
         disconnect.ws_close_code = 0;
         std::memset(disconnect.detail, 0, sizeof(disconnect.detail));
+
+        // Per-connection reconnect signaling
+        conn_reconnect.reconnect_request[0].store(false, std::memory_order_relaxed);
+        conn_reconnect.reconnect_request[1].store(false, std::memory_order_relaxed);
+        conn_reconnect.ws_handshake_done[0].store(false, std::memory_order_relaxed);
+        conn_reconnect.ws_handshake_done[1].store(false, std::memory_order_relaxed);
 
         // Target URL (set by handshake manager)
         std::memset(target_host, 0, sizeof(target_host));

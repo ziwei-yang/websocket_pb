@@ -575,11 +575,11 @@ struct TCPPacket {
         size_t actual_data_available = (frame_len > actual_data_offset) ?
                                         (frame_len - actual_data_offset) : 0;
         if (orig_tcp_data_len > actual_data_available) {
-            fprintf(stderr, "[TCP] FATAL: frame truncated - IP header declares %zu bytes payload "
-                    "but frame only has %zu bytes (frame_len=%u, ip_total=%u, UMEM frame_size too small?)\n",
+            fprintf(stderr, "[TCP] WARNING: frame truncated - IP header declares %zu bytes payload "
+                    "but frame only has %zu bytes (frame_len=%u, ip_total=%u) — dropping\n",
                     orig_tcp_data_len, actual_data_available,
                     static_cast<unsigned>(frame_len), ip_total_len);
-            abort();
+            return result;  // Drop truncated frame (BPF should have caught this)
         }
         size_t tcp_data_len = orig_tcp_data_len;
 

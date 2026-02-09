@@ -47,28 +47,11 @@ inline constexpr uint32_t FRAME_SIZE = calculate_frame_size(NIC_MTU);
 // UMEM Configuration
 // ============================================================================
 
-inline constexpr size_t TOTAL_UMEM_FRAMES = 65536;  // 16x larger for high throughput
-
-// UMEM partition fractions (1/2 + 1/8 + 1/8 + 1/4 = 1)
-inline constexpr size_t RX_FRAMES   = TOTAL_UMEM_FRAMES / 2;      // 32768 - incoming packets
-inline constexpr size_t ACK_FRAMES  = TOTAL_UMEM_FRAMES / 8;      // 8192  - TCP ACKs
-inline constexpr size_t PONG_FRAMES = TOTAL_UMEM_FRAMES / 8;      // 8192  - encrypted WS PONGs
-inline constexpr size_t MSG_FRAMES  = TOTAL_UMEM_FRAMES / 4;      // 16384 - WS messages
-
-// Pool start indices
-inline constexpr size_t RX_POOL_START   = 0;
-inline constexpr size_t ACK_POOL_START  = RX_FRAMES;
-inline constexpr size_t PONG_POOL_START = RX_FRAMES + ACK_FRAMES;
-inline constexpr size_t MSG_POOL_START  = RX_FRAMES + ACK_FRAMES + PONG_FRAMES;
-
-// Pool end indices (exclusive)
-inline constexpr size_t RX_POOL_END   = ACK_POOL_START;
-inline constexpr size_t ACK_POOL_END  = PONG_POOL_START;
-inline constexpr size_t PONG_POOL_END = MSG_POOL_START;
-inline constexpr size_t MSG_POOL_END  = TOTAL_UMEM_FRAMES;
-
-// TX pool combined size (for ACK tracking)
-inline constexpr size_t TX_POOL_SIZE = ACK_FRAMES + PONG_FRAMES + MSG_FRAMES;
+// UMEM layout: [RX_FRAMES | TX_POOL_SIZE]
+// TX pool is unified — no sub-pool distinction (ACKs, PONGs, MSGs all share one FIFO)
+inline constexpr size_t RX_FRAMES   = 2048;
+inline constexpr size_t TX_POOL_SIZE = 2048;
+inline constexpr size_t TOTAL_UMEM_FRAMES = RX_FRAMES + TX_POOL_SIZE;  // 4096
 
 // TX throttle: max MSG packets in flight before blocking RAW_OUTBOX
 // This implements congestion control at XDP level to prevent overwhelming
@@ -93,8 +76,8 @@ inline constexpr size_t UMEM_TOTAL_SIZE = ((UMEM_TOTAL_SIZE_RAW + PAGE_SIZE - 1)
 // Ring Buffer Sizes (power of 2)
 // ============================================================================
 
-inline constexpr size_t RAW_INBOX_SIZE      = 32768;  // 16x larger
-inline constexpr size_t RAW_OUTBOX_SIZE     = 32768;  // 16x larger (match RAW_INBOX)
+inline constexpr size_t RAW_INBOX_SIZE      = 4096;
+inline constexpr size_t RAW_OUTBOX_SIZE     = 4096;
 inline constexpr size_t ACK_OUTBOX_SIZE     = 8192;   // 16x larger
 inline constexpr size_t PONG_OUTBOX_SIZE    = 1024;   // 16x larger
 inline constexpr size_t MSG_METADATA_SIZE   = 65536;  // 16x larger
@@ -145,8 +128,8 @@ inline constexpr uint32_t COMP_BATCH = 32;
 inline constexpr uint32_t XDP_FRAME_HEADROOM = XDP_HEADROOM;
 
 // XSK ring sizes (must match fill/comp sizes for optimal throughput)
-inline constexpr uint32_t XDP_RX_RING_SIZE = RX_FRAMES;       // 32768
-inline constexpr uint32_t XDP_TX_RING_SIZE = TX_POOL_SIZE;     // 32768
+inline constexpr uint32_t XDP_RX_RING_SIZE = RX_FRAMES;       // 2048
+inline constexpr uint32_t XDP_TX_RING_SIZE = TX_POOL_SIZE;     // 2048
 
 // Batch size for XDP RX/TX/COMP operations
 inline constexpr uint32_t XDP_BATCH_SIZE = 64;
@@ -237,7 +220,7 @@ namespace shm_paths {
 static_assert(FRAME_SIZE >= NIC_MTU + 94, "FRAME_SIZE must fit NIC_MTU + headers");
 static_assert((FRAME_SIZE & (FRAME_SIZE - 1)) == 0 || FRAME_SIZE % 1024 == 0,
               "FRAME_SIZE should be power of 2 or 1KB aligned");
-static_assert(RX_FRAMES + ACK_FRAMES + PONG_FRAMES + MSG_FRAMES == TOTAL_UMEM_FRAMES,
+static_assert(RX_FRAMES + TX_POOL_SIZE == TOTAL_UMEM_FRAMES,
               "UMEM partition must equal total frames");
 static_assert((RAW_INBOX_SIZE & (RAW_INBOX_SIZE - 1)) == 0, "RAW_INBOX_SIZE must be power of 2");
 static_assert((MSG_METADATA_SIZE & (MSG_METADATA_SIZE - 1)) == 0, "MSG_METADATA_SIZE must be power of 2");
@@ -248,13 +231,11 @@ static_assert((MSG_INBOX_SIZE & (MSG_INBOX_SIZE - 1)) == 0, "MSG_INBOX_SIZE must
 // Helper Functions
 // ============================================================================
 
-// Derive pool type from UMEM address
+// Derive pool type from UMEM address (RX vs TX)
 constexpr FrameType get_pool_from_addr(uint64_t addr, uint32_t frame_size) {
     uint32_t frame_idx = static_cast<uint32_t>(addr / frame_size);
-    if (frame_idx < RX_POOL_END) return FRAME_TYPE_RX;
-    if (frame_idx < ACK_POOL_END) return FRAME_TYPE_ACK;
-    if (frame_idx < PONG_POOL_END) return FRAME_TYPE_PONG;
-    return FRAME_TYPE_MSG;
+    if (frame_idx < RX_FRAMES) return FRAME_TYPE_RX;
+    return FRAME_TYPE_MSG;  // All TX frames are in one unified pool
 }
 
 // Get frame index from UMEM address

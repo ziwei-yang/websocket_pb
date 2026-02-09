@@ -12,9 +12,9 @@
 //               ├── RAW_INBOX (consumer) - RX packets from XDP Poll
 //               └── RAW_OUTBOX (producer) - TX packets to XDP Poll
 //
-// Frame Pool Usage (50/50 split, mirrors XDPTransport):
-//   - RX: Frames 0-32767 (consumed from RAW_INBOX, produced by XDP Poll)
-//   - TX: Frames 32768-65535 (unified pool for data + ACKs + retransmits)
+// Frame Pool Usage (from pipeline_config.hpp):
+//   - RX: Frames [0, RX_FRAMES) (consumed from RAW_INBOX, produced by XDP Poll)
+//   - TX: Frames [RX_FRAMES, TOTAL_UMEM_FRAMES) (unified pool for data + ACKs + retransmits)
 //
 // C++20, policy-based design, single-thread HFT focus
 #pragma once
@@ -360,9 +360,9 @@ private:
     IPCRingProducer<websocket::xdp::PacketFrameDescriptor>* raw_outbox_prod_ = nullptr;
     ConnStateShm* conn_state_ = nullptr;
 
-    // TX pool (50/50 split: frames 32768-65535)
-    static constexpr uint32_t TX_POOL_START = 32768;
-    static constexpr uint32_t TX_POOL_SIZE = 32768;
+    // TX pool (frames RX_FRAMES .. TOTAL_UMEM_FRAMES-1)
+    static constexpr uint32_t TX_POOL_START = websocket::pipeline::RX_FRAMES;
+    static constexpr uint32_t TX_POOL_SIZE = websocket::pipeline::TX_POOL_SIZE;
     uint32_t tx_alloc_pos_ = 0;    // monotonic, next to allocate
     uint32_t tx_free_pos_ = 0;     // monotonic, next available for reuse
     bool frame_acked_[TX_POOL_SIZE] = {};

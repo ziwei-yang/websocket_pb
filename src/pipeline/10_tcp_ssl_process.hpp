@@ -38,6 +38,8 @@
 #include <cstdlib>
 #include <atomic>
 #include <type_traits>
+#include <algorithm>
+#include <stdexcept>
 #include <vector>
 #include <string>
 #include <unistd.h>
@@ -113,31 +115,46 @@ inline ParsedURL parse_url(const char* url) {
 }
 
 // ============================================================================
+// ConnPhase - Per-connection transport phase (state machine)
+// ============================================================================
+
+enum class ConnPhase : uint8_t {
+    ACTIVE = 0,          // Normal: direct AES-CTR decrypt → msg_metadata
+    TCP_CONNECTING,      // SYN sent, waiting for SYN-ACK
+    TLS_HANDSHAKING,     // wolfSSL_connect() in progress (non-blocking steps)
+    TLS_READY,           // TLS done, reading via wolfSSL for WS handshake
+    WAITING_RETRY,       // Error occurred, waiting for backoff before retry
+};
+
+struct ReconnectCtx {
+    ConnPhase phase = ConnPhase::TCP_CONNECTING;  // Start in TCP_CONNECTING
+    uint32_t attempts = 0;
+    uint64_t phase_start_cycle = 0;
+    uint64_t last_attempt_cycle = 0;  // For backoff timing
+
+    void reset() {
+        phase = ConnPhase::ACTIVE;
+        attempts = 0;
+        phase_start_cycle = 0;
+        last_attempt_cycle = 0;
+    }
+};
+
+// ============================================================================
 // TransportProcess - Protocol-agnostic TCP + SSL using DisruptorPacketIO
 //
 // Template Parameters:
 //   - SSLPolicy: SSL/TLS implementation (OpenSSLPolicy, WolfSSLPolicy, NoSSLPolicy)
-//                SSL behavior is fully determined by this template argument.
-//                NoSSLPolicy methods are safe no-ops / pass-through delegates.
 //   - MsgMetadataProd: IPCRingProducer<MsgMetadata> for publishing metadata
-//   - LowPrioCons: IPCRingConsumer<PongFrameAligned> for low-priority outbound (PONGs, etc.)
+//   - LowPrioCons: IPCRingConsumer<PongFrameAligned> for low-priority outbound
 //   - Profiling: Enable profiling counters
-//
-// This process runs on a single core and handles:
-//   1. Consuming RX packets from RAW_INBOX (via DisruptorPacketIO)
-//   2. Userspace TCP connection
-//   3. SSL/TLS handshake (via SSLPolicy; no-op for NoSSLPolicy)
-//   4. SSL/raw read -> MSG_INBOX
-//   5. Publishing MsgMetadata to downstream process
-//   6. Consuming low-priority outbox (PONGs) from WS process and sending via SSL/raw
-//   7. Consuming MSG_OUTBOX events and sending via SSL/raw (optional)
-//   8. Producing TX packets to RAW_OUTBOX (via DisruptorPacketIO)
 // ============================================================================
 
 template<typename SSLPolicy,
          typename MsgMetadataProd,
          typename LowPrioCons,
          bool EnableAB = false,
+         bool AutoReconnect = false,
          bool Profiling = false>
 struct TransportProcess {
 public:
@@ -195,8 +212,9 @@ public:
     // ========================================================================
 
     bool init() {
-        printf("[TRANSPORT] Initializing Transport Process%s\n",
-               EnableAB ? " (Dual A/B)" : "");
+        printf("[TRANSPORT] Initializing Transport Process%s%s\n",
+               EnableAB ? " (Dual A/B)" : "",
+               AutoReconnect ? " (AutoReconnect)" : "");
         printf("[TRANSPORT] URL: %s\n", url_);
 
         if (!parsed_url_.valid) {
@@ -248,95 +266,89 @@ public:
             printf("%s%s", ips[i].c_str(), (i < ips.size() - 1) ? ", " : "\n");
         }
 
-        if constexpr (EnableAB) {
-            // ── Dual A/B: Connect A + SSL, then Connect B + SSL ──
-            // Phase 2a: TCP Connection A
-            printf("[TRANSPORT] Phase 2a: TCP Connect A to %s:%u\n",
-                   parsed_url_.host.c_str(), parsed_url_.port);
-            transport_.connect(0, parsed_url_.host.c_str(), parsed_url_.port);
+        if constexpr (AutoReconnect) {
+            // Non-blocking startup: initiate TCP connect for all connections
+            // State machine in run() handles TCP→TLS→TLS_READY→ACTIVE
+            if constexpr (EnableAB) {
+                transport_.start_connect(0, parsed_url_.host.c_str(), parsed_url_.port);
+                reconn_[0].phase = ConnPhase::TCP_CONNECTING;
+                reconn_[0].phase_start_cycle = rdtsc();
 
-            // Phase 3a: SSL/TLS Handshake for A
-            printf("[TRANSPORT] Phase 3a: SSL/TLS Handshake A\n");
-            ssl_[0].init();
-            ssl_[0].handshake_userspace_transport(&transport_.a, parsed_url_.host.c_str());
-            printf("[TRANSPORT] SSL handshake A complete\n");
-
-            // Extract TLS record keys for A
-            websocket::crypto::TLSRecordKeys tls_keys_a;
-            if (ssl_[0].extract_record_keys(tls_keys_a)) {
-                transport_.a.set_tls_record_keys(tls_keys_a);
-                printf("[TRANSPORT] Direct AES-CTR decryption enabled for A\n");
+                transport_.start_connect(1, parsed_url_.host.c_str(), parsed_url_.port);
+                reconn_[1].phase = ConnPhase::TCP_CONNECTING;
+                reconn_[1].phase_start_cycle = rdtsc();
+            } else {
+                transport_.initiate_connect(parsed_url_.host.c_str(), parsed_url_.port);
+                reconn_[0].phase = ConnPhase::TCP_CONNECTING;
+                reconn_[0].phase_start_cycle = rdtsc();
             }
-
-            transport_.a.reset_hw_timestamps();
-            transport_.a.reset_recv_stats();
-
-            // Phase 2b: TCP Connection B (demuxed poll keeps A alive)
-            printf("[TRANSPORT] Phase 2b: TCP Connect B to %s:%u\n",
-                   parsed_url_.host.c_str(), parsed_url_.port);
-            transport_.connect(1, parsed_url_.host.c_str(), parsed_url_.port);
-
-            // Phase 3b: SSL/TLS Handshake for B
-            printf("[TRANSPORT] Phase 3b: SSL/TLS Handshake B\n");
-            ssl_[1].init();
-            ssl_[1].handshake_userspace_transport(&transport_.b, parsed_url_.host.c_str());
-            printf("[TRANSPORT] SSL handshake B complete\n");
-
-            // Extract TLS record keys for B
-            websocket::crypto::TLSRecordKeys tls_keys_b;
-            if (ssl_[1].extract_record_keys(tls_keys_b)) {
-                transport_.b.set_tls_record_keys(tls_keys_b);
-                printf("[TRANSPORT] Direct AES-CTR decryption enabled for B\n");
-            }
-
-            transport_.b.reset_hw_timestamps();
-            transport_.b.reset_recv_stats();
-
         } else {
-            // ── Single connection ──
-            // Phase 2: TCP Connection
-            printf("[TRANSPORT] Phase 2: TCP Connect to %s:%u\n",
-                   parsed_url_.host.c_str(), parsed_url_.port);
-            transport_.connect(parsed_url_.host.c_str(), parsed_url_.port);
+            // Non-reconnect: blocking TCP + TLS handshake (original path)
+            if constexpr (EnableAB) {
+                transport_.start_connect(0, parsed_url_.host.c_str(), parsed_url_.port);
+                // Blocking wait for TCP
+                while (!transport_.handshake_complete(0)) {
+                    transport_.poll();
+                    usleep(100);
+                }
+                transport_.set_connected(0);
 
-            // Phase 3: SSL/TLS Handshake (via SSLPolicy; no-op for NoSSLPolicy)
-            printf("[TRANSPORT] Phase 3: SSL/TLS Handshake\n");
-            ssl_[0].init();
-            ssl_[0].handshake_userspace_transport(&transport_, parsed_url_.host.c_str());
-            printf("[TRANSPORT] SSL handshake complete\n");
+                if (ssl_[0].init() != 0) return false;
+                if (ssl_[0].handshake_userspace_transport(&transport_.a, parsed_url_.host.c_str()) != 0) return false;
+                websocket::crypto::TLSRecordKeys tls_keys_a;
+                if (ssl_[0].extract_record_keys(tls_keys_a)) {
+                    transport_.a.set_tls_record_keys(tls_keys_a);
+                }
+                transport_.a.reset_hw_timestamps();
+                transport_.a.reset_recv_stats();
 
-            // Extract TLS record keys for direct AES-CTR decryption
-            websocket::crypto::TLSRecordKeys tls_keys;
-            if (ssl_[0].extract_record_keys(tls_keys)) {
-                transport_.set_tls_record_keys(tls_keys);
-                printf("[TRANSPORT] Direct AES-CTR decryption enabled (seq=0)\n");
+                transport_.start_connect(1, parsed_url_.host.c_str(), parsed_url_.port);
+                while (!transport_.handshake_complete(1)) {
+                    transport_.poll();
+                    usleep(100);
+                }
+                transport_.set_connected(1);
+
+                if (ssl_[1].init() != 0) return false;
+                if (ssl_[1].handshake_userspace_transport(&transport_.b, parsed_url_.host.c_str()) != 0) return false;
+                websocket::crypto::TLSRecordKeys tls_keys_b;
+                if (ssl_[1].extract_record_keys(tls_keys_b)) {
+                    transport_.b.set_tls_record_keys(tls_keys_b);
+                }
+                transport_.b.reset_hw_timestamps();
+                transport_.b.reset_recv_stats();
+            } else {
+                transport_.connect(parsed_url_.host.c_str(), parsed_url_.port);
+                if (ssl_[0].init() != 0) return false;
+                if (ssl_[0].handshake_userspace_transport(&transport_, parsed_url_.host.c_str()) != 0) return false;
+                websocket::crypto::TLSRecordKeys tls_keys;
+                if (ssl_[0].extract_record_keys(tls_keys)) {
+                    transport_.set_tls_record_keys(tls_keys);
+                }
+                transport_.reset_hw_timestamps();
+                transport_.reset_recv_stats();
             }
 
-            // Reset stats before message streaming
-            transport_.reset_hw_timestamps();
-            transport_.reset_recv_stats();
-        }
-
-        // Signal TLS ready for downstream process
-        if (conn_state_) {
-            conn_state_->set_handshake_tls_ready();
+            // Signal TLS ready for downstream process
+            if (conn_state_) {
+                conn_state_->set_handshake_tls_ready();
+            }
         }
 
         return true;
     }
 
     void run() {
-        printf("[TRANSPORT] Phase 4: Message Streaming%s\n",
-               EnableAB ? " (Dual A/B)" : "");
+        printf("[TRANSPORT] Phase 4: Message Streaming%s%s\n",
+               EnableAB ? " (Dual A/B)" : "",
+               AutoReconnect ? " (AutoReconnect)" : "");
 
         running_ = true;
 
         // Timing records for latency breakdown
-        timing_record_t timing;
-        memset(&timing, 0, sizeof(timing));
-        [[maybe_unused]] timing_record_t timing_b;
-        if constexpr (EnableAB) {
-            memset(&timing_b, 0, sizeof(timing_b));
+        timing_record_t timing[NUM_CONN];
+        for (size_t i = 0; i < NUM_CONN; i++) {
+            memset(&timing[i], 0, sizeof(timing_record_t));
         }
 
         while (running_ && check_running()) {
@@ -346,71 +358,108 @@ public:
             }
 
             if constexpr (EnableAB) {
-                // ── Dual A/B run loop ──
-
+                // ── Dual A/B: Demuxed poll ──
                 // Op 0: Demuxed poll (processes RX for BOTH A and B)
                 profile_op<Profiling>([this]{ return static_cast<int32_t>(transport_.poll()); }, slot, 0);
-
-                // Op 1: Process MSG_OUTBOX (route by connection_id)
-                profile_op<Profiling>(
-                    [this]{ return process_msg_outbox(); }, slot, 1,
-                    msg_outbox_cons_ != nullptr);
-
-                // Op 2: SSL read from connection A -> msg_inbox_[0] + msg_metadata_[0]
-                int32_t ssl_bytes_a = process_ssl_read_ab(0, timing);
-                if constexpr (Profiling) {
-                    slot->op_details[2] = ssl_bytes_a;
-                    slot->op_cycles[2] = (timing.recv_end_cycle > timing.recv_start_cycle)
-                        ? static_cast<int32_t>(timing.recv_end_cycle - timing.recv_start_cycle)
-                        : 0;
-                }
-                if (ssl_bytes_a < 0) break;
-
-                // Op 3: Process LOW_MSG_OUTBOX (PONGs — route by connection_id)
-                profile_op<Profiling>(
-                    [this]{ return process_low_prio_outbox(); }, slot, 3);
-
-                // Op 4: SSL read from connection B -> msg_inbox_[1] + msg_metadata_[1]
-                int32_t ssl_bytes_b = process_ssl_read_ab(1, timing_b);
-                if constexpr (Profiling) {
-                    slot->op_details[4] = ssl_bytes_b;
-                    slot->op_cycles[4] = (timing_b.recv_end_cycle > timing_b.recv_start_cycle)
-                        ? static_cast<int32_t>(timing_b.recv_end_cycle - timing_b.recv_start_cycle)
-                        : 0;
-                }
-                if (ssl_bytes_b < 0) break;
-
             } else {
-                // ── Single connection run loop (unchanged) ──
-
+                // ── Single connection ──
                 // Op 0: Poll transport
                 profile_op<Profiling>([this]{ return static_cast<int32_t>(transport_.poll()); }, slot, 0);
-
-                // Op 1: Process MSG_OUTBOX (high priority outbound messages)
-                profile_op<Profiling>(
-                    [this]{ return process_msg_outbox(); }, slot, 1,
-                    msg_outbox_cons_ != nullptr);
-
-                // Op 2: SSL/raw read -> MSG_INBOX (manually profiled via timing struct)
-                int32_t ssl_bytes = process_ssl_read(timing);
-                if constexpr (Profiling) {
-                    slot->op_details[2] = ssl_bytes;
-                    slot->op_cycles[2] = (timing.recv_end_cycle > timing.recv_start_cycle)
-                        ? static_cast<int32_t>(timing.recv_end_cycle - timing.recv_start_cycle)
-                        : 0;
-                }
-
-                if (ssl_bytes < 0) break;  // Fatal error
-
-                // Op 3: Process LOW_MSG_OUTBOX (always — PING/PONG must not be
-                // starved by continuous SSL reads or the PONG watchdog triggers)
-                profile_op<Profiling>(
-                    [this]{ return process_low_prio_outbox(); }, slot, 3);
             }
+
+            // Op 1: Process MSG_OUTBOX (high priority outbound messages)
+            profile_op<Profiling>(
+                [this]{ return process_msg_outbox(); }, slot, 1,
+                msg_outbox_cons_ != nullptr);
+
+            // ── Per-connection state machine dispatch ──
+            for (uint8_t ci = 0; ci < NUM_CONN; ci++) {
+                if constexpr (AutoReconnect) {
+                    // Check WS-initiated reconnect request
+                    if (conn_state_->get_reconnect_request(ci)) {
+                        conn_state_->clear_reconnect_request(ci);
+                        if (reconn_[ci].phase == ConnPhase::ACTIVE) {
+                            start_reconnect(ci);
+                        } else {
+                            // Already reconnecting — request arrived during intermediate phase
+                            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                            fprintf(stderr, "[%ld.%06ld] [RECONNECT] Ignoring WS reconnect request for conn %u "
+                                    "(already in phase %u)\n",
+                                    _ts.tv_sec, _ts.tv_nsec / 1000, ci,
+                                    static_cast<unsigned>(reconn_[ci].phase));
+                        }
+                    }
+
+                    // Check transport-level TCP failure
+                    if (reconn_[ci].phase == ConnPhase::ACTIVE) {
+                        auto& conn = get_transport(ci);
+                        if (conn.needs_reconnect()) {
+                            conn.clear_reconnect_flag();
+                            start_reconnect(ci);
+                        }
+                    }
+
+                    // Dispatch based on phase
+                    switch (reconn_[ci].phase) {
+                    case ConnPhase::TCP_CONNECTING:
+                        step_tcp_connect(ci);
+                        break;
+                    case ConnPhase::TLS_HANDSHAKING:
+                        step_tls_handshake(ci);
+                        break;
+                    case ConnPhase::TLS_READY:
+                        // Read via wolfSSL and publish to msg_metadata
+                        process_ssl_read_wolfssl(ci, timing[ci]);
+                        // Check if WS handshake is done → extract keys → ACTIVE
+                        if (conn_state_->get_ws_handshake_done(ci)) {
+                            conn_state_->clear_ws_handshake_done(ci);
+                            switch_to_direct_decrypt(ci);
+                        }
+                        break;
+                    case ConnPhase::WAITING_RETRY:
+                        if (!should_backoff(ci)) {
+                            start_reconnect_from_tcp(ci);
+                        }
+                        break;
+                    case ConnPhase::ACTIVE:
+                        // Normal direct AES-CTR decrypt path
+                        {
+                            int32_t ssl_bytes = process_ssl_read_for_conn(ci, timing[ci]);
+                            if constexpr (Profiling) {
+                                // Map conn 0 → op slot 2, conn 1 → op slot 4
+                                size_t op_idx = (ci == 0) ? 2 : 4;
+                                slot->op_details[op_idx] = ssl_bytes;
+                                slot->op_cycles[op_idx] = (timing[ci].recv_end_cycle > timing[ci].recv_start_cycle)
+                                    ? static_cast<int32_t>(timing[ci].recv_end_cycle - timing[ci].recv_start_cycle) : 0;
+                            }
+                            if (!AutoReconnect && ssl_bytes < 0) {
+                                running_ = false;
+                            }
+                        }
+                        break;
+                    }
+                } else {
+                    // Non-reconnect: all connections already ACTIVE from init()
+                    int32_t ssl_bytes = process_ssl_read_for_conn(ci, timing[ci]);
+                    if constexpr (Profiling) {
+                        size_t op_idx = (ci == 0) ? 2 : 4;
+                        slot->op_details[op_idx] = ssl_bytes;
+                        slot->op_cycles[op_idx] = (timing[ci].recv_end_cycle > timing[ci].recv_start_cycle)
+                            ? static_cast<int32_t>(timing[ci].recv_end_cycle - timing[ci].recv_start_cycle) : 0;
+                    }
+                    if (ssl_bytes < 0) {
+                        running_ = false;
+                    }
+                }
+            }
+
+            // Op 3: Process LOW_MSG_OUTBOX (PONGs)
+            profile_op<Profiling>(
+                [this]{ return process_low_prio_outbox(); }, slot, 3);
 
             // Commit profiling sample
             if constexpr (Profiling) {
-                slot->transport_poll_cycle = timing.recv_start_cycle;
+                slot->transport_poll_cycle = timing[0].recv_start_cycle;
                 slot->packet_nic_ns = 0;
                 slot->nic_poll_cycle = 0;
                 profiling_data_->commit();
@@ -479,6 +528,19 @@ public:
 
 private:
     // ========================================================================
+    // Transport accessor helper (works for both EnableAB and single)
+    // ========================================================================
+
+    auto& get_transport(uint8_t ci) {
+        if constexpr (EnableAB) {
+            return transport_.transport(ci);
+        } else {
+            (void)ci;
+            return transport_;
+        }
+    }
+
+    // ========================================================================
     // Hostname Resolution
     // ========================================================================
 
@@ -510,7 +572,195 @@ private:
     }
 
     // ========================================================================
-    // MsgMetadata Publishing
+    // Reconnect State Machine: start_reconnect, step_tcp_connect, step_tls_handshake
+    // ========================================================================
+
+    void start_reconnect(uint8_t ci) {
+        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+        fprintf(stderr, "[%ld.%06ld] [RECONNECT] Starting reconnect for conn %u (attempt %u)\n",
+                _ts.tv_sec, _ts.tv_nsec / 1000, ci, reconn_[ci].attempts + 1);
+
+        // Publish TCP_DISCONNECTED event so WS knows
+        publish_control_event(ci, MetaEventType::TCP_DISCONNECTED);
+
+        // Shutdown SSL session
+        ssl_[ci].shutdown();
+
+        // Reset and reconnect TCP
+        int rc;
+        if constexpr (EnableAB) {
+            rc = transport_.start_reconnect(ci);
+        } else {
+            transport_.reset_for_reconnect();
+            rc = transport_.initiate_reconnect();
+        }
+
+        reconn_[ci].phase = (rc == 0) ? ConnPhase::TCP_CONNECTING : ConnPhase::WAITING_RETRY;
+        reconn_[ci].phase_start_cycle = rdtsc();
+        reconn_[ci].attempts++;
+        reconn_[ci].last_attempt_cycle = rdtsc();
+    }
+
+    void step_tcp_connect(uint8_t ci) {
+        auto& conn = get_transport(ci);
+
+        if (conn.handshake_complete()) {
+            // SYN-ACK received, TCP ESTABLISHED
+            conn.set_connected();
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            fprintf(stderr, "[%ld.%06ld] [RECONNECT] TCP established for conn %u\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+
+            // Prepare TLS handshake
+            if (ssl_[ci].init() != 0 ||
+                ssl_[ci].prepare_handshake(&conn, parsed_url_.host.c_str()) != 0) {
+                fprintf(stderr, "[RECONNECT] TLS init failed for conn %u, restarting\n", ci);
+                if (should_backoff(ci)) {
+                    reconn_[ci].phase = ConnPhase::WAITING_RETRY;
+                    return;
+                }
+                start_reconnect_from_tcp(ci);
+                return;
+            }
+            reconn_[ci].phase = ConnPhase::TLS_HANDSHAKING;
+            reconn_[ci].phase_start_cycle = rdtsc();
+            return;
+        }
+
+        // Timeout check (5s)
+        uint64_t elapsed = rdtsc() - reconn_[ci].phase_start_cycle;
+        uint64_t timeout_cycles = 5ULL * tsc_freq_hz_;
+        if (elapsed > timeout_cycles) {
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            fprintf(stderr, "[%ld.%06ld] [RECONNECT] TCP connect timeout for conn %u, restarting\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+            // Apply backoff then restart
+            if (should_backoff(ci)) return;
+            start_reconnect_from_tcp(ci);
+        }
+    }
+
+    void step_tls_handshake(uint8_t ci) {
+        // Single step of wolfSSL_connect (need poll first for data)
+        auto result = ssl_[ci].step_handshake();
+
+        using HR = typename SSLPolicy::HandshakeResult;
+        if (result == HR::SUCCESS) {
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            fprintf(stderr, "[%ld.%06ld] [RECONNECT] TLS handshake complete for conn %u\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+
+            // Publish TLS_CONNECTED event
+            publish_control_event(ci, MetaEventType::TLS_CONNECTED);
+
+            // Enter TLS_READY: read via wolfSSL until WS signals handshake done
+            reconn_[ci].phase = ConnPhase::TLS_READY;
+            reconn_[ci].phase_start_cycle = rdtsc();
+
+            // Signal TLS ready on first connection for non-reconnect startup path
+            if (!tls_ready_signaled_) {
+                conn_state_->set_handshake_tls_ready();
+                tls_ready_signaled_ = true;
+            }
+            return;
+        }
+
+        if (result == HR::ERROR) {
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            fprintf(stderr, "[%ld.%06ld] [RECONNECT] TLS handshake error for conn %u, restarting\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+            if (should_backoff(ci)) return;
+            start_reconnect_from_tcp(ci);
+            return;
+        }
+
+        // IN_PROGRESS: timeout check (5s)
+        uint64_t elapsed = rdtsc() - reconn_[ci].phase_start_cycle;
+        uint64_t timeout_cycles = 5ULL * tsc_freq_hz_;
+        if (elapsed > timeout_cycles) {
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            fprintf(stderr, "[%ld.%06ld] [RECONNECT] TLS handshake timeout for conn %u, restarting\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+            if (should_backoff(ci)) return;
+            start_reconnect_from_tcp(ci);
+        }
+    }
+
+    /**
+     * Switch from wolfSSL reads (TLS_READY) to direct AES-CTR decrypt (ACTIVE).
+     * Called when WS process signals ws_handshake_done.
+     */
+    void switch_to_direct_decrypt(uint8_t ci) {
+        auto& conn = get_transport(ci);
+
+        // Extract TLS keys for direct decryption
+        websocket::crypto::TLSRecordKeys tls_keys;
+        if (ssl_[ci].extract_record_keys(tls_keys)) {
+            conn.set_tls_record_keys(tls_keys);
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            fprintf(stderr, "[%ld.%06ld] [RECONNECT] Direct AES-CTR decrypt enabled for conn %u\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+        }
+
+        // Stop trickle thread (if applicable)
+        conn.stop_rx_trickle_thread();
+
+        conn.reset_hw_timestamps();
+        conn.reset_recv_stats();
+
+        reconn_[ci].reset();  // phase → ACTIVE, attempts → 0
+    }
+
+    /**
+     * Restart from TCP level (shutdown SSL, reset transport, SYN).
+     */
+    void start_reconnect_from_tcp(uint8_t ci) {
+        ssl_[ci].shutdown();
+        int rc;
+        if constexpr (EnableAB) {
+            rc = transport_.start_reconnect(ci);
+        } else {
+            transport_.reset_for_reconnect();
+            rc = transport_.initiate_reconnect();
+        }
+        reconn_[ci].phase = (rc == 0) ? ConnPhase::TCP_CONNECTING : ConnPhase::WAITING_RETRY;
+        reconn_[ci].phase_start_cycle = rdtsc();
+        reconn_[ci].last_attempt_cycle = rdtsc();
+    }
+
+    /**
+     * Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s cap.
+     * Returns true if we should skip this iteration (too soon).
+     */
+    bool should_backoff(uint8_t ci) {
+        if (reconn_[ci].attempts == 0) return false;
+        uint32_t backoff_ms = RECONNECT_BACKOFF_BASE_MS
+            << std::min(reconn_[ci].attempts - 1, 4u);
+        if (backoff_ms > RECONNECT_BACKOFF_MAX_MS) backoff_ms = RECONNECT_BACKOFF_MAX_MS;
+        uint64_t backoff_cycles = static_cast<uint64_t>(backoff_ms) * (tsc_freq_hz_ / 1000);
+        uint64_t now = rdtsc();
+        return (now - reconn_[ci].last_attempt_cycle < backoff_cycles);
+    }
+
+    // ========================================================================
+    // Publish Control Events on MSG_METADATA
+    // ========================================================================
+
+    void publish_control_event(uint8_t ci, MetaEventType event_type) {
+        auto* prod = msg_metadata_prod_[ci];
+        int64_t seq = prod->try_claim();
+        if (seq < 0) {
+            fprintf(stderr, "[TRANSPORT] WARNING: MSG_METADATA full for control event\n");
+            return;
+        }
+        auto& meta = (*prod)[seq];
+        meta.clear();
+        meta.event_type = static_cast<uint8_t>(event_type);
+        prod->publish(seq);
+    }
+
+    // ========================================================================
+    // MsgMetadata Publishing (for data events)
     // ========================================================================
 
     void publish_metadata(MsgMetadataProd* prod, uint32_t write_offset, uint32_t len,
@@ -538,87 +788,17 @@ private:
         meta.tls_record_end = tls_record_end;
         meta.first_pkt_mem_idx = timing.oldest_pkt_mem_idx;
         meta.last_pkt_mem_idx = timing.latest_pkt_mem_idx;
+        meta.event_type = static_cast<uint8_t>(MetaEventType::DATA);
         prod->publish(seq);
         last_op_cycle_ = rdtscp();
     }
 
     // ========================================================================
-    // SSL Read -> MSG_INBOX
+    // SSL Read → MSG_INBOX (unified for single and AB connections)
     // ========================================================================
 
-    int32_t process_ssl_read(timing_record_t& timing) requires (!EnableAB) {
-        auto* inbox = msg_inbox_[0];
-        auto* meta_prod = msg_metadata_prod_[0];
-
-        uint32_t write_pos = inbox->current_write_pos();
-        uint32_t linear_space = MSG_INBOX_SIZE - write_pos;
-        if (linear_space > 16384) linear_space = 16384;
-
-        timing.recv_start_cycle = rdtsc();
-        ssize_t read_len;
-        if (transport_.has_tls_record_keys()) {
-            // Direct AES-CTR decryption — bypass SSL library
-            read_len = transport_.ssl_read_by_chunk(
-                inbox->write_ptr(), linear_space,
-                [](const uint8_t*, size_t) {});
-            if (read_len == -1) read_len = 0;  // non-app-data skipped
-        } else {
-            read_len = ssl_[0].read(inbox->write_ptr(), linear_space);
-        }
-        timing.recv_end_cycle = rdtscp();
-
-        if (read_len > 0) {
-            // Capture timestamps from transport before advancing write pointer
-            timing.hw_timestamp_count = transport_.get_recv_packet_count();
-            if (timing.hw_timestamp_count > 0) {
-                timing.hw_timestamp_oldest_ns = transport_.get_recv_oldest_timestamp();
-                timing.hw_timestamp_latest_ns = transport_.get_recv_latest_timestamp();
-                last_valid_ssl_start_cycle_ = timing.recv_start_cycle;
-                last_valid_ssl_end_cycle_ = timing.recv_end_cycle;
-            } else {
-                timing.hw_timestamp_oldest_ns = 0;
-                timing.hw_timestamp_latest_ns = 0;
-            }
-            timing.bpf_entry_oldest_ns = transport_.get_recv_oldest_bpf_entry_ns();
-            timing.bpf_entry_latest_ns = transport_.get_recv_latest_bpf_entry_ns();
-            timing.poll_cycle_oldest = transport_.get_recv_oldest_poll_cycle();
-            timing.poll_cycle_latest = transport_.get_recv_latest_poll_cycle();
-            timing.oldest_pkt_mem_idx = transport_.get_recv_oldest_pkt_mem_idx();
-            timing.latest_pkt_mem_idx = transport_.get_recv_latest_pkt_mem_idx();
-
-            uint32_t write_offset = inbox->current_write_pos();
-            inbox->advance_write(static_cast<uint32_t>(read_len));
-
-            bool tls_boundary = transport_.has_tls_record_keys()
-                                ? transport_.tls_record_boundary() : false;
-            publish_metadata(meta_prod, write_offset, static_cast<uint32_t>(read_len), timing, tls_boundary);
-
-            transport_.reset_recv_stats();
-            ssl_read_count_++;
-            return static_cast<int32_t>(read_len);
-
-        } else if (read_len < 0) {
-            if (!transport_.has_tls_record_keys() && errno != EAGAIN) {
-                // Only SSL library path can set errno
-                fprintf(stderr, "[TRANSPORT] Read error: %s\n", strerror(errno));
-                if (conn_state_) {
-                    conn_state_->set_disconnect(DisconnectReason::SSL_READ_ERROR, 0, strerror(errno));
-                }
-                running_ = false;
-                return -1;
-            }
-        }
-
-        return 0;  // No data (EAGAIN)
-    }
-
-    // ========================================================================
-    // SSL Read for A/B connection (EnableAB=true only)
-    // ========================================================================
-
-    int32_t process_ssl_read_ab(uint8_t ci, timing_record_t& timing) requires (EnableAB) {
-
-        auto& conn = transport_.transport(ci);
+    int32_t process_ssl_read_for_conn(uint8_t ci, timing_record_t& timing) {
+        auto& conn = get_transport(ci);
         auto* inbox = msg_inbox_[ci];
         auto* meta_prod = msg_metadata_prod_[ci];
 
@@ -673,12 +853,62 @@ private:
                 if (conn_state_) {
                     conn_state_->set_disconnect(DisconnectReason::SSL_READ_ERROR, 0, strerror(errno));
                 }
+                if constexpr (AutoReconnect) {
+                    start_reconnect(ci);
+                    return 0;
+                }
                 running_ = false;
                 return -1;
             }
         }
 
         return 0;
+    }
+
+    // ========================================================================
+    // SSL Read via wolfSSL (TLS_READY phase — before direct decrypt switch)
+    // ========================================================================
+
+    void process_ssl_read_wolfssl(uint8_t ci, timing_record_t& timing) {
+        auto& conn = get_transport(ci);
+        auto* inbox = msg_inbox_[ci];
+        auto* meta_prod = msg_metadata_prod_[ci];
+
+        uint32_t write_pos = inbox->current_write_pos();
+        uint32_t linear_space = MSG_INBOX_SIZE - write_pos;
+        if (linear_space > 16384) linear_space = 16384;
+
+        timing.recv_start_cycle = rdtsc();
+        ssize_t read_len = ssl_[ci].read(inbox->write_ptr(), linear_space);
+        timing.recv_end_cycle = rdtscp();
+
+        if (read_len > 0) {
+            timing.hw_timestamp_count = conn.get_recv_packet_count();
+            if (timing.hw_timestamp_count > 0) {
+                timing.hw_timestamp_oldest_ns = conn.get_recv_oldest_timestamp();
+                timing.hw_timestamp_latest_ns = conn.get_recv_latest_timestamp();
+                last_valid_ssl_start_cycle_ = timing.recv_start_cycle;
+                last_valid_ssl_end_cycle_ = timing.recv_end_cycle;
+            } else {
+                timing.hw_timestamp_oldest_ns = 0;
+                timing.hw_timestamp_latest_ns = 0;
+            }
+            timing.bpf_entry_oldest_ns = conn.get_recv_oldest_bpf_entry_ns();
+            timing.bpf_entry_latest_ns = conn.get_recv_latest_bpf_entry_ns();
+            timing.poll_cycle_oldest = conn.get_recv_oldest_poll_cycle();
+            timing.poll_cycle_latest = conn.get_recv_latest_poll_cycle();
+            timing.oldest_pkt_mem_idx = conn.get_recv_oldest_pkt_mem_idx();
+            timing.latest_pkt_mem_idx = conn.get_recv_latest_pkt_mem_idx();
+
+            uint32_t write_offset = inbox->current_write_pos();
+            inbox->advance_write(static_cast<uint32_t>(read_len));
+
+            // Publish as DATA event
+            publish_metadata(meta_prod, write_offset, static_cast<uint32_t>(read_len), timing, false);
+
+            conn.reset_recv_stats();
+            ssl_read_count_++;
+        }
     }
 
     // ========================================================================
@@ -691,18 +921,30 @@ private:
         while (low_prio_cons_->try_consume(pong)) {
             if (pong.data_len == 0) continue;
 
-            // Route by connection_id (EnableAB: 0 or 1, single: always 0)
             uint8_t ci = EnableAB ? pong.connection_id : 0;
 
-            // Send via SSL
+            // Skip if connection is not in a sendable state
+            if constexpr (AutoReconnect) {
+                if (reconn_[ci].phase != ConnPhase::ACTIVE &&
+                    reconn_[ci].phase != ConnPhase::TLS_READY) {
+                    continue;  // Drop: connection not ready
+                }
+            }
+
             size_t total_sent = 0;
+            int retries = 0;
+            static constexpr int MAX_WRITE_RETRIES = 50;  // 50 * 100us = 5ms max
             while (total_sent < pong.data_len) {
                 transport_.poll();
                 ssize_t sent = ssl_[ci].write(pong.data + total_sent, pong.data_len - total_sent);
                 if (sent > 0) {
                     total_sent += sent;
+                    retries = 0;
                 } else if (sent < 0 && errno != EAGAIN) {
-                    fprintf(stderr, "[TRANSPORT] Low-prio send error: %s\n", strerror(errno));
+                    break;
+                } else if (++retries >= MAX_WRITE_RETRIES) {
+                    fprintf(stderr, "[TRANSPORT] Low-prio send stalled (conn %u, %zu/%u bytes)\n",
+                            ci, total_sent, pong.data_len);
                     break;
                 }
                 usleep(100);
@@ -724,17 +966,30 @@ private:
         while (msg_outbox_cons_->try_consume(evt)) {
             if (evt.data_len == 0) continue;
 
-            // Route by connection_id (EnableAB: 0 or 1, single: always 0)
             uint8_t ci = EnableAB ? evt.connection_id : 0;
 
+            // Skip if connection is not in a sendable state
+            if constexpr (AutoReconnect) {
+                if (reconn_[ci].phase != ConnPhase::ACTIVE &&
+                    reconn_[ci].phase != ConnPhase::TLS_READY) {
+                    continue;  // Drop: connection not ready
+                }
+            }
+
             size_t total_sent = 0;
+            int retries = 0;
+            static constexpr int MAX_WRITE_RETRIES = 50;
             while (total_sent < evt.data_len) {
                 transport_.poll();
                 ssize_t sent = ssl_[ci].write(evt.data + total_sent, evt.data_len - total_sent);
                 if (sent > 0) {
                     total_sent += sent;
+                    retries = 0;
                 } else if (sent < 0 && errno != EAGAIN) {
-                    fprintf(stderr, "[TRANSPORT] MSG_OUTBOX send error: %s\n", strerror(errno));
+                    break;
+                } else if (++retries >= MAX_WRITE_RETRIES) {
+                    fprintf(stderr, "[TRANSPORT] MSG_OUTBOX send stalled (conn %u, %zu/%u bytes)\n",
+                            ci, total_sent, evt.data_len);
                     break;
                 }
                 usleep(100);
@@ -742,80 +997,6 @@ private:
             count++;
         }
         return count;
-    }
-
-    // ========================================================================
-    // Timing Breakdown
-    // ========================================================================
-
-    void print_timing_breakdown(uint32_t len, timing_record_t& timing) {
-        uint64_t callback_cycle = rdtscp();
-        struct timespec ts_mono, ts_real;
-        clock_gettime(CLOCK_MONOTONIC, &ts_mono);
-        clock_gettime(CLOCK_REALTIME, &ts_real);
-        uint64_t mono_now_ns = (uint64_t)ts_mono.tv_sec * 1000000000ULL + ts_mono.tv_nsec;
-        uint64_t real_now_ns = (uint64_t)ts_real.tv_sec * 1000000000ULL + ts_real.tv_nsec;
-
-        // Header line
-        fprintf(stderr, "[%ld.%06ld] [SSL_READ #%lu] packets=%u decrypted_len=%u\n",
-                ts_mono.tv_sec, ts_mono.tv_nsec / 1000, ssl_read_count_ + 1,
-                timing.hw_timestamp_count, len);
-
-        // Helper lambda to format a NIC/BPF/poll line
-        auto print_packet_line = [&](const char* label,
-                                     uint64_t nic_ns, uint64_t bpf_ns, uint64_t poll_cycle) {
-            // NIC ~ (CLOCK_REALTIME, unreliable in XDP mode)
-            char nic_str[32];
-            if (nic_ns > 0 && real_now_ns > nic_ns) {
-                snprintf(nic_str, sizeof(nic_str), "~ %.1fus ago", (double)(real_now_ns - nic_ns) / 1000.0);
-            } else {
-                snprintf(nic_str, sizeof(nic_str), "N/A");
-            }
-
-            // BPF (CLOCK_MONOTONIC)
-            char bpf_str[32];
-            if (bpf_ns > 0 && mono_now_ns > bpf_ns) {
-                snprintf(bpf_str, sizeof(bpf_str), "%.1fus ago", (double)(mono_now_ns - bpf_ns) / 1000.0);
-            } else {
-                snprintf(bpf_str, sizeof(bpf_str), "N/A");
-            }
-
-            // Poll (TSC cycles)
-            char poll_str[32];
-            if (poll_cycle > 0 && tsc_freq_hz_ > 0 && callback_cycle > poll_cycle) {
-                snprintf(poll_str, sizeof(poll_str), "%.1fus ago",
-                         cycles_to_ns(callback_cycle - poll_cycle, tsc_freq_hz_) / 1000.0);
-            } else {
-                snprintf(poll_str, sizeof(poll_str), "N/A");
-            }
-
-            fprintf(stderr, "  %s | NIC %s | BPF %s | poll %s |\n", label, nic_str, bpf_str, poll_str);
-        };
-
-        // Oldest/latest packet lines
-        if (timing.hw_timestamp_count > 1) {
-            print_packet_line("oldest", timing.hw_timestamp_oldest_ns,
-                             timing.bpf_entry_oldest_ns, timing.poll_cycle_oldest);
-            print_packet_line("latest", timing.hw_timestamp_latest_ns,
-                             timing.bpf_entry_latest_ns, timing.poll_cycle_latest);
-        } else {
-            print_packet_line("packet", timing.hw_timestamp_latest_ns,
-                             timing.bpf_entry_latest_ns, timing.poll_cycle_latest);
-        }
-
-        // Pipeline stages
-        double poll_recv_us = 0, ssl_us = 0, total_us = 0;
-        if (timing.poll_cycle_latest > 0 && timing.recv_start_cycle > timing.poll_cycle_latest) {
-            poll_recv_us = cycles_to_ns(timing.recv_start_cycle - timing.poll_cycle_latest, tsc_freq_hz_) / 1000.0;
-        }
-        if (timing.recv_end_cycle > timing.recv_start_cycle) {
-            ssl_us = cycles_to_ns(timing.recv_end_cycle - timing.recv_start_cycle, tsc_freq_hz_) / 1000.0;
-        }
-        if (timing.poll_cycle_latest > 0 && callback_cycle > timing.poll_cycle_latest) {
-            total_us = cycles_to_ns(callback_cycle - timing.poll_cycle_latest, tsc_freq_hz_) / 1000.0;
-        }
-        fprintf(stderr, "  poll->recv %.1fus | SSL decrypt %.1fus | total poll->cb %.1fus\n",
-                poll_recv_us, ssl_us, total_us);
     }
 
     // ========================================================================
@@ -844,8 +1025,6 @@ private:
     RawOutboxProd* raw_outbox_prod_ = nullptr;
 
     // IPC interfaces
-    // When EnableAB: arrays of 2, indexed by connection_id
-    // When !EnableAB: arrays of 1, always index 0
     static constexpr size_t NUM_CONN = EnableAB ? 2 : 1;
     MsgInbox* msg_inbox_[NUM_CONN]{};
     MsgMetadataProd* msg_metadata_prod_[NUM_CONN]{};
@@ -856,6 +1035,10 @@ private:
     // Transport and SSL
     TransportType transport_;
     SSLPolicy ssl_[NUM_CONN]{};
+
+    // Reconnect state machine (per-connection)
+    ReconnectCtx reconn_[NUM_CONN]{};
+    bool tls_ready_signaled_ = false;  // First TLS_CONNECTED → set_handshake_tls_ready()
 
     // Timing
     uint64_t tsc_freq_hz_ = 0;
@@ -870,6 +1053,10 @@ private:
 
     // State
     std::atomic<bool> running_{false};
+
+    // Reconnect backoff constants
+    static constexpr uint32_t RECONNECT_BACKOFF_BASE_MS = 1000;   // 1s initial
+    static constexpr uint32_t RECONNECT_BACKOFF_MAX_MS  = 30000;  // 30s cap
 
     // Counters
     uint64_t ssl_read_count_ = 0;

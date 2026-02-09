@@ -167,6 +167,18 @@ struct ZeroCopyRetransmitQueue {
         count_ = 0;
     }
 
+    // Drain all segments, calling callback(frame_idx) for each, then clear
+    template<typename Func>
+    void drain_all(Func&& callback) {
+        while (count_ > 0) {
+            callback(segments_[head_].frame_idx);
+            head_ = (head_ + 1) % MAX_SEGMENTS;
+            count_--;
+        }
+        head_ = 0;
+        tail_ = 0;
+    }
+
     uint32_t get_oldest_seq() const {
         return count_ == 0 ? 0 : segments_[head_].seq;
     }

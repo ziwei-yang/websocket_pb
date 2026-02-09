@@ -235,35 +235,17 @@ struct XDPPollProcess {
         }
 
         // Configure BPF filter with exchange IPs from ConnStateShm
-        // (resolved by parent process before forking)
-        fprintf(stderr, "[XDP-POLL] BPF config check: bpf_loader_=%p, conn_state_=%p, ip_count=%u\n",
-               (void*)bpf_loader_.get(), (void*)conn_state_,
-               conn_state_ ? conn_state_->exchange_ip_count : 0);
         if (bpf_loader_ && conn_state_ && conn_state_->exchange_ip_count > 0) {
-            fprintf(stderr, "[XDP-POLL] Configuring BPF filter with %u exchange IPs\n",
-                   conn_state_->exchange_ip_count);
             for (uint8_t i = 0; i < conn_state_->exchange_ip_count; i++) {
                 char ip_str[INET_ADDRSTRLEN];
                 struct in_addr addr;
                 addr.s_addr = conn_state_->exchange_ips[i];
                 inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
-                fprintf(stderr, "[XDP-POLL] Adding exchange IP: %s\n", ip_str);
-                try {
-                    bpf_loader_->add_exchange_ip(ip_str);
-                } catch (const std::exception& e) {
-                    fprintf(stderr, "[XDP-POLL] ERROR adding IP: %s\n", e.what());
-                }
+                bpf_loader_->add_exchange_ip(ip_str);
             }
-            // Also add the target port
-            fprintf(stderr, "[XDP-POLL] Adding exchange port: %u\n", conn_state_->target_port);
-            try {
-                bpf_loader_->add_exchange_port(conn_state_->target_port);
-            } catch (const std::exception& e) {
-                fprintf(stderr, "[XDP-POLL] ERROR adding port: %s\n", e.what());
-            }
+            bpf_loader_->add_exchange_port(conn_state_->target_port);
 
             // Set local IP for incoming packet filtering
-            // Get local IP from interface
             int sock = socket(AF_INET, SOCK_DGRAM, 0);
             if (sock >= 0) {
                 struct ifreq ifr = {};
@@ -272,19 +254,10 @@ struct XDPPollProcess {
                     auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
                     char ip_str[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str));
-                    fprintf(stderr, "[XDP-POLL] Setting local IP: %s\n", ip_str);
-                    try {
-                        bpf_loader_->set_local_ip(ip_str);
-                    } catch (const std::exception& e) {
-                        fprintf(stderr, "[XDP-POLL] ERROR setting local IP: %s\n", e.what());
-                    }
-                } else {
-                    fprintf(stderr, "[XDP-POLL] WARNING: Failed to get interface IP\n");
+                    bpf_loader_->set_local_ip(ip_str);
                 }
                 ::close(sock);
             }
-        } else {
-            fprintf(stderr, "[XDP-POLL] WARNING: Cannot configure BPF filter (missing data)\n");
         }
 
         // Signal XDP ready for fork-first architecture
@@ -338,6 +311,12 @@ struct XDPPollProcess {
 
             // 5. Reclaim RX frames (idle or TX-starved)
             [[maybe_unused]] int32_t reclaim_count = profile_op<Profiling>([this]{ return reclaim_rx_frames(); }, slot, 5, maint_gate);
+
+            if (tx_starved) {
+                tx_starved_count_++;
+            } else {
+                tx_starved_count_ = 0;
+            }
 
             // Record sample
             if constexpr (Profiling) {
@@ -399,6 +378,8 @@ struct XDPPollProcess {
             if (xsk_ring_prod__needs_wakeup(&tx_ring_)) {
                 sendto(xsk_fd_, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
             }
+
+            tx_total_submitted_ += tx_count;
 
             // Commit consumer after successful TX submission
             raw_outbox_cons_->commit_manually();
@@ -510,18 +491,6 @@ struct XDPPollProcess {
 
         if (nb_completed == 0) return 0;
 
-#if DEBUG
-        static uint32_t total_completions = 0;
-        static bool first_logged = false;
-        total_completions += nb_completed;
-        if (!first_logged) {
-            fprintf(stderr, "[XDP-COMP] Got %u completions (total: %u) prod=%u cons=%u\n",
-                    nb_completed, total_completions, *comp_ring_.producer, *comp_ring_.consumer);
-            if (total_completions > 100) first_logged = true;
-        }
-        fflush(stderr);
-#endif
-
         // Just peek and release - Transport handles frame lifecycle via mark_frame_acked()
         xsk_ring_cons__release(&comp_ring_, nb_completed);
         tx_completions_ += nb_completed;
@@ -543,9 +512,7 @@ struct XDPPollProcess {
         uint32_t idx = 0;
         uint32_t got = xsk_ring_prod__reserve(&tx_ring_, needed, &idx);
 
-        if (got == 0) {
-            return 0;  // Retry next iteration
-        }
+        if (got == 0) return 0;
 
         if (tx_preserved_count_ == 0) {
             tx_preserved_idx_ = idx;  // First reservation, save start index
@@ -773,6 +740,7 @@ private:
     // Stats
     uint64_t rx_packets_ = 0;
     uint64_t tx_completions_ = 0;
+    uint64_t tx_total_submitted_ = 0;
 
     // For testing/debugging
     int64_t last_released_seq_ = -1;
@@ -787,6 +755,9 @@ private:
     // Pre-reserved TX slots (proactive reservation in idle loop)
     uint32_t tx_preserved_count_ = 0;   // Current number of preserved slots
     uint32_t tx_preserved_idx_ = 0;     // Starting index of preserved slots
+
+    // TX stall tracking
+    uint64_t tx_starved_count_ = 0;     // Consecutive loops with tx_preserved_count_==0
 
 #if DEBUG
     // For FIFO ordering verification (design doc: abort on out-of-order)

@@ -98,45 +98,51 @@ struct PacketTransportAB {
     }
 
     // ========================================================================
-    // Connect A or B (demuxed handshake)
+    // Non-blocking Connect / Reconnect (for state-machine-based init)
     // ========================================================================
 
     /**
-     * Connect connection ci (0=A, 1=B) with demuxed handshake.
-     * During the handshake poll loop, both A and B process their packets,
-     * so an already-established connection stays alive.
+     * Non-blocking: initiate TCP connect for connection ci.
+     * Sends SYN and returns immediately. Use handshake_complete(ci) to check.
      */
-    void connect(uint8_t ci, const char* host, uint16_t port) {
+    void start_connect(uint8_t ci, const char* host, uint16_t port) {
         auto& c = (ci == 0) ? a : b;
-        auto& other = (ci == 0) ? b : a;
-
-        c.initiate_connect(host, port);  // Send SYN (non-blocking)
-
-        // Demuxed handshake loop
-        auto start = std::chrono::steady_clock::now();
-        constexpr uint32_t timeout_ms = 5000;
-
-        while (!c.handshake_complete()) {
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-
-            if (elapsed_ms >= timeout_ms) {
-                fprintf(stderr, "[PacketTransportAB] Connection %u handshake timeout\n", ci);
-                throw std::runtime_error("PacketTransportAB: handshake timeout");
-            }
-
-            poll();                   // Demuxed: both A and B get their packets
-            c.check_retransmit();     // Retransmit SYN if needed
-            if (other.is_connected()) {
-                other.check_retransmit();
-            }
-
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
-
-        c.set_connected();
-        fprintf(stderr, "[PacketTransportAB] Connection %u established (local_port=%u)\n",
+        c.initiate_connect(host, port);
+        fprintf(stderr, "[PacketTransportAB] SYN sent for conn %u (local_port=%u)\n",
                 ci, c.tcp_params().local_port);
+    }
+
+    /**
+     * Non-blocking: initiate TCP reconnect for connection ci.
+     * Resets state, sends SYN using cached IP. Returns immediately.
+     *
+     * @return 0 on success, -1 on failure
+     */
+    int start_reconnect(uint8_t ci) {
+        auto& c = (ci == 0) ? a : b;
+        c.reset_for_reconnect();
+        int rc = c.initiate_reconnect();
+        if (rc != 0) {
+            fprintf(stderr, "[PacketTransportAB] Reconnect SYN failed for conn %u\n", ci);
+            return rc;
+        }
+        fprintf(stderr, "[PacketTransportAB] Reconnect SYN sent for conn %u (local_port=%u)\n",
+                ci, c.tcp_params().local_port);
+        return 0;
+    }
+
+    /**
+     * Check if TCP handshake completed for connection ci.
+     */
+    bool handshake_complete(uint8_t ci) const {
+        return transport(ci).handshake_complete();
+    }
+
+    /**
+     * Mark connection ci as connected after TCP handshake.
+     */
+    void set_connected(uint8_t ci) {
+        transport(ci).set_connected();
     }
 
     // ========================================================================

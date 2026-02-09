@@ -39,6 +39,7 @@ INTERFACE="enp108s0"
 RELOAD_DRIVER=false
 SKIP_CLOCK_SYNC=false
 ENABLE_AB_FLAG=false
+ENABLE_RECONNECT_FLAG=false
 TEST_SOURCE=""
 
 # Paths
@@ -101,6 +102,7 @@ Usage: $0 [OPTIONS] <test_source>
 Options:
   -i, --interface IFACE   Network interface (default: enp108s0)
   --enable-ab             Enable dual A/B connection mode (-DENABLE_AB)
+  --enable-reconnect      Enable auto-reconnect mode (-DENABLE_RECONNECT)
   --reload                Reload NIC driver before setup
   --skip-clock-sync       Skip NIC clock synchronization
   -h, --help              Show help
@@ -136,6 +138,10 @@ parse_args() {
                 ;;
             --enable-ab)
                 ENABLE_AB_FLAG=true
+                shift
+                ;;
+            --enable-reconnect)
+                ENABLE_RECONNECT_FLAG=true
                 shift
                 ;;
             --reload)
@@ -394,11 +400,9 @@ build_test() {
         log_info "Defaulting to OpenSSL (USE_OPENSSL=1)"
     fi
 
-    # Build BPF first if needed
-    if [[ ! -f "$BPF_OBJ" ]]; then
-        log_info "Building BPF program first..."
-        make bpf USE_XDP=1 XDP_INTERFACE="$INTERFACE" || die "Failed to build BPF program"
-    fi
+    # Always recompile BPF program (source may have changed)
+    log_info "Compiling BPF program..."
+    make bpf USE_XDP=1 XDP_INTERFACE="$INTERFACE" || die "Failed to build BPF program"
 
     # Dual A/B connection mode (via --enable-ab flag or ENABLE_AB env var)
     local AB_FLAGS=""
@@ -407,11 +411,18 @@ build_test() {
         log_info "Dual A/B connection mode enabled (ENABLE_AB=1)"
     fi
 
+    # Auto-reconnect mode (via --enable-reconnect flag or ENABLE_RECONNECT env var)
+    local RECONNECT_FLAGS=""
+    if [[ "$ENABLE_RECONNECT_FLAG" == "true" ]] || [[ -n "$ENABLE_RECONNECT" ]]; then
+        RECONNECT_FLAGS="ENABLE_RECONNECT=1"
+        log_info "Auto-reconnect mode enabled (ENABLE_RECONNECT=1)"
+    fi
+
     # Remove existing binary to force rebuild (make doesn't track flag changes like ENABLE_AB)
     rm -f "$TEST_BIN"
 
     # Build test binary (as normal user, no sudo)
-    make "$MAKE_TARGET" USE_XDP=1 XDP_INTERFACE="$INTERFACE" $SSL_FLAGS $AB_FLAGS || die "Failed to build test: $MAKE_TARGET"
+    make "$MAKE_TARGET" USE_XDP=1 XDP_INTERFACE="$INTERFACE" $SSL_FLAGS $AB_FLAGS $RECONNECT_FLAGS || die "Failed to build test: $MAKE_TARGET"
 
     log_ok "Test binary built: $TEST_BIN"
 }
@@ -545,11 +556,9 @@ main() {
     # Setup phase
     echo "--- Setup ---"
 
-    # Build BPF first (as user, before sudo prepare)
-    if [[ ! -f "$BPF_OBJ" ]]; then
-        log_info "Building BPF program..."
-        make bpf USE_XDP=1 XDP_INTERFACE="$INTERFACE" || die "Failed to build BPF program"
-    fi
+    # Always recompile BPF program (source may have changed)
+    log_info "Compiling BPF program..."
+    make bpf USE_XDP=1 XDP_INTERFACE="$INTERFACE" || die "Failed to build BPF program"
 
     # Save interface settings before xdp_prepare modifies them
     save_interface_settings

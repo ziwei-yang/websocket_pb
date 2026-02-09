@@ -322,6 +322,17 @@ int exchange_packet_filter(struct xdp_md *ctx) {
 
     // Check if this is exchange traffic
     if (is_exchange_packet(&pctx)) {
+        // Drop truncated frames: IP header declares more bytes than the frame contains.
+        // This catches NIC/driver bugs where rx_desc->len < ETH + ip->tot_len.
+        // Without this check, userspace abort()s on the mismatch.
+        // Compare as scalars (data_end - data) to avoid pkt pointer + unbounded var.
+        __u16 ip_total = bpf_ntohs(pctx.ip->tot_len);
+        __u32 frame_len = (__u32)(pctx.data_end - pctx.data);
+        if (frame_len < sizeof(struct ethhdr) + ip_total) {
+            inc_stat(STAT_DROPPED_PACKETS);
+            return XDP_DROP;
+        }
+
         inc_stat(STAT_EXCHANGE_PACKETS);
 
         // Extract NIC hardware RX timestamp and BPF entry time into metadata area

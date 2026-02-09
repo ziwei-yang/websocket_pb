@@ -15,6 +15,11 @@ ifdef ENABLE_AB
     CXXFLAGS += -DENABLE_AB
 endif
 
+# Auto-reconnect mode
+ifdef ENABLE_RECONNECT
+    CXXFLAGS += -DENABLE_RECONNECT
+endif
+
 # Build directory
 BUILD_DIR := ./build
 TEST_DIR := ./test/unittest

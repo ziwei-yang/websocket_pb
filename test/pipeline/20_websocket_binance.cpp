@@ -629,6 +629,13 @@ static constexpr bool AB_ENABLED = true;
 static constexpr bool AB_ENABLED = false;
 #endif
 
+// Auto-reconnect mode (compile-time toggle)
+#ifdef ENABLE_RECONNECT
+static constexpr bool RECONNECT_ENABLED = true;
+#else
+static constexpr bool RECONNECT_ENABLED = false;
+#endif
+
 // XDP Poll Process types (with profiling enabled)
 // Note: XDPCopyProcess is available but experimental - use XDPPollProcess for production
 using XDPPollType = XDPPollProcess<
@@ -643,6 +650,7 @@ using TransportType = TransportProcess<
     IPCRingProducer<MsgMetadata>,
     IPCRingConsumer<PongFrameAligned>,
     AB_ENABLED,                             // EnableAB
+    RECONNECT_ENABLED,                      // AutoReconnect
     PROFILING_ENABLED>;                     // Profiling
 
 // WebSocket Process types
@@ -652,6 +660,7 @@ using WebSocketType = WebSocketProcess<
     IPCRingProducer<PongFrameAligned>,     // PongsProd
     IPCRingProducer<MsgOutboxEvent>,       // MsgOutboxProd
     AB_ENABLED,                             // EnableAB
+    RECONNECT_ENABLED,                      // AutoReconnect
     PROFILING_ENABLED>;                     // Profiling
 
 // Number of connections
