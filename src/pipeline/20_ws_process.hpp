@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <chrono>
 #include <array>
+#include <concepts>
 
 // pipeline_data.hpp must be included BEFORE pipeline_config.hpp
 // to avoid CACHE_LINE_SIZE macro conflict with disruptor
@@ -331,6 +332,33 @@ inline void generate_mask_key(uint8_t* mask_key) {
 // 6. Track partial frames across SSL_read boundaries
 // ============================================================================
 
+// ============================================================================
+// AppHandler Concept + NullAppHandler
+//
+// AppHandler is an inline callback invoked by WebSocketProcess for each
+// complete TEXT/BINARY frame. When AppHandler::enabled is true, the
+// WSFrameInfo ring is skipped entirely — the handler replaces it.
+// ============================================================================
+
+template<typename T>
+concept AppHandlerConcept = requires(T handler,
+                                     uint8_t connection_id,
+                                     uint8_t opcode,
+                                     const uint8_t* payload,
+                                     uint32_t payload_len,
+                                     const WSFrameInfo& info) {
+    { T::enabled } -> std::convertible_to<bool>;
+    { handler.on_ws_frame(connection_id, opcode, payload, payload_len, info) };
+};
+
+// Default: no-op handler that compiles away entirely
+struct NullAppHandler {
+    static constexpr bool enabled = false;
+    void on_ws_frame(uint8_t, uint8_t, const uint8_t*, uint32_t, const WSFrameInfo&) {}
+};
+
+static_assert(AppHandlerConcept<NullAppHandler>);
+
 // Maximum metadata entries to accumulate before forced commit
 constexpr size_t MAX_ACCUMULATED_METADATA = 64;
 
@@ -379,10 +407,12 @@ template<typename MsgMetadataCons,     // IPCRingConsumer<MsgMetadata>
          typename MsgOutboxProd,       // IPCRingProducer<MsgOutboxEvent>
          bool EnableAB = false,
          bool AutoReconnect = false,
-         bool Profiling = false>
+         bool Profiling = false,
+         AppHandlerConcept AppHandler = NullAppHandler>
 struct WebSocketProcess {
 public:
     static constexpr size_t NUM_CONN = EnableAB ? 2 : 1;
+    static constexpr bool HasAppHandler = AppHandler::enabled;
 
     // ========================================================================
     // Initialization
@@ -399,7 +429,9 @@ public:
 
         msg_inbox_[0] = msg_inbox;
         msg_metadata_cons_[0] = msg_metadata_cons;
-        ws_frame_info_prod_ = ws_frame_info_prod;
+        if constexpr (!HasAppHandler) {
+            ws_frame_info_prod_ = ws_frame_info_prod;
+        }
         pongs_prod_ = pongs_prod;
         msg_outbox_prod_ = msg_outbox_prod;
         conn_state_ = conn_state;
@@ -1019,6 +1051,9 @@ private:
     // ========================================================================
 
     void publish_partial_frame_info(uint8_t ci) {
+        // Partial frames are never delivered to AppHandler — skip entirely
+        if constexpr (HasAppHandler) return;
+
         auto& ps = parse_state_[ci];
 
         int64_t seq = ws_frame_info_prod_->try_claim();
@@ -1225,34 +1260,36 @@ private:
             }
         }
 
-        // Publish WSFrameInfo for PING
-        int64_t ws_seq = ws_frame_info_prod_->try_claim();
-        if (ws_seq < 0) {
-            fprintf(stderr, "[WS-PROCESS] FATAL: WS_FRAME_INFO full\n");
-            std::abort();
+        // Publish WSFrameInfo for PING (skip when AppHandler is active)
+        if constexpr (!HasAppHandler) {
+            int64_t ws_seq = ws_frame_info_prod_->try_claim();
+            if (ws_seq < 0) {
+                fprintf(stderr, "[WS-PROCESS] FATAL: WS_FRAME_INFO full\n");
+                std::abort();
+            }
+
+            auto& info = (*ws_frame_info_prod_)[ws_seq];
+            info.clear();
+
+            info.msg_inbox_offset = ps.current_payload_offset;
+            info.payload_len = static_cast<uint32_t>(payload_len);
+            info.opcode = static_cast<uint8_t>(websocket::http::WebSocketOpcode::PING);
+            info.set_fin(true);
+            info.set_fragmented(false);
+            info.set_last_fragment(false);
+            info.connection_id = ci;
+
+            populate_timestamps(info, ps);
+            info.ws_parse_cycle = parse_cycle;
+
+            info.ws_frame_publish_cycle = rdtscp();
+            {
+                struct timespec _ts;
+                clock_gettime(CLOCK_MONOTONIC, &_ts);
+                info.publish_time_ts = _ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+            }
+            ws_frame_info_prod_->publish(ws_seq);
         }
-
-        auto& info = (*ws_frame_info_prod_)[ws_seq];
-        info.clear();
-
-        info.msg_inbox_offset = ps.current_payload_offset;
-        info.payload_len = static_cast<uint32_t>(payload_len);
-        info.opcode = static_cast<uint8_t>(websocket::http::WebSocketOpcode::PING);
-        info.set_fin(true);
-        info.set_fragmented(false);
-        info.set_last_fragment(false);
-        info.connection_id = ci;
-
-        populate_timestamps(info, ps);
-        info.ws_parse_cycle = parse_cycle;
-
-        info.ws_frame_publish_cycle = rdtscp();
-        {
-            struct timespec _ts;
-            clock_gettime(CLOCK_MONOTONIC, &_ts);
-            info.publish_time_ts = _ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
-        }
-        ws_frame_info_prod_->publish(ws_seq);
 
         // If we already have a pending PING for this conn, flush it first
         if (has_pending_ping_[ci]) {
@@ -1399,34 +1436,66 @@ private:
                            uint64_t parse_cycle, bool is_fragmented, bool is_last_fragment) {
         auto& ps = parse_state_[ci];
 
-        int64_t seq = ws_frame_info_prod_->try_claim();
-        if (seq < 0) {
-            fprintf(stderr, "[WS-PROCESS] FATAL: WS_FRAME_INFO full\n");
-            std::abort();
+        if constexpr (HasAppHandler) {
+            // AppHandler replaces WSFrameInfo ring — build info on stack, call handler
+            WSFrameInfo info{};
+            info.clear();
+            info.msg_inbox_offset = ps.current_payload_offset;
+            info.payload_len = static_cast<uint32_t>(payload_len);
+            info.opcode = opcode;
+            info.set_fin(!is_fragmented || is_last_fragment);
+            info.set_fragmented(is_fragmented);
+            info.set_last_fragment(is_last_fragment);
+            info.connection_id = ci;
+            populate_timestamps(info, ps);
+            info.set_tls_record_end(ps.pending_tls_record_end);
+            info.ws_parse_cycle = parse_cycle;
+            info.ws_frame_publish_cycle = rdtscp();
+            {
+                struct timespec _ts;
+                clock_gettime(CLOCK_MONOTONIC, &_ts);
+                info.publish_time_ts = _ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+            }
+
+            // Call handler for complete TEXT/BINARY messages
+            if (opcode == 0x01 || opcode == 0x02) {
+                if (!is_fragmented || is_last_fragment) {
+                    const uint8_t* payload = msg_inbox_[ci]->data_at(info.msg_inbox_offset);
+                    app_handler_.on_ws_frame(ci, opcode, payload,
+                                             static_cast<uint32_t>(payload_len), info);
+                }
+            }
+        } else {
+            // Original path: publish to WSFrameInfo ring for parent consumer
+            int64_t seq = ws_frame_info_prod_->try_claim();
+            if (seq < 0) {
+                fprintf(stderr, "[WS-PROCESS] FATAL: WS_FRAME_INFO full\n");
+                std::abort();
+            }
+
+            auto& info = (*ws_frame_info_prod_)[seq];
+            info.clear();
+
+            info.msg_inbox_offset = ps.current_payload_offset;
+            info.payload_len = static_cast<uint32_t>(payload_len);
+            info.opcode = opcode;
+            info.set_fin(!is_fragmented || is_last_fragment);
+            info.set_fragmented(is_fragmented);
+            info.set_last_fragment(is_last_fragment);
+            info.connection_id = ci;
+
+            populate_timestamps(info, ps);
+            info.set_tls_record_end(ps.pending_tls_record_end);
+            info.ws_parse_cycle = parse_cycle;
+
+            info.ws_frame_publish_cycle = rdtscp();
+            {
+                struct timespec _ts;
+                clock_gettime(CLOCK_MONOTONIC, &_ts);
+                info.publish_time_ts = _ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
+            }
+            ws_frame_info_prod_->publish(seq);
         }
-
-        auto& info = (*ws_frame_info_prod_)[seq];
-        info.clear();
-
-        info.msg_inbox_offset = ps.current_payload_offset;
-        info.payload_len = static_cast<uint32_t>(payload_len);
-        info.opcode = opcode;
-        info.set_fin(!is_fragmented || is_last_fragment);
-        info.set_fragmented(is_fragmented);
-        info.set_last_fragment(is_last_fragment);
-        info.connection_id = ci;
-
-        populate_timestamps(info, ps);
-        info.set_tls_record_end(ps.pending_tls_record_end);
-        info.ws_parse_cycle = parse_cycle;
-
-        info.ws_frame_publish_cycle = rdtscp();
-        {
-            struct timespec _ts;
-            clock_gettime(CLOCK_MONOTONIC, &_ts);
-            info.publish_time_ts = _ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
-        }
-        ws_frame_info_prod_->publish(seq);
 
         reset_accumulator(ci);
     }
@@ -1585,11 +1654,14 @@ private:
     WsConnPhase ws_phase_[NUM_CONN]{};
     PartialHttpResponse http_response_[NUM_CONN]{};
 
-    // Shared ring buffer interfaces
+    // Shared ring buffer interfaces (ws_frame_info_prod_ unused when HasAppHandler)
     WSFrameInfoProd* ws_frame_info_prod_ = nullptr;
     PongsProd* pongs_prod_ = nullptr;
     MsgOutboxProd* msg_outbox_prod_ = nullptr;
     ConnStateShm* conn_state_ = nullptr;
+
+    // AppHandler (inline callback, replaces WSFrameInfo ring when enabled)
+    [[no_unique_address]] AppHandler app_handler_{};
 
     // AutoReconnect startup signal
     bool ws_ready_signaled_ = false;
@@ -1600,6 +1672,7 @@ private:
     uint64_t last_op_cycle_ = 0;
 public:
     void set_profiling_data(CycleSampleBuffer* data) { profiling_data_ = data; }
+    AppHandler& app_handler() { return app_handler_; }
 private:
 
     // Per-connection watchdog state
