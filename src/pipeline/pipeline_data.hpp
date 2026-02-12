@@ -579,6 +579,16 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
     uint8_t  exchange_ip_count;                     // Number of valid IPs
     uint8_t  _pad_exchange[7];
 
+    // Per-connection target IP (set by parent, read by Transport)
+    // Network byte order. conn_target_ip[0] = conn A, conn_target_ip[1] = conn B
+    uint32_t conn_target_ip[2];
+
+    // Probe interface name (non-XDP interface used for DNS/probing by Transport on reconnect)
+    char probe_interface[64];
+
+    // Dual-dead detection threshold (milliseconds), 0 = disabled
+    uint64_t dual_dead_threshold_ms;
+
     // ========================================================================
     // Cache Line 5: TCP state (Transport process only - no atomics needed)
     // ========================================================================
@@ -825,6 +835,12 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         // Exchange IPs (set by parent before forking)
         std::memset(exchange_ips, 0, sizeof(exchange_ips));
         exchange_ip_count = 0;
+
+        // IP probe fields
+        conn_target_ip[0] = 0;
+        conn_target_ip[1] = 0;
+        std::memset(probe_interface, 0, sizeof(probe_interface));
+        dual_dead_threshold_ms = 0;
 
         // TCP state (plain assignments - Transport only)
         snd_nxt = 0;

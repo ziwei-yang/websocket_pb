@@ -1312,6 +1312,70 @@ struct PacketTransport {
     }
 
     /**
+     * Connect to a specific IP address (no DNS resolution).
+     * ip_host_order: IPv4 address in host byte order.
+     */
+    void initiate_connect_ip(uint32_t ip_host_order, uint16_t port) {
+        if (connected_) {
+            throw std::runtime_error("Already connected");
+        }
+
+        char remote_ip_str[INET_ADDRSTRLEN];
+        struct in_addr in_addr_tmp;
+        in_addr_tmp.s_addr = htonl(ip_host_order);
+        inet_ntop(AF_INET, &in_addr_tmp, remote_ip_str, sizeof(remote_ip_str));
+
+        if (pio().is_bpf_enabled()) {
+            pio().add_remote_ip(remote_ip_str);
+        }
+
+        printf("[PacketTransport] Initiating connect to %s:%u (by IP)...\n",
+               remote_ip_str, port);
+
+        // Setup TCP parameters
+        tcp_params_.remote_ip = ip_host_order;
+        tcp_params_.remote_port = port;
+        tcp_params_.local_port = userspace_stack::UserspaceStack::generate_port();
+        tcp_params_.snd_una = tcp_params_.snd_nxt = userspace_stack::UserspaceStack::generate_isn();
+        tcp_params_.rcv_nxt = 0;
+        tcp_params_.snd_wnd = userspace_stack::TCP_MAX_WINDOW;
+        tcp_params_.rcv_wnd = userspace_stack::TCP_MAX_WINDOW;
+
+        if (tsc_freq_hz_ == 0) {
+            tsc_freq_hz_ = calibrate_tsc_freq();
+        }
+        retransmit_queue_.init(tsc_freq_hz_, timers_.rto);
+
+        // Send SYN
+        uint32_t syn_frame_idx;
+        size_t syn_len = 0;
+        uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+            syn_frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
+            uint8_t* syn_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
+            syn_len = stack_.build_syn(syn_buffer, pio().frame_capacity(), tcp_params_);
+            desc.frame_len = static_cast<uint16_t>(syn_len);
+        });
+
+        if (claimed == 0 || syn_len == 0) {
+            throw std::runtime_error("Failed to allocate TX frame for SYN");
+        }
+
+        pio().commit_tx_frames(syn_frame_idx, syn_frame_idx);
+        state_ = userspace_stack::TCPState::SYN_SENT;
+
+        retransmit_queue_.add_ref(tcp_params_.snd_nxt, userspace_stack::TCP_FLAG_SYN,
+                                  syn_frame_idx, static_cast<uint16_t>(syn_len), 0);
+        tcp_params_.snd_nxt++;
+
+        fprintf(stderr, "[PacketTransport] SYN sent (local_port=%u, by IP)\n", tcp_params_.local_port);
+    }
+
+    /// Update the cached remote IP for next initiate_reconnect() call.
+    void set_remote_ip(uint32_t ip_host_order) {
+        tcp_params_.remote_ip = ip_host_order;
+    }
+
+    /**
      * Check if TCP handshake completed (ESTABLISHED state).
      */
     bool handshake_complete() const {

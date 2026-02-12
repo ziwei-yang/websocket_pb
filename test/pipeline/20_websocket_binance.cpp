@@ -593,6 +593,41 @@ int main(int argc, char* argv[]) {
     auto actual_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time).count();
 
+    // Signal child processes to stop, then drain any remaining events
+    pipeline.conn_state()->shutdown_all();
+    usleep(200000);  // 200ms for processes to quiesce
+
+    {
+        WSFrameInfo frame;
+        while (ws_frame_cons.try_consume(frame)) {
+            total_frames++;
+            uint8_t ci = frame.connection_id;
+            if (frame_records.size() < MAX_FRAME_RECORDS) {
+                frame_records.push_back(frame);
+            }
+            if (frame.is_fragmented() && !frame.is_last_fragment()) {
+                partial_events++;
+                continue;
+            }
+            switch (frame.opcode) {
+                case 0x01:
+                    text_frames++;
+                    if (frame.payload_len > 0) {
+                        const uint8_t* payload = pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset);
+                        if (is_valid_trade_json(reinterpret_cast<const char*>(payload), frame.payload_len)) {
+                            valid_trades++;
+                        }
+                    }
+                    break;
+                case 0x02: binary_frames++; break;
+                case 0x09: ping_frames++; break;
+                case 0x0A: pong_frames++; break;
+                case 0x08: close_frames++; break;
+                default: break;
+            }
+        }
+    }
+
     // Save profiling data
     pipeline.save_profiling_data();
 

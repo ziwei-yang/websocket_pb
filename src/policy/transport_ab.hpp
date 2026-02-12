@@ -61,6 +61,13 @@ struct PacketTransportAB {
      * Packet layout: ETH(14) + IP(20, IHL=5 enforced) + TCP(src:2, dst:2)
      * TCP dest port is at byte offset 36 (network byte order).
      */
+    // Demux counters for diagnostics
+    uint64_t demux_to_a_ = 0;
+    uint64_t demux_to_b_ = 0;
+    uint64_t demux_dropped_ = 0;
+    uint64_t demux_short_ = 0;
+    uint64_t demux_log_cycle_ = 0;
+
     size_t poll() {
         a.get_packet_io()->poll_wait();
         size_t n = a.get_packet_io()->process_rx_frames(SIZE_MAX,
@@ -73,6 +80,7 @@ struct PacketTransportAB {
                     // Too short — drop
                     uint32_t fi = a.get_packet_io()->frame_ptr_to_idx(desc.frame_ptr);
                     a.get_packet_io()->mark_frame_consumed(fi);
+                    demux_short_++;
                     return;
                 }
 
@@ -81,12 +89,15 @@ struct PacketTransportAB {
 
                 if (dst_port == a.tcp_params().local_port) {
                     a.process_rx_frame(idx, desc);
+                    demux_to_a_++;
                 } else if (dst_port == b.tcp_params().local_port) {
                     b.process_rx_frame(idx, desc);
+                    demux_to_b_++;
                 } else {
                     // Neither connection — drop
                     uint32_t fi = a.get_packet_io()->frame_ptr_to_idx(desc.frame_ptr);
                     a.get_packet_io()->mark_frame_consumed(fi);
+                    demux_dropped_++;
                 }
             });
         // Service retransmit queues for both connections
@@ -94,6 +105,19 @@ struct PacketTransportAB {
         if (b.is_connected()) {
             b.check_retransmit();
         }
+
+        // Periodic demux stats log (every ~10s)
+        uint64_t now = rdtscp();
+        if (demux_log_cycle_ == 0) demux_log_cycle_ = now;
+        // Approximate 10s using ~3GHz TSC
+        if (now - demux_log_cycle_ > 30000000000ULL) {
+            fprintf(stderr, "[DEMUX-STATS] A=%lu B=%lu dropped=%lu short=%lu "
+                    "portA=%u portB=%u\n",
+                    demux_to_a_, demux_to_b_, demux_dropped_, demux_short_,
+                    a.tcp_params().local_port, b.tcp_params().local_port);
+            demux_log_cycle_ = now;
+        }
+
         return n;
     }
 
@@ -110,6 +134,22 @@ struct PacketTransportAB {
         c.initiate_connect(host, port);
         fprintf(stderr, "[PacketTransportAB] SYN sent for conn %u (local_port=%u)\n",
                 ci, c.tcp_params().local_port);
+    }
+
+    /**
+     * Non-blocking: initiate TCP connect by IP for connection ci.
+     * ip_host_order: IPv4 address in host byte order.
+     */
+    void start_connect_ip(uint8_t ci, uint32_t ip_host_order, uint16_t port) {
+        auto& c = (ci == 0) ? a : b;
+        c.initiate_connect_ip(ip_host_order, port);
+        fprintf(stderr, "[PacketTransportAB] SYN sent for conn %u (local_port=%u, by IP)\n",
+                ci, c.tcp_params().local_port);
+    }
+
+    void set_remote_ip(uint8_t ci, uint32_t ip_host_order) {
+        auto& c = (ci == 0) ? a : b;
+        c.set_remote_ip(ip_host_order);
     }
 
     /**

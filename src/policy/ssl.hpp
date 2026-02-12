@@ -342,6 +342,13 @@ struct OpenSSLPolicy {
             throw std::runtime_error(std::string("SSL_connect() failed: ") + err_buf);
         }
 
+        // Log negotiated TLS version and cipher
+        const char* version = SSL_get_version(ssl_);
+        const char* cipher = SSL_CIPHER_get_name(SSL_get_current_cipher(ssl_));
+        fprintf(stderr, "[TLS] Handshake SUCCESS (BSD socket)\n");
+        fprintf(stderr, "[TLS]   Version: %s\n", version ? version : "unknown");
+        fprintf(stderr, "[TLS]   Cipher:  %s\n", cipher ? cipher : "unknown");
+
         #if defined(__linux__) && !defined(USE_LIBRESSL) && !defined(HAVE_WOLFSSL)
         // Check if kTLS was successfully activated (OpenSSL only)
         BIO* wbio = SSL_get_wbio(ssl_);
@@ -449,6 +456,14 @@ struct OpenSSLPolicy {
                 // Handshake successful - stop trickle thread, switch to inline trickle
                 transport->stop_rx_trickle_thread();
                 ktls_enabled_ = false;
+
+                // Log negotiated TLS version and cipher
+                const char* version = SSL_get_version(ssl_);
+                const char* cipher = SSL_CIPHER_get_name(SSL_get_current_cipher(ssl_));
+                fprintf(stderr, "[TLS] Handshake SUCCESS\n");
+                fprintf(stderr, "[TLS]   Version: %s\n", version ? version : "unknown");
+                fprintf(stderr, "[TLS]   Cipher:  %s\n", cipher ? cipher : "unknown");
+
                 // Reset server record counter — only count post-handshake records
                 server_record_count_ = 0;
                 return 0;
@@ -1365,6 +1380,13 @@ struct LibreSSLPolicy {
             throw std::runtime_error(std::string("SSL_connect() failed: ") + err_buf);
         }
 
+        // Log negotiated TLS version and cipher
+        const char* version = SSL_get_version(ssl_);
+        const char* cipher = SSL_CIPHER_get_name(SSL_get_current_cipher(ssl_));
+        fprintf(stderr, "[TLS] Handshake SUCCESS (BSD socket)\n");
+        fprintf(stderr, "[TLS]   Version: %s\n", version ? version : "unknown");
+        fprintf(stderr, "[TLS]   Cipher:  %s\n", cipher ? cipher : "unknown");
+
         // Reset server record counter — only count post-handshake records
         server_record_count_ = 0;
     }
@@ -1455,6 +1477,13 @@ struct LibreSSLPolicy {
 
             if (ret == 1) {
                 // Handshake successful
+                // Log negotiated TLS version and cipher
+                const char* version = SSL_get_version(ssl_);
+                const char* cipher = SSL_CIPHER_get_name(SSL_get_current_cipher(ssl_));
+                fprintf(stderr, "[TLS] Handshake SUCCESS\n");
+                fprintf(stderr, "[TLS]   Version: %s\n", version ? version : "unknown");
+                fprintf(stderr, "[TLS]   Cipher:  %s\n", cipher ? cipher : "unknown");
+
                 // Reset server record counter — only count post-handshake records
                 server_record_count_ = 0;
                 return 0;

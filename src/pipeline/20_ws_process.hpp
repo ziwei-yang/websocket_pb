@@ -370,10 +370,12 @@ struct PartialHttpResponse {
     uint8_t buffer[4096];
     size_t accumulated = 0;
     bool headers_complete = false;
+    size_t headers_end = 0;  // Position after \r\n\r\n (first WS byte)
 
     void clear() {
         accumulated = 0;
         headers_complete = false;
+        headers_end = 0;
     }
 
     // Check if we have complete HTTP headers (ends with \r\n\r\n)
@@ -383,6 +385,7 @@ struct PartialHttpResponse {
             if (buffer[i] == '\r' && buffer[i+1] == '\n' &&
                 buffer[i+2] == '\r' && buffer[i+3] == '\n') {
                 headers_complete = true;
+                headers_end = i + 4;
                 return true;
             }
         }
@@ -603,6 +606,8 @@ public:
                         maybe_send_client_ping(static_cast<uint8_t>(ci));
                     }
                 }
+                // Fast dual-dead detection (fires at ~3s vs ~20s per-conn watchdog)
+                check_dual_dead();
                 if (count > 0) last_op_cycle_ = rdtscp();
                 return count;
             }, slot, 1, idle);
@@ -841,6 +846,7 @@ private:
         if (meta.decrypted_len == 0) return;
 
         auto& resp = http_response_[ci];
+        size_t prev_accumulated = resp.accumulated;
         const uint8_t* data = msg_inbox_[ci]->data_at(meta.msg_inbox_offset);
         size_t to_copy = std::min(static_cast<size_t>(meta.decrypted_len),
                                   sizeof(resp.buffer) - resp.accumulated);
@@ -883,6 +889,10 @@ private:
         has_pending_frame_[ci] = false;
         pending_frame_[ci].clear();
 
+        // Reset dual-dead baseline: 0 means "no data yet" so check_dual_dead()
+        // won't fire until real WS data arrives on this connection
+        last_data_cycle_[ci] = 0;
+
         // Reset + resume watchdog for this connection
         reset_watchdog_state(ci);
 
@@ -906,6 +916,21 @@ private:
 
         fprintf(stderr, "[%ld.%06ld] [WS-RECONNECT] Connection %u fully restored\n",
                 _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+
+        // Forward leftover WS bytes: if the SSL_read that completed the HTTP
+        // headers also contained WS frame data after \r\n\r\n, those bytes are
+        // in MSG_INBOX but were consumed as "HTTP". Forward them to the WS parser.
+        size_t http_bytes_in_this_meta = resp.headers_end > prev_accumulated
+            ? (resp.headers_end - prev_accumulated)
+            : 0;
+        if (http_bytes_in_this_meta < to_copy) {
+            size_t ws_bytes = to_copy - http_bytes_in_this_meta;
+            MsgMetadata ws_meta = meta;
+            ws_meta.msg_inbox_offset = (meta.msg_inbox_offset +
+                static_cast<uint32_t>(http_bytes_in_this_meta)) % MSG_INBOX_SIZE;
+            ws_meta.decrypted_len = static_cast<uint32_t>(ws_bytes);
+            on_ws_data(ci, ws_meta);
+        }
     }
 
     // ========================================================================
@@ -913,6 +938,7 @@ private:
     // ========================================================================
 
     void on_ws_data(uint8_t ci, MsgMetadata& meta) {
+        last_data_cycle_[ci] = rdtscp();
         auto& ps = parse_state_[ci];
         auto* inbox = msg_inbox_[ci];
 
@@ -1312,6 +1338,22 @@ private:
             close_code = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
         }
 
+        // RFC 6455: valid close codes are 1000-4999. Anything outside this
+        // range indicates a parse desync (random data misread as CLOSE frame).
+        if (close_code != 1005 && (close_code < 1000 || close_code > 4999)) {
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            fprintf(stderr, "[%ld.%06ld] [WS-PARSE-ERROR] Spurious CLOSE "
+                    "(conn %u, code=%u) — frame parse desync, requesting reconnect\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci, close_code);
+            if constexpr (AutoReconnect) {
+                conn_state_->set_reconnect_request(ci);
+            } else {
+                conn_state_->set_disconnect(DisconnectReason::WS_CLOSE, close_code, "parse_desync");
+                conn_state_->shutdown_all();
+            }
+            return;
+        }
+
         char close_reason[128] = {0};
         if (payload_len > 2 && payload != nullptr) {
             size_t reason_len = std::min(payload_len - 2, static_cast<uint64_t>(sizeof(close_reason) - 1));
@@ -1402,6 +1444,7 @@ private:
 
         if (should_reconnect) {
             trigger_watchdog_reconnect(ci, now_cycle, tsc_freq);
+            ws_phase_[ci] = WsConnPhase::DISCONNECTED;
             return;
         }
 
@@ -1512,15 +1555,37 @@ private:
             ? ((now_cycle - w.last_server_ping_cycle) * 1000ULL) / tsc_freq : 0;
         bool interval_learned = (w.server_ping_count >= 2 && w.learned_interval_cycles > 0);
 
+        uint64_t data_gap_ms = (last_data_cycle_[ci] > 0)
+            ? ((now_cycle - last_data_cycle_[ci]) * 1000ULL) / tsc_freq : 0;
+
+        // Cross-connection diagnostic: check the other connection's health
+        uint8_t other = 1 - ci;
+        uint64_t other_data_gap_ms = 0;
+        const char* other_phase = "N/A";
+        if constexpr (EnableAB) {
+            if (last_data_cycle_[other] > 0)
+                other_data_gap_ms = ((now_cycle - last_data_cycle_[other]) * 1000ULL) / tsc_freq;
+            other_phase = (ws_phase_[other] == WsConnPhase::ACTIVE) ? "ACTIVE" :
+                          (ws_phase_[other] == WsConnPhase::DISCONNECTED) ? "DISCONNECTED" :
+                          "WS_UPGRADE_SENT";
+        }
+
         fprintf(stderr, "[%ld.%06ld] [WS-WATCHDOG] %s: conn %u dead\n"
                 "  PONG missing: last %lums ago (threshold %lums)\n"
-                "  server PING missing: last %lums ago (threshold %lums)\n",
+                "  server PING missing: last %lums ago (threshold %lums)\n"
+                "  last DATA: %lums ago\n",
                 _ts.tv_sec, _ts.tv_nsec / 1000,
                 AutoReconnect ? "RECONNECT" : "FATAL", ci,
                 (unsigned long)pong_gap_ms,
                 (unsigned long)(interval_learned ? w.learned_interval_ms : DEFAULT_PONG_TIMEOUT_MS),
                 (unsigned long)ping_gap_ms,
-                (unsigned long)(interval_learned ? (w.learned_interval_ms * 3 / 2) : 0));
+                (unsigned long)(interval_learned ? (w.learned_interval_ms * 3 / 2) : 0),
+                (unsigned long)data_gap_ms);
+
+        if constexpr (EnableAB) {
+            fprintf(stderr, "  other conn %u: phase=%s, last DATA %lums ago\n",
+                    other, other_phase, (unsigned long)other_data_gap_ms);
+        }
 
         if constexpr (AutoReconnect) {
             conn_state_->set_reconnect_request(ci);
@@ -1537,6 +1602,42 @@ private:
 
     void reset_watchdog_state(uint8_t ci) {
         wd_[ci] = WatchdogState{};
+    }
+
+    /// Fast dual-dead detection: if both connections are silent beyond threshold,
+    /// trigger reconnect for both immediately (3s vs 20s normal per-conn watchdog).
+    void check_dual_dead() {
+        if constexpr (!EnableAB || !AutoReconnect) return;
+
+        // Both connections must be ACTIVE and have received data
+        if (ws_phase_[0] != WsConnPhase::ACTIVE || ws_phase_[1] != WsConnPhase::ACTIVE) return;
+        if (last_data_cycle_[0] == 0 || last_data_cycle_[1] == 0) return;
+
+        uint64_t now = rdtscp();
+        uint64_t freq = conn_state_->tsc_freq_hz;
+        uint64_t threshold_ms = conn_state_->dual_dead_threshold_ms;
+        if (threshold_ms == 0 || freq == 0) return;  // Disabled
+
+        uint64_t gap_0 = ((now - last_data_cycle_[0]) * 1000ULL) / freq;
+        uint64_t gap_1 = ((now - last_data_cycle_[1]) * 1000ULL) / freq;
+
+        if (gap_0 > threshold_ms && gap_1 > threshold_ms) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            fprintf(stderr, "[%ld.%06ld] [WS-DUAL-DEAD] Both connections silent "
+                    "(conn0: %lums, conn1: %lums, threshold: %lums)\n",
+                    ts.tv_sec, ts.tv_nsec / 1000,
+                    (unsigned long)gap_0, (unsigned long)gap_1,
+                    (unsigned long)threshold_ms);
+
+            trigger_watchdog_reconnect(0, now, freq);
+            trigger_watchdog_reconnect(1, now, freq);
+
+            // Immediately mark DISCONNECTED to prevent repeated firing
+            // while waiting for TCP_DISCONNECTED from Transport process.
+            // Stale data will be correctly drained by on_event().
+            ws_phase_[0] = WsConnPhase::DISCONNECTED;
+            ws_phase_[1] = WsConnPhase::DISCONNECTED;
+        }
     }
 
     // ========================================================================
@@ -1689,6 +1790,7 @@ private:
         uint64_t last_server_ping_cycle = 0;
     };
     WatchdogState wd_[NUM_CONN]{};
+    uint64_t last_data_cycle_[NUM_CONN]{};  // TSC of last DATA event per connection
 
     static constexpr uint64_t DEFAULT_PONG_TIMEOUT_MS = 5000;  // 5s pre-learning default
 };

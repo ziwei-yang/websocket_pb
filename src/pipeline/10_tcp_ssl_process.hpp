@@ -56,6 +56,7 @@
 #include "../policy/transport.hpp"
 #include "../policy/transport_ab.hpp"
 #include "../core/timing.hpp"
+// ip_probe.hpp no longer needed — reconnect uses startup IP pool from conn_state
 
 namespace websocket::pipeline {
 
@@ -270,22 +271,23 @@ public:
             // Non-blocking startup: initiate TCP connect for all connections
             // State machine in run() handles TCP→TLS→TLS_READY→ACTIVE
             if constexpr (EnableAB) {
-                transport_.start_connect(0, parsed_url_.host.c_str(), parsed_url_.port);
+                // Use per-connection target IPs from parent probe
+                transport_.start_connect_ip(0, ntohl(conn_state_->conn_target_ip[0]), parsed_url_.port);
                 reconn_[0].phase = ConnPhase::TCP_CONNECTING;
                 reconn_[0].phase_start_cycle = rdtsc();
 
-                transport_.start_connect(1, parsed_url_.host.c_str(), parsed_url_.port);
+                transport_.start_connect_ip(1, ntohl(conn_state_->conn_target_ip[1]), parsed_url_.port);
                 reconn_[1].phase = ConnPhase::TCP_CONNECTING;
                 reconn_[1].phase_start_cycle = rdtsc();
             } else {
-                transport_.initiate_connect(parsed_url_.host.c_str(), parsed_url_.port);
+                transport_.initiate_connect_ip(ntohl(conn_state_->conn_target_ip[0]), parsed_url_.port);
                 reconn_[0].phase = ConnPhase::TCP_CONNECTING;
                 reconn_[0].phase_start_cycle = rdtsc();
             }
         } else {
             // Non-reconnect: blocking TCP + TLS handshake (original path)
             if constexpr (EnableAB) {
-                transport_.start_connect(0, parsed_url_.host.c_str(), parsed_url_.port);
+                transport_.start_connect_ip(0, ntohl(conn_state_->conn_target_ip[0]), parsed_url_.port);
                 // Blocking wait for TCP
                 while (!transport_.handshake_complete(0)) {
                     transport_.poll();
@@ -302,7 +304,7 @@ public:
                 transport_.a.reset_hw_timestamps();
                 transport_.a.reset_recv_stats();
 
-                transport_.start_connect(1, parsed_url_.host.c_str(), parsed_url_.port);
+                transport_.start_connect_ip(1, ntohl(conn_state_->conn_target_ip[1]), parsed_url_.port);
                 while (!transport_.handshake_complete(1)) {
                     transport_.poll();
                     usleep(100);
@@ -318,7 +320,13 @@ public:
                 transport_.b.reset_hw_timestamps();
                 transport_.b.reset_recv_stats();
             } else {
-                transport_.connect(parsed_url_.host.c_str(), parsed_url_.port);
+                transport_.initiate_connect_ip(ntohl(conn_state_->conn_target_ip[0]), parsed_url_.port);
+                // Blocking wait for TCP
+                while (!transport_.handshake_complete()) {
+                    transport_.poll();
+                    usleep(100);
+                }
+                transport_.set_connected();
                 if (ssl_[0].init() != 0) return false;
                 if (ssl_[0].handshake_userspace_transport(&transport_, parsed_url_.host.c_str()) != 0) return false;
                 websocket::crypto::TLSRecordKeys tls_keys;
@@ -379,6 +387,14 @@ public:
                     if (conn_state_->get_reconnect_request(ci)) {
                         conn_state_->clear_reconnect_request(ci);
                         if (reconn_[ci].phase == ConnPhase::ACTIVE) {
+                            if constexpr (EnableAB) {
+                                uint8_t other = 1 - ci;
+                                struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                                fprintf(stderr, "[%ld.%06ld] [RECONNECT] WS-watchdog triggered conn %u "
+                                        "(other conn %u phase=%u)\n",
+                                        _ts.tv_sec, _ts.tv_nsec / 1000, ci, other,
+                                        static_cast<unsigned>(reconn_[other].phase));
+                            }
                             start_reconnect(ci);
                         } else {
                             // Already reconnecting — request arrived during intermediate phase
@@ -586,7 +602,44 @@ private:
         // Shutdown SSL session
         ssl_[ci].shutdown();
 
-        // Reset and reconnect TCP
+        // Pick a different IP from the startup pool (all IPs are already in BPF filter)
+        if (conn_state_->exchange_ip_count > 1) {
+            uint32_t current_ip = conn_state_->conn_target_ip[ci];
+            uint32_t other_ip = 0;
+            if constexpr (EnableAB) {
+                other_ip = conn_state_->conn_target_ip[1 - ci];
+            }
+
+            // Round-robin through the pool, skip current and other connection's IP
+            uint32_t new_ip = current_ip;
+            uint8_t count = conn_state_->exchange_ip_count;
+            for (uint8_t i = 0; i < count; i++) {
+                uint8_t idx = (reconn_[ci].attempts + i) % count;
+                uint32_t candidate = conn_state_->exchange_ips[idx];
+                if (candidate != current_ip && candidate != other_ip) {
+                    new_ip = candidate;
+                    break;
+                }
+            }
+
+            if (new_ip != current_ip) {
+                if constexpr (EnableAB) {
+                    transport_.set_remote_ip(ci, ntohl(new_ip));
+                } else {
+                    transport_.set_remote_ip(ntohl(new_ip));
+                }
+                conn_state_->conn_target_ip[ci] = new_ip;
+
+                char ip_str[INET_ADDRSTRLEN];
+                struct in_addr tmp;
+                tmp.s_addr = new_ip;
+                inet_ntop(AF_INET, &tmp, ip_str, sizeof(ip_str));
+                fprintf(stderr, "[%ld.%06ld] [RECONNECT] Switched to pool IP: conn %u -> %s\n",
+                        _ts.tv_sec, _ts.tv_nsec / 1000, ci, ip_str);
+            }
+        }
+
+        // Reset and reconnect TCP (uses updated remote IP)
         int rc;
         if constexpr (EnableAB) {
             rc = transport_.start_reconnect(ci);
