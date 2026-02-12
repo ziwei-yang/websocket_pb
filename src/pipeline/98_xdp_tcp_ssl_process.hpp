@@ -258,8 +258,7 @@ public:
 
             // 3. SSL read -> MSG_INBOX
             // Calculate linear space available in circular buffer
-            uint32_t write_pos = msg_inbox_->current_write_pos();
-            uint32_t linear_space = MSG_INBOX_SIZE - write_pos;
+            uint32_t linear_space = msg_inbox_->linear_space_to_wrap();
             if (linear_space > 16384) linear_space = 16384;  // Limit read size
 
             timing.recv_start_cycle = rdtsc();

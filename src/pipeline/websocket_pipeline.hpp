@@ -68,6 +68,8 @@ concept PipelineTraitsConcept = requires {
     typename T::SSLPolicy;
     typename T::AppHandler;
     requires AppHandlerConcept<typename T::AppHandler>;
+    typename T::UpgradeCustomizer;
+    requires UpgradeCustomizerConcept<typename T::UpgradeCustomizer>;
 
     // ── CPU core assignments (required, no default) ──
     { T::XDP_POLL_CORE }    -> std::convertible_to<int>;
@@ -96,6 +98,9 @@ concept PipelineTraitsConcept = requires {
 // ============================================================================
 
 struct DefaultPipelineConfig {
+    // ── Default type policies ──
+    using UpgradeCustomizer = NullUpgradeCustomizer;
+
     // ── Feature toggles ──
     static constexpr bool ENABLE_AB        = false;
     static constexpr bool AUTO_RECONNECT   = false;
@@ -388,6 +393,7 @@ public:
     // ── Process type aliases ──
     using SSLPolicyType = typename Traits::SSLPolicy;
     using AppHandlerType = typename Traits::AppHandler;
+    using UpgradeCustomizerType = typename Traits::UpgradeCustomizer;
 
     using XDPPollType = XDPPollProcess<
         IPCRingProducer<PacketFrameDescriptor>,
@@ -407,7 +413,8 @@ public:
         IPCRingProducer<PongFrameAligned>,
         IPCRingProducer<MsgOutboxEvent>,
         EnableAB, AutoReconnect, Prof,
-        AppHandlerType>;
+        AppHandlerType,
+        UpgradeCustomizerType>;
 
     // ========================================================================
     // Lifecycle

@@ -359,6 +359,28 @@ struct NullAppHandler {
 
 static_assert(AppHandlerConcept<NullAppHandler>);
 
+// ============================================================================
+// UpgradeCustomizer Concept + NullUpgradeCustomizer
+//
+// UpgradeCustomizer allows test binaries to inject custom HTTP headers
+// into the WebSocket upgrade request (e.g., X-MBX-APIKEY for Binance SBE).
+// Default NullUpgradeCustomizer is a no-op — zero behavioral change.
+// ============================================================================
+
+struct NullUpgradeCustomizer {
+    static void customize(const ConnStateShm*,
+        std::vector<std::pair<std::string, std::string>>&) {}
+};
+
+template<typename T>
+concept UpgradeCustomizerConcept = requires(
+    const ConnStateShm* cs,
+    std::vector<std::pair<std::string, std::string>>& headers) {
+    { T::customize(cs, headers) };
+};
+
+static_assert(UpgradeCustomizerConcept<NullUpgradeCustomizer>);
+
 // Maximum metadata entries to accumulate before forced commit
 constexpr size_t MAX_ACCUMULATED_METADATA = 64;
 
@@ -411,7 +433,8 @@ template<typename MsgMetadataCons,     // IPCRingConsumer<MsgMetadata>
          bool EnableAB = false,
          bool AutoReconnect = false,
          bool Profiling = false,
-         AppHandlerConcept AppHandler = NullAppHandler>
+         AppHandlerConcept AppHandler = NullAppHandler,
+         UpgradeCustomizerConcept UpgradeCustomizer = NullUpgradeCustomizer>
 struct WebSocketProcess {
 public:
     static constexpr size_t NUM_CONN = EnableAB ? 2 : 1;
@@ -653,6 +676,7 @@ private:
     void send_http_upgrade_request(uint8_t ci) {
         char request_buf[4096];
         std::vector<std::pair<std::string, std::string>> custom_headers;
+        UpgradeCustomizer::customize(conn_state_, custom_headers);
 
         size_t request_len = websocket::http::build_websocket_upgrade_request(
             conn_state_->target_host,

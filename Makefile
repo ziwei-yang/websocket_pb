@@ -882,6 +882,35 @@ test-pipeline-websocket-binance: $(PIPELINE_WEBSOCKET_BINANCE_BIN) bpf
 	./scripts/test_xdp.sh 20_websocket_binance.cpp
 
 # ============================================================================
+# Binance SBE Binary Protocol Test (WebSocketProcess with SBE binary stream)
+# Tests full pipeline with SBE binary decoding via AppHandler
+# ============================================================================
+
+PIPELINE_BINANCE_SBE_SRC := test/pipeline/24_binance_sbe_xdp.cpp
+PIPELINE_BINANCE_SBE_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_xdp
+
+$(PIPELINE_BINANCE_SBE_BIN): $(PIPELINE_BINANCE_SBE_SRC) $(PIPELINE_HEADERS) src/msg/binance_sbe.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling Binance SBE test..."
+ifdef USE_XDP
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ Binance SBE test build complete: $@"
+else
+	@echo "❌ Error: Binance SBE test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
+	@exit 1
+endif
+else
+	@echo "❌ Error: Binance SBE test requires USE_XDP=1"
+	@exit 1
+endif
+
+build-test-pipeline-binance_sbe_xdp: $(PIPELINE_BINANCE_SBE_BIN)
+
+test-pipeline-binance-sbe: $(PIPELINE_BINANCE_SBE_BIN) bpf
+	@echo "🧪 Running Binance SBE test via script..."
+	./scripts/test_xdp.sh 24_binance_sbe_xdp.cpp
+
+# ============================================================================
 # WebSocket OKX Test (WebSocketProcess with OKX WSS stream)
 # Tests full pipeline: XDP Poll + Transport + WebSocket processes
 # ============================================================================

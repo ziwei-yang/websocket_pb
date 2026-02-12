@@ -855,8 +855,10 @@ private:
         auto* inbox = msg_inbox_[ci];
         auto* meta_prod = msg_metadata_prod_[ci];
 
-        uint32_t write_pos = inbox->current_write_pos();
-        uint32_t linear_space = MSG_INBOX_SIZE - write_pos;
+        // Use modulo'd position — current_write_pos() grows monotonically past
+        // MSG_INBOX_SIZE; raw subtraction underflows after the first buffer wrap,
+        // causing SSL_read to overflow past the end of data[].
+        uint32_t linear_space = inbox->linear_space_to_wrap();
         if (linear_space > 16384) linear_space = 16384;
 
         timing.recv_start_cycle = rdtsc();
@@ -927,8 +929,7 @@ private:
         auto* inbox = msg_inbox_[ci];
         auto* meta_prod = msg_metadata_prod_[ci];
 
-        uint32_t write_pos = inbox->current_write_pos();
-        uint32_t linear_space = MSG_INBOX_SIZE - write_pos;
+        uint32_t linear_space = inbox->linear_space_to_wrap();
         if (linear_space > 16384) linear_space = 16384;
 
         timing.recv_start_cycle = rdtsc();
