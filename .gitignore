@@ -1,5 +1,6 @@
 # Build artifacts
 build/
+bin/
 *.o
 *.a
 *.so
@@ -130,3 +131,5 @@ scripts/output/
 # Temporary run files
 /tmp/run_*.sh
 issue/
+debug/
+issues/

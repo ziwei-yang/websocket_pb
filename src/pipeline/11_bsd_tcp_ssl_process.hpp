@@ -2682,10 +2682,18 @@ private:
      */
     uint64_t query_tcp_segs_in(int sockfd) const {
 #ifdef __linux__
-        struct tcp_info info = {};
-        socklen_t len = sizeof(info);
-        if (getsockopt(sockfd, IPPROTO_TCP, TCP_INFO, &info, &len) == 0) {
-            return info.tcpi_segs_in;
+        // netinet/tcp.h defines a truncated tcp_info (104 bytes) missing tcpi_segs_in.
+        // The kernel's full struct has it at offset 140 (__u32).
+        // Read into a raw buffer to access it without requiring linux/tcp.h.
+        static constexpr size_t TCPI_SEGS_IN_OFFSET = 140;
+        static constexpr size_t KERNEL_TCP_INFO_SIZE = 256;  // generous upper bound
+        char buf[KERNEL_TCP_INFO_SIZE] = {};
+        socklen_t len = sizeof(buf);
+        if (getsockopt(sockfd, IPPROTO_TCP, TCP_INFO, buf, &len) == 0 &&
+            len >= TCPI_SEGS_IN_OFFSET + sizeof(uint32_t)) {
+            uint32_t segs_in;
+            std::memcpy(&segs_in, buf + TCPI_SEGS_IN_OFFSET, sizeof(segs_in));
+            return segs_in;
         }
 #endif
         (void)sockfd;

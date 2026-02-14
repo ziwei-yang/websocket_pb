@@ -896,6 +896,15 @@ private:
         IPCRingProducer<MsgOutboxEvent> msg_outbox_prod(*msg_outbox_region_);
         IPCRingProducer<PongFrameAligned> pongs_prod(*pongs_region_);
 
+        // Conn B metadata consumer must outlive ws_process.run() — declared here
+        // so it stays alive for the entire function scope (not scoped inside
+        // the if-constexpr block which would create a dangling pointer).
+        std::unique_ptr<IPCRingConsumer<MsgMetadata>> msg_metadata_cons_b_holder;
+        if constexpr (EnableAB) {
+            msg_metadata_cons_b_holder = std::make_unique<IPCRingConsumer<MsgMetadata>>(
+                *msg_metadata_region_[1]);
+        }
+
         // WSFrameInfo producer — created always (template param requires the type),
         // but only wired to the ring when !HasAppHandler
         WSFrameInfoProdHelper ws_frame_info_prod_holder(ws_frame_info_region_);
@@ -906,10 +915,9 @@ private:
         if constexpr (Prof) ws_process.set_profiling_data(&profiling_->ws_process);
 
         if constexpr (EnableAB) {
-            IPCRingConsumer<MsgMetadata> msg_metadata_cons_b(*msg_metadata_region_[1]);
             bool ok = ws_process.init(msg_inbox_[0], &msg_metadata_cons_a,
                 ws_frame_info_prod_holder.get(), &pongs_prod, &msg_outbox_prod,
-                conn_state_, msg_inbox_[1], &msg_metadata_cons_b);
+                conn_state_, msg_inbox_[1], msg_metadata_cons_b_holder.get());
             if (!ok) { conn_state_->shutdown_all(); return; }
         } else {
             bool ok = ws_process.init(msg_inbox_[0], &msg_metadata_cons_a,
