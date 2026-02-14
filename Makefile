@@ -288,13 +288,34 @@ TEST_RETRANSMIT_QUEUE_BIN := $(BUILD_DIR)/test_retransmit_queue
 TEST_SSL_POLICY_BIN := $(BUILD_DIR)/test_ssl_policy
 TEST_WS_PARSER_BIN := $(BUILD_DIR)/test_ws_parser
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-hftshm bpf check-ktls release debug epoll build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread
 
 all: $(EXAMPLE_BIN)
 
 # Create build directory
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
+
+# SSL backend sentinel — forces rebuild when SSL backend changes between
+# USE_OPENSSL, USE_WOLFSSL, USE_LIBRESSL.  The sentinel file records the
+# backend name; if it differs from the current invocation the file is
+# rewritten, which makes every binary that depends on it out-of-date.
+ifdef USE_WOLFSSL
+    SSL_BACKEND_NAME := wolfssl
+else ifdef USE_OPENSSL
+    SSL_BACKEND_NAME := openssl
+else ifdef USE_LIBRESSL
+    SSL_BACKEND_NAME := libressl
+else
+    SSL_BACKEND_NAME := none
+endif
+
+SSL_BACKEND_SENTINEL := $(BUILD_DIR)/.ssl_backend
+
+$(SSL_BACKEND_SENTINEL): FORCE | $(BUILD_DIR)
+	@echo "$(SSL_BACKEND_NAME)" | cmp -s - $@ || echo "$(SSL_BACKEND_NAME)" > $@
+
+FORCE:
 
 # Build example
 $(EXAMPLE_BIN): $(EXAMPLE_SRC) | $(BUILD_DIR)
@@ -831,7 +852,7 @@ test-pipeline-transport-https-libressl: $(PIPELINE_TRANSPORT_HTTPS_LIBRESSL_BIN)
 PIPELINE_TRANSPORT_WSS_SRC := test/pipeline/15_transport_wss.cpp
 PIPELINE_TRANSPORT_WSS_BIN := $(BUILD_DIR)/test_pipeline_transport_wss
 
-$(PIPELINE_TRANSPORT_WSS_BIN): $(PIPELINE_TRANSPORT_WSS_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+$(PIPELINE_TRANSPORT_WSS_BIN): $(PIPELINE_TRANSPORT_WSS_SRC) $(PIPELINE_HEADERS) $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling Transport WSS test..."
 ifdef USE_XDP
 ifdef USE_WOLFSSL
@@ -860,7 +881,7 @@ test-pipeline-transport-wss: $(PIPELINE_TRANSPORT_WSS_BIN) bpf
 PIPELINE_WEBSOCKET_BINANCE_SRC := test/pipeline/20_websocket_binance.cpp
 PIPELINE_WEBSOCKET_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_websocket_binance
 
-$(PIPELINE_WEBSOCKET_BINANCE_BIN): $(PIPELINE_WEBSOCKET_BINANCE_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+$(PIPELINE_WEBSOCKET_BINANCE_BIN): $(PIPELINE_WEBSOCKET_BINANCE_SRC) $(PIPELINE_HEADERS) $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling WebSocket Binance test..."
 ifdef USE_XDP
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
@@ -918,7 +939,7 @@ test-pipeline-binance-sbe: $(PIPELINE_BINANCE_SBE_BIN) bpf
 PIPELINE_WEBSOCKET_OKX_SRC := test/pipeline/21_websocket_okx.cpp
 PIPELINE_WEBSOCKET_OKX_BIN := $(BUILD_DIR)/test_pipeline_websocket_okx
 
-$(PIPELINE_WEBSOCKET_OKX_BIN): $(PIPELINE_WEBSOCKET_OKX_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+$(PIPELINE_WEBSOCKET_OKX_BIN): $(PIPELINE_WEBSOCKET_OKX_SRC) $(PIPELINE_HEADERS) $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling WebSocket OKX test..."
 ifdef USE_XDP
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
@@ -940,6 +961,121 @@ test-pipeline-websocket-okx: $(PIPELINE_WEBSOCKET_OKX_BIN) bpf
 	./scripts/test_xdp.sh 21_websocket_okx.cpp
 
 # ============================================================================
+# BSD Socket WebSocket Binance Test - 2-thread InlineSSL (test22)
+# Uses kernel TCP via BSD sockets instead of XDP
+# ============================================================================
+
+PIPELINE_BSD_WS_BINANCE_2T_SRC := test/pipeline/22_websocket_binance_bsdsocket_2thread.cpp
+PIPELINE_BSD_WS_BINANCE_2T_BIN := $(BUILD_DIR)/test_pipeline_websocket_binance_bsdsocket_2thread
+
+$(PIPELINE_BSD_WS_BINANCE_2T_BIN): $(PIPELINE_BSD_WS_BINANCE_2T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
+	@echo "🔨 Compiling BSD Socket WebSocket Binance 2-thread test..."
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL),$(USE_LIBRESSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ BSD Socket WebSocket Binance 2-thread test build complete: $@"
+else
+	@echo "❌ Error: BSD Socket WebSocket Binance test requires USE_WOLFSSL=1, USE_OPENSSL=1, or USE_LIBRESSL=1"
+	@exit 1
+endif
+
+build-test-pipeline-websocket_binance_bsdsocket_2thread: $(PIPELINE_BSD_WS_BINANCE_2T_BIN)
+
+# Default timeout for streaming test
+TIMEOUT ?= 5000
+
+test-pipeline-websocket-binance-bsdsocket-2thread: $(PIPELINE_BSD_WS_BINANCE_2T_BIN)
+	@echo "🧪 Running BSD Socket WebSocket Binance 2-thread test..."
+ifeq ($(UNAME_S),Darwin)
+	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_WS_BINANCE_2T_BIN) --timeout $(TIMEOUT)
+else
+	./$(PIPELINE_BSD_WS_BINANCE_2T_BIN) --timeout $(TIMEOUT)
+endif
+
+# ============================================================================
+# BSD Socket WebSocket Binance Test - 3-thread DedicatedSSL (test23)
+# Uses kernel TCP via BSD sockets with separate SSL thread
+# ============================================================================
+
+PIPELINE_BSD_WS_BINANCE_3T_SRC := test/pipeline/23_websocket_binance_bsdsocket_3thread.cpp
+PIPELINE_BSD_WS_BINANCE_3T_BIN := $(BUILD_DIR)/test_pipeline_websocket_binance_bsdsocket_3thread
+
+$(PIPELINE_BSD_WS_BINANCE_3T_BIN): $(PIPELINE_BSD_WS_BINANCE_3T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
+	@echo "🔨 Compiling BSD Socket WebSocket Binance 3-thread test..."
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL),$(USE_LIBRESSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ BSD Socket WebSocket Binance 3-thread test build complete: $@"
+else
+	@echo "❌ Error: BSD Socket WebSocket Binance test requires USE_WOLFSSL=1, USE_OPENSSL=1, or USE_LIBRESSL=1"
+	@exit 1
+endif
+
+build-test-pipeline-websocket_binance_bsdsocket_3thread: $(PIPELINE_BSD_WS_BINANCE_3T_BIN)
+
+test-pipeline-websocket-binance-bsdsocket-3thread: $(PIPELINE_BSD_WS_BINANCE_3T_BIN)
+	@echo "🧪 Running BSD Socket WebSocket Binance 3-thread test..."
+ifeq ($(UNAME_S),Darwin)
+	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_WS_BINANCE_3T_BIN) --timeout $(TIMEOUT)
+else
+	./$(PIPELINE_BSD_WS_BINANCE_3T_BIN) --timeout $(TIMEOUT)
+endif
+
+# ============================================================================
+# BSD Socket Binance SBE Test - 2-thread InlineSSL (test25)
+# Uses kernel TCP via BSD sockets with SBE binary protocol
+# ============================================================================
+
+PIPELINE_BSD_SBE_BINANCE_2T_SRC := test/pipeline/25_binance_sbe_bsdsocket_2thread.cpp
+PIPELINE_BSD_SBE_BINANCE_2T_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_bsdsocket_2thread
+
+$(PIPELINE_BSD_SBE_BINANCE_2T_BIN): $(PIPELINE_BSD_SBE_BINANCE_2T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/binance_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
+	@echo "🔨 Compiling BSD Socket Binance SBE 2-thread test..."
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL),$(USE_LIBRESSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ BSD Socket Binance SBE 2-thread test build complete: $@"
+else
+	@echo "❌ Error: BSD Socket Binance SBE test requires USE_WOLFSSL=1, USE_OPENSSL=1, or USE_LIBRESSL=1"
+	@exit 1
+endif
+
+build-test-pipeline-binance_sbe_bsdsocket_2thread: $(PIPELINE_BSD_SBE_BINANCE_2T_BIN)
+
+test-pipeline-binance-sbe-bsdsocket-2thread: $(PIPELINE_BSD_SBE_BINANCE_2T_BIN)
+	@echo "🧪 Running BSD Socket Binance SBE 2-thread test..."
+ifeq ($(UNAME_S),Darwin)
+	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_SBE_BINANCE_2T_BIN) --timeout $(TIMEOUT)
+else
+	./$(PIPELINE_BSD_SBE_BINANCE_2T_BIN) --timeout $(TIMEOUT)
+endif
+
+# ============================================================================
+# BSD Socket Binance SBE Test - 3-thread DedicatedSSL (test26)
+# Uses kernel TCP via BSD sockets with separate SSL thread + SBE binary protocol
+# ============================================================================
+
+PIPELINE_BSD_SBE_BINANCE_3T_SRC := test/pipeline/26_binance_sbe_bsdsocket_3thread.cpp
+PIPELINE_BSD_SBE_BINANCE_3T_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_bsdsocket_3thread
+
+$(PIPELINE_BSD_SBE_BINANCE_3T_BIN): $(PIPELINE_BSD_SBE_BINANCE_3T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/binance_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
+	@echo "🔨 Compiling BSD Socket Binance SBE 3-thread test..."
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL),$(USE_LIBRESSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ BSD Socket Binance SBE 3-thread test build complete: $@"
+else
+	@echo "❌ Error: BSD Socket Binance SBE test requires USE_WOLFSSL=1, USE_OPENSSL=1, or USE_LIBRESSL=1"
+	@exit 1
+endif
+
+build-test-pipeline-binance_sbe_bsdsocket_3thread: $(PIPELINE_BSD_SBE_BINANCE_3T_BIN)
+
+test-pipeline-binance-sbe-bsdsocket-3thread: $(PIPELINE_BSD_SBE_BINANCE_3T_BIN)
+	@echo "🧪 Running BSD Socket Binance SBE 3-thread test..."
+ifeq ($(UNAME_S),Darwin)
+	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_SBE_BINANCE_3T_BIN) --timeout $(TIMEOUT)
+else
+	./$(PIPELINE_BSD_SBE_BINANCE_3T_BIN) --timeout $(TIMEOUT)
+endif
+
+# ============================================================================
 # Unified XDP+TCP+SSL+WS Pipeline Test (Single-Process)
 # Tests unified pipeline: all layers in one process, outputs to IPC rings
 # ============================================================================
@@ -947,7 +1083,7 @@ test-pipeline-websocket-okx: $(PIPELINE_WEBSOCKET_OKX_BIN) bpf
 PIPELINE_UNIFIED_BINANCE_SRC := test/pipeline/99_websocket_binance_1_proc.cpp
 PIPELINE_UNIFIED_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_99_websocket_binance
 
-$(PIPELINE_UNIFIED_BINANCE_BIN): $(PIPELINE_UNIFIED_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/99_xdp_tcp_ssl_ws_process.hpp | $(BUILD_DIR)
+$(PIPELINE_UNIFIED_BINANCE_BIN): $(PIPELINE_UNIFIED_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/99_xdp_tcp_ssl_ws_process.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling Unified XDP+TCP+SSL+WS Pipeline test..."
 ifdef USE_XDP
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
@@ -976,7 +1112,7 @@ test-pipeline-unified-binance: $(PIPELINE_UNIFIED_BINANCE_BIN) bpf
 PIPELINE_98_BINANCE_SRC := test/pipeline/98_websocket_binance_piotransport_ws.cpp
 PIPELINE_98_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_98_websocket_binance
 
-$(PIPELINE_98_BINANCE_BIN): $(PIPELINE_98_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/98_xdp_tcp_ssl_process.hpp src/pipeline/20_ws_process.hpp | $(BUILD_DIR)
+$(PIPELINE_98_BINANCE_BIN): $(PIPELINE_98_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/98_xdp_tcp_ssl_process.hpp src/pipeline/20_ws_process.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling UnifiedSSL + WebSocket Pipeline test (98_*)..."
 ifdef USE_XDP
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
@@ -1005,7 +1141,7 @@ test-pipeline-98-binance: $(PIPELINE_98_BINANCE_BIN) bpf
 PIPELINE_96_BINANCE_SRC := test/pipeline/96_websocket_binance_xdp_piotransport_ws.cpp
 PIPELINE_96_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_96_websocket_binance
 
-$(PIPELINE_96_BINANCE_BIN): $(PIPELINE_96_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/00_xdp_poll_process.hpp src/pipeline/10_tcp_ssl_process.hpp src/pipeline/disruptor_packet_io.hpp src/pipeline/20_ws_process.hpp | $(BUILD_DIR)
+$(PIPELINE_96_BINANCE_BIN): $(PIPELINE_96_BINANCE_SRC) $(PIPELINE_HEADERS) src/pipeline/00_xdp_poll_process.hpp src/pipeline/10_tcp_ssl_process.hpp src/pipeline/disruptor_packet_io.hpp src/pipeline/20_ws_process.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling XDP Poll + PIO Transport + WebSocket Pipeline test (96_*)..."
 ifdef USE_XDP
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
@@ -1025,6 +1161,178 @@ build-test-pipeline-96_websocket_binance: $(PIPELINE_96_BINANCE_BIN)
 test-pipeline-96-binance: $(PIPELINE_96_BINANCE_BIN) bpf
 	@echo "🧪 Running XDP Poll + PIO Transport + WebSocket Pipeline test via script..."
 	./scripts/test_xdp.sh 96_websocket_binance.cpp
+
+# ============================================================================
+# BSD Socket Transport SSL Tests (separate by SSL library)
+# Tests 2-thread (InlineSSL) and 3-thread (DedicatedSSL) modes
+# ============================================================================
+
+# SSL library paths for explicit linking
+ifeq ($(UNAME_S),Darwin)
+    WOLFSSL_INC := -I$(HOME)/Proj/wolfssl
+    WOLFSSL_LIB := -L$(HOME)/Proj/wolfssl/src/.libs -Wl,-rpath,$(HOME)/Proj/wolfssl/src/.libs -lwolfssl
+    OPENSSL_INC := -I$(HOME)/Proj/openssl/include
+    OPENSSL_LIB := -L$(HOME)/Proj/openssl -Wl,-rpath,$(HOME)/Proj/openssl -lssl -lcrypto
+    LIBRESSL_INC := -I$(HOME)/Proj/libressl/install/include
+    LIBRESSL_LIB := -L$(HOME)/Proj/libressl/install/lib -Wl,-rpath,$(HOME)/Proj/libressl/install/lib -lssl -lcrypto
+else
+    WOLFSSL_INC := -I$(HOME)/Proj/wolfssl/install/include
+    WOLFSSL_LIB := -L$(HOME)/Proj/wolfssl/install/lib -Wl,-rpath,$(HOME)/Proj/wolfssl/install/lib -lwolfssl
+    OPENSSL_INC := -I$(HOME)/Proj/openssl/install/include
+    OPENSSL_LIB := -L$(HOME)/Proj/openssl/install/lib64 -Wl,-rpath,$(HOME)/Proj/openssl/install/lib64 -lssl -lcrypto
+    LIBRESSL_INC := -I$(HOME)/Proj/libressl/install/include
+    LIBRESSL_LIB := -L$(HOME)/Proj/libressl/install/lib -Wl,-rpath,$(HOME)/Proj/libressl/install/lib -lssl -lcrypto
+endif
+
+# Base CXXFLAGS without SSL-specific flags
+BASE_CXXFLAGS := -std=c++20 -O3 -march=native -Wall -Wextra -I./src -I../01_shared_headers -DNIC_MTU=$(NIC_MTU)
+ifeq ($(UNAME_S),Darwin)
+    BASE_CXXFLAGS += -D__APPLE__
+else
+    BASE_CXXFLAGS += -D__linux__
+endif
+
+# --- OpenSSL Test ---
+PIPELINE_BSD_OPENSSL_SRC := test/pipeline/112_bsd_transport_openssl.cpp
+PIPELINE_BSD_OPENSSL_BIN := $(BUILD_DIR)/test_pipeline_bsd_transport_openssl
+
+$(PIPELINE_BSD_OPENSSL_BIN): $(PIPELINE_BSD_OPENSSL_SRC) src/pipeline/11_bsd_tcp_ssl_process.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling BSD Transport OpenSSL test..."
+	$(CXX) $(BASE_CXXFLAGS) $(OPENSSL_INC) -o $@ $< $(OPENSSL_LIB)
+	@echo "✅ BSD Transport OpenSSL test build complete: $@"
+
+build-test-pipeline-bsd-transport-openssl: $(PIPELINE_BSD_OPENSSL_BIN)
+
+# Usage: make test-pipeline-bsd-transport-openssl           # Test both 2-thread + 3-thread
+#        make test-pipeline-bsd-transport-openssl MODE=2thread  # 2-thread InlineSSL only
+#        make test-pipeline-bsd-transport-openssl MODE=3thread  # 3-thread DedicatedSSL only
+test-pipeline-bsd-transport-openssl: $(PIPELINE_BSD_OPENSSL_BIN)
+	@echo "🧪 Running BSD Transport OpenSSL test..."
+	./$(PIPELINE_BSD_OPENSSL_BIN) $(MODE)
+
+# --- WolfSSL Test ---
+PIPELINE_BSD_WOLFSSL_SRC := test/pipeline/112_bsd_transport_wolfssl.cpp
+PIPELINE_BSD_WOLFSSL_BIN := $(BUILD_DIR)/test_pipeline_bsd_transport_wolfssl
+
+$(PIPELINE_BSD_WOLFSSL_BIN): $(PIPELINE_BSD_WOLFSSL_SRC) src/pipeline/11_bsd_tcp_ssl_process.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling BSD Transport WolfSSL test..."
+	$(CXX) $(BASE_CXXFLAGS) $(WOLFSSL_INC) -DHAVE_WOLFSSL -o $@ $< $(WOLFSSL_LIB)
+	@echo "✅ BSD Transport WolfSSL test build complete: $@"
+
+build-test-pipeline-bsd-transport-wolfssl: $(PIPELINE_BSD_WOLFSSL_BIN)
+
+test-pipeline-bsd-transport-wolfssl: $(PIPELINE_BSD_WOLFSSL_BIN)
+	@echo "🧪 Running BSD Transport WolfSSL test..."
+ifeq ($(UNAME_S),Darwin)
+	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_WOLFSSL_BIN) $(MODE)
+else
+	./$(PIPELINE_BSD_WOLFSSL_BIN) $(MODE)
+endif
+
+# --- LibreSSL Test ---
+PIPELINE_BSD_LIBRESSL_SRC := test/pipeline/112_bsd_transport_libressl.cpp
+PIPELINE_BSD_LIBRESSL_BIN := $(BUILD_DIR)/test_pipeline_bsd_transport_libressl
+
+$(PIPELINE_BSD_LIBRESSL_BIN): $(PIPELINE_BSD_LIBRESSL_SRC) src/pipeline/11_bsd_tcp_ssl_process.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling BSD Transport LibreSSL test..."
+	$(CXX) $(BASE_CXXFLAGS) $(LIBRESSL_INC) -DUSE_LIBRESSL -o $@ $< $(LIBRESSL_LIB)
+	@echo "✅ BSD Transport LibreSSL test build complete: $@"
+
+build-test-pipeline-bsd-transport-libressl: $(PIPELINE_BSD_LIBRESSL_BIN)
+
+test-pipeline-bsd-transport-libressl: $(PIPELINE_BSD_LIBRESSL_BIN)
+	@echo "🧪 Running BSD Transport LibreSSL test..."
+	./$(PIPELINE_BSD_LIBRESSL_BIN) $(MODE)
+
+# ============================================================================
+# BSD Socket Transport TCP Test (NoSSLPolicy, no XDP required)
+# ============================================================================
+
+PIPELINE_BSD_TRANSPORT_TCP_SRC := test/pipeline/110_bsd_transport_tcp.cpp
+PIPELINE_BSD_TRANSPORT_TCP_BIN := $(BUILD_DIR)/test_pipeline_bsd_transport_tcp
+
+# Build BSD Transport TCP test (no USE_XDP required - uses kernel TCP)
+$(PIPELINE_BSD_TRANSPORT_TCP_BIN): $(PIPELINE_BSD_TRANSPORT_TCP_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling BSD Transport TCP test..."
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ BSD Transport TCP test build complete: $@"
+
+# Build-only target for BSD Transport TCP test
+build-test-pipeline-bsd-transport-tcp: $(PIPELINE_BSD_TRANSPORT_TCP_BIN)
+
+# Run BSD Transport TCP test with localhost echo server (default)
+# No XDP/BPF required - uses standard BSD sockets with kernel TCP
+# Usage: make test-pipeline-bsd-transport-tcp              # localhost echo (default)
+#        make test-pipeline-bsd-transport-tcp ECHO_TARGET=139.162.79.171:12345  # remote
+ECHO_TARGET ?= localhost
+test-pipeline-bsd-transport-tcp: $(PIPELINE_BSD_TRANSPORT_TCP_BIN)
+	@echo "🧪 Running BSD Transport TCP test ($(ECHO_TARGET))..."
+	./$(PIPELINE_BSD_TRANSPORT_TCP_BIN) $(subst :, ,$(ECHO_TARGET))
+
+# ============================================================================
+# BSD Socket Transport io_uring Test (Option E - Linux only)
+# ============================================================================
+
+PIPELINE_BSD_IOURING_SRC := test/pipeline/111_bsd_transport_iouring.cpp
+PIPELINE_BSD_IOURING_BIN := $(BUILD_DIR)/test_pipeline_bsd_transport_iouring
+
+# Build io_uring Transport test (Linux only, requires liburing)
+$(PIPELINE_BSD_IOURING_BIN): $(PIPELINE_BSD_IOURING_SRC) | $(BUILD_DIR)
+ifeq ($(OS),Linux)
+	@echo "🔨 Compiling io_uring Transport test (Option E)..."
+	$(CXX) -std=c++20 -O3 -march=native -Wall -Wextra $(INCLUDES) -o $@ $< -luring -lpthread
+	@echo "✅ io_uring Transport test build complete: $@"
+else
+	@echo "⚠️  io_uring Transport test is Linux-only (skipping on $(OS))"
+endif
+
+# Build-only target for io_uring Transport test
+build-test-pipeline-bsd-transport-iouring: $(PIPELINE_BSD_IOURING_BIN)
+
+# Run io_uring Transport test with localhost echo server (default)
+# Requires: Linux 5.1+ with io_uring support, liburing
+# Usage: make test-pipeline-bsd-transport-iouring
+#        make test-pipeline-bsd-transport-iouring ECHO_TARGET=139.162.79.171:12345
+test-pipeline-bsd-transport-iouring: $(PIPELINE_BSD_IOURING_BIN)
+ifeq ($(OS),Linux)
+	@echo "🧪 Running io_uring Transport test ($(ECHO_TARGET))..."
+	./$(PIPELINE_BSD_IOURING_BIN) $(subst :, ,$(ECHO_TARGET))
+else
+	@echo "⚠️  io_uring Transport test is Linux-only (skipping on $(OS))"
+endif
+
+# ============================================================================
+# Unified BSD Socket Transport Test (all configurations)
+# ============================================================================
+
+PIPELINE_BSD_UNIFIED_SRC := test/pipeline/113_bsd_transport.cpp
+PIPELINE_BSD_UNIFIED_BIN := $(BUILD_DIR)/test_pipeline_bsd_transport
+
+# Build unified BSD Transport test (tests all configurations)
+$(PIPELINE_BSD_UNIFIED_BIN): $(PIPELINE_BSD_UNIFIED_SRC) src/pipeline/11_bsd_tcp_ssl_process.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling unified BSD Transport test..."
+ifeq ($(UNAME_S),Linux)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS) -luring
+else
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+endif
+	@echo "✅ Unified BSD Transport test build complete: $@"
+
+# Build-only target
+build-test-pipeline-bsd-transport: $(PIPELINE_BSD_UNIFIED_BIN)
+
+# Run unified BSD Transport test
+# Usage: make test-pipeline-bsd-transport              # Test all configs
+#        make test-pipeline-bsd-transport MODE=2thread  # 2-thread only
+#        make test-pipeline-bsd-transport MODE=iouring  # io_uring only (Linux)
+MODE ?=
+test-pipeline-bsd-transport: $(PIPELINE_BSD_UNIFIED_BIN)
+	@echo "🧪 Running unified BSD Transport test..."
+ifeq ($(UNAME_S),Darwin)
+	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_UNIFIED_BIN) $(MODE)
+else
+	./$(PIPELINE_BSD_UNIFIED_BIN) $(MODE)
+endif
 
 # ============================================================================
 # HftShm RingBuffer Tests (requires hft-shm CLI)

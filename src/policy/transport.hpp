@@ -500,26 +500,9 @@ namespace transport {
 // NOTE: Legacy XDPUserspaceTransport has been removed.
 // Use PacketTransport<XDPPacketIO> instead (see below).
 
-// ============================================================================
-// TLS Record Parser State (for ssl_read_by_chunk)
-// ============================================================================
-
-enum class TLSRecordState : uint8_t {
-    NEED_HEADER,   // Waiting for 5-byte TLS record header
-    NEED_PAYLOAD,  // Decrypting ciphertext payload
-    NEED_TAG       // Skipping 16-byte AEAD tag
-};
-
-struct TLSRecordParser {
-    TLSRecordState state = TLSRecordState::NEED_HEADER;
-    uint8_t  content_type = 0;
-    uint16_t record_length = 0;       // From header (includes tag for TLS 1.3, or explicit_nonce + tag for TLS 1.2)
-    uint16_t ciphertext_length = 0;   // Actual payload to decrypt (record_length minus overhead)
-    uint16_t payload_consumed = 0;    // Bytes of ciphertext consumed so far in this record
-    uint16_t tag_consumed = 0;        // Bytes of tag consumed so far
-    uint32_t block_counter = 0;       // AES-CTR counter within this record (starts at 2)
-    uint8_t  nonce[12] = {};          // Derived nonce for current record
-};
+// Import TLS record parser types from core/aes_ctr.hpp (shared with BSDSocketTransport)
+using crypto::TLSRecordState;
+using crypto::TLSRecordParser;
 
 // ============================================================================
 // PacketTransport<PacketIO> - Policy-based Transport Abstraction

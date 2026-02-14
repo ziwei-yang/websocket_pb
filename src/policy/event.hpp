@@ -110,6 +110,7 @@ struct EpollPolicy {
      * @throws std::runtime_error if epoll_create1() fails
      */
     void init() {
+        if (epfd_ >= 0) { ::close(epfd_); epfd_ = -1; }
         epfd_ = epoll_create1(EPOLL_CLOEXEC);
         if (epfd_ < 0) {
             throw std::runtime_error("epoll_create1() failed");
@@ -375,6 +376,7 @@ struct KqueuePolicy {
      * @throws std::runtime_error if kqueue() fails
      */
     void init() {
+        if (kq_ >= 0) { ::close(kq_); kq_ = -1; }
         kq_ = kqueue();
         if (kq_ < 0) {
             throw std::runtime_error("kqueue() failed");

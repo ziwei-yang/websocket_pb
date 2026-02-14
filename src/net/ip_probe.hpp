@@ -35,7 +35,28 @@
 #include <errno.h>
 #include <time.h>
 
+// macOS does not support SOCK_CLOEXEC / SOCK_NONBLOCK flags in socket()
+#ifdef __APPLE__
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0
+#endif
+#ifndef SOCK_NONBLOCK
+#define SOCK_NONBLOCK 0
+#endif
+#endif
+
 namespace websocket::net {
+
+namespace detail {
+/// Set O_NONBLOCK and FD_CLOEXEC via fcntl (needed on macOS where socket flags are unavailable)
+inline void set_nonblock_cloexec([[maybe_unused]] int fd) {
+#ifdef __APPLE__
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
+}
+}  // namespace detail
 
 // ============================================================================
 // Status and Error Reporting
@@ -201,6 +222,7 @@ inline int resolve_via_udp(const char* hostname, const char* nameserver,
     // Create UDP socket to nameserver
     int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
+    detail::set_nonblock_cloexec(fd);
 
     struct sockaddr_in ns_addr = {};
     ns_addr.sin_family = AF_INET;
@@ -386,6 +408,7 @@ inline int64_t probe_one(ProbeEntry& entry, uint16_t port,
         entry.error_code = errno;
         return -1;
     }
+    detail::set_nonblock_cloexec(fd);
 
     // Bind to interface if requested
     if (bind_interface && bind_interface[0]) {

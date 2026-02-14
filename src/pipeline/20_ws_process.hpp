@@ -631,6 +631,7 @@ public:
                 }
                 // Fast dual-dead detection (fires at ~3s vs ~20s per-conn watchdog)
                 check_dual_dead();
+                check_upgrade_timeout();
                 if (count > 0) last_op_cycle_ = rdtscp();
                 return count;
             }, slot, 1, idle);
@@ -863,6 +864,7 @@ private:
         // Send HTTP upgrade request via MSG_OUTBOX
         send_http_upgrade_request(ci);
         ws_phase_[ci] = WsConnPhase::WS_UPGRADE_SENT;
+        upgrade_sent_cycle_[ci] = rdtscp();
         http_response_[ci].clear();
     }
 
@@ -977,6 +979,7 @@ private:
             ps.data_accumulated = 0;
             ps.parse_offset = 0;
             ps.accumulated_metadata_count = 0;
+            ps.has_carry_over = false;
             ps.batch_frame_num = 0;
         }
 
@@ -1084,9 +1087,15 @@ private:
                 has_pending_frame_[ci] = false;
                 pending_frame_[ci].clear();
 
+                // Reset metadata accumulator for next frame
                 ps.accumulated_metadata_count = 0;
+                ps.has_carry_over = false;
                 if (ps.parse_offset < ps.data_accumulated) {
+                    // More data in batch - current meta is start of next frame.
+                    // Mark as carry-over so populate_timestamps() skips its stale
+                    // timing fields when subsequent real metadata entries exist.
                     ps.accumulated_metadata[ps.accumulated_metadata_count++] = ps.current_metadata;
+                    ps.has_carry_over = true;
                 }
             }
         }
@@ -1664,6 +1673,33 @@ private:
         }
     }
 
+    void check_upgrade_timeout() {
+        if constexpr (!AutoReconnect) return;
+
+        static constexpr uint64_t UPGRADE_TIMEOUT_MS = 10000;  // 10 seconds
+
+        uint64_t now = rdtscp();
+        uint64_t freq = conn_state_->tsc_freq_hz;
+        if (freq == 0) return;
+
+        for (size_t ci = 0; ci < NUM_CONN; ci++) {
+            if (ws_phase_[ci] != WsConnPhase::WS_UPGRADE_SENT) continue;
+            if (upgrade_sent_cycle_[ci] == 0) continue;
+
+            uint64_t elapsed_ms = ((now - upgrade_sent_cycle_[ci]) * 1000ULL) / freq;
+            if (elapsed_ms > UPGRADE_TIMEOUT_MS) {
+                struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                fprintf(stderr, "[%ld.%06ld] [WS-RECONNECT] HTTP upgrade timeout for conn %zu "
+                        "(%lu ms elapsed), requesting reconnect\n",
+                        _ts.tv_sec, _ts.tv_nsec / 1000, ci, (unsigned long)elapsed_ms);
+
+                ws_phase_[ci] = WsConnPhase::DISCONNECTED;
+                upgrade_sent_cycle_[ci] = 0;
+                conn_state_->set_reconnect_request(ci);
+            }
+        }
+    }
+
     // ========================================================================
     // Timestamp Helpers
     // ========================================================================
@@ -1673,7 +1709,15 @@ private:
 
     void populate_timestamps(WSFrameInfo& info, PerConnParseState& ps) {
         if (ps.accumulated_metadata_count > 0) {
-            const auto& first_meta = ps.accumulated_metadata[0];
+            // Skip carry-over metadata for "first" timestamps when real metadata
+            // exists — carry-over timestamps are from the previous frame's batch
+            // and would incorrectly show a stale poll event as the data source.
+            // Fall back to carry-over if it's the only metadata (frame fits in leftover).
+            size_t first_idx = 0;
+            if (ps.has_carry_over && ps.accumulated_metadata_count > 1) {
+                first_idx = 1;
+            }
+            const auto& first_meta = ps.accumulated_metadata[first_idx];
             info.first_byte_ts = first_meta.first_nic_timestamp_ns;
             info.first_bpf_entry_ns = first_meta.first_bpf_entry_ns;
             info.first_poll_cycle = first_meta.first_nic_frame_poll_cycle;
@@ -1690,9 +1734,26 @@ private:
         info.ssl_read_ct = static_cast<uint8_t>(ps.accumulated_metadata_count);
         info.last_pkt_mem_idx = ps.current_metadata.last_pkt_mem_idx;
 
+        // Carry-over-only: frame fits entirely in leftover data from
+        // previous batch. No new poll events delivered data for this frame.
+        // Use latest timestamps as first (frame was available from previous batch,
+        // but couldn't be published until new metadata triggered process_metadata).
+        if (ps.has_carry_over && ps.accumulated_metadata_count == 1) {
+            info.first_poll_cycle = info.latest_poll_cycle;
+            info.first_byte_ts = info.last_byte_ts;
+            info.first_bpf_entry_ns = info.latest_bpf_entry_ns;
+        }
+
+        // Sum packet counts — skip carry-over to avoid inflating count with
+        // stale poll events from the previous batch
         uint32_t total_nic_packets = 0;
-        for (size_t i = 0; i < ps.accumulated_metadata_count; ++i) {
+        size_t pkt_start = (ps.has_carry_over && ps.accumulated_metadata_count > 1) ? 1 : 0;
+        for (size_t i = pkt_start; i < ps.accumulated_metadata_count; ++i) {
             total_nic_packets += ps.accumulated_metadata[i].nic_packet_ct;
+        }
+        // Carry-over-only: no new polls contributed — reset to 0
+        if (ps.has_carry_over && ps.accumulated_metadata_count == 1) {
+            total_nic_packets = 0;
         }
         info.nic_packet_ct = static_cast<uint8_t>(total_nic_packets);
 
@@ -1711,6 +1772,7 @@ private:
 
     void reset_accumulator(uint8_t ci) {
         parse_state_[ci].accumulated_metadata_count = 0;
+        parse_state_[ci].has_carry_over = false;
     }
 
     void reset_fragment_state(uint8_t ci) {
@@ -1740,6 +1802,7 @@ private:
         // Timestamp accumulation
         std::array<MsgMetadata, MAX_ACCUMULATED_METADATA> accumulated_metadata;
         size_t accumulated_metadata_count = 0;
+        bool has_carry_over = false;  // accumulated_metadata[0] is carried from prev frame
         MsgMetadata first_packet_metadata;
         MsgMetadata current_metadata;
 
@@ -1815,6 +1878,7 @@ private:
     };
     WatchdogState wd_[NUM_CONN]{};
     uint64_t last_data_cycle_[NUM_CONN]{};  // TSC of last DATA event per connection
+    uint64_t upgrade_sent_cycle_[NUM_CONN]{};  // TSC when entering WS_UPGRADE_SENT
 
     static constexpr uint64_t DEFAULT_PONG_TIMEOUT_MS = 5000;  // 5s pre-learning default
 };

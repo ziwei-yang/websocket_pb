@@ -314,18 +314,43 @@ struct alignas(64) WSFrameInfo {
                 fmt(bv, bpf_us);
                 if (interval_us >= 0) {
                     fmt(iv, interval_us);
-                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "%7s| bpf %6s |", iv, bv);
+                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "%7s| bpf %6s ", iv, bv);
                 } else {
                     fmt(iv, -interval_us);
-                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "\033[31m%7s\033[0m| bpf %6s |", iv, bv);
+                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "\033[31m%7s\033[0m| bpf %6s ", iv, bv);
                 }
             } else {
                 char bv[16];
                 fmt(bv, bpf_us);
-                std::snprintf(bpf_prefix, sizeof(bpf_prefix), "       | bpf %6s |", bv);
+                std::snprintf(bpf_prefix, sizeof(bpf_prefix), "       | bpf %6s ", bv);
+            }
+        } else if (first_poll_cycle > 0 && publish_time_ts > 0 && tsc_freq_hz > 0) {
+            // No BPF timestamps (BSD socket mode) — reconstruct poll mono ns from TSC
+            double ns_per_cycle = 1e9 / static_cast<double>(tsc_freq_hz);
+            uint64_t poll_ref_cycle = (use_latest_ref && latest_poll_cycle > 0)
+                                       ? latest_poll_cycle : first_poll_cycle;
+            // publish_time_ts is CLOCK_MONOTONIC ns at ws_frame_publish_cycle
+            uint64_t poll_mono_ns = publish_time_ts -
+                static_cast<uint64_t>(static_cast<double>(ws_frame_publish_cycle - poll_ref_cycle) * ns_per_cycle);
+
+            bool is_new_packet = (prev_latest_poll_cycle == 0 ||
+                                  latest_poll_cycle != prev_latest_poll_cycle);
+            if (is_new_packet && prev_publish_mono_ns > 0) {
+                double interval_us =
+                    static_cast<double>(static_cast<int64_t>(poll_mono_ns - prev_publish_mono_ns)) / 1000.0;
+                char iv[16];
+                if (interval_us >= 0) {
+                    fmt(iv, interval_us);
+                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "%7s|            ", iv);
+                } else {
+                    fmt(iv, -interval_us);
+                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "\033[31m%7s\033[0m|            ", iv);
+                }
+            } else {
+                std::snprintf(bpf_prefix, sizeof(bpf_prefix), "       |            ");
             }
         } else {
-            std::snprintf(bpf_prefix, sizeof(bpf_prefix), "       |            |");
+            std::snprintf(bpf_prefix, sizeof(bpf_prefix), "       |            ");
         }
 
         // Stages before publish: poll -> ssl -> parse -> publish(0)
@@ -406,6 +431,18 @@ struct alignas(64) WSFrameInfo {
                     break;
                 }
             }
+        } else if (opcode == 0x02 && payload_data != nullptr && payload_len >= 16) {
+            // SBE binary: eventTime (int64 microseconds) at offset 8 (after 8-byte SBE header)
+            int64_t e_us;
+            std::memcpy(&e_us, payload_data + 8, 8);
+            if (e_us > 1000000000000000LL) {  // sanity: after 2001 in microseconds
+                struct timespec rts;
+                clock_gettime(CLOCK_REALTIME, &rts);
+                int64_t local_ms = static_cast<int64_t>(rts.tv_sec) * 1000LL
+                                 + rts.tv_nsec / 1000000LL;
+                int64_t diff = local_ms - e_us / 1000;
+                std::snprintf(exch_diff, sizeof(exch_diff), " %+ldms", diff);
+            }
         }
         const char* line_color;
         const char* line_reset;
@@ -416,16 +453,30 @@ struct alignas(64) WSFrameInfo {
             line_color = (ssl_read_batch_num == 1) ? "\033[34;47m" : "\033[47m";
             line_reset = "\033[0m";
         }
-        fprintf(stderr,
-                "%s%s"
-                " %u pkt %5u %4s~%6s |"
-                " ssl %u %s %4s~%6s |"
-                " WS %3u %6s |"
-                " \xce\xa3%6s |%s%s%s\n",
-                line_color, bpf_prefix,
-                nic_packet_ct, last_pkt_mem_idx, t[0], t[1],
-                ssl_read_ct, sz, t[2], t[3],
-                ssl_read_batch_num, t[4], tot, late, exch_diff, line_reset);
+        bool is_bsd_mode = (first_bpf_entry_ns == 0 && first_poll_cycle > 0);
+        if (is_bsd_mode) {
+            fprintf(stderr,
+                    "%s%s"
+                    "| socket %5u %10s "
+                    "| ssl %u %s %4s~%6s "
+                    "| WS %3u %6s "
+                    "| \xce\xa3%6s |%s%s%s\n",
+                    line_color, bpf_prefix,
+                    nic_packet_ct, t[1],
+                    ssl_read_ct, sz, t[2], t[3],
+                    ssl_read_batch_num, t[4], tot, late, exch_diff, line_reset);
+        } else {
+            fprintf(stderr,
+                    "%s%s"
+                    "| %u pkt %5u %4s~%6s "
+                    "| ssl %u %s %4s~%6s "
+                    "| WS %3u %6s "
+                    "| \xce\xa3%6s |%s%s%s\n",
+                    line_color, bpf_prefix,
+                    nic_packet_ct, last_pkt_mem_idx, t[0], t[1],
+                    ssl_read_ct, sz, t[2], t[3],
+                    ssl_read_batch_num, t[4], tot, late, exch_diff, line_reset);
+        }
     }
 };
 static_assert(sizeof(WSFrameInfo) == 128, "WSFrameInfo must be 128 bytes");

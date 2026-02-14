@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <string>
 #include <unistd.h>  // usleep() for DPDK handshake polling
 #include <string>
 #include <vector>
@@ -215,7 +216,7 @@ struct OpenSSLPolicy {
 
         // 3. Set signature algorithms to match Python exactly (20 algorithms, 40 bytes)
         // Order from Python PCAP: ECDSA→EdDSA→RSA-PSS-PSS→RSA-PSS-RSAE→RSA-PKCS1→Legacy→DSA
-#if OPENSSL_VERSION_NUMBER >= 0x10002000L
+#if OPENSSL_VERSION_NUMBER >= 0x10002000L && !defined(LIBRESSL_VERSION_NUMBER)
         SSL_CTX_set1_sigalgs_list(ctx_,
             // ECDSA with SHA-2 (04 03, 05 03, 06 03)
             "ECDSA+SHA256:ECDSA+SHA384:ECDSA+SHA512:"
@@ -297,6 +298,18 @@ struct OpenSSLPolicy {
     uint64_t get_server_record_count() const { return server_record_count_; }
 
     /**
+     * Set hostname for SNI (Server Name Indication)
+     * Must be called before handshake() for proper TLS connection to virtual hosts
+     *
+     * @param hostname Server hostname (e.g., "nginx.org")
+     */
+    void set_hostname(const char* hostname) {
+        if (hostname && hostname[0] != '\0') {
+            hostname_ = hostname;
+        }
+    }
+
+    /**
      * Perform TLS handshake
      *
      * @param fd Socket file descriptor
@@ -327,6 +340,11 @@ struct OpenSSLPolicy {
 
         // Store policy pointer in SSL ex_data for keylog callback
         SSL_set_ex_data(ssl_, get_ex_data_index(), this);
+
+        // Set SNI hostname if configured (required for virtual hosts like nginx.org)
+        if (!hostname_.empty()) {
+            SSL_set_tlsext_host_name(ssl_, hostname_.c_str());
+        }
 
         // Associate socket with SSL object
         if (SSL_set_fd(ssl_, fd) != 1) {
@@ -513,6 +531,41 @@ struct OpenSSLPolicy {
     HandshakeResult step_handshake() { return HandshakeResult::SUCCESS; }
 
     /**
+     * Prepare a fresh SSL session on an existing socket for BSD reconnection.
+     * @param fd Socket file descriptor (already connected)
+     * @return 0 on success, -1 on failure
+     */
+    int reconnect_bsd(int fd) {
+        if (ssl_) { SSL_free(ssl_); ssl_ = nullptr; }
+        clear_encrypted_view();
+        clear_encrypted_output();
+        keylog_lines_.clear();
+        if (!ctx_) { if (init() != 0) return -1; }
+        ssl_ = SSL_new(ctx_);
+        if (!ssl_) return -1;
+        SSL_set_ex_data(ssl_, get_ex_data_index(), this);
+        if (SSL_set_fd(ssl_, fd) != 1) { SSL_free(ssl_); ssl_ = nullptr; return -1; }
+        if (!hostname_.empty()) SSL_set_tlsext_host_name(ssl_, hostname_.c_str());
+        SSL_set_connect_state(ssl_);
+        server_record_count_ = 0;
+        return 0;
+    }
+
+    /**
+     * One non-blocking SSL_connect() attempt for BSD socket reconnection.
+     * @return HandshakeResult::SUCCESS, IN_PROGRESS, or ERROR
+     */
+    HandshakeResult step_bsd_handshake() {
+        if (!ssl_) return HandshakeResult::ERROR;
+        int ret = SSL_connect(ssl_);
+        if (ret == 1) { server_record_count_ = 0; return HandshakeResult::SUCCESS; }
+        int err = SSL_get_error(ssl_, ret);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+            return HandshakeResult::IN_PROGRESS;
+        return HandshakeResult::ERROR;
+    }
+
+    /**
      * Read decrypted data from SSL connection
      *
      * @param buf Buffer to store data
@@ -654,6 +707,89 @@ struct OpenSSLPolicy {
 
         // Set client mode
         SSL_set_connect_state(ssl_);
+    }
+
+    /**
+     * Switch existing SSL session to zero-copy mode
+     *
+     * This preserves the SSL session state (cipher keys, sequence numbers, etc.)
+     * while changing the I/O mechanism from socket to zero-copy BIOs.
+     *
+     * Call this AFTER handshake() completes to enable 3-thread operation where:
+     * - RX thread: recv() raw encrypted data -> view ring
+     * - SSL thread: SSL_read() from view ring, SSL_write() to output buffer
+     * - TX thread: send() encrypted output
+     *
+     * @throws std::runtime_error if SSL session is not initialized
+     */
+    void switch_to_zero_copy_bio() {
+        if (!ssl_) {
+            throw std::runtime_error("Cannot switch to zero-copy BIO: SSL not initialized");
+        }
+
+        // Create zero-copy BIO method if not already created
+        if (!zc_bio_method_) {
+            zc_bio_method_ = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "zero-copy");
+            if (!zc_bio_method_) {
+                throw std::runtime_error("BIO_meth_new() failed");
+            }
+            BIO_meth_set_read(zc_bio_method_, zc_bio_read);
+            BIO_meth_set_write(zc_bio_method_, zc_bio_write);
+            BIO_meth_set_ctrl(zc_bio_method_, zc_bio_ctrl);
+            BIO_meth_set_create(zc_bio_method_, zc_bio_create);
+            BIO_meth_set_destroy(zc_bio_method_, zc_bio_destroy);
+        }
+
+        // Create new BIO instances with this policy as context
+        BIO* bio_in = BIO_new(zc_bio_method_);
+        BIO* bio_out = BIO_new(zc_bio_method_);
+        if (!bio_in || !bio_out) {
+            if (bio_in) BIO_free(bio_in);
+            if (bio_out) BIO_free(bio_out);
+            throw std::runtime_error("BIO_new() failed");
+        }
+
+        // Store policy pointer in BIO data for callbacks
+        BIO_set_data(bio_in, this);
+        BIO_set_data(bio_out, this);
+        BIO_set_init(bio_in, 1);
+        BIO_set_init(bio_out, 1);
+
+        // Replace socket BIO with memory BIOs (SSL_set_bio frees old BIOs)
+        // This preserves the handshake state while changing the I/O mechanism
+        SSL_set_bio(ssl_, bio_in, bio_out);
+
+        // Clear any stale view/output state
+        clear_encrypted_view();
+        clear_encrypted_output();
+    }
+
+    /**
+     * Switch only the READ BIO to the view-ring (zero-copy) BIO.
+     * The WRITE BIO remains the original socket BIO for TX.
+     *
+     * Used as a fallback for non-AES-GCM ciphers (e.g., ChaCha20) in BSD
+     * transport 2-thread mode, where we can't extract keys for direct
+     * AES-CTR decryption. recv() data is pushed into the view ring,
+     * then SSL_read() decrypts from it.
+     */
+    void switch_to_viewring_read_bio_for_bsdsocket(int sockfd) {
+        if (!ssl_) throw std::runtime_error("Cannot switch BIO: SSL not initialized");
+        if (!zc_bio_method_) {
+            zc_bio_method_ = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "zero-copy");
+            if (!zc_bio_method_) throw std::runtime_error("BIO_meth_new() failed");
+            BIO_meth_set_read(zc_bio_method_, zc_bio_read);
+            BIO_meth_set_write(zc_bio_method_, zc_bio_write);
+            BIO_meth_set_ctrl(zc_bio_method_, zc_bio_ctrl);
+            BIO_meth_set_create(zc_bio_method_, zc_bio_create);
+            BIO_meth_set_destroy(zc_bio_method_, zc_bio_destroy);
+        }
+        BIO* bio_in = BIO_new(zc_bio_method_);
+        BIO_set_data(bio_in, this);
+        BIO_set_init(bio_in, 1);
+        BIO* bio_out = BIO_new_socket(sockfd, BIO_NOCLOSE);
+        SSL_set_bio(ssl_, bio_in, bio_out);
+        clear_encrypted_view();
     }
 
     // ------------------------------------------------------------------------
@@ -982,8 +1118,12 @@ private:
 
     static void record_count_callback(int write_p, int version, int content_type,
                                        const void* buf, size_t len, SSL* ssl, void* arg) {
-        (void)version; (void)content_type; (void)buf; (void)len; (void)arg;
-        if (write_p == 0) {  // 0 = read (server->client)
+        (void)version; (void)buf; (void)len; (void)arg;
+        // Count only TLS record headers (0x100 = SSL3_RT_HEADER).
+        // The msg_callback fires once per record header, mapping 1:1 to the
+        // TLS record sequence number. Inner messages (ct=22 handshake, ct=23
+        // app data) are extra callbacks that don't correspond to separate records.
+        if (write_p == 0 && content_type == 0x100) {
             auto* self = static_cast<OpenSSLPolicy*>(SSL_get_ex_data(ssl, get_ex_data_index()));
             if (self) self->server_record_count_++;
         }
@@ -1205,6 +1345,7 @@ public:
     bool ktls_enabled_;
     BIO_METHOD* bio_method_;      // For userspace transport BIO
     BIO_METHOD* zc_bio_method_ = nullptr;  // For zero-copy BIO
+    std::string hostname_;        // SNI hostname
 
     // Zero-copy RX state (ring buffer of UMEM encrypted data views)
     ViewSegment in_views_[VIEW_RING_SIZE];
@@ -1332,6 +1473,18 @@ struct LibreSSLPolicy {
     uint64_t get_server_record_count() const { return server_record_count_; }
 
     /**
+     * Set hostname for SNI (Server Name Indication)
+     * Must be called before handshake() for proper TLS connection to virtual hosts
+     *
+     * @param hostname Server hostname (e.g., "nginx.org")
+     */
+    void set_hostname(const char* hostname) {
+        if (hostname && hostname[0] != '\0') {
+            hostname_ = hostname;
+        }
+    }
+
+    /**
      * Perform TLS handshake
      *
      * @param fd Socket file descriptor
@@ -1365,6 +1518,11 @@ struct LibreSSLPolicy {
 
         // Store policy pointer in SSL ex_data for keylog callback
         SSL_set_ex_data(ssl_, libressl_get_ex_data_index(), this);
+
+        // Set SNI hostname if configured (required for virtual hosts like nginx.org)
+        if (!hostname_.empty()) {
+            SSL_set_tlsext_host_name(ssl_, hostname_.c_str());
+        }
 
         // Associate socket with SSL object
         if (SSL_set_fd(ssl_, fd) != 1) {
@@ -1533,6 +1691,41 @@ struct LibreSSLPolicy {
     HandshakeResult step_handshake() { return HandshakeResult::SUCCESS; }
 
     /**
+     * Prepare a fresh SSL session on an existing socket for BSD reconnection.
+     * @param fd Socket file descriptor (already connected)
+     * @return 0 on success, -1 on failure
+     */
+    int reconnect_bsd(int fd) {
+        if (ssl_) { SSL_free(ssl_); ssl_ = nullptr; }
+        clear_encrypted_view();
+        clear_encrypted_output();
+        keylog_lines_.clear();
+        if (!ctx_) { if (init() != 0) return -1; }
+        ssl_ = SSL_new(ctx_);
+        if (!ssl_) return -1;
+        SSL_set_ex_data(ssl_, libressl_get_ex_data_index(), this);
+        if (SSL_set_fd(ssl_, fd) != 1) { SSL_free(ssl_); ssl_ = nullptr; return -1; }
+        if (!hostname_.empty()) SSL_set_tlsext_host_name(ssl_, hostname_.c_str());
+        SSL_set_connect_state(ssl_);
+        server_record_count_ = 0;
+        return 0;
+    }
+
+    /**
+     * One non-blocking SSL_connect() attempt for BSD socket reconnection.
+     * @return HandshakeResult::SUCCESS, IN_PROGRESS, or ERROR
+     */
+    HandshakeResult step_bsd_handshake() {
+        if (!ssl_) return HandshakeResult::ERROR;
+        int ret = SSL_connect(ssl_);
+        if (ret == 1) { server_record_count_ = 0; return HandshakeResult::SUCCESS; }
+        int err = SSL_get_error(ssl_, ret);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+            return HandshakeResult::IN_PROGRESS;
+        return HandshakeResult::ERROR;
+    }
+
+    /**
      * Read decrypted data from SSL connection
      *
      * @param buf Buffer to store data
@@ -1674,6 +1867,81 @@ struct LibreSSLPolicy {
 
         // Set client mode
         SSL_set_connect_state(ssl_);
+    }
+
+    /**
+     * Switch existing SSL session to zero-copy BIO mode (for 3-thread operation).
+     *
+     * Call this AFTER handshake() completes to enable 3-thread operation where:
+     * - RX thread: recv() raw encrypted data -> view ring
+     * - SSL thread: SSL_read() from view ring, SSL_write() to output buffer
+     * - TX thread: send() encrypted output
+     *
+     * @throws std::runtime_error if SSL session is not initialized
+     */
+    void switch_to_zero_copy_bio() {
+        if (!ssl_) {
+            throw std::runtime_error("Cannot switch to zero-copy BIO: SSL not initialized");
+        }
+
+        // Create zero-copy BIO method if not already created
+        if (!zc_bio_method_) {
+            zc_bio_method_ = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "zero-copy");
+            if (!zc_bio_method_) {
+                throw std::runtime_error("BIO_meth_new() failed");
+            }
+            BIO_meth_set_read(zc_bio_method_, zc_bio_read);
+            BIO_meth_set_write(zc_bio_method_, zc_bio_write);
+            BIO_meth_set_ctrl(zc_bio_method_, zc_bio_ctrl);
+            BIO_meth_set_create(zc_bio_method_, zc_bio_create);
+            BIO_meth_set_destroy(zc_bio_method_, zc_bio_destroy);
+        }
+
+        // Create new BIO instances with this policy as context
+        BIO* bio_in = BIO_new(zc_bio_method_);
+        BIO* bio_out = BIO_new(zc_bio_method_);
+        if (!bio_in || !bio_out) {
+            if (bio_in) BIO_free(bio_in);
+            if (bio_out) BIO_free(bio_out);
+            throw std::runtime_error("BIO_new() failed");
+        }
+
+        // Store policy pointer in BIO data for callbacks
+        BIO_set_data(bio_in, this);
+        BIO_set_data(bio_out, this);
+        BIO_set_init(bio_in, 1);
+        BIO_set_init(bio_out, 1);
+
+        // Replace socket BIO with memory BIOs (SSL_set_bio frees old BIOs)
+        // This preserves the handshake state while changing the I/O mechanism
+        SSL_set_bio(ssl_, bio_in, bio_out);
+
+        // Clear any stale view/output state
+        clear_encrypted_view();
+        clear_encrypted_output();
+    }
+
+    /**
+     * Switch only the READ BIO to the view-ring BIO, keep socket write BIO.
+     * Fallback for non-AES-GCM ciphers in BSD transport 2-thread mode.
+     */
+    void switch_to_viewring_read_bio_for_bsdsocket(int sockfd) {
+        if (!ssl_) throw std::runtime_error("Cannot switch BIO: SSL not initialized");
+        if (!zc_bio_method_) {
+            zc_bio_method_ = BIO_meth_new(BIO_TYPE_SOURCE_SINK | BIO_get_new_index(), "zero-copy");
+            if (!zc_bio_method_) throw std::runtime_error("BIO_meth_new() failed");
+            BIO_meth_set_read(zc_bio_method_, zc_bio_read);
+            BIO_meth_set_write(zc_bio_method_, zc_bio_write);
+            BIO_meth_set_ctrl(zc_bio_method_, zc_bio_ctrl);
+            BIO_meth_set_create(zc_bio_method_, zc_bio_create);
+            BIO_meth_set_destroy(zc_bio_method_, zc_bio_destroy);
+        }
+        BIO* bio_in = BIO_new(zc_bio_method_);
+        BIO_set_data(bio_in, this);
+        BIO_set_init(bio_in, 1);
+        BIO* bio_out = BIO_new_socket(sockfd, BIO_NOCLOSE);
+        SSL_set_bio(ssl_, bio_in, bio_out);
+        clear_encrypted_view();
     }
 
     // ------------------------------------------------------------------------
@@ -1944,8 +2212,9 @@ private:
 
     static void libressl_record_count_callback(int write_p, int version, int content_type,
                                                 const void* buf, size_t len, SSL* ssl, void* arg) {
-        (void)version; (void)content_type; (void)buf; (void)len; (void)arg;
-        if (write_p == 0) {  // 0 = read (server->client)
+        (void)version; (void)buf; (void)len; (void)arg;
+        // Count only TLS record headers (0x100 = SSL3_RT_HEADER), same as OpenSSL.
+        if (write_p == 0 && content_type == 0x100) {
             auto* self = static_cast<LibreSSLPolicy*>(SSL_get_ex_data(ssl, libressl_get_ex_data_index()));
             if (self) self->server_record_count_++;
         }
@@ -2074,6 +2343,7 @@ public:
     SSL* ssl_;
     BIO_METHOD* bio_method_;      // For userspace transport BIO
     BIO_METHOD* zc_bio_method_ = nullptr;  // For zero-copy BIO
+    std::string hostname_;        // SNI hostname
 
     // Zero-copy RX state (ring buffer)
     ViewSegment in_views_[VIEW_RING_SIZE];
@@ -2218,22 +2488,32 @@ struct WolfSSLPolicy {
         // Set minimum TLS version to 1.2
         wolfSSL_CTX_SetMinVersion(ctx_, WOLFSSL_TLSV1_2);
 
-        // Set cipher preference: AES-128-GCM first (fastest on Intel with AES-NI)
-        // WolfSSL uses a unified cipher list for TLS 1.2 and 1.3
-        // TLS 1.3 ciphers: TLS13-AES128-GCM-SHA256, TLS13-AES256-GCM-SHA384, TLS13-CHACHA20-POLY1305-SHA256
-        // TLS 1.2 ciphers: ECDHE-RSA-AES128-GCM-SHA256, etc.
-        int ret = wolfSSL_CTX_set_cipher_list(ctx_,
-            "TLS13-AES128-GCM-SHA256:TLS13-AES256-GCM-SHA384:TLS13-CHACHA20-POLY1305-SHA256:"
-            "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-CHACHA20-POLY1305-SHA256");
-        if (ret != WOLFSSL_SUCCESS) {
-            fprintf(stderr, "[TLS] Warning: Failed to set cipher preference\n");
-        }
+        // Use WolfSSL default cipher list for broadest server compatibility.
+        // Custom cipher lists can cause handshake_failure (alert 40) if
+        // WolfSSL's internal cipher name mapping differs from expectations.
+        // WolfSSL defaults include AES-GCM, ChaCha20-Poly1305, and ECC suites.
 
-        // Disable verification (HFT optimization - verify in production!)
+        // Disable all verification (HFT - trust everything)
         wolfSSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);
 
-        fprintf(stderr, "[TLS] WolfSSL initialized with AES-128-GCM preferred\n");
+        // Load system CA certs so WolfSSL can parse cert chains internally
+        // (WOLFSSL_SYS_CA_CERTS build flag requires this even with VERIFY_NONE)
+        wolfSSL_CTX_load_system_CA_certs(ctx_);
+
+        fprintf(stderr, "[TLS] WolfSSL initialized (default ciphers)\n");
         return 0;
+    }
+
+    /**
+     * Set hostname for SNI (Server Name Indication)
+     * Must be called before handshake() for proper TLS connection to virtual hosts
+     *
+     * @param hostname Server hostname (e.g., "nginx.org")
+     */
+    void set_hostname(const char* hostname) {
+        if (hostname && hostname[0] != '\0') {
+            hostname_ = hostname;
+        }
     }
 
     uint64_t get_server_record_count() const { return server_record_count_; }
@@ -2263,6 +2543,15 @@ struct WolfSSLPolicy {
 
         if (!ssl_) {
             throw std::runtime_error("wolfSSL_new() failed");
+        }
+
+        // Set SNI hostname if configured (required for virtual hosts like nginx.org)
+        if (!hostname_.empty()) {
+            int sni_ret = wolfSSL_UseSNI(ssl_, WOLFSSL_SNI_HOST_NAME,
+                                         hostname_.c_str(), static_cast<unsigned short>(hostname_.length()));
+            if (sni_ret != WOLFSSL_SUCCESS) {
+                printf("[WolfSSL] Warning: SNI setup failed for %s\n", hostname_.c_str());
+            }
         }
 
         // Associate socket with SSL object
@@ -2505,6 +2794,48 @@ struct WolfSSLPolicy {
     }
 
     /**
+     * Prepare a fresh SSL session on an existing socket for BSD reconnection.
+     * @param fd Socket file descriptor (already connected)
+     * @return 0 on success, -1 on failure
+     */
+    int reconnect_bsd(int fd) {
+        if (ssl_) { wolfSSL_free(ssl_); ssl_ = nullptr; }
+        clear_encrypted_view();
+        clear_encrypted_output();
+        if (!ctx_) { if (init() != 0) return -1; }
+        ssl_ = wolfSSL_new(ctx_);
+        if (!ssl_) return -1;
+        wolfSSL_set_fd(ssl_, fd);
+        if (!hostname_.empty()) {
+#ifdef HAVE_SNI
+            wolfSSL_UseSNI(ssl_, WOLFSSL_SNI_HOST_NAME,
+                           hostname_.c_str(), static_cast<unsigned short>(hostname_.size()));
+#endif
+        }
+        // wolfSSL_new() inherits client mode from ctx_ (wolfSSLv23_client_method)
+        // so wolfSSL_set_connect_state() is not needed
+        server_record_count_ = 0;
+        return 0;
+    }
+
+    /**
+     * One non-blocking wolfSSL_connect() attempt for BSD socket reconnection.
+     * @return HandshakeResult::SUCCESS, IN_PROGRESS, or ERROR
+     */
+    HandshakeResult step_bsd_handshake() {
+        if (!ssl_) return HandshakeResult::ERROR;
+        int ret = wolfSSL_connect(ssl_);
+        if (ret == SSL_SUCCESS) {
+            server_record_count_ = 0;
+            return HandshakeResult::SUCCESS;
+        }
+        int err = wolfSSL_get_error(ssl_, ret);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+            return HandshakeResult::IN_PROGRESS;
+        return HandshakeResult::ERROR;
+    }
+
+    /**
      * Read decrypted data from SSL connection
      *
      * @param buf Buffer to store data
@@ -2628,7 +2959,8 @@ struct WolfSSLPolicy {
         keys.is_tls13 = is_tls13;
 
         // Use wolfSSL_get_keys() to access key material directly
-        // Requires wolfSSL built with OPENSSL_EXTRA
+        // Requires wolfSSL built with ATOMIC_USER or OPENSSL_ALL or OPENSSL_EXTRA
+#if defined(ATOMIC_USER) || defined(OPENSSL_ALL) || defined(OPENSSL_EXTRA)
         unsigned int suite_len = 0, key_sz = 0, iv_sz = 0;
         unsigned char* ms = nullptr;
         unsigned char* sr = nullptr;
@@ -2644,24 +2976,14 @@ struct WolfSSLPolicy {
             return false;
         }
 
-        // For TLS 1.3, wolfSSL_get_keys returns traffic secrets
-        // For TLS 1.2, it returns the key material directly
         if (is_tls13) {
-            // In TLS 1.3, we need the server traffic key and IV
-            // wolfSSL stores these internally after handshake
-            // With --enable-opensslall, we can access them
-            // The key material pointers from wolfSSL_get_keys in TLS 1.3 mode
-            // contain the derived keys directly
             if (key_sz >= key_len && iv_sz >= 12) {
-                // sr points to server write key, cr points to server write IV
                 memcpy(keys.key, sr, key_len);
                 memcpy(keys.iv, cr, 12);
                 return true;
             }
             return false;
         } else {
-            // TLS 1.2: key material from PRF expansion
-            // Layout depends on WolfSSL internals
             if (key_sz >= key_len && iv_sz >= 4) {
                 memcpy(keys.key, sr, key_len);
                 memcpy(keys.iv, cr, 4);  // 4-byte implicit IV for TLS 1.2 AES-GCM
@@ -2669,6 +2991,10 @@ struct WolfSSLPolicy {
             }
             return false;
         }
+#else
+        (void)keys; (void)is_tls13; (void)key_len;
+        return false;
+#endif
     }
 
     // ========================================================================
@@ -2697,6 +3023,49 @@ struct WolfSSLPolicy {
         // Set this object as the I/O context
         wolfSSL_SetIOReadCtx(ssl_, this);
         wolfSSL_SetIOWriteCtx(ssl_, this);
+    }
+
+    /**
+     * Switch existing SSL session to zero-copy mode
+     *
+     * This preserves the SSL session state (cipher keys, sequence numbers, etc.)
+     * while changing the I/O mechanism from socket to zero-copy callbacks.
+     *
+     * Call this AFTER handshake() completes to enable 3-thread operation where:
+     * - RX thread: recv() raw encrypted data -> view ring
+     * - SSL thread: SSL_read() from view ring, SSL_write() to output buffer
+     * - TX thread: send() encrypted output
+     *
+     * @throws std::runtime_error if SSL session is not initialized
+     */
+    void switch_to_zero_copy_bio() {
+        if (!ssl_) {
+            throw std::runtime_error("Cannot switch to zero-copy BIO: SSL not initialized");
+        }
+
+        // Switch I/O callbacks at the SSL object level
+        // This preserves the handshake state while changing the I/O mechanism
+        wolfSSL_SSLSetIORecv(ssl_, zc_recv_cb);
+        wolfSSL_SSLSetIOSend(ssl_, zc_send_cb);
+
+        // Set this object as the I/O context for the callbacks
+        wolfSSL_SetIOReadCtx(ssl_, this);
+        wolfSSL_SetIOWriteCtx(ssl_, this);
+
+        // Clear any stale view/output state
+        clear_encrypted_view();
+        clear_encrypted_output();
+    }
+
+    /**
+     * Switch only the RECV callback to the view-ring, keep socket send callback.
+     * Fallback for non-AES-GCM ciphers in BSD transport 2-thread mode.
+     */
+    void switch_to_viewring_read_bio_for_bsdsocket(int /*sockfd*/) {
+        if (!ssl_) throw std::runtime_error("Cannot switch BIO: SSL not initialized");
+        wolfSSL_SSLSetIORecv(ssl_, zc_recv_cb);
+        wolfSSL_SetIOReadCtx(ssl_, this);
+        clear_encrypted_view();
     }
 
     // ------------------------------------------------------------------------
@@ -2869,6 +3238,7 @@ private:
 public:
     WOLFSSL_CTX* ctx_;
     WOLFSSL* ssl_;
+    std::string hostname_;  // SNI hostname
 
     // Server record counter (post-handshake, for TLS 1.3 seq_num tracking)
     uint64_t server_record_count_ = 0;
@@ -2959,6 +3329,11 @@ struct NoSSLPolicy {
     int init() {
         // No SSL context needed
         return 0;
+    }
+
+    // No-op for NoSSL
+    void set_hostname(const char* /*hostname*/) {
+        // No SNI for plaintext
     }
 
     // BSD socket handshake (no-op for NoSSL)
@@ -3052,6 +3427,14 @@ struct NoSSLPolicy {
         return 0;
     }
     HandshakeResult step_handshake() { return HandshakeResult::SUCCESS; }
+
+    // BSD reconnect: no-op for NoSSL.
+    int reconnect_bsd(int /*fd*/) { return 0; }
+    // BSD handshake step: no-op for NoSSL, always succeeds immediately.
+    HandshakeResult step_bsd_handshake() { return HandshakeResult::SUCCESS; }
+
+    // No-op: no encryption to bypass
+    void switch_to_viewring_read_bio_for_bsdsocket(int /*sockfd*/) {}
 
     // ========================================================================
     // Zero-Copy Methods (for pipeline operation)
