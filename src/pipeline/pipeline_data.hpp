@@ -265,7 +265,8 @@ struct alignas(64) WSFrameInfo {
     void print_timeline(uint64_t tsc_freq_hz,
                         uint64_t prev_publish_mono_ns = 0,
                         uint64_t prev_latest_poll_cycle = 0,
-                        const uint8_t* payload_data = nullptr) const {
+                        const uint8_t* payload_data = nullptr,
+                        int64_t exchange_event_time_ms = 0) const {
         uint64_t ref = ws_frame_publish_cycle;
         if (ref == 0) return;
         double to_us = 1e6 / static_cast<double>(tsc_freq_hz);
@@ -374,9 +375,23 @@ struct alignas(64) WSFrameInfo {
             double ws_late_us = ws_late_ns / 1000.0;
             if (ws_late_us > 0.0) append_late("ws_late", ws_late_us);
         }
-        // Parse Binance "E" (event time) from payload for clock skew display
+        // Exchange event time → local clock diff display
         char exch_diff[24] = "";
-        if (opcode == 0x01 && payload_data != nullptr && payload_len > 10) {
+        auto compute_exch_diff = [&](int64_t e_ms) {
+            if (e_ms > 1000000000000LL) {  // sanity: after 2001
+                struct timespec rts;
+                clock_gettime(CLOCK_REALTIME, &rts);
+                int64_t local_ms = static_cast<int64_t>(rts.tv_sec) * 1000LL
+                                 + rts.tv_nsec / 1000000LL;
+                int64_t diff = local_ms - e_ms;
+                std::snprintf(exch_diff, sizeof(exch_diff), " %+ldms", diff);
+            }
+        };
+        if (exchange_event_time_ms > 0) {
+            // Caller provided event time (e.g., SBE binary frames)
+            compute_exch_diff(exchange_event_time_ms);
+        } else if (opcode == 0x01 && payload_data != nullptr && payload_len > 10) {
+            // Parse Binance "E" (event time) from JSON payload
             const char* p = reinterpret_cast<const char*>(payload_data);
             const char* p_end = p + payload_len;
             for (const char* s = p; s + 4 < p_end; ++s) {
@@ -387,14 +402,7 @@ struct alignas(64) WSFrameInfo {
                         e_ms = e_ms * 10 + (*d - '0');
                         ++d;
                     }
-                    if (e_ms > 1000000000000LL) {  // sanity: after 2001
-                        struct timespec rts;
-                        clock_gettime(CLOCK_REALTIME, &rts);
-                        int64_t local_ms = static_cast<int64_t>(rts.tv_sec) * 1000LL
-                                         + rts.tv_nsec / 1000000LL;
-                        int64_t diff = local_ms - e_ms;
-                        std::snprintf(exch_diff, sizeof(exch_diff), " %+ldms", diff);
-                    }
+                    compute_exch_diff(e_ms);
                     break;
                 }
             }

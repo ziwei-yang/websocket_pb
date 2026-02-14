@@ -10,8 +10,8 @@
 // - Connects to stream-sbe.binance.com:443 (SBE binary protocol)
 // - Sends X-MBX-APIKEY header via UpgradeCustomizer (BINANCE_API_KEY env var)
 // - Subscribes to btcusdt@trade stream
-// - Decodes SBE binary frames via AppHandler (zero-copy, inline in WS process)
-// - Logs decoded trade fields: id, price, qty, buyer/maker, symbol
+// - Parent consumes WSFrameInfo from disruptor ring, decodes SBE, prints timeline
+// - WS process uses NullAppHandler (publishes WSFrameInfo to ring, no inline decode)
 
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +23,7 @@
 #include <string_view>
 #include <vector>
 #include <algorithm>
+#include <thread>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -82,60 +83,12 @@ struct BinanceUpgradeCustomizer {
 };
 
 // ============================================================================
-// BinanceSBEHandler — inline AppHandler that decodes SBE binary frames
-// ============================================================================
-
-struct BinanceSBEHandler {
-    static constexpr bool enabled = true;
-
-    // Timeline state (set before fork via pipeline.app_handler())
-    uint64_t tsc_freq_hz = 0;
-    uint64_t prev_publish_mono_ns[2] = {};
-    uint64_t prev_latest_poll_cycle[2] = {};
-
-    // Counters (running in WS process child — single thread, no atomics needed)
-    uint64_t text_frames = 0;
-    uint64_t binary_frames = 0;
-    uint64_t sbe_decode_errors = 0;
-
-    void on_ws_frame(uint8_t ci, uint8_t opcode, const uint8_t* payload,
-                     uint32_t len, const WSFrameInfo& info) {
-        // Text frames: JSON subscription confirmation
-        if (opcode == 0x01) {
-            text_frames++;
-            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            fprintf(stderr, "[%ld.%06ld] [SBE] TEXT frame (conn %u, %u bytes): %.*s\n",
-                    ts.tv_sec, ts.tv_nsec / 1000, ci, len,
-                    (int)std::min(len, 512u), reinterpret_cast<const char*>(payload));
-            return;
-        }
-
-        // Only process binary frames
-        if (opcode != 0x02) return;
-        binary_frames++;
-
-        // Validate SBE header (size + decode check)
-        sbe::SBEHeader hdr;
-        if (len < sbe::HEADER_SIZE || !sbe::decode_header(payload, len, hdr)) {
-            sbe_decode_errors++;
-            return;
-        }
-
-        // Print compact timeline (same format as test 20)
-        info.print_timeline(tsc_freq_hz, prev_publish_mono_ns[ci],
-                            prev_latest_poll_cycle[ci], payload);
-        prev_publish_mono_ns[ci] = info.ssl_read_end_mono_ns(tsc_freq_hz);
-        prev_latest_poll_cycle[ci] = info.latest_poll_cycle;
-    }
-};
-
-// ============================================================================
 // PipelineTraits for Binance SBE
 // ============================================================================
 
 struct BinanceSBETraits : DefaultPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
-    using AppHandler         = BinanceSBEHandler;
+    using AppHandler         = NullAppHandler;
     using UpgradeCustomizer  = BinanceUpgradeCustomizer;
 
     static constexpr int XDP_POLL_CORE   = 2;
@@ -144,7 +97,7 @@ struct BinanceSBETraits : DefaultPipelineConfig {
 
     static constexpr bool ENABLE_AB      = AB_ENABLED;
     static constexpr bool AUTO_RECONNECT = RECONNECT_ENABLED;
-    static constexpr bool PROFILING      = false;
+    static constexpr bool PROFILING      = true;
 
     static constexpr const char* WSS_HOST = "stream-sbe.binance.com";
     static constexpr uint16_t WSS_PORT    = 443;
@@ -182,6 +135,37 @@ void parse_args(int argc, char* argv[]) {
             printf("[ARGS] Timeout set to %d ms%s\n",
                    g_timeout_ms, g_timeout_ms <= 0 ? " (FOREVER MODE)" : "");
             break;
+        }
+    }
+}
+
+// Write message to stdout, fall back to /dev/tty if pipe is broken
+void write_tty(const char* msg, int len) {
+    ssize_t wr = write(STDOUT_FILENO, msg, len);
+    if (wr <= 0) {
+        int fd = open("/dev/tty", O_WRONLY);
+        if (fd >= 0) { (void)write(fd, msg, len); close(fd); }
+    }
+}
+
+// Periodic profiling save thread (every 10 minutes)
+constexpr int PROFILING_SAVE_INTERVAL_S = 600;
+
+template<typename Pipeline>
+void profiling_save_thread(Pipeline& pipeline) {
+    int elapsed = 0;
+    while (!g_shutdown.load(std::memory_order_acquire)) {
+        usleep(1000000);  // 1s granularity
+        if (g_shutdown.load(std::memory_order_acquire)) break;
+        if (++elapsed >= PROFILING_SAVE_INTERVAL_S) {
+            elapsed = 0;
+            pipeline.save_profiling_data();
+            // Print confirmation with tty fallback
+            char msg[128];
+            int n = snprintf(msg, sizeof(msg),
+                "[PROFILING] Periodic save complete (every %d min)\n",
+                PROFILING_SAVE_INTERVAL_S / 60);
+            write_tty(msg, n);
         }
     }
 }
@@ -254,9 +238,6 @@ int main(int argc, char* argv[]) {
     pipeline.set_subscription_json(
         R"({"method":"SUBSCRIBE","params":["btcusdt@trade"],"id":1})");
 
-    // Configure AppHandler timeline (copied into WS child at fork)
-    pipeline.app_handler().tsc_freq_hz = pipeline.conn_state()->tsc_freq_hz;
-
     if (!pipeline.start()) {
         fprintf(stderr, "\nFATAL: Failed to start pipeline\n");
         pipeline.shutdown();
@@ -266,10 +247,27 @@ int main(int argc, char* argv[]) {
     // Give processes time to stabilize
     usleep(500000);  // 500ms
 
+    // Start periodic profiling save thread
+    std::thread prof_thread(profiling_save_thread<decltype(pipeline)>,
+                            std::ref(pipeline));
+
     // ========================================================================
-    // Main loop — AppHandler processes frames inline in WS process.
-    // Parent just waits for timeout/signal.
+    // Main loop — consume WSFrameInfo from disruptor ring in parent process
     // ========================================================================
+
+    constexpr size_t NUM_CONN = AB_ENABLED ? 2 : 1;
+
+    // Create consumer for WS_FRAME_INFO ring
+    IPCRingConsumer<WSFrameInfo> ws_frame_cons(*pipeline.ws_frame_info_region());
+
+    uint64_t tsc_freq = pipeline.conn_state()->tsc_freq_hz;
+    uint64_t prev_publish_mono_ns[NUM_CONN] = {};
+    uint64_t prev_latest_poll_cycle[NUM_CONN] = {};
+
+    uint64_t total_frames = 0;
+    uint64_t text_frames = 0;
+    uint64_t binary_frames = 0;
+    uint64_t sbe_decode_errors = 0;
 
     printf("\n--- SBE Stream Test (%s) ---\n",
            run_forever ? "FOREVER MODE - Ctrl+C to stop" :
@@ -291,21 +289,111 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        usleep(100000);  // 100ms — parent is idle, all work happens in WS child
+        WSFrameInfo frame;
+        bool end_of_batch;
+        while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
+            total_frames++;
+            uint8_t ci = frame.connection_id;
+            const uint8_t* payload = pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset);
+
+            // Extract exchange event time from SBE binary frames
+            int64_t event_time_ms = 0;
+            if (frame.opcode == 0x02 && frame.payload_len >= sbe::HEADER_SIZE + 8) {
+                binary_frames++;
+                sbe::SBEHeader hdr;
+                if (sbe::decode_header(payload, frame.payload_len, hdr)) {
+                    int64_t event_time_us = sbe::read_i64(payload + sbe::HEADER_SIZE);
+                    event_time_ms = event_time_us / 1000;
+                } else {
+                    sbe_decode_errors++;
+                }
+            } else if (frame.opcode == 0x01) {
+                text_frames++;
+            }
+
+            frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci],
+                                 prev_latest_poll_cycle[ci], payload, event_time_ms);
+            prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);
+            prev_latest_poll_cycle[ci] = frame.latest_poll_cycle;
+        }
+
+        __builtin_ia32_pause();
+    }
+
+    // Drain remaining frames after loop exit
+    {
+        WSFrameInfo frame;
+        while (ws_frame_cons.try_consume(frame)) {
+            total_frames++;
+            uint8_t ci = frame.connection_id;
+            const uint8_t* payload = pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset);
+
+            int64_t event_time_ms = 0;
+            if (frame.opcode == 0x02 && frame.payload_len >= sbe::HEADER_SIZE + 8) {
+                binary_frames++;
+                sbe::SBEHeader hdr;
+                if (sbe::decode_header(payload, frame.payload_len, hdr)) {
+                    event_time_ms = sbe::read_i64(payload + sbe::HEADER_SIZE) / 1000;
+                } else {
+                    sbe_decode_errors++;
+                }
+            } else if (frame.opcode == 0x01) {
+                text_frames++;
+            }
+
+            frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci],
+                                 prev_latest_poll_cycle[ci], payload, event_time_ms);
+            prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);
+            prev_latest_poll_cycle[ci] = frame.latest_poll_cycle;
+        }
     }
 
     auto actual_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time).count();
 
     // ========================================================================
-    // Shutdown summary
+    // Shutdown summary (write to buffer, then tty fallback for broken pipes)
     // ========================================================================
 
-    printf("\n=== Shutting down ===\n");
     pipeline.conn_state()->shutdown_all();
-    usleep(500000);  // 500ms for processes to quiesce
+
+    // Stop periodic profiling thread
+    if (prof_thread.joinable()) prof_thread.join();
+
+    usleep(200000);  // 200ms for processes to quiesce
+
+    // Drain remaining frames after shutdown
+    {
+        WSFrameInfo frame;
+        while (ws_frame_cons.try_consume(frame)) {
+            total_frames++;
+            uint8_t ci = frame.connection_id;
+            if (frame.opcode == 0x02) binary_frames++;
+            else if (frame.opcode == 0x01) text_frames++;
+        }
+    }
+
+    // Save profiling data before shutdown (processes still alive, shared memory valid)
+    // Redirect stdout to /dev/tty so save_profiling_data() printf is visible
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
+    int tty_fd = open("/dev/tty", O_WRONLY);
+    if (tty_fd >= 0) {
+        dup2(tty_fd, STDOUT_FILENO);
+        close(tty_fd);
+    }
+    pipeline.save_profiling_data();
+    // Restore stdout
+    if (saved_stdout >= 0) {
+        dup2(saved_stdout, STDOUT_FILENO);
+        close(saved_stdout);
+    }
 
     // Ring buffer status
+    auto* ws_fi_region = pipeline.ws_frame_info_region();
+    int64_t ws_frame_prod = ws_fi_region->producer_published()->load(std::memory_order_acquire);
+    int64_t ws_frame_cons_seq = ws_frame_cons.sequence();
+
     auto* meta_region = pipeline.msg_metadata_region(0);
     int64_t meta_prod = meta_region->producer_published()->load(std::memory_order_acquire);
     int64_t meta_cons = meta_region->consumer_sequence(0)->load(std::memory_order_acquire);
@@ -318,23 +406,54 @@ int main(int argc, char* argv[]) {
     int64_t pongs_prod = pongs_reg->producer_published()->load(std::memory_order_acquire);
     int64_t pongs_cons = pongs_reg->consumer_sequence(0)->load(std::memory_order_acquire);
 
-    printf("\n=== SBE Test Results ===\n");
-    printf("  Duration:        %ld ms\n", actual_duration);
-    printf("  (Frame counts are logged by WS child process via AppHandler)\n");
-    printf("\n--- Ring Buffer Status ---\n");
-    printf("  MSG_METADATA  producer: %ld, consumer: %ld (%s)\n",
+    // Build summary in stack buffer (survives broken pipes from tee + Ctrl+C)
+    char summary[4096];
+    int pos = 0;
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== Shutting down ===\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== SBE Test Results ===\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  Duration:        %ld ms\n", actual_duration);
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  Total frames:    %lu\n", total_frames);
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  Binary (SBE):    %lu\n", binary_frames);
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  Text (JSON):     %lu\n", text_frames);
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  SBE errors:      %lu\n", sbe_decode_errors);
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n--- Ring Buffer Status ---\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  WS_FRAME_INFO producer: %ld, consumer: %ld (%s)\n",
+           ws_frame_prod, ws_frame_cons_seq, (ws_frame_cons_seq >= ws_frame_prod) ? "ok" : "BEHIND");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  MSG_METADATA  producer: %ld, consumer: %ld (%s)\n",
            meta_prod, meta_cons, (meta_cons >= meta_prod - 1) ? "ok" : "BEHIND");
-    printf("  MSG_OUTBOX    producer: %ld, consumer: %ld (%s)\n",
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  MSG_OUTBOX    producer: %ld, consumer: %ld (%s)\n",
            outbox_prod, outbox_cons, (outbox_cons >= outbox_prod) ? "ok" : "BEHIND");
-    printf("  PONGS         producer: %ld, consumer: %ld (%s)\n",
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  PONGS         producer: %ld, consumer: %ld (%s)\n",
            pongs_prod, pongs_cons, (pongs_cons >= pongs_prod) ? "ok" : "BEHIND");
-    printf("====================\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "====================\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n==============================================\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  SBE TEST COMPLETE\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "==============================================\n");
+
+    // Try stdout first; fall back to /dev/tty if pipe is broken
+    fflush(stdout);
+    fflush(stderr);
+    ssize_t wr = write(STDOUT_FILENO, summary, pos);
+    if (wr <= 0) {
+        int tty_fd = open("/dev/tty", O_WRONLY);
+        if (tty_fd >= 0) {
+            (void)write(tty_fd, summary, pos);
+            close(tty_fd);
+        }
+    }
+
+    // Also save to /tmp for persistence
+    {
+        char path[256];
+        snprintf(path, sizeof(path), "/tmp/sbe_summary_%d.txt", getpid());
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            (void)write(fd, summary, pos);
+            close(fd);
+        }
+    }
 
     pipeline.shutdown();
-
-    printf("\n==============================================\n");
-    printf("  SBE TEST COMPLETE\n");
-    printf("==============================================\n");
 
     return 0;
 }

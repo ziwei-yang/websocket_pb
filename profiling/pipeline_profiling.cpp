@@ -92,9 +92,9 @@ static const char* TRANSPORT_OP_NAMES[CycleSample::N] = {
 
 // Operation names for WebSocket process
 static const char* WS_PROCESS_OP_NAMES[CycleSample::N] = {
-    "WS Process",          // 0: process_manually + commit
+    "WS Process",          // 0: process_manually + commit (conn A / single)
     "Ping/Pong",           // 1: flush_pending_pong + maybe_send_client_ping
-    "(reserved)",          // 2: unused
+    "WS Process B",        // 2: process_manually + commit (conn B, EnableAB only)
     "(reserved)",          // 3: unused
     "(reserved)",          // 4: unused
     "(reserved)"           // 5: unused
@@ -1657,13 +1657,13 @@ int analyze_xdp_poll_loop(const char* filename) {
         // XDP Poll: TX submitted (op 0) or RX received (op 1)
         // Transport: any op produced work — poll (op 0), msg outbox (op 1),
         //            SSL read (op 2), or low-prio outbox (op 3)
-        // WebSocket: metadata consumed (op 0)
+        // WebSocket: metadata consumed on conn A (op 0) or conn B (op 2, EnableAB)
         bool data_moved;
         if (is_transport)
             data_moved = (sample.op_details[0] > 0) || (sample.op_details[1] > 0) ||
                          (sample.op_details[2] > 0) || (sample.op_details[3] > 0);
         else if (is_ws_process)
-            data_moved = (sample.op_details[0] > 0);
+            data_moved = (sample.op_details[0] > 0) || (sample.op_details[2] > 0);
         else
             data_moved = (sample.op_details[0] > 0) || (sample.op_details[1] > 0);
 
@@ -1741,16 +1741,17 @@ int analyze_xdp_poll_loop(const char* filename) {
         }
     }
 
-    // Compute cycle breakdown percentages for histogram titles
-    double total_mean = total_cycles_stats.mean();
+    // Compute cycle breakdown percentages from DATA-MOVED samples only
+    // (idle rdtscp overhead is ~equal across all ops, drowns out real work)
+    double dm_total_mean = total_cycles_data_moved.count > 0 ? total_cycles_data_moved.mean() : 0;
     double op_pct[CycleSample::N];
     double accounted = 0;
     for (size_t i = 0; i < CycleSample::N; ++i) {
-        double op_mean = op_cycles_stats[i].mean();
-        op_pct[i] = total_mean > 0 ? 100.0 * op_mean / total_mean : 0;
+        double op_mean = op_cycles_data_moved_stats[i].count > 0 ? op_cycles_data_moved_stats[i].mean() : 0;
+        op_pct[i] = dm_total_mean > 0 ? 100.0 * op_mean / dm_total_mean : 0;
         accounted += op_mean;
     }
-    double overhead_pct = total_mean > 0 ? 100.0 * (total_mean - accounted) / total_mean : 0;
+    double overhead_pct = dm_total_mean > 0 ? 100.0 * (dm_total_mean - accounted) / dm_total_mean : 0;
 
     // Event latency analysis for Transport (IPC latency)
     if (is_transport && event_latency_stats.count > 0) {
