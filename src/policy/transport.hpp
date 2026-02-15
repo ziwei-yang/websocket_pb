@@ -1503,7 +1503,7 @@ struct PacketTransport {
 
         for (;;) {
             // Stop if we've reached the per-call decrypt limit
-            if (static_cast<size_t>(offset) >= websocket::pipeline::SSL_DECRYPT_CHUNK_SIZE)
+            if (static_cast<size_t>(offset) >= chunk_size)
                 return offset;
 
             switch (tls_parser_.state) {
@@ -1603,7 +1603,7 @@ struct PacketTransport {
                 size_t avail = recv_buffer_.available();
                 if (avail == 0) return offset;
 
-                size_t budget = websocket::pipeline::SSL_DECRYPT_CHUNK_SIZE - static_cast<size_t>(offset);
+                size_t budget = chunk_size - static_cast<size_t>(offset);
                 size_t can_decrypt = chunk_size;
                 if (can_decrypt > budget) can_decrypt = budget;
                 if (can_decrypt > payload_remaining) can_decrypt = payload_remaining;

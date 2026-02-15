@@ -352,7 +352,6 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBE2ThreadTraits>& pipeline) {
     }
 
     IPCRingConsumer<WSFrameInfo> ws_frame_cons(*pipeline.ws_frame_info_region());
-    MsgInbox* msg_inbox = pipeline.msg_inbox(0);
     ConnStateShm* conn_state = pipeline.conn_state();
 
     uint64_t total_frames = 0, text_frames = 0, binary_frames = 0;
@@ -367,6 +366,7 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBE2ThreadTraits>& pipeline) {
 
     uint64_t prev_publish_mono_ns = 0;
     uint64_t prev_latest_poll_cycle = 0;
+    int64_t pending_event_time_ms[2] = {};  // per-connection carry for fragmented messages
 
     auto start_time = std::chrono::steady_clock::now();
     auto stream_end = start_time + std::chrono::milliseconds(g_timeout_ms);
@@ -376,15 +376,6 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBE2ThreadTraits>& pipeline) {
     // Helper lambda for frame processing
     auto process_frame = [&](WSFrameInfo& frame) {
         total_frames++;
-        const uint8_t* payload = msg_inbox->data_at(frame.msg_inbox_offset);
-
-        frame.print_timeline(tsc_freq, prev_publish_mono_ns, prev_latest_poll_cycle, payload);
-        prev_publish_mono_ns = frame.ssl_read_end_mono_ns(tsc_freq);
-        prev_latest_poll_cycle = frame.latest_poll_cycle;
-
-        if (frame_records.size() < MAX_FRAME_RECORDS) {
-            frame_records.push_back(frame);
-        }
 
         int64_t current_seq = ws_frame_cons.sequence();
         if (last_sequence != -1 && current_seq != last_sequence + 1) {
@@ -394,19 +385,66 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBE2ThreadTraits>& pipeline) {
         }
         last_sequence = current_seq;
 
+        auto* inbox = pipeline.msg_inbox(frame.connection_id);
+        const uint8_t* payload = inbox->data_at(frame.msg_inbox_offset);
+
+        // Extract SBE event time from binary payload (all Binance SBE messages
+        // have eventTime at offset 8: 8-byte SBE header + int64 utcTimestampUs)
+        auto extract_sbe_event_time_ms = [](const uint8_t* p, uint32_t len) -> int64_t {
+            if (len < 16) return 0;
+            uint16_t template_id, schema_id;
+            std::memcpy(&template_id, p + 2, 2);
+            std::memcpy(&schema_id, p + 4, 2);
+            if (template_id >= 10000 && template_id <= 10003 && schema_id == 1) {
+                int64_t event_time_us;
+                std::memcpy(&event_time_us, p + 8, 8);
+                return event_time_us / 1000;
+            }
+            return 0;
+        };
+
+        // Skip intermediate fragments — carry eventTime for last fragment
         if (frame.is_fragmented() && !frame.is_last_fragment()) {
+            if (frame.opcode == 0x02) {
+                int64_t et = extract_sbe_event_time_ms(payload, frame.payload_len);
+                if (et > 0) pending_event_time_ms[frame.connection_id] = et;
+            }
+            prev_publish_mono_ns = frame.ssl_read_end_mono_ns(tsc_freq);
+            prev_latest_poll_cycle = frame.latest_poll_cycle;
             partial_events++;
             return;
         }
 
+        // For complete binary frames, extract from payload; for last fragments, use carried value
+        int64_t event_time_ms = 0;
+        if (frame.is_fragmented() && frame.is_last_fragment()) {
+            event_time_ms = pending_event_time_ms[frame.connection_id];
+            pending_event_time_ms[frame.connection_id] = 0;
+        } else if (frame.opcode == 0x02) {
+            event_time_ms = extract_sbe_event_time_ms(payload, frame.payload_len);
+        }
+
+        frame.print_timeline(tsc_freq, prev_publish_mono_ns, prev_latest_poll_cycle, payload, event_time_ms);
+        prev_publish_mono_ns = frame.ssl_read_end_mono_ns(tsc_freq);
+        prev_latest_poll_cycle = frame.latest_poll_cycle;
+
+        if (frame_records.size() < MAX_FRAME_RECORDS) {
+            frame_records.push_back(frame);
+        }
+
         switch (frame.opcode) {
+            case 0x00:  // continuation (last fragment)
+                binary_frames++;
+                break;
             case 0x01:
                 text_frames++;
                 break;
             case 0x02: {
                 binary_frames++;
+                const uint8_t* contig;
+                bool is_contig = inbox->read_contiguous(frame.msg_inbox_offset, frame.payload_len, contig);
                 sbe::SBEHeader hdr;
-                if (validate_sbe_frame(payload, frame.payload_len, hdr)) {
+                if (!is_contig || validate_sbe_frame(contig, frame.payload_len, hdr)) {
                     sbe_valid_events++;
                 } else {
                     sbe_decode_errors++;

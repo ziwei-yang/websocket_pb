@@ -431,18 +431,6 @@ struct alignas(64) WSFrameInfo {
                     break;
                 }
             }
-        } else if (opcode == 0x02 && payload_data != nullptr && payload_len >= 16) {
-            // SBE binary: eventTime (int64 microseconds) at offset 8 (after 8-byte SBE header)
-            int64_t e_us;
-            std::memcpy(&e_us, payload_data + 8, 8);
-            if (e_us > 1000000000000000LL) {  // sanity: after 2001 in microseconds
-                struct timespec rts;
-                clock_gettime(CLOCK_REALTIME, &rts);
-                int64_t local_ms = static_cast<int64_t>(rts.tv_sec) * 1000LL
-                                 + rts.tv_nsec / 1000000LL;
-                int64_t diff = local_ms - e_us / 1000;
-                std::snprintf(exch_diff, sizeof(exch_diff), " %+ldms", diff);
-            }
         }
         const char* line_color;
         const char* line_reset;

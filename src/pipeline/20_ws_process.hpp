@@ -1045,6 +1045,7 @@ private:
                 frame_complete = true;
             } else {
                 // Start parsing new frame
+                ps.frame_start_parse_offset = ps.parse_offset;
                 consumed = start_parse_frame(pending_frame_[ci], data, linear_avail);
                 has_pending_frame_[ci] = true;
 
@@ -1071,7 +1072,7 @@ private:
             }
 
             if (frame_complete) {
-                ps.current_payload_offset = (ps.data_start_offset + ps.parse_offset +
+                ps.current_payload_offset = (ps.data_start_offset + ps.frame_start_parse_offset +
                                             pending_frame_[ci].expected_header_len) % MSG_INBOX_SIZE;
 
                 if (ps.accumulated_metadata_count > 0) {
@@ -1124,7 +1125,8 @@ private:
         auto& info = (*ws_frame_info_prod_)[seq];
         info.clear();
 
-        info.msg_inbox_offset = (ps.data_start_offset + pending_frame_[ci].expected_header_len) % MSG_INBOX_SIZE;
+        info.msg_inbox_offset = (ps.data_start_offset + ps.frame_start_parse_offset +
+                               pending_frame_[ci].expected_header_len) % MSG_INBOX_SIZE;
         info.payload_len = static_cast<uint32_t>(pending_frame_[ci].payload_bytes_received);
         info.opcode = pending_frame_[ci].opcode;
         info.set_fin(pending_frame_[ci].fin);
@@ -1808,6 +1810,7 @@ private:
 
         // Payload offset for current frame
         uint32_t current_payload_offset = 0;
+        uint32_t frame_start_parse_offset = 0;  // parse_offset when frame header started
         bool pending_tls_record_end = false;
 
         // Wrap-around buffer for WS headers spanning MSG_INBOX wrap point

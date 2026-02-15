@@ -302,6 +302,7 @@ int main(int argc, char* argv[]) {
                 binary_frames++;
                 sbe::SBEHeader hdr;
                 if (sbe::decode_header(payload, frame.payload_len, hdr)) {
+                    // All Binance SBE stream types have eventTime (utcTimestampUs) at body offset 0
                     int64_t event_time_us = sbe::read_i64(payload + sbe::HEADER_SIZE);
                     event_time_ms = event_time_us / 1000;
                 } else {
@@ -333,6 +334,7 @@ int main(int argc, char* argv[]) {
                 binary_frames++;
                 sbe::SBEHeader hdr;
                 if (sbe::decode_header(payload, frame.payload_len, hdr)) {
+                    // All Binance SBE stream types have eventTime (utcTimestampUs) at body offset 0
                     event_time_ms = sbe::read_i64(payload + sbe::HEADER_SIZE) / 1000;
                 } else {
                     sbe_decode_errors++;

@@ -122,7 +122,8 @@ struct TradeEntryView {
     int64_t  price_mantissa()  const { return read_i64(p_ + 8); }
     int64_t  qty_mantissa()    const { return read_i64(p_ + 16); }
     bool     is_buyer_maker()  const { return read_u8(p_ + 24) == 1; }
-    bool     is_best_match()   const { return read_u8(p_ + 25) == 1; }
+    static constexpr bool is_best_match() { return true; }  // presence="constant" valueRef="True"
+    static constexpr size_t WIRE_SIZE = 25;  // 8+8+8+1, isBestMatch not on wire
 };
 
 // ── TradesView (templateId=10000) ────────────────────────────────────────
