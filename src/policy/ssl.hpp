@@ -234,37 +234,19 @@ struct OpenSSLPolicy {
             "DSA+SHA1:DSA+SHA256:DSA+SHA384:DSA+SHA512");
 #endif
 
-        // 4. Set TLS 1.3 ciphersuites - Python order: AES-256 FIRST
+        // 4. Set TLS 1.3 ciphersuites - AES-GCM only (required for direct AES-CTR decryption)
 #if OPENSSL_VERSION_NUMBER >= 0x10101000L
         SSL_CTX_set_ciphersuites(ctx_,
-            "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256");
+            "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256");
 #endif
 
-        // 5. Set TLS 1.2 ciphers - Python order (31 total ciphers)
+        // 5. Set TLS 1.2 ciphers - AES-GCM only (required for direct AES-CTR decryption)
         SSL_CTX_set_cipher_list(ctx_,
-            // ECDHE + AES-GCM (highest priority)
             "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
             "DHE-RSA-AES256-GCM-SHA384:"
-            // ECDHE + ChaCha20
-            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
-            "DHE-RSA-CHACHA20-POLY1305:"
-            // ECDHE + AES-128-GCM
             "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
             "DHE-RSA-AES128-GCM-SHA256:"
-            // ECDHE + AES-CBC-SHA384/SHA256
-            "ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:"
-            "DHE-RSA-AES256-SHA256:"
-            "ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:"
-            "DHE-RSA-AES128-SHA256:"
-            // ECDHE + AES-CBC-SHA (legacy)
-            "ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:"
-            "DHE-RSA-AES256-SHA:"
-            "ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA:"
-            "DHE-RSA-AES128-SHA:"
-            // RSA-only fallbacks
-            "AES256-GCM-SHA384:AES128-GCM-SHA256:"
-            "AES256-SHA256:AES128-SHA256:"
-            "AES256-SHA:AES128-SHA");
+            "AES256-GCM-SHA384:AES128-GCM-SHA256");
 
         // Limit TLS record size to fit in single TCP segment (Hybrid Approach for MTU)
         // MAX_TLS_RECORD_PAYLOAD = PIPELINE_TCP_MSS - TLS13_OVERHEAD (from pipeline_config.hpp)
@@ -768,10 +750,9 @@ struct OpenSSLPolicy {
      * Switch only the READ BIO to the view-ring (zero-copy) BIO.
      * The WRITE BIO remains the original socket BIO for TX.
      *
-     * Used as a fallback for non-AES-GCM ciphers (e.g., ChaCha20) in BSD
-     * transport 2-thread mode, where we can't extract keys for direct
-     * AES-CTR decryption. recv() data is pushed into the view ring,
-     * then SSL_read() decrypts from it.
+     * Used for TLS_READY phase (WS handshake decryption before switching
+     * to AES-CTR). recv() data is pushed into the view ring, then
+     * SSL_read() decrypts from it.
      */
     void switch_to_viewring_read_bio_for_bsdsocket(int sockfd) {
         if (!ssl_) throw std::runtime_error("Cannot switch BIO: SSL not initialized");
@@ -1453,6 +1434,18 @@ struct LibreSSLPolicy {
         // Disable session tickets (reduces ClientHello size slightly)
         SSL_CTX_set_options(ctx_, SSL_OP_NO_TICKET);
 
+        // Restrict to AES-GCM ciphers only (required for direct AES-CTR decryption)
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+        SSL_CTX_set_ciphersuites(ctx_,
+            "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256");
+#endif
+        SSL_CTX_set_cipher_list(ctx_,
+            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+            "DHE-RSA-AES256-GCM-SHA384:"
+            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+            "DHE-RSA-AES128-GCM-SHA256:"
+            "AES256-GCM-SHA384:AES128-GCM-SHA256");
+
         // Limit TLS record size to fit in single TCP segment (Hybrid Approach for MTU)
         // MAX_TLS_RECORD_PAYLOAD = PIPELINE_TCP_MSS - TLS13_OVERHEAD (from pipeline_config.hpp)
         // This is derived from NIC_MTU which is a compile-time argument
@@ -1923,7 +1916,7 @@ struct LibreSSLPolicy {
 
     /**
      * Switch only the READ BIO to the view-ring BIO, keep socket write BIO.
-     * Fallback for non-AES-GCM ciphers in BSD transport 2-thread mode.
+     * Used for TLS_READY phase (WS handshake decryption before switching to AES-CTR).
      */
     void switch_to_viewring_read_bio_for_bsdsocket(int sockfd) {
         if (!ssl_) throw std::runtime_error("Cannot switch BIO: SSL not initialized");
@@ -2488,10 +2481,13 @@ struct WolfSSLPolicy {
         // Set minimum TLS version to 1.2
         wolfSSL_CTX_SetMinVersion(ctx_, WOLFSSL_TLSV1_2);
 
-        // Use WolfSSL default cipher list for broadest server compatibility.
-        // Custom cipher lists can cause handshake_failure (alert 40) if
-        // WolfSSL's internal cipher name mapping differs from expectations.
-        // WolfSSL defaults include AES-GCM, ChaCha20-Poly1305, and ECC suites.
+        // Restrict to AES-GCM ciphers only (required for direct AES-CTR decryption)
+        wolfSSL_CTX_set_cipher_list(ctx_,
+            "TLS13-AES256-GCM-SHA384:TLS13-AES128-GCM-SHA256:"
+            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+            "DHE-RSA-AES256-GCM-SHA384:"
+            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+            "DHE-RSA-AES128-GCM-SHA256");
 
         // Disable all verification (HFT - trust everything)
         wolfSSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, nullptr);
@@ -2500,7 +2496,7 @@ struct WolfSSLPolicy {
         // (WOLFSSL_SYS_CA_CERTS build flag requires this even with VERIFY_NONE)
         wolfSSL_CTX_load_system_CA_certs(ctx_);
 
-        fprintf(stderr, "[TLS] WolfSSL initialized (default ciphers)\n");
+        fprintf(stderr, "[TLS] WolfSSL initialized (AES-GCM only)\n");
         return 0;
     }
 
@@ -3059,7 +3055,7 @@ struct WolfSSLPolicy {
 
     /**
      * Switch only the RECV callback to the view-ring, keep socket send callback.
-     * Fallback for non-AES-GCM ciphers in BSD transport 2-thread mode.
+     * Used for TLS_READY phase (WS handshake decryption before switching to AES-CTR).
      */
     void switch_to_viewring_read_bio_for_bsdsocket(int /*sockfd*/) {
         if (!ssl_) throw std::runtime_error("Cannot switch BIO: SSL not initialized");

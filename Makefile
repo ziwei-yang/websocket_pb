@@ -288,7 +288,7 @@ TEST_RETRANSMIT_QUEUE_BIN := $(BUILD_DIR)/test_retransmit_queue
 TEST_SSL_POLICY_BIN := $(BUILD_DIR)/test_ssl_policy
 TEST_WS_PARSER_BIN := $(BUILD_DIR)/test_ws_parser
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread build-test-pipeline-binance_sbe_bsdsocket_1thread test-pipeline-binance-sbe-bsdsocket-1thread
 
 all: $(EXAMPLE_BIN)
 
@@ -1017,6 +1017,34 @@ ifeq ($(UNAME_S),Darwin)
 	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_WS_BINANCE_3T_BIN) --timeout $(TIMEOUT)
 else
 	./$(PIPELINE_BSD_WS_BINANCE_3T_BIN) --timeout $(TIMEOUT)
+endif
+
+# ============================================================================
+# BSD Socket Binance SBE Test - 1-thread SingleThreadSSL (test27)
+# Uses kernel TCP via BSD sockets with single-thread RX+TX loop + SBE binary protocol
+# ============================================================================
+
+PIPELINE_BSD_SBE_BINANCE_1T_SRC := test/pipeline/27_binance_sbe_bsdsocket_1thread.cpp
+PIPELINE_BSD_SBE_BINANCE_1T_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_bsdsocket_1thread
+
+$(PIPELINE_BSD_SBE_BINANCE_1T_BIN): $(PIPELINE_BSD_SBE_BINANCE_1T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/binance_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
+	@echo "🔨 Compiling BSD Socket Binance SBE 1-thread test..."
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL),$(USE_LIBRESSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ BSD Socket Binance SBE 1-thread test build complete: $@"
+else
+	@echo "❌ Error: BSD Socket Binance SBE test requires USE_WOLFSSL=1, USE_OPENSSL=1, or USE_LIBRESSL=1"
+	@exit 1
+endif
+
+build-test-pipeline-binance_sbe_bsdsocket_1thread: $(PIPELINE_BSD_SBE_BINANCE_1T_BIN)
+
+test-pipeline-binance-sbe-bsdsocket-1thread: $(PIPELINE_BSD_SBE_BINANCE_1T_BIN)
+	@echo "🧪 Running BSD Socket Binance SBE 1-thread test..."
+ifeq ($(UNAME_S),Darwin)
+	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_SBE_BINANCE_1T_BIN) --timeout $(TIMEOUT)
+else
+	./$(PIPELINE_BSD_SBE_BINANCE_1T_BIN) --timeout $(TIMEOUT)
 endif
 
 # ============================================================================

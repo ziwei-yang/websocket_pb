@@ -4,9 +4,10 @@
 // Supports:
 //   - SSLPolicy: NoSSLPolicy, OpenSSLPolicy, LibreSSLPolicy, kTLSPolicy
 //   - IOPolicy: BlockingIO<EventPolicy> or AsyncIO (io_uring)
-//   - SSLThreadingPolicy: InlineSSL (2-thread) or DedicatedSSL (3-thread)
+//   - SSLThreadingPolicy: InlineSSL (2-thread), DedicatedSSL (3-thread), SingleThreadSSL (1-thread)
 //
 // Thread Models:
+//   - BlockingIO + SingleThreadSSL: 1 thread (single-thread RX+TX loop, no spinlocks)
 //   - BlockingIO + InlineSSL: 2 threads (RX + TX, SSL inline)
 //   - BlockingIO + DedicatedSSL: 3 threads (RX + SSL + TX)
 //   - AsyncIO + InlineSSL: 1 thread (io_uring event loop)
@@ -105,6 +106,7 @@ using BlockingSelect = BlockingIO<websocket::event_policies::SelectPolicy>;
  */
 struct InlineSSL {
     static constexpr bool has_ssl_thread = false;
+    static constexpr bool is_single_thread = false;
 };
 
 /**
@@ -119,6 +121,22 @@ struct InlineSSL {
  */
 struct DedicatedSSL {
     static constexpr bool has_ssl_thread = true;
+    static constexpr bool is_single_thread = false;
+};
+
+/**
+ * SingleThreadSSL - Single-threaded RX+TX in one loop
+ *
+ * Only valid with BlockingIO:
+ *   - Single thread: poll(all sockets, 1ms) → recv → decrypt → publish, then TX
+ *   - No spinlocks (no concurrent SSL access)
+ *   - Trade-off: TX latency depends on poll timeout
+ *
+ * Best for market-data-only scenarios where TX latency is not critical.
+ */
+struct SingleThreadSSL {
+    static constexpr bool has_ssl_thread = false;
+    static constexpr bool is_single_thread = true;
 };
 
 // ============================================================================
@@ -707,6 +725,8 @@ public:
                 printf("[BSD-Transport] Initialized AutoReconnect (1-thread io_uring mode)\n");
             } else if constexpr (SSLThreadingPolicy::has_ssl_thread) {
                 printf("[BSD-Transport] Initialized AutoReconnect (3-thread mode: RX + SSL + TX)\n");
+            } else if constexpr (SSLThreadingPolicy::is_single_thread) {
+                printf("[BSD-Transport] Initialized AutoReconnect (1-thread mode: single-thread RX+TX)\n");
             } else {
                 printf("[BSD-Transport] Initialized AutoReconnect (2-thread mode: RX + TX)\n");
             }
@@ -830,6 +850,8 @@ public:
             printf("[BSD-Transport] Initialized (1-thread io_uring mode)\n");
         } else if constexpr (SSLThreadingPolicy::has_ssl_thread) {
             printf("[BSD-Transport] Initialized (3-thread mode: RX + SSL + TX)\n");
+        } else if constexpr (SSLThreadingPolicy::is_single_thread) {
+            printf("[BSD-Transport] Initialized (1-thread mode: single-thread RX+TX)\n");
         } else {
             printf("[BSD-Transport] Initialized (2-thread mode: RX + TX)\n");
         }
@@ -852,6 +874,9 @@ public:
         } else if constexpr (SSLThreadingPolicy::has_ssl_thread) {
             // 3-thread: RX + SSL + TX
             run_blocking_3thread();
+        } else if constexpr (SSLThreadingPolicy::is_single_thread) {
+            // 1-thread: single-thread RX+TX loop
+            run_blocking_1thread();
         } else {
             // 2-thread: RX + TX
             run_blocking_2thread();
@@ -1047,7 +1072,7 @@ private:
     // ========================================================================
     void setup_post_handshake(size_t ci) {
         if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
-            // Try to extract AES-GCM keys for direct AES-CTR decryption
+            // Extract AES-GCM keys for direct AES-CTR decryption (required)
             if (ssl_[ci].extract_record_keys(tls_keys_[ci])) {
                 websocket::crypto::expand_keys(tls_keys_[ci]);
                 tls_parser_[ci] = websocket::crypto::TLSRecordParser{};
@@ -1061,20 +1086,22 @@ private:
                        ci, tls_keys_[ci].is_tls13 ? "1.3" : "1.2", tls_keys_[ci].key_len * 8,
                        (unsigned long)tls_seq_num_[ci]);
             } else {
-                fprintf(stderr, "[BSD-Transport] extract_record_keys failed (conn %zu), using SSL fallback\n", ci);
+                // FATAL: AES-GCM cipher required but key extraction failed
+                fprintf(stderr, "[BSD-Transport] FATAL: extract_record_keys failed (conn %zu)"
+                        " — AES-GCM cipher required. Triggering reconnect.\n", ci);
+                if constexpr (AutoReconnect) {
+                    start_reconnect(ci);
+                }
+                return;  // Do not proceed to ACTIVE
             }
 
             if constexpr (SSLThreadingPolicy::has_ssl_thread) {
                 // 3-thread: always need zero-copy BIO
                 ssl_[ci].switch_to_zero_copy_bio();
                 fprintf(stderr, "[BSD-Transport] Switched to zero-copy BIO for 3-thread mode (conn %zu)\n", ci);
-            } else {
-                // 2-thread: if no AES-CTR keys, fall back to hybrid BIO
-                if (!tls_keys_valid_[ci]) {
-                    ssl_[ci].switch_to_viewring_read_bio_for_bsdsocket(sockfd_[ci]);
-                    fprintf(stderr, "[BSD-Transport] Fallback to hybrid BIO (conn %zu, non-AES-GCM cipher)\n", ci);
-                }
             }
+            // 2-thread/1-thread: no BIO switch needed (viewring already set from TLS_READY,
+            // and AES-CTR path doesn't use SSL_read at all)
         }
     }
 
@@ -1409,20 +1436,15 @@ private:
     }
 
     /**
-     * Process TLS_READY reads (2-thread model): recv → view ring → ssl_read_and_publish.
+     * Process TLS_READY reads: recv → view ring → ssl_read_and_publish.
+     * Used by 2-thread and 1-thread models.
      */
     void process_tls_ready_read(size_t ci) {
         uint8_t raw_buf[16384];
         ssize_t raw_n = ::recv(sockfd_[ci], raw_buf, sizeof(raw_buf), 0);
         if (raw_n > 0) {
-            if constexpr (!SSLThreadingPolicy::has_ssl_thread) {
-                while (ssl_fallback_lock_[ci].test_and_set(std::memory_order_acquire)) {}
-            }
             ssl_[ci].append_encrypted_view(raw_buf, static_cast<size_t>(raw_n));
             ssl_read_and_publish(ci);
-            if constexpr (!SSLThreadingPolicy::has_ssl_thread) {
-                ssl_fallback_lock_[ci].clear(std::memory_order_release);
-            }
         } else if (raw_n == 0) {
             // Peer closed during TLS_READY
             if constexpr (AutoReconnect) {
@@ -1747,8 +1769,8 @@ private:
         // Per-connection event policies and recv buffers
         typename IOPolicy::event_policy_t event_policy[NUM_CONN];
         std::unique_ptr<BSDZeroCopyRecvBuffer> recv_buf[NUM_CONN];
-        constexpr size_t FALLBACK_BUFSIZE = 16384;
-        uint8_t fallback_buf[FALLBACK_BUFSIZE];
+        constexpr size_t RAW_RECV_BUFSIZE = 16384;
+        [[maybe_unused]] uint8_t raw_recv_buf[RAW_RECV_BUFSIZE];  // Used by NoSSL path
 
         for (size_t ci = 0; ci < NUM_CONN; ci++) {
             reinit_event_policy(ci, event_policy[ci]);
@@ -1781,76 +1803,28 @@ private:
                 if (!poll.ready) continue;
 
                 // =================================================================
-                // Path A: Direct AES-CTR decryption (AES-GCM cipher)
+                // Path A: Direct AES-CTR decryption (AES-GCM guaranteed)
                 // =================================================================
                 if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
-                    if (tls_keys_valid_[ci]) {
-                        ssize_t raw_n = recv_buf[ci]->recv_into_next(sockfd_[ci], poll.poll_cycle,
-                            poll.hw_oldest_ns, poll.hw_latest_ns, poll.hw_count, 0);
+                    ssize_t raw_n = recv_buf[ci]->recv_into_next(sockfd_[ci], poll.poll_cycle,
+                        poll.hw_oldest_ns, poll.hw_latest_ns, poll.hw_count, 0);
 
-                        if (raw_n > 0) {
-                            uint64_t segs_after_recv = query_tcp_segs_in(sockfd_[ci]);
-                            uint32_t seg_delta = static_cast<uint32_t>(segs_after_recv - prev_tcp_segs_in_[ci]);
-                            prev_tcp_segs_in_[ci] = segs_after_recv;
-                            auto& last_slot = recv_buf[ci]->slots[(recv_buf[ci]->tail_ - 1) & BSDZeroCopyRecvBuffer::POOL_MASK];
-                            last_slot.tcp_seg_delta = seg_delta;
+                    if (raw_n > 0) {
+                        uint64_t segs_after_recv = query_tcp_segs_in(sockfd_[ci]);
+                        uint32_t seg_delta = static_cast<uint32_t>(segs_after_recv - prev_tcp_segs_in_[ci]);
+                        prev_tcp_segs_in_[ci] = segs_after_recv;
+                        auto& last_slot = recv_buf[ci]->slots[(recv_buf[ci]->tail_ - 1) & BSDZeroCopyRecvBuffer::POOL_MASK];
+                        last_slot.tcp_seg_delta = seg_delta;
 
-                            aes_ctr_decrypt_loop(ci, *recv_buf[ci]);
-                        } else if (raw_n == 0) {
-                            printf("[RX] Connection %zu closed by peer\n", ci);
-                            if constexpr (AutoReconnect) { start_reconnect(ci); }
-                            else { running_.store(false, std::memory_order_release); }
-                        } else {
-                            prev_tcp_segs_in_[ci] = poll.segs_before;
-                        }
-                        continue;
+                        aes_ctr_decrypt_loop(ci, *recv_buf[ci]);
+                    } else if (raw_n == 0) {
+                        printf("[RX] Connection %zu closed by peer\n", ci);
+                        if constexpr (AutoReconnect) { start_reconnect(ci); }
+                        else { running_.store(false, std::memory_order_release); }
+                    } else {
+                        prev_tcp_segs_in_[ci] = poll.segs_before;
                     }
-
-                    // =============================================================
-                    // Path B: Hybrid BIO fallback (non-AES-GCM cipher)
-                    // Lock ssl_[ci] to serialize with TX thread's ssl_[ci].write()
-                    // =============================================================
-                    {
-                        ssize_t raw_n = ::recv(sockfd_[ci], fallback_buf, FALLBACK_BUFSIZE, 0);
-                        if (raw_n > 0) {
-                            while (ssl_fallback_lock_[ci].test_and_set(std::memory_order_acquire)) {}
-                            ssl_[ci].append_encrypted_view(fallback_buf, static_cast<size_t>(raw_n));
-
-                            uint64_t ssl_start = rdtscp();
-                            uint8_t decrypt_out[16384];
-                            ssize_t n;
-                            while ((n = ssl_[ci].read(decrypt_out, sizeof(decrypt_out))) > 0) {
-                                uint64_t ssl_end = rdtscp();
-
-                                uint64_t segs_after = query_tcp_segs_in(sockfd_[ci]);
-                                uint32_t seg_delta = static_cast<uint32_t>(segs_after - prev_tcp_segs_in_[ci]);
-                                prev_tcp_segs_in_[ci] = segs_after;
-
-                                uint32_t write_pos = msg_inbox_[ci]->current_write_pos();
-                                msg_inbox_[ci]->write_data(decrypt_out, static_cast<uint32_t>(n));
-
-                                BSDReadStats stats{};
-                                stats.oldest_poll_cycle = poll.poll_cycle;
-                                stats.latest_poll_cycle = poll.poll_cycle;
-                                stats.oldest_hw_ns = poll.hw_oldest_ns;
-                                stats.latest_hw_ns = poll.hw_latest_ns;
-                                stats.total_hw_count = poll.hw_count;
-                                stats.total_seg_delta = seg_delta;
-                                publish_rx_metadata(ci, stats, write_pos, static_cast<uint32_t>(n),
-                                                    ssl_start, ssl_end, ssl_[ci].pending() == 0);
-                                ssl_start = rdtscp();
-                            }
-                            ssl_[ci].clear_encrypted_view();
-                            ssl_fallback_lock_[ci].clear(std::memory_order_release);
-                        } else if (raw_n == 0) {
-                            printf("[RX] Connection %zu closed by peer\n", ci);
-                            if constexpr (AutoReconnect) { start_reconnect(ci); }
-                            else { running_.store(false, std::memory_order_release); }
-                        } else {
-                            prev_tcp_segs_in_[ci] = poll.segs_before;
-                        }
-                        continue;
-                    }
+                    continue;
                 }
 
                 // =================================================================
@@ -1858,7 +1832,7 @@ private:
                 // =================================================================
                 if constexpr (!detail::is_userspace_ssl_v<SSLPolicy>) {
                     uint64_t ssl_read_start_cycle = rdtscp();
-                    ssize_t n = ::recv(sockfd_[ci], fallback_buf, FALLBACK_BUFSIZE, 0);
+                    ssize_t n = ::recv(sockfd_[ci], raw_recv_buf, RAW_RECV_BUFSIZE, 0);
 
                     if (n > 0) {
                         uint64_t ssl_read_end_cycle = rdtscp();
@@ -1868,7 +1842,7 @@ private:
                         prev_tcp_segs_in_[ci] = segs_after;
 
                         uint32_t write_pos = msg_inbox_[ci]->current_write_pos();
-                        msg_inbox_[ci]->write_data(fallback_buf, static_cast<uint32_t>(n));
+                        msg_inbox_[ci]->write_data(raw_recv_buf, static_cast<uint32_t>(n));
 
                         BSDReadStats stats{};
                         stats.oldest_poll_cycle = poll.poll_cycle;
@@ -1925,27 +1899,14 @@ private:
                             }
                         }
 
-                        // Lock ssl_[ci] when using fallback path (non-AES-GCM)
-                        // to serialize with RX thread's ssl_[ci].read()
-                        bool need_ssl_lock = false;
-                        if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
-                            if (!SSLThreadingPolicy::has_ssl_thread && !tls_keys_valid_[ci]) {
-                                need_ssl_lock = true;
-                            }
-                        }
-
                         ssize_t total_sent = 0;
                         while (total_sent < event.data_len) {
                             ssize_t sent;
                             if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
-                                if (need_ssl_lock)
-                                    while (ssl_fallback_lock_[ci].test_and_set(std::memory_order_acquire)) {}
                                 sent = ssl_[ci].write(
                                     event.data + total_sent,
                                     event.data_len - total_sent
                                 );
-                                if (need_ssl_lock)
-                                    ssl_fallback_lock_[ci].clear(std::memory_order_release);
                             } else {
                                 sent = ::send(sockfd_[ci],
                                     event.data + total_sent,
@@ -2005,12 +1966,7 @@ private:
 
                         ssize_t sent;
                         if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
-                            bool need_lock = !SSLThreadingPolicy::has_ssl_thread && !tls_keys_valid_[ci];
-                            if (need_lock)
-                                while (ssl_fallback_lock_[ci].test_and_set(std::memory_order_acquire)) {}
                             sent = ssl_[ci].write(pong.data, pong.data_len);
-                            if (need_lock)
-                                ssl_fallback_lock_[ci].clear(std::memory_order_release);
                         } else {
                             sent = ::send(sockfd_[ci], pong.data, pong.data_len, MSG_NOSIGNAL);
                         }
@@ -2035,6 +1991,271 @@ private:
         }
 
         printf("[TX] Thread exiting\n");
+    }
+
+    // ========================================================================
+    // BlockingIO - 1 Thread Model (SingleThreadSSL)
+    // ========================================================================
+
+    /**
+     * run_blocking_1thread() - Single-threaded RX+TX main loop
+     *
+     * Combines recv/decrypt and outbox/pong send in one loop:
+     *   1. Drive reconnect state machines (if AutoReconnect)
+     *   2. Unified poll() across all ACTIVE/TLS_READY sockets (1ms timeout)
+     *   3. Per-ready-connection: recv → Path A (AES-CTR) or Path C (NoSSL) → MSG_INBOX + MSG_METADATA
+     *   4. Process MSG_OUTBOX (max 16) and PONGS (max 8) → SSL_write/send
+     *
+     * No child threads, no spinlocks. Runs on caller's thread.
+     * TX latency is bounded by poll timeout (1ms worst case).
+     */
+    void run_blocking_1thread() {
+        // Per-connection event policies (used only for reconnect state machine)
+        typename IOPolicy::event_policy_t event_policy[NUM_CONN];
+        std::unique_ptr<BSDZeroCopyRecvBuffer> recv_buf[NUM_CONN];
+        constexpr size_t RAW_RECV_BUFSIZE = 16384;
+        [[maybe_unused]] uint8_t raw_recv_buf[RAW_RECV_BUFSIZE];  // Used by NoSSL path
+
+        for (size_t ci = 0; ci < NUM_CONN; ci++) {
+            reinit_event_policy(ci, event_policy[ci]);
+            recv_buf[ci] = std::make_unique<BSDZeroCopyRecvBuffer>();
+        }
+
+        struct pollfd pfds[NUM_CONN];
+        size_t pfd_to_ci[NUM_CONN];
+
+        while (running_.load(std::memory_order_acquire)) {
+            // Check ConnStateShm shutdown
+            if (conn_state_ && !conn_state_->is_running(PROC_TRANSPORT)) {
+                printf("[1T] ConnStateShm signals shutdown\n");
+                running_.store(false, std::memory_order_release);
+                break;
+            }
+
+            // ── AutoReconnect: drive state machines for non-ACTIVE connections ──
+            if constexpr (AutoReconnect) {
+                for (size_t ci = 0; ci < NUM_CONN; ci++) {
+                    auto disp = dispatch_reconnect_phase(ci, event_policy[ci]);
+                    if (disp == ReconnDispatch::TLS_READY) {
+                        process_tls_ready_read(ci);
+                        if (conn_state_->get_ws_handshake_done(ci)) {
+                            conn_state_->clear_ws_handshake_done(ci);
+                            switch_to_direct_decrypt(ci);
+                            recv_buf[ci] = std::make_unique<BSDZeroCopyRecvBuffer>();
+                        }
+                    }
+                    // ACTIVE: will be collected into pfds[] below
+                    // SKIP: nothing to do
+                }
+            }
+
+            // ── RX Phase: unified poll + per-connection recv/decrypt ──
+            int nfds = 0;
+            for (size_t ci = 0; ci < NUM_CONN; ci++) {
+                if (sockfd_[ci] < 0) continue;
+                if constexpr (AutoReconnect) {
+                    if (reconn_[ci].phase != BSDConnPhase::ACTIVE) continue;
+                }
+                pfds[nfds] = { sockfd_[ci], POLLIN, 0 };
+                pfd_to_ci[nfds] = ci;
+                nfds++;
+            }
+
+            int ready = 0;
+            if (nfds > 0) {
+                ready = ::poll(pfds, static_cast<nfds_t>(nfds), 1);  // 1ms timeout
+            } else {
+                // No sockets ready — sleep 1ms to avoid busy-spin during reconnect
+                usleep(1000);
+            }
+
+            if (ready > 0) {
+                for (int fi = 0; fi < nfds; fi++) {
+                    if (!(pfds[fi].revents & POLLIN)) continue;
+                    size_t ci = pfd_to_ci[fi];
+
+                    uint64_t poll_cycle = rdtscp();
+
+#ifdef __linux__
+                    uint64_t hw_oldest_ns = 0, hw_latest_ns = 0;
+                    uint32_t hw_count = 0;
+                    {
+                        timing_record_t hw_timing = {};
+                        drain_hw_timestamps(sockfd_[ci], &hw_timing);
+                        hw_oldest_ns = hw_timing.hw_timestamp_oldest_ns;
+                        hw_latest_ns = hw_timing.hw_timestamp_latest_ns;
+                        hw_count = hw_timing.hw_timestamp_count;
+                    }
+#endif
+
+                    // =============================================================
+                    // Path A: Direct AES-CTR decryption (AES-GCM guaranteed)
+                    // =============================================================
+                    if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
+                        ssize_t raw_n = recv_buf[ci]->recv_into_next(sockfd_[ci], poll_cycle,
+#ifdef __linux__
+                            hw_oldest_ns, hw_latest_ns, hw_count,
+#else
+                            0, 0, 0,
+#endif
+                            0);
+
+                        if (raw_n > 0) {
+                            uint64_t segs_after_recv = query_tcp_segs_in(sockfd_[ci]);
+                            uint32_t seg_delta = static_cast<uint32_t>(segs_after_recv - prev_tcp_segs_in_[ci]);
+                            prev_tcp_segs_in_[ci] = segs_after_recv;
+                            auto& last_slot = recv_buf[ci]->slots[(recv_buf[ci]->tail_ - 1) & BSDZeroCopyRecvBuffer::POOL_MASK];
+                            last_slot.tcp_seg_delta = seg_delta;
+
+                            aes_ctr_decrypt_loop(ci, *recv_buf[ci]);
+                        } else if (raw_n == 0) {
+                            printf("[1T] Connection %zu closed by peer\n", ci);
+                            if constexpr (AutoReconnect) { start_reconnect(ci); }
+                            else { running_.store(false, std::memory_order_release); }
+                        }
+                        continue;
+                    }
+
+                    // =============================================================
+                    // Path C: NoSSL — raw recv → MSG_INBOX
+                    // =============================================================
+                    if constexpr (!detail::is_userspace_ssl_v<SSLPolicy>) {
+                        uint64_t ssl_read_start_cycle = rdtscp();
+                        ssize_t n = ::recv(sockfd_[ci], raw_recv_buf, RAW_RECV_BUFSIZE, 0);
+
+                        if (n > 0) {
+                            uint64_t ssl_read_end_cycle = rdtscp();
+
+                            uint64_t segs_after = query_tcp_segs_in(sockfd_[ci]);
+                            uint32_t seg_delta = static_cast<uint32_t>(segs_after - prev_tcp_segs_in_[ci]);
+                            prev_tcp_segs_in_[ci] = segs_after;
+
+                            uint32_t write_pos = msg_inbox_[ci]->current_write_pos();
+                            msg_inbox_[ci]->write_data(raw_recv_buf, static_cast<uint32_t>(n));
+
+                            BSDReadStats stats{};
+                            stats.oldest_poll_cycle = poll_cycle;
+                            stats.latest_poll_cycle = poll_cycle;
+#ifdef __linux__
+                            stats.oldest_hw_ns = hw_oldest_ns;
+                            stats.latest_hw_ns = hw_latest_ns;
+                            stats.total_hw_count = hw_count;
+#endif
+                            stats.total_seg_delta = seg_delta;
+                            publish_rx_metadata(ci, stats, write_pos, static_cast<uint32_t>(n),
+                                                ssl_read_start_cycle, ssl_read_end_cycle, false);
+                        } else if (n == 0) {
+                            printf("[1T] Connection %zu closed by peer\n", ci);
+                            if constexpr (AutoReconnect) { start_reconnect(ci); }
+                            else { running_.store(false, std::memory_order_release); }
+                        }
+                    }
+                } // for each ready pfd
+            } // if (ready > 0)
+
+            // ── TX Phase: MSG_OUTBOX + PONGS — no locks needed ──
+            {
+                size_t processed = msg_outbox_cons_->process_manually(
+                    [&](MsgOutboxEvent& event, int64_t seq, bool end_of_batch) {
+                        (void)seq;
+                        (void)end_of_batch;
+
+                        if (event.data_len > 0) {
+                            size_t ci = EnableAB ? event.connection_id : 0;
+
+                            if constexpr (AutoReconnect) {
+                                if (reconn_[ci].phase != BSDConnPhase::ACTIVE &&
+                                    reconn_[ci].phase != BSDConnPhase::TLS_READY) {
+                                    return true;  // Drop: connection not ready
+                                }
+                            }
+
+                            ssize_t total_sent = 0;
+                            while (total_sent < event.data_len) {
+                                ssize_t sent;
+                                if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
+                                    sent = ssl_[ci].write(
+                                        event.data + total_sent,
+                                        event.data_len - total_sent
+                                    );
+                                } else {
+                                    sent = ::send(sockfd_[ci],
+                                        event.data + total_sent,
+                                        event.data_len - total_sent,
+                                        MSG_NOSIGNAL);
+                                }
+
+                                if (sent < 0) {
+                                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                        std::this_thread::yield();
+                                        continue;
+                                    }
+                                    printf("[1T] send error (conn %zu): %s\n", ci, strerror(errno));
+                                    if constexpr (AutoReconnect) {
+                                        break;
+                                    } else {
+                                        running_.store(false, std::memory_order_release);
+                                        return false;
+                                    }
+                                }
+                                total_sent += sent;
+                            }
+                        }
+
+                        if (event.msg_type == MSG_TYPE_WS_CLOSE) {
+                            printf("[1T] Close requested by upstream\n");
+                            running_.store(false, std::memory_order_release);
+                            return false;
+                        }
+
+                        return true;
+                    },
+                    16
+                );
+
+                if (processed > 0) {
+                    msg_outbox_cons_->commit_manually();
+                }
+
+                // Process PONGS
+                processed = pongs_cons_->process_manually(
+                    [&](PongFrameAligned& pong, int64_t seq, bool end_of_batch) {
+                        (void)seq;
+                        (void)end_of_batch;
+
+                        if (pong.data_len > 0) {
+                            size_t ci = EnableAB ? pong.connection_id : 0;
+
+                            if constexpr (AutoReconnect) {
+                                if (reconn_[ci].phase != BSDConnPhase::ACTIVE &&
+                                    reconn_[ci].phase != BSDConnPhase::TLS_READY) {
+                                    return true;
+                                }
+                            }
+
+                            ssize_t sent;
+                            if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
+                                sent = ssl_[ci].write(pong.data, pong.data_len);
+                            } else {
+                                sent = ::send(sockfd_[ci], pong.data, pong.data_len, MSG_NOSIGNAL);
+                            }
+
+                            if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                                printf("[1T] PONG send error (conn %zu): %s\n", ci, strerror(errno));
+                            }
+                        }
+                        return true;
+                    },
+                    8
+                );
+
+                if (processed > 0) {
+                    pongs_cons_->commit_manually();
+                }
+            }
+        }
+
+        printf("[1T] Single-thread loop exiting\n");
     }
 
     // ========================================================================
@@ -2125,13 +2346,10 @@ private:
      *
      * Per-connection RX path:
      *   - TLS_READY: pop chunks → append_encrypted_view → SSL_read (WS handshake)
-     *   - ACTIVE + AES-CTR: pop chunks → ChunkPoolBuffer → ssl_read_by_chunk
-     *   - ACTIVE + Fallback: pop chunks → append_encrypted_view → SSL_read
+     *   - ACTIVE: pop chunks → ChunkPoolBuffer → ssl_read_by_chunk (AES-CTR)
      * TX path: route MSG_OUTBOX/PONGS by connection_id → ssl_[ci].write()
      */
     void ssl_thread_main() {
-        // Decryption buffer for SSL_read output (fallback/TLS_READY paths)
-        uint8_t decrypt_buf[16384];
         // Encryption buffer for SSL_write output
         uint8_t encrypt_buf[16384];
 
@@ -2143,7 +2361,6 @@ private:
             std::unique_ptr<std::array<EncryptedChunk, RX_POOL_SIZE>> rx_pool;
             size_t pool_write_idx = 0;
             ChunkPoolBuffer chunk_pool_buf;
-            BSDReadStats fallback_stats{};
         };
         PerConnSSLState conn_ssl[NUM_CONN];
         for (size_t ci = 0; ci < NUM_CONN; ci++) {
@@ -2205,9 +2422,8 @@ private:
                     // phase == ACTIVE: fall through to decrypt path
                 }
 
-                // ACTIVE: AES-CTR or Fallback path
-                if (tls_keys_valid_[ci]) {
-                    // AES-CTR path: pop chunks into pool, decrypt via ssl_read_by_chunk
+                // ACTIVE: AES-CTR path (AES-GCM guaranteed)
+                {
                     size_t live = cs.pool_write_idx - cs.chunk_pool_buf.chunks_consumed();
 
                     while (live < RX_POOL_SIZE) {
@@ -2223,65 +2439,6 @@ private:
                     // Drain TLS records via AES-CTR decryption into MSG_INBOX
                     if (aes_ctr_decrypt_loop(ci, cs.chunk_pool_buf))
                         did_work = true;
-                } else {
-                    // Fallback path: pop chunks → append_encrypted_view → SSL_read
-                    {
-                        size_t consumed = ssl_[ci].view_segments_consumed();
-                        size_t live = cs.pool_write_idx - consumed;
-
-                        cs.fallback_stats = {};
-                        while (live < RX_POOL_SIZE) {
-                            auto& slot = (*cs.rx_pool)[cs.pool_write_idx & RX_POOL_MASK];
-                            if (!encrypted_rx_ring_[ci].try_pop(slot)) break;
-
-                            cs.fallback_stats.oldest_poll_cycle = (cs.fallback_stats.oldest_poll_cycle == 0)
-                                ? slot.recv_cycle : cs.fallback_stats.oldest_poll_cycle;
-                            cs.fallback_stats.latest_poll_cycle = slot.recv_cycle;
-                            if (cs.fallback_stats.oldest_hw_ns == 0 && slot.hw_timestamp_oldest_ns > 0)
-                                cs.fallback_stats.oldest_hw_ns = slot.hw_timestamp_oldest_ns;
-                            if (slot.hw_timestamp_latest_ns > 0)
-                                cs.fallback_stats.latest_hw_ns = slot.hw_timestamp_latest_ns;
-                            cs.fallback_stats.total_hw_count += slot.hw_timestamp_count;
-                            cs.fallback_stats.total_seg_delta += slot.tcp_seg_delta;
-
-                            int ret = ssl_[ci].append_encrypted_view(slot.data, slot.len);
-                            if (ret < 0) {
-                                printf("[SSL] View ring overflow (conn %zu)\n", ci);
-                                running_.store(false, std::memory_order_release);
-                                break;
-                            }
-                            cs.pool_write_idx++;
-                            live++;
-                            did_work = true;
-                        }
-                    }
-
-                    // Decrypt via SSL_read
-                    while (true) {
-                        uint64_t ssl_start = rdtscp();
-                        ssize_t ret = ssl_[ci].read(decrypt_buf, sizeof(decrypt_buf));
-                        if (ret <= 0) break;
-
-                        bool tls_boundary = (ssl_[ci].pending() == 0);
-
-                        uint32_t total = static_cast<uint32_t>(ret);
-                        uint32_t sent = 0;
-                        while (sent < total) {
-                            uint32_t chunk_len = std::min(total - sent,
-                                                          static_cast<uint32_t>(SSL_DECRYPT_CHUNK_SIZE));
-                            bool is_last_chunk = (sent + chunk_len >= total);
-                            uint64_t ssl_end = rdtscp();
-
-                            uint32_t write_pos = msg_inbox_[ci]->current_write_pos();
-                            msg_inbox_[ci]->write_data(decrypt_buf + sent, chunk_len);
-
-                            publish_rx_metadata(ci, cs.fallback_stats, write_pos, chunk_len,
-                                                ssl_start, ssl_end,
-                                                tls_boundary && is_last_chunk);
-                            sent += chunk_len;
-                        }
-                        did_work = true;
-                    }
                 }
             } // for each connection
 
@@ -2720,12 +2877,6 @@ private:
     uint64_t tls_seq_num_[NUM_CONN]{};
     bool tls_keys_valid_[NUM_CONN]{};
 
-    // Per-connection spinlock for 2-thread SSL fallback path (non-AES-GCM ciphers).
-    // When tls_keys_valid_ is false, RX and TX threads both access ssl_[ci],
-    // requiring serialization. Not needed for AES-CTR path (RX bypasses SSL_read)
-    // or 3-thread path (SSL thread serializes all SSL ops).
-    std::atomic_flag ssl_fallback_lock_[NUM_CONN] = {};
-
     // Timestamp tracking (per-connection)
     uint64_t last_op_cycle_[NUM_CONN]{};
     uint64_t prev_tcp_segs_in_[NUM_CONN]{};
@@ -2779,6 +2930,14 @@ template<typename SSLPolicy, typename MsgOutboxCons, typename MsgMetadataProd, t
          bool EnableAB = false, bool AutoReconnect = false>
 using BSDSocketTransport3Thread = BSDSocketTransportProcess<
     SSLPolicy, DefaultBlockingIO, DedicatedSSL,
+    MsgOutboxCons, MsgMetadataProd, PongsCons,
+    EnableAB, AutoReconnect>;
+
+// 1-thread blocking with platform-default event policy (single-thread RX+TX, no spinlocks)
+template<typename SSLPolicy, typename MsgOutboxCons, typename MsgMetadataProd, typename PongsCons,
+         bool EnableAB = false, bool AutoReconnect = false>
+using BSDSocketTransport1Thread = BSDSocketTransportProcess<
+    SSLPolicy, DefaultBlockingIO, SingleThreadSSL,
     MsgOutboxCons, MsgMetadataProd, PongsCons,
     EnableAB, AutoReconnect>;
 

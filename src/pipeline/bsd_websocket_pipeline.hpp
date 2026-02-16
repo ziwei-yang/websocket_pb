@@ -2,7 +2,7 @@
 // BSDWebSocketPipeline<Traits> — single-call launcher for BSD socket transport pipeline
 //
 // Centralizes IP probe, IPC ring management, shared memory allocation,
-// and fork logic for BSD socket transport (2-thread InlineSSL or 3-thread DedicatedSSL).
+// and fork logic for BSD socket transport (1-thread SingleThreadSSL, 2-thread InlineSSL, or 3-thread DedicatedSSL).
 //
 // Unlike WebSocketPipeline (XDP), this launcher:
 //   - No XDP/UMEM/BPF (uses kernel TCP stack)
@@ -345,7 +345,10 @@ public:
     bool setup() {
         printf("\n=== Setting up BSD WebSocket Pipeline ===\n");
         printf("SSL:        %s\n", SSLPolicyType::name());
-        printf("Threading:  %s\n", SSLThreadingType::has_ssl_thread ? "3-thread (DedicatedSSL)" : "2-thread (InlineSSL)");
+        printf("Threading:  %s\n",
+               SSLThreadingType::has_ssl_thread ? "3-thread (DedicatedSSL)" :
+               SSLThreadingType::is_single_thread ? "1-thread (SingleThreadSSL)" :
+               "2-thread (InlineSSL)");
 
         // IP Probe: resolve all IPs, measure RTT, rank
         {
@@ -487,7 +490,9 @@ public:
         if (transport_pid_ == 0) { run_transport_process(); _exit(0); }
         printf("[PIPELINE] Forked BSD Transport (PID %d, %s, %s)\n",
                transport_pid_, SSLPolicyType::name(),
-               SSLThreadingType::has_ssl_thread ? "3-thread" : "2-thread");
+               SSLThreadingType::has_ssl_thread ? "3-thread" :
+               SSLThreadingType::is_single_thread ? "1-thread" :
+               "2-thread");
 
         // Wait for TLS ready
         auto start = std::chrono::steady_clock::now();
