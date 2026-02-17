@@ -54,6 +54,7 @@
 #include "pipeline_config.hpp"
 #include "11_bsd_tcp_ssl_process.hpp"
 #include "20_ws_process.hpp"
+#include "21_ws_core.hpp"
 #include "msg_inbox.hpp"
 #include "../net/ip_probe.hpp"
 
@@ -87,6 +88,8 @@ concept BSDPipelineTraitsConcept = requires {
     { T::PROBE_COUNT }            -> std::convertible_to<uint32_t>;
     { T::PROBE_TIMEOUT_MS }       -> std::convertible_to<uint32_t>;
     { T::DUAL_DEAD_THRESHOLD_MS } -> std::convertible_to<uint64_t>;
+
+    { T::INLINE_WS }             -> std::convertible_to<bool>;
 };
 
 // ============================================================================
@@ -109,6 +112,8 @@ struct DefaultBSDPipelineConfig {
     static constexpr uint32_t PROBE_COUNT            = 3;
     static constexpr uint32_t PROBE_TIMEOUT_MS       = 200;
     static constexpr uint64_t DUAL_DEAD_THRESHOLD_MS = 3000;
+
+    static constexpr bool INLINE_WS = false;
 };
 
 // ============================================================================
@@ -187,7 +192,7 @@ public:
         return true;
     }
 
-    template<bool EnableAB, bool HasAppHandler>
+    template<bool EnableAB, bool HasAppHandler, bool IsInlineWS = false>
     bool create_all_rings() {
         mkdir(shm_base(), 0755);
         std::string full_dir = std::string(shm_base()) + "/" + ipc_ring_dir_;
@@ -196,17 +201,19 @@ public:
             return false;
         }
 
-        // Transport <-> WebSocket rings (no raw_inbox/raw_outbox for BSD)
-        if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
-                         sizeof(MsgOutboxEvent), 1)) return false;
-        if (!create_ring("msg_metadata_a", MSG_METADATA_SIZE * sizeof(MsgMetadata),
-                         sizeof(MsgMetadata), 1)) return false;
-        if constexpr (EnableAB) {
-            if (!create_ring("msg_metadata_b", MSG_METADATA_SIZE * sizeof(MsgMetadata),
+        // Transport <-> WebSocket IPC rings (skip in InlineWS mode — no WS process)
+        if constexpr (!IsInlineWS) {
+            if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
+                             sizeof(MsgOutboxEvent), 1)) return false;
+            if (!create_ring("msg_metadata_a", MSG_METADATA_SIZE * sizeof(MsgMetadata),
                              sizeof(MsgMetadata), 1)) return false;
+            if constexpr (EnableAB) {
+                if (!create_ring("msg_metadata_b", MSG_METADATA_SIZE * sizeof(MsgMetadata),
+                                 sizeof(MsgMetadata), 1)) return false;
+            }
+            if (!create_ring("pongs", PONGS_SIZE * sizeof(PongFrameAligned),
+                             sizeof(PongFrameAligned), 1)) return false;
         }
-        if (!create_ring("pongs", PONGS_SIZE * sizeof(PongFrameAligned),
-                         sizeof(PongFrameAligned), 1)) return false;
 
         // WebSocket -> Parent ring (skip when AppHandler replaces it)
         if constexpr (!HasAppHandler) {
@@ -305,8 +312,16 @@ public:
     static constexpr bool EnableAB       = Traits::ENABLE_AB;
     static constexpr bool AutoReconnect  = Traits::AUTO_RECONNECT;
     static constexpr bool Prof           = Traits::PROFILING;
+    static constexpr bool InlineWS       = Traits::INLINE_WS;
     static constexpr size_t NUM_CONN     = EnableAB ? 2 : 1;
     static constexpr bool HasAppHandler  = Traits::AppHandler::enabled;
+
+    // InlineWS requires SingleThreadSSL (ssl_.write from same thread as ssl_.read)
+    static_assert(!InlineWS || Traits::SSLThreadingPolicy::is_single_thread,
+                  "INLINE_WS requires SingleThreadSSL");
+    // InlineWS requires AutoReconnect (event-driven handshake, no blocking metadata poll)
+    static_assert(!InlineWS || AutoReconnect,
+                  "INLINE_WS requires AUTO_RECONNECT=true");
 
     using SSLPolicyType      = typename Traits::SSLPolicy;
     using IOPolicyType       = typename Traits::IOPolicy;
@@ -314,6 +329,7 @@ public:
     using AppHandlerType     = typename Traits::AppHandler;
     using UpgradeCustomizerType = typename Traits::UpgradeCustomizer;
 
+    // --- IPC mode types (non-InlineWS) ---
     using BSDTransportType = BSDSocketTransportProcess<
         SSLPolicyType,
         IOPolicyType,
@@ -332,6 +348,24 @@ public:
         AppHandlerType,
         UpgradeCustomizerType>;
 
+    // --- Inline mode types (InlineWS) ---
+    using InlineWSCoreType = WSCore<
+        DirectTXSink<SSLPolicyType, EnableAB>,
+        IPCRingProducer<WSFrameInfo>,
+        EnableAB, AutoReconnect, Prof,
+        AppHandlerType,
+        UpgradeCustomizerType>;
+
+    using InlineTransportType = BSDSocketTransportProcess<
+        SSLPolicyType,
+        IOPolicyType,
+        SSLThreadingType,
+        NullRingAdapter,
+        NullRingAdapter,
+        NullRingAdapter,
+        EnableAB, AutoReconnect,
+        InlineWSCoreType>;
+
     BSDWebSocketPipeline() : ipc_manager_("bsd_ws_pipeline") {}
     ~BSDWebSocketPipeline() { shutdown(); }
 
@@ -345,10 +379,14 @@ public:
     bool setup() {
         printf("\n=== Setting up BSD WebSocket Pipeline ===\n");
         printf("SSL:        %s\n", SSLPolicyType::name());
-        printf("Threading:  %s\n",
-               SSLThreadingType::has_ssl_thread ? "3-thread (DedicatedSSL)" :
-               SSLThreadingType::is_single_thread ? "1-thread (SingleThreadSSL)" :
-               "2-thread (InlineSSL)");
+        if constexpr (InlineWS) {
+            printf("Threading:  1-thread InlineWS (transport + WS in single process)\n");
+        } else {
+            printf("Threading:  %s\n",
+                   SSLThreadingType::has_ssl_thread ? "3-thread (DedicatedSSL)" :
+                   SSLThreadingType::is_single_thread ? "1-thread (SingleThreadSSL)" :
+                   "2-thread (InlineSSL)");
+        }
 
         // IP Probe: resolve all IPs, measure RTT, rank
         {
@@ -408,8 +446,8 @@ public:
         // TSC calibration
         tsc_freq_ghz_ = bsd_pipeline_helpers::calibrate_tsc_ghz();
 
-        // Create IPC rings
-        if (!ipc_manager_.template create_all_rings<EnableAB, HasAppHandler>()) {
+        // Create IPC rings (InlineWS skips transport↔WS rings)
+        if (!ipc_manager_.template create_all_rings<EnableAB, HasAppHandler, InlineWS>()) {
             fprintf(stderr, "FAIL: Cannot create IPC rings\n");
             return false;
         }
@@ -462,12 +500,14 @@ public:
 
         // Open shared regions
         try {
-            msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
-            msg_metadata_region_[0] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_a"));
-            if constexpr (EnableAB) {
-                msg_metadata_region_[1] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_b"));
+            if constexpr (!InlineWS) {
+                msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
+                msg_metadata_region_[0] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_a"));
+                if constexpr (EnableAB) {
+                    msg_metadata_region_[1] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_b"));
+                }
+                pongs_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pongs"));
             }
-            pongs_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pongs"));
             if constexpr (!HasAppHandler) {
                 ws_frame_info_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("ws_frame_info"));
             }
@@ -484,44 +524,60 @@ public:
         // Flush before fork to prevent duplicate buffered output
         fflush(stdout);
 
-        // Fork Transport process
-        transport_pid_ = fork();
-        if (transport_pid_ < 0) { fprintf(stderr, "FAIL: fork() for Transport\n"); return false; }
-        if (transport_pid_ == 0) { run_transport_process(); _exit(0); }
-        printf("[PIPELINE] Forked BSD Transport (PID %d, %s, %s)\n",
-               transport_pid_, SSLPolicyType::name(),
-               SSLThreadingType::has_ssl_thread ? "3-thread" :
-               SSLThreadingType::is_single_thread ? "1-thread" :
-               "2-thread");
+        if constexpr (InlineWS) {
+            // InlineWS: single child process (transport embeds WS processing)
+            transport_pid_ = fork();
+            if (transport_pid_ < 0) { fprintf(stderr, "FAIL: fork() for InlineWS Transport\n"); return false; }
+            if (transport_pid_ == 0) { run_inline_transport_process(); _exit(0); }
+            printf("[PIPELINE] Forked InlineWS Transport (PID %d, %s, 1-thread)\n",
+                   transport_pid_, SSLPolicyType::name());
 
-        // Wait for TLS ready
-        auto start = std::chrono::steady_clock::now();
-        while (!conn_state_->is_handshake_tls_ready()) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start).count();
-            if (elapsed > 15000) { fprintf(stderr, "FAIL: TLS handshake timeout\n"); return false; }
-            if (!conn_state_->is_running(PROC_TRANSPORT)) {
-                fprintf(stderr, "FAIL: Transport exited during TLS handshake\n"); return false;
+            // Wait for WS ready (transport handles TLS + WS handshake internally)
+            if (!conn_state_->wait_for_handshake_ws_ready(30000000)) {
+                fprintf(stderr, "FAIL: InlineWS handshake timeout\n");
+                return false;
             }
-            usleep(1000);
+            printf("[PIPELINE] InlineWS transport ready (1 process, no IPC)\n");
+        } else {
+            // Standard 2-process mode: fork Transport, then fork WS
+            transport_pid_ = fork();
+            if (transport_pid_ < 0) { fprintf(stderr, "FAIL: fork() for Transport\n"); return false; }
+            if (transport_pid_ == 0) { run_transport_process(); _exit(0); }
+            printf("[PIPELINE] Forked BSD Transport (PID %d, %s, %s)\n",
+                   transport_pid_, SSLPolicyType::name(),
+                   SSLThreadingType::has_ssl_thread ? "3-thread" :
+                   SSLThreadingType::is_single_thread ? "1-thread" :
+                   "2-thread");
+
+            // Wait for TLS ready
+            auto tls_start = std::chrono::steady_clock::now();
+            while (!conn_state_->is_handshake_tls_ready()) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - tls_start).count();
+                if (elapsed > 15000) { fprintf(stderr, "FAIL: TLS handshake timeout\n"); return false; }
+                if (!conn_state_->is_running(PROC_TRANSPORT)) {
+                    fprintf(stderr, "FAIL: Transport exited during TLS handshake\n"); return false;
+                }
+                usleep(1000);
+            }
+            printf("[PIPELINE] TLS handshake complete\n");
+
+            // Flush before fork
+            fflush(stdout);
+
+            // Fork WebSocket process
+            websocket_pid_ = fork();
+            if (websocket_pid_ < 0) { fprintf(stderr, "FAIL: fork() for WebSocket\n"); return false; }
+            if (websocket_pid_ == 0) { run_websocket_process(); _exit(0); }
+            printf("[PIPELINE] Forked WebSocket (PID %d)\n", websocket_pid_);
+
+            // Wait for WS ready
+            if (!conn_state_->wait_for_handshake_ws_ready(30000000)) {
+                fprintf(stderr, "FAIL: WebSocket handshake timeout\n");
+                return false;
+            }
+            printf("[PIPELINE] All processes ready\n");
         }
-        printf("[PIPELINE] TLS handshake complete\n");
-
-        // Flush before fork
-        fflush(stdout);
-
-        // Fork WebSocket process
-        websocket_pid_ = fork();
-        if (websocket_pid_ < 0) { fprintf(stderr, "FAIL: fork() for WebSocket\n"); return false; }
-        if (websocket_pid_ == 0) { run_websocket_process(); _exit(0); }
-        printf("[PIPELINE] Forked WebSocket (PID %d)\n", websocket_pid_);
-
-        // Wait for WS ready
-        if (!conn_state_->wait_for_handshake_ws_ready(30000000)) {
-            fprintf(stderr, "FAIL: WebSocket handshake timeout\n");
-            return false;
-        }
-        printf("[PIPELINE] All processes ready\n");
         return true;
     }
 
@@ -544,14 +600,18 @@ public:
             pid = 0;
         };
         reap(transport_pid_, "Transport");
-        reap(websocket_pid_, "WebSocket");
+        if constexpr (!InlineWS) {
+            reap(websocket_pid_, "WebSocket");
+        }
 
         // Cleanup shared regions
-        delete msg_outbox_region_; msg_outbox_region_ = nullptr;
-        for (size_t i = 0; i < NUM_CONN; i++) {
-            delete msg_metadata_region_[i]; msg_metadata_region_[i] = nullptr;
+        if constexpr (!InlineWS) {
+            delete msg_outbox_region_; msg_outbox_region_ = nullptr;
+            for (size_t i = 0; i < NUM_CONN; i++) {
+                delete msg_metadata_region_[i]; msg_metadata_region_[i] = nullptr;
+            }
+            delete pongs_region_; pongs_region_ = nullptr;
         }
-        delete pongs_region_; pongs_region_ = nullptr;
         delete ws_frame_info_region_; ws_frame_info_region_ = nullptr;
 
         if (conn_state_ && conn_state_ != MAP_FAILED) {
@@ -591,6 +651,46 @@ private:
     // ========================================================================
     // Child process entry points
     // ========================================================================
+
+    void run_inline_transport_process() {
+        static_assert(InlineWS, "run_inline_transport_process() only valid when INLINE_WS=true");
+        bsd_pipeline_helpers::pin_to_cpu(Traits::TRANSPORT_CORE);
+
+        // WSFrameInfo producer — transport → parent
+        std::unique_ptr<IPCRingProducer<WSFrameInfo>> ws_frame_info_prod_holder;
+        if constexpr (!HasAppHandler) {
+            ws_frame_info_prod_holder = std::make_unique<IPCRingProducer<WSFrameInfo>>(
+                *ws_frame_info_region_);
+        }
+
+        InlineTransportType transport;
+        transport.inline_app_handler() = app_handler_;
+
+        // init() for InlineTransportType: NullRingAdapter pointers are unused
+        if constexpr (EnableAB) {
+            bool ok = transport.init(Traits::WSS_HOST, Traits::WSS_PORT,
+                                     nullptr, nullptr, nullptr,
+                                     msg_inbox_[0], conn_state_,
+                                     msg_inbox_[1], nullptr);
+            if (!ok) { conn_state_->shutdown_all(); return; }
+        } else {
+            bool ok = transport.init(Traits::WSS_HOST, Traits::WSS_PORT,
+                                     nullptr, nullptr, nullptr,
+                                     msg_inbox_[0], conn_state_);
+            if (!ok) { conn_state_->shutdown_all(); return; }
+        }
+
+        // Wire WSCore to msg_inbox, ws_frame_info_prod, DirectTXSink
+        if constexpr (EnableAB) {
+            transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_,
+                                  msg_inbox_[0], msg_inbox_[1]);
+        } else {
+            transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_,
+                                  msg_inbox_[0]);
+        }
+
+        transport.run();
+    }
 
     void run_transport_process() {
         bsd_pipeline_helpers::pin_to_cpu(Traits::TRANSPORT_CORE);

@@ -1,23 +1,18 @@
-// test/pipeline/26_binance_sbe_bsdsocket_3thread.cpp
-// BSD Socket Binance SBE Test - 3-thread DedicatedSSL mode
+// test/pipeline/28_binance_sbe_bsdsocket_inline_ws.cpp
+// BSD Socket Binance SBE Test - InlineWS mode (transport + WS in single process)
 //
-// Uses BSDWebSocketPipeline launcher with SBE binary protocol.
-// Parent consumes WSFrameInfo from disruptor ring and validates SBE fields.
+// Uses BSDWebSocketPipeline launcher with INLINE_WS=true.
+// Transport embeds WSCore directly — no IPC rings between transport and WS,
+// no separate WS process fork. Only 1 child process.
 //
 // Architecture:
-//   - BSD Transport Process (3-thread: RX + SSL + TX) with DedicatedSSL
-//   - WebSocket Process: WS handshake + frame parsing -> WSFrameInfo ring
+//   - InlineWS Transport Process (1-thread: recv → decrypt → WS parse → WSFrameInfo ring)
 //   - Parent Process: consume WSFrameInfo ring, SBE decode + print_timeline
 //
-// Threading model:
-//   - RX thread: recv() raw bytes -> encrypted_rx_ring
-//   - SSL thread: decrypt RX via SSL_read, encrypt TX via SSL_write
-//   - TX thread: encrypted_tx_ring -> send() raw bytes
-//
 // Usage:
-//   make build-test-pipeline-binance_sbe_bsdsocket_3thread NIC_MTU=1500 USE_OPENSSL=1
+//   make build-test-pipeline-binance_sbe_bsdsocket_inline_ws NIC_MTU=1500 USE_OPENSSL=1
 //   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES BINANCE_API_KEY=<key> \
-//     ./build/test_pipeline_binance_sbe_bsdsocket_3thread --timeout 10000
+//     ./build/test_pipeline_binance_sbe_bsdsocket_inline_ws --timeout 10000
 //
 // Options:
 //   --timeout <ms>   Stream timeout in milliseconds (default: 10000)
@@ -72,13 +67,13 @@ struct BinanceUpgradeCustomizer {
 };
 
 // ============================================================================
-// Pipeline Traits (3-thread DedicatedSSL)
+// Pipeline Traits (InlineWS — transport + WS in single process)
 // ============================================================================
 
-struct BinanceSBE3ThreadTraits : DefaultBSDPipelineConfig {
+struct BinanceSBEInlineWSTraits : DefaultBSDPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
     using IOPolicy           = DefaultBlockingIO;
-    using SSLThreadingPolicy = DedicatedSSL;
+    using SSLThreadingPolicy = SingleThreadSSL;
     using AppHandler         = NullAppHandler;
     using UpgradeCustomizer  = BinanceUpgradeCustomizer;
 
@@ -91,6 +86,7 @@ struct BinanceSBE3ThreadTraits : DefaultBSDPipelineConfig {
 
     static constexpr bool ENABLE_AB      = true;
     static constexpr bool AUTO_RECONNECT = true;
+    static constexpr bool INLINE_WS      = true;   // <-- key difference
 };
 
 // ============================================================================
@@ -183,18 +179,15 @@ void write_summary(const char* tag,
                    uint64_t text_frames, uint64_t binary_frames,
                    uint64_t ping_frames, uint64_t pong_frames, uint64_t close_frames,
                    uint64_t sbe_valid_events, uint64_t sbe_decode_errors,
-                   bool sequence_error, int64_t pong_deficit,
+                   bool sequence_error,
                    const std::vector<WSFrameInfo>& frame_records, uint64_t tsc_freq,
                    const char* dump_path,
-                   int64_t ws_frame_prod, int64_t ws_frame_cons_seq,
-                   int64_t meta_prod, int64_t meta_cons,
-                   int64_t outbox_prod, int64_t outbox_cons,
-                   int64_t pongs_prod, int64_t pongs_cons) {
+                   int64_t ws_frame_prod, int64_t ws_frame_cons_seq) {
     char buf[16384];
     int pos = 0;
 
     pos += snprintf(buf + pos, sizeof(buf) - pos, "\n=== Shutting down ===\n");
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n=== SBE Test Results ===\n");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n=== SBE InlineWS Test Results ===\n");
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  Duration:        %ld ms\n", duration_ms);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  Total events:    %lu (ring events incl. partial)\n", total_frames);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  Partial events:  %lu\n", partial_events);
@@ -202,13 +195,6 @@ void write_summary(const char* tag,
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  BINARY frames:   %lu\n", binary_frames);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  PING frames:     %lu\n", ping_frames);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  PONG frames:     %lu\n", pong_frames);
-    if (pong_deficit > 0) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "  PONG DEFICIT:    %ld (PINGs received but PONGs not queued - INVESTIGATE!)\n", pong_deficit);
-    } else {
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "  PONG balance:    OK (all PINGs have corresponding PONGs queued)\n");
-    }
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  CLOSE frames:    %lu\n", close_frames);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  SBE valid:       %lu\n", sbe_valid_events);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  SBE errors:      %lu\n", sbe_decode_errors);
@@ -306,20 +292,12 @@ void write_summary(const char* tag,
         pos += snprintf(buf + pos, sizeof(buf) - pos, "[FRAME-RECORDS] %s\n", dump_path);
     }
 
-    // Ring buffer status
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Ring Buffer Status ---\n");
+    // Ring buffer status (InlineWS: only ws_frame_info ring exists)
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Ring Buffer Status (InlineWS) ---\n");
     bool ws_caught = ws_frame_cons_seq >= ws_frame_prod;
-    bool meta_caught = meta_cons >= meta_prod - 1;
-    bool outbox_caught = outbox_cons >= outbox_prod;
-    bool pongs_caught = pongs_cons >= pongs_prod;
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  WS_FRAME_INFO producer: %ld, consumer: %ld (%s)\n",
         ws_frame_prod, ws_frame_cons_seq, ws_caught ? "ok" : "NO - FAIL");
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "  MSG_METADATA  producer: %ld, consumer: %ld (%s)\n",
-        meta_prod, meta_cons, meta_caught ? "ok" : "NO - FAIL");
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "  MSG_OUTBOX    producer: %ld, consumer: %ld (%s)\n",
-        outbox_prod, outbox_cons, outbox_caught ? "ok" : "NO - FAIL");
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "  PONGS         producer: %ld, consumer: %ld (%s)\n",
-        pongs_prod, pongs_cons, pongs_caught ? "ok" : "NO - FAIL");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  (No msg_metadata/msg_outbox/pongs rings — InlineWS)\n");
     pos += snprintf(buf + pos, sizeof(buf) - pos, "====================\n");
 
     fflush(stdout);
@@ -347,13 +325,13 @@ void write_summary(const char* tag,
 // Stream Test
 // ============================================================================
 
-bool run_stream_test(BSDWebSocketPipeline<BinanceSBE3ThreadTraits>& pipeline) {
+bool run_stream_test(BSDWebSocketPipeline<BinanceSBEInlineWSTraits>& pipeline) {
     bool run_forever = (g_timeout_ms <= 0);
 
     if (run_forever) {
-        printf("\n--- SBE Stream Test (FOREVER MODE - Ctrl+C to stop) ---\n");
+        printf("\n--- SBE InlineWS Stream Test (FOREVER MODE - Ctrl+C to stop) ---\n");
     } else {
-        printf("\n--- SBE Stream Test (%dms) ---\n", g_timeout_ms);
+        printf("\n--- SBE InlineWS Stream Test (%dms) ---\n", g_timeout_ms);
     }
 
     IPCRingConsumer<WSFrameInfo> ws_frame_cons(*pipeline.ws_frame_info_region());
@@ -464,6 +442,7 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBE3ThreadTraits>& pipeline) {
     };
 
     // Main streaming loop
+    // InlineWS: only 1 child process (transport), check PROC_TRANSPORT
     while (run_forever || std::chrono::steady_clock::now() < stream_end) {
         if (g_shutdown.load(std::memory_order_acquire)) {
             signal(SIGINT, SIG_IGN);
@@ -472,8 +451,8 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBE3ThreadTraits>& pipeline) {
             break;
         }
 
-        if (!conn_state->is_running(PROC_WEBSOCKET)) {
-            fprintf(stderr, "[SBE] WebSocket process exited during streaming\n");
+        if (!conn_state->is_running(PROC_TRANSPORT)) {
+            fprintf(stderr, "[SBE] Transport process exited during streaming\n");
             break;
         }
 
@@ -515,39 +494,23 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBE3ThreadTraits>& pipeline) {
     auto actual_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time).count();
 
-    dump_frame_records(frame_records.data(), frame_records.size(), "bsd_sbe_3t");
+    dump_frame_records(frame_records.data(), frame_records.size(), "bsd_sbe_inline");
 
     char dump_path[256];
-    snprintf(dump_path, sizeof(dump_path), "/tmp/bsd_sbe_3t_frame_records_%d.bin", getpid());
+    snprintf(dump_path, sizeof(dump_path), "/tmp/bsd_sbe_inline_frame_records_%d.bin", getpid());
 
-    // Ring buffer status
+    // Ring buffer status (InlineWS: only ws_frame_info ring)
     auto* ws_fi_region = pipeline.ws_frame_info_region();
-    auto* meta_region = pipeline.msg_metadata_region(0);
-    auto* outbox_region = pipeline.msg_outbox_region();
-    auto* pongs_region = pipeline.pongs_region();
-
     int64_t ws_frame_prod = ws_fi_region->producer_published()->load(std::memory_order_acquire);
     int64_t ws_frame_cons_seq = ws_frame_cons.sequence();
-    int64_t meta_prod = meta_region->producer_published()->load(std::memory_order_acquire);
-    int64_t meta_cons = meta_region->consumer_sequence(0)->load(std::memory_order_acquire);
-    int64_t outbox_prod = outbox_region->producer_published()->load(std::memory_order_acquire);
-    int64_t outbox_cons = outbox_region->consumer_sequence(0)->load(std::memory_order_acquire);
-    int64_t pongs_prod_seq = pongs_region->producer_published()->load(std::memory_order_acquire);
-    int64_t pongs_cons_seq = pongs_region->consumer_sequence(0)->load(std::memory_order_acquire);
 
-    int64_t pongs_queued = pongs_prod_seq + 1;
-    int64_t pong_deficit = static_cast<int64_t>(ping_frames) - pongs_queued;
-
-    write_summary("bsd_sbe_3t", actual_duration,
+    write_summary("bsd_sbe_inline", actual_duration,
                   total_frames, partial_events,
                   text_frames, binary_frames, ping_frames, pong_frames, close_frames,
-                  sbe_valid_events, sbe_decode_errors, sequence_error, pong_deficit,
+                  sbe_valid_events, sbe_decode_errors, sequence_error,
                   frame_records, tsc_freq,
                   frame_records.empty() ? nullptr : dump_path,
-                  ws_frame_prod, ws_frame_cons_seq,
-                  meta_prod, meta_cons,
-                  outbox_prod, outbox_cons,
-                  pongs_prod_seq, pongs_cons_seq);
+                  ws_frame_prod, ws_frame_cons_seq);
 
     if (run_forever) return true;
 
@@ -597,13 +560,13 @@ int main(int argc, char* argv[]) {
     bool run_forever = (g_timeout_ms <= 0);
 
     printf("==============================================\n");
-    printf("  BSD Socket Binance SBE Test (3-thread)      \n");
+    printf("  BSD Socket Binance SBE Test (InlineWS)      \n");
     printf("==============================================\n");
-    printf("  Target:     %s:%u (WSS)\n", BinanceSBE3ThreadTraits::WSS_HOST, BinanceSBE3ThreadTraits::WSS_PORT);
-    printf("  Path:       %s\n", BinanceSBE3ThreadTraits::WSS_PATH);
+    printf("  Target:     %s:%u (WSS)\n", BinanceSBEInlineWSTraits::WSS_HOST, BinanceSBEInlineWSTraits::WSS_PORT);
+    printf("  Path:       %s\n", BinanceSBEInlineWSTraits::WSS_PATH);
     printf("  SSL:        %s\n", SSLPolicyType::name());
-    printf("  Threading:  3-thread (DedicatedSSL)\n");
-    printf("  Processes:  BSD Transport + WebSocket\n");
+    printf("  Threading:  InlineWS (transport + WS in single process)\n");
+    printf("  Processes:  1 child (transport embeds WS)\n");
     printf("  API Key:    set\n");
     printf("  Dual A/B:   yes\n");
     printf("  Reconnect:  yes\n");
@@ -615,7 +578,7 @@ int main(int argc, char* argv[]) {
     }
     printf("==============================================\n\n");
 
-    BSDWebSocketPipeline<BinanceSBE3ThreadTraits> pipeline;
+    BSDWebSocketPipeline<BinanceSBEInlineWSTraits> pipeline;
 
     if (!pipeline.setup()) {
         fprintf(stderr, "\nFATAL: Setup failed\n");
@@ -645,9 +608,9 @@ int main(int argc, char* argv[]) {
 
     printf("\n==============================================\n");
     if (result == 0) {
-        printf("  SBE TEST PASSED (3-thread)\n");
+        printf("  SBE TEST PASSED (InlineWS)\n");
     } else {
-        printf("  SBE TEST FAILED (3-thread)\n");
+        printf("  SBE TEST FAILED (InlineWS)\n");
     }
     printf("==============================================\n");
 

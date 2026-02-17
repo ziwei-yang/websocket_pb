@@ -1104,6 +1104,34 @@ else
 endif
 
 # ============================================================================
+# BSD Socket Binance SBE Test - InlineWS (test28)
+# Transport + WS in single process — no IPC rings between transport and WS
+# ============================================================================
+
+PIPELINE_BSD_SBE_BINANCE_INLINE_SRC := test/pipeline/28_binance_sbe_bsdsocket_inline_ws.cpp
+PIPELINE_BSD_SBE_BINANCE_INLINE_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_bsdsocket_inline_ws
+
+$(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN): $(PIPELINE_BSD_SBE_BINANCE_INLINE_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/21_ws_core.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/binance_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
+	@echo "🔨 Compiling BSD Socket Binance SBE InlineWS test..."
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL),$(USE_LIBRESSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ BSD Socket Binance SBE InlineWS test build complete: $@"
+else
+	@echo "❌ Error: BSD Socket Binance SBE test requires USE_WOLFSSL=1, USE_OPENSSL=1, or USE_LIBRESSL=1"
+	@exit 1
+endif
+
+build-test-pipeline-binance_sbe_bsdsocket_inline_ws: $(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN)
+
+test-pipeline-binance-sbe-bsdsocket-inline-ws: $(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN)
+	@echo "🧪 Running BSD Socket Binance SBE InlineWS test..."
+ifeq ($(UNAME_S),Darwin)
+	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN) --timeout $(TIMEOUT)
+else
+	./$(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN) --timeout $(TIMEOUT)
+endif
+
+# ============================================================================
 # Unified XDP+TCP+SSL+WS Pipeline Test (Single-Process)
 # Tests unified pipeline: all layers in one process, outputs to IPC rings
 # ============================================================================

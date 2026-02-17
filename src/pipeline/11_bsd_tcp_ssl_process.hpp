@@ -44,6 +44,7 @@
 #include "../core/timing.hpp"
 #include "../policy/event.hpp"
 #include "../policy/ssl.hpp"
+#include "21_ws_core.hpp"
 
 namespace websocket::pipeline {
 
@@ -597,6 +598,15 @@ struct BSDReconnectCtx {
 };
 
 // ============================================================================
+// NullRingAdapter - Sentinel type for unused IPC rings (InlineWS mode)
+// ============================================================================
+
+struct NullRingAdapter {
+    // Satisfies ring consumer/producer concepts structurally but is never used.
+    // InlineWS mode skips all outbox/pongs/metadata ring access at compile time.
+};
+
+// ============================================================================
 // BSDSocketTransportProcess - Unified BSD Socket Transport
 // ============================================================================
 
@@ -620,7 +630,8 @@ template<
     typename MsgMetadataProd,
     typename PongsCons,
     bool EnableAB = false,
-    bool AutoReconnect = false
+    bool AutoReconnect = false,
+    typename WSProcessor = void
 >
 class BSDSocketTransportProcess {
     // ========================================================================
@@ -643,6 +654,21 @@ class BSDSocketTransportProcess {
     static_assert(
         !(IOPolicy::is_async && SSLThreadingPolicy::has_ssl_thread),
         "AsyncIO cannot use DedicatedSSL"
+    );
+
+    // InlineWS: transport embeds WS processing directly (no IPC to WS process)
+    static constexpr bool InlineWS = !std::is_same_v<WSProcessor, void>;
+
+    // InlineWS requires SingleThreadSSL (ssl_.write from same thread as ssl_.read)
+    static_assert(
+        !InlineWS || SSLThreadingPolicy::is_single_thread,
+        "InlineWS requires SingleThreadSSL (single-thread RX+TX)"
+    );
+
+    // InlineWS requires AutoReconnect (event-driven handshake, no blocking metadata poll)
+    static_assert(
+        !InlineWS || AutoReconnect,
+        "InlineWS requires AutoReconnect=true"
     );
 
     // Number of connections
@@ -1021,31 +1047,36 @@ private:
                              uint32_t write_pos, uint32_t decrypted_len,
                              uint64_t ssl_start, uint64_t ssl_end,
                              bool tls_record_end) {
-        int64_t seq = msg_metadata_prod_[ci]->try_claim();
-        if (seq >= 0) {
-            auto& meta = (*msg_metadata_prod_[ci])[seq];
-            meta.clear();
-            meta.first_nic_frame_poll_cycle = stats.oldest_poll_cycle;
-            meta.latest_nic_frame_poll_cycle = stats.latest_poll_cycle;
-            meta.ssl_read_start_cycle = ssl_start;
-            meta.ssl_read_end_cycle = ssl_end;
-            meta.ssl_last_op_cycle = last_op_cycle_[ci];
-            meta.ssl_read_id = ssl_read_count_[ci];
-            meta.msg_inbox_offset = write_pos;
-            meta.decrypted_len = decrypted_len;
-            meta.tls_record_end = tls_record_end;
-            meta.nic_packet_ct = (stats.total_hw_count > 0)
-                ? stats.total_hw_count
-                : (stats.total_seg_delta > 0)
-                    ? stats.total_seg_delta
-                    : stats.packet_count;
+        MsgMetadata meta{};
+        meta.clear();
+        meta.first_nic_frame_poll_cycle = stats.oldest_poll_cycle;
+        meta.latest_nic_frame_poll_cycle = stats.latest_poll_cycle;
+        meta.ssl_read_start_cycle = ssl_start;
+        meta.ssl_read_end_cycle = ssl_end;
+        meta.ssl_last_op_cycle = last_op_cycle_[ci];
+        meta.ssl_read_id = ssl_read_count_[ci];
+        meta.msg_inbox_offset = write_pos;
+        meta.decrypted_len = decrypted_len;
+        meta.tls_record_end = tls_record_end;
+        meta.nic_packet_ct = (stats.total_hw_count > 0)
+            ? stats.total_hw_count
+            : (stats.total_seg_delta > 0)
+                ? stats.total_seg_delta
+                : stats.packet_count;
 #ifdef __linux__
-            if (stats.oldest_hw_ns > 0) {
-                meta.first_nic_timestamp_ns = stats.oldest_hw_ns;
-                meta.latest_nic_timestamp_ns = stats.latest_hw_ns;
-            }
+        if (stats.oldest_hw_ns > 0) {
+            meta.first_nic_timestamp_ns = stats.oldest_hw_ns;
+            meta.latest_nic_timestamp_ns = stats.latest_hw_ns;
+        }
 #endif
-            msg_metadata_prod_[ci]->publish(seq);
+        if constexpr (InlineWS) {
+            inline_ws_.ws_core.feed(static_cast<uint8_t>(ci), meta);
+        } else {
+            int64_t seq = msg_metadata_prod_[ci]->try_claim();
+            if (seq >= 0) {
+                (*msg_metadata_prod_[ci])[seq] = meta;
+                msg_metadata_prod_[ci]->publish(seq);
+            }
         }
         last_op_cycle_[ci] = rdtscp();
         ssl_read_count_[ci]++;
@@ -1055,16 +1086,24 @@ private:
      * Publish a control event (TCP_DISCONNECTED, TLS_CONNECTED) on the metadata ring.
      */
     void publish_control_event(size_t ci, MetaEventType event_type) {
-        auto* prod = msg_metadata_prod_[ci];
-        int64_t seq = prod->try_claim();
-        if (seq < 0) {
-            fprintf(stderr, "[BSD-Transport] WARNING: MSG_METADATA full for control event\n");
-            return;
+        if constexpr (InlineWS) {
+            if (event_type == MetaEventType::TLS_CONNECTED) {
+                inline_ws_.ws_core.on_tls_connected(static_cast<uint8_t>(ci));
+            } else if (event_type == MetaEventType::TCP_DISCONNECTED) {
+                inline_ws_.ws_core.on_tcp_disconnected(static_cast<uint8_t>(ci));
+            }
+        } else {
+            auto* prod = msg_metadata_prod_[ci];
+            int64_t seq = prod->try_claim();
+            if (seq < 0) {
+                fprintf(stderr, "[BSD-Transport] WARNING: MSG_METADATA full for control event\n");
+                return;
+            }
+            auto& meta = (*prod)[seq];
+            meta.clear();
+            meta.event_type = static_cast<uint8_t>(event_type);
+            prod->publish(seq);
         }
-        auto& meta = (*prod)[seq];
-        meta.clear();
-        meta.event_type = static_cast<uint8_t>(event_type);
-        prod->publish(seq);
     }
 
     // ========================================================================
@@ -2153,8 +2192,13 @@ private:
                 } // for each ready pfd
             } // if (ready > 0)
 
-            // ── TX Phase: MSG_OUTBOX + PONGS — no locks needed ──
-            {
+            // ── TX Phase ──
+            if constexpr (InlineWS) {
+                // InlineWS: TX is handled by DirectTXSink (ssl_.write from WSCore).
+                // Idle tick: ping/pong/watchdog
+                inline_ws_.ws_core.idle_tick();
+            } else {
+                // IPC mode: MSG_OUTBOX + PONGS — no locks needed
                 size_t processed = msg_outbox_cons_->process_manually(
                     [&](MsgOutboxEvent& event, int64_t seq, bool end_of_batch) {
                         (void)seq;
@@ -2857,6 +2901,47 @@ private:
         return 0;
     }
 
+    // ========================================================================
+    // InlineWS State (conditional)
+    // ========================================================================
+
+    struct InlineWSState {
+        WSProcessor ws_core;
+        DirectTXSink<SSLPolicy, EnableAB> tx_sink;
+    };
+    struct EmptyState {};
+    [[no_unique_address]] std::conditional_t<InlineWS, InlineWSState, EmptyState> inline_ws_{};
+
+public:
+    /**
+     * Initialize InlineWS mode: wire WSCore to msg_inbox, ws_frame_info_prod, DirectTXSink.
+     * Called by pipeline launcher before run().
+     */
+    template<typename WSFrameInfoProd>
+    void init_inline(WSFrameInfoProd* ws_frame_info_prod,
+                     ConnStateShm* conn_state,
+                     MsgInbox* msg_inbox_a,
+                     MsgInbox* msg_inbox_b = nullptr) {
+        static_assert(InlineWS, "init_inline() only valid when WSProcessor != void");
+        inline_ws_.tx_sink.ssl_ = ssl_;
+        if constexpr (EnableAB) {
+            inline_ws_.ws_core.init(msg_inbox_a, ws_frame_info_prod,
+                                    &inline_ws_.tx_sink, conn_state, msg_inbox_b);
+        } else {
+            inline_ws_.ws_core.init(msg_inbox_a, ws_frame_info_prod,
+                                    &inline_ws_.tx_sink, conn_state);
+        }
+    }
+
+    /**
+     * Access the inline WSCore's app_handler (for AppHandler propagation).
+     */
+    auto& inline_app_handler() {
+        static_assert(InlineWS);
+        return inline_ws_.ws_core.app_handler();
+    }
+
+private:
     // ========================================================================
     // Member Variables
     // ========================================================================

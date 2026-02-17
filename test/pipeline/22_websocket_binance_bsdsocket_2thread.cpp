@@ -392,7 +392,7 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceBSD2ThreadTraits>& pipeline) {
             process_frame(frame);
         }
 
-        __builtin_ia32_pause();
+        usleep(1000);
     }
 
     // Final drain
