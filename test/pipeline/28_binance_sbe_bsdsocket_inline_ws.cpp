@@ -297,7 +297,7 @@ void write_summary(const char* tag,
     bool ws_caught = ws_frame_cons_seq >= ws_frame_prod;
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  WS_FRAME_INFO producer: %ld, consumer: %ld (%s)\n",
         ws_frame_prod, ws_frame_cons_seq, ws_caught ? "ok" : "NO - FAIL");
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "  (No msg_metadata/msg_outbox/pongs rings — InlineWS)\n");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  (No msg_metadata/pongs rings — InlineWS; msg_outbox available for client sends)\n");
     pos += snprintf(buf + pos, sizeof(buf) - pos, "====================\n");
 
     fflush(stdout);

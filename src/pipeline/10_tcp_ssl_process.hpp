@@ -56,6 +56,7 @@
 #include "../policy/transport.hpp"
 #include "../policy/transport_ab.hpp"
 #include "../core/timing.hpp"
+#include "21_ws_core.hpp"
 // ip_probe.hpp no longer needed — reconnect uses startup IP pool from conn_state
 
 namespace websocket::pipeline {
@@ -156,8 +157,15 @@ template<typename SSLPolicy,
          typename LowPrioCons,
          bool EnableAB = false,
          bool AutoReconnect = false,
-         bool Profiling = false>
+         bool Profiling = false,
+         typename WSProcessor = void>
 struct TransportProcess {
+    // InlineWS: transport embeds WS processing directly (no IPC to WS process)
+    static constexpr bool InlineWS = !std::is_same_v<WSProcessor, void>;
+
+    // InlineWS requires AutoReconnect (event-driven handshake, no blocking metadata poll)
+    static_assert(!InlineWS || AutoReconnect, "InlineWS requires AutoReconnect=true");
+
 public:
     // Type aliases for IPC rings
     using RawInboxCons = IPCRingConsumer<websocket::xdp::PacketFrameDescriptor>;
@@ -469,9 +477,14 @@ public:
                 }
             }
 
-            // Op 3: Process LOW_MSG_OUTBOX (PONGs)
-            profile_op<Profiling>(
-                [this]{ return process_low_prio_outbox(); }, slot, 3);
+            // Op 3: Process LOW_MSG_OUTBOX (PONGs) / InlineWS idle tick
+            if constexpr (InlineWS) {
+                // InlineWS: pongs handled by WSCore internally via DirectTXSink
+                inline_ws_.ws_core.idle_tick();
+            } else {
+                profile_op<Profiling>(
+                    [this]{ return process_low_prio_outbox(); }, slot, 3);
+            }
 
             // Commit profiling sample
             if constexpr (Profiling) {
@@ -800,31 +813,33 @@ private:
     // ========================================================================
 
     void publish_control_event(uint8_t ci, MetaEventType event_type) {
-        auto* prod = msg_metadata_prod_[ci];
-        int64_t seq = prod->try_claim();
-        if (seq < 0) {
-            fprintf(stderr, "[TRANSPORT] WARNING: MSG_METADATA full for control event\n");
-            return;
+        if constexpr (InlineWS) {
+            if (event_type == MetaEventType::TLS_CONNECTED) {
+                inline_ws_.ws_core.on_tls_connected(ci);
+            } else if (event_type == MetaEventType::TCP_DISCONNECTED) {
+                inline_ws_.ws_core.on_tcp_disconnected(ci);
+            }
+        } else {
+            auto* prod = msg_metadata_prod_[ci];
+            int64_t seq = prod->try_claim();
+            if (seq < 0) {
+                fprintf(stderr, "[TRANSPORT] WARNING: MSG_METADATA full for control event\n");
+                return;
+            }
+            auto& meta = (*prod)[seq];
+            meta.clear();
+            meta.event_type = static_cast<uint8_t>(event_type);
+            prod->publish(seq);
         }
-        auto& meta = (*prod)[seq];
-        meta.clear();
-        meta.event_type = static_cast<uint8_t>(event_type);
-        prod->publish(seq);
     }
 
     // ========================================================================
     // MsgMetadata Publishing (for data events)
     // ========================================================================
 
-    void publish_metadata(MsgMetadataProd* prod, uint32_t write_offset, uint32_t len,
+    void publish_metadata(uint8_t ci, MsgMetadataProd* prod, uint32_t write_offset, uint32_t len,
                           timing_record_t& timing, bool tls_record_end) {
-        int64_t seq = prod->try_claim();
-        if (seq < 0) {
-            fprintf(stderr, "[TRANSPORT] FATAL: MSG_METADATA full\n");
-            abort();
-        }
-
-        auto& meta = (*prod)[seq];
+        MsgMetadata meta{};
         meta.first_nic_timestamp_ns = timing.hw_timestamp_oldest_ns;
         meta.latest_nic_timestamp_ns = timing.hw_timestamp_latest_ns;
         meta.first_bpf_entry_ns = timing.bpf_entry_oldest_ns;
@@ -842,7 +857,18 @@ private:
         meta.first_pkt_mem_idx = timing.oldest_pkt_mem_idx;
         meta.last_pkt_mem_idx = timing.latest_pkt_mem_idx;
         meta.event_type = static_cast<uint8_t>(MetaEventType::DATA);
-        prod->publish(seq);
+
+        if constexpr (InlineWS) {
+            inline_ws_.ws_core.feed(ci, meta);
+        } else {
+            int64_t seq = prod->try_claim();
+            if (seq < 0) {
+                fprintf(stderr, "[TRANSPORT] FATAL: MSG_METADATA full\n");
+                abort();
+            }
+            (*prod)[seq] = meta;
+            prod->publish(seq);
+        }
         last_op_cycle_ = rdtscp();
     }
 
@@ -896,7 +922,7 @@ private:
 
             bool tls_boundary = conn.has_tls_record_keys()
                                 ? conn.tls_record_boundary() : false;
-            publish_metadata(meta_prod, write_offset, static_cast<uint32_t>(read_len), timing, tls_boundary);
+            publish_metadata(ci, meta_prod, write_offset, static_cast<uint32_t>(read_len), timing, tls_boundary);
 
             conn.reset_recv_stats();
             ssl_read_count_++;
@@ -958,7 +984,7 @@ private:
             inbox->advance_write(static_cast<uint32_t>(read_len));
 
             // Publish as DATA event
-            publish_metadata(meta_prod, write_offset, static_cast<uint32_t>(read_len), timing, false);
+            publish_metadata(ci, meta_prod, write_offset, static_cast<uint32_t>(read_len), timing, false);
 
             conn.reset_recv_stats();
             ssl_read_count_++;
@@ -1115,6 +1141,46 @@ private:
     // Counters
     uint64_t ssl_read_count_ = 0;
     uint64_t low_prio_tx_count_ = 0;
+
+    // ========================================================================
+    // InlineWS State (conditional)
+    // ========================================================================
+
+    struct InlineWSState {
+        WSProcessor ws_core;
+        DirectTXSink<SSLPolicy, EnableAB> tx_sink;
+    };
+    struct EmptyState {};
+    [[no_unique_address]] std::conditional_t<InlineWS, InlineWSState, EmptyState> inline_ws_{};
+
+public:
+    /**
+     * Initialize InlineWS mode: wire WSCore to msg_inbox, ws_frame_info_prod, DirectTXSink.
+     * Called by pipeline launcher before run().
+     */
+    template<typename WSFrameInfoProd>
+    void init_inline(WSFrameInfoProd* ws_frame_info_prod,
+                     ConnStateShm* conn_state,
+                     MsgInbox* msg_inbox_a,
+                     MsgInbox* msg_inbox_b = nullptr) {
+        static_assert(InlineWS, "init_inline() only valid when WSProcessor != void");
+        inline_ws_.tx_sink.ssl_ = ssl_;
+        if constexpr (EnableAB) {
+            inline_ws_.ws_core.init(msg_inbox_a, ws_frame_info_prod,
+                                    &inline_ws_.tx_sink, conn_state, msg_inbox_b);
+        } else {
+            inline_ws_.ws_core.init(msg_inbox_a, ws_frame_info_prod,
+                                    &inline_ws_.tx_sink, conn_state);
+        }
+    }
+
+    /**
+     * Access the inline WSCore's app_handler (for AppHandler propagation).
+     */
+    auto& inline_app_handler() {
+        static_assert(InlineWS);
+        return inline_ws_.ws_core.app_handler();
+    }
 };
 
 }  // namespace websocket::pipeline

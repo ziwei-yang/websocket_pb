@@ -1,17 +1,19 @@
-// test/pipeline/24_binance_sbe_xdp.cpp
-// Test WebSocketProcess with SBE binary protocol against Binance SBE stream
+// test/pipeline/29_binance_sbe_xdp_inline_ws.cpp
+// XDP Binance SBE Test - InlineWS mode (transport + WS in single process)
 //
-// Usage: ./test_pipeline_binance_sbe_xdp <interface> <bpf_path> [ignored...] [--timeout <ms>]
-// (Called by scripts/build_xdp.sh 24_binance_sbe_xdp.cpp)
+// Uses WebSocketPipeline launcher with INLINE_WS=true.
+// Transport embeds WSCore directly — no IPC rings between transport and WS,
+// no separate WS process fork. 2 processes total (XDP Poll + Transport+WS).
 //
-// Build: make build-test-pipeline-binance_sbe_xdp XDP_INTERFACE=enp108s0 USE_WOLFSSL=1
+// Architecture:
+//   - XDP Poll Process (core 2): AF_XDP → RAW_INBOX ring
+//   - InlineWS Transport Process (core 4): recv → decrypt → WS parse → WSFrameInfo ring
+//   - Parent Process: consume WSFrameInfo ring, SBE decode + print_timeline
 //
-// This test:
-// - Connects to stream-sbe.binance.com:443 (SBE binary protocol)
-// - Sends X-MBX-APIKEY header via UpgradeCustomizer (BINANCE_API_KEY env var)
-// - Subscribes to btcusdt@trade stream
-// - Parent consumes WSFrameInfo from disruptor ring, decodes SBE, prints timeline
-// - WS process uses NullAppHandler (publishes WSFrameInfo to ring, no inline decode)
+// Usage: ./test_pipeline_binance_sbe_xdp_inline_ws <interface> <bpf_path> [--timeout <ms>]
+// (Called by scripts/build_xdp.sh 29_binance_sbe_xdp_inline_ws.cpp)
+//
+// Build: make build-test-pipeline-binance_sbe_xdp_inline_ws XDP_INTERFACE=enp108s0 USE_WOLFSSL=1 ENABLE_AB=1 ENABLE_RECONNECT=1
 
 #include <cstdio>
 #include <cstdlib>
@@ -44,10 +46,11 @@ static constexpr bool AB_ENABLED = false;
 #endif
 #undef ENABLE_AB
 
+// ENABLE_RECONNECT is required for InlineWS — always force true
 #ifdef ENABLE_RECONNECT
 static constexpr bool RECONNECT_ENABLED = true;
 #else
-static constexpr bool RECONNECT_ENABLED = false;
+static constexpr bool RECONNECT_ENABLED = true;  // InlineWS requires AUTO_RECONNECT
 #endif
 #undef ENABLE_RECONNECT
 
@@ -83,28 +86,29 @@ struct BinanceUpgradeCustomizer {
 };
 
 // ============================================================================
-// PipelineTraits for Binance SBE
+// PipelineTraits for Binance SBE (InlineWS)
 // ============================================================================
 
-struct BinanceSBETraits : DefaultPipelineConfig {
+struct BinanceSBEInlineWSTraits : DefaultPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
     using AppHandler         = NullAppHandler;
     using UpgradeCustomizer  = BinanceUpgradeCustomizer;
 
     static constexpr int XDP_POLL_CORE   = 2;
     static constexpr int TRANSPORT_CORE  = 4;
-    static constexpr int WEBSOCKET_CORE  = 6;
+    static constexpr int WEBSOCKET_CORE  = 4;  // unused in InlineWS, same as transport
 
     static constexpr bool ENABLE_AB      = AB_ENABLED;
-    static constexpr bool AUTO_RECONNECT = RECONNECT_ENABLED;
+    static constexpr bool AUTO_RECONNECT = true;   // required for InlineWS
     static constexpr bool PROFILING      = true;
+    static constexpr bool INLINE_WS      = true;   // key toggle
 
     static constexpr const char* WSS_HOST = "stream-sbe.binance.com";
     static constexpr uint16_t WSS_PORT    = 443;
     static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade";
 };
 
-static_assert(PipelineTraitsConcept<BinanceSBETraits>);
+static_assert(PipelineTraitsConcept<BinanceSBEInlineWSTraits>);
 
 // ============================================================================
 // Configuration
@@ -112,7 +116,7 @@ static_assert(PipelineTraitsConcept<BinanceSBETraits>);
 
 namespace {
 
-constexpr int DEFAULT_STREAM_DURATION_MS = 10000;   // Stream for 10 seconds
+constexpr int DEFAULT_STREAM_DURATION_MS = 10000;
 int g_timeout_ms = DEFAULT_STREAM_DURATION_MS;
 
 std::atomic<bool> g_shutdown{false};
@@ -139,7 +143,6 @@ void parse_args(int argc, char* argv[]) {
     }
 }
 
-// Write message to stdout, fall back to /dev/tty if pipe is broken
 void write_tty(const char* msg, int len) {
     ssize_t wr = write(STDOUT_FILENO, msg, len);
     if (wr <= 0) {
@@ -148,19 +151,17 @@ void write_tty(const char* msg, int len) {
     }
 }
 
-// Periodic profiling save thread (every 10 minutes)
 constexpr int PROFILING_SAVE_INTERVAL_S = 600;
 
 template<typename Pipeline>
 void profiling_save_thread(Pipeline& pipeline) {
     int elapsed = 0;
     while (!g_shutdown.load(std::memory_order_acquire)) {
-        usleep(1000000);  // 1s granularity
+        usleep(1000000);
         if (g_shutdown.load(std::memory_order_acquire)) break;
         if (++elapsed >= PROFILING_SAVE_INTERVAL_S) {
             elapsed = 0;
             pipeline.save_profiling_data();
-            // Print confirmation with tty fallback
             char msg[128];
             int n = snprintf(msg, sizeof(msg),
                 "[PROFILING] Periodic save complete (every %d min)\n",
@@ -178,8 +179,8 @@ void profiling_save_thread(Pipeline& pipeline) {
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <interface> <bpf_path> [ignored...] [--timeout <ms>]\n", argv[0]);
-        fprintf(stderr, "\nBinance SBE binary protocol test.\n");
+        fprintf(stderr, "Usage: %s <interface> <bpf_path> [--timeout <ms>]\n", argv[0]);
+        fprintf(stderr, "\nBinance SBE binary protocol test (InlineWS mode).\n");
         fprintf(stderr, "Requires BINANCE_API_KEY env var with Ed25519 API key.\n");
         return 1;
     }
@@ -189,7 +190,6 @@ int main(int argc, char* argv[]) {
 
     parse_args(argc, argv);
 
-    // Check API key
     const char* api_key = getenv("BINANCE_API_KEY");
     if (!api_key || !api_key[0]) {
         fprintf(stderr, "WARNING: BINANCE_API_KEY not set. SBE stream may reject connection.\n");
@@ -208,15 +208,17 @@ int main(int argc, char* argv[]) {
     bool run_forever = (g_timeout_ms <= 0);
 
     printf("==============================================\n");
-    printf("  Binance SBE Binary Protocol Test            \n");
+    printf("  Binance SBE Test (XDP InlineWS)             \n");
     printf("==============================================\n");
     printf("  Interface:  %s\n", interface);
-    printf("  Target:     %s:%u (WSS)\n", BinanceSBETraits::WSS_HOST, BinanceSBETraits::WSS_PORT);
-    printf("  Path:       %s\n", BinanceSBETraits::WSS_PATH);
+    printf("  Target:     %s:%u (WSS)\n", BinanceSBEInlineWSTraits::WSS_HOST, BinanceSBEInlineWSTraits::WSS_PORT);
+    printf("  Path:       %s\n", BinanceSBEInlineWSTraits::WSS_PATH);
     printf("  SSL:        %s\n", SSLPolicyType::name());
+    printf("  Mode:       InlineWS (transport + WS in single process)\n");
+    printf("  Processes:  2 (XDP Poll + Transport+WS)\n");
     printf("  API Key:    %s\n", (api_key && api_key[0]) ? "set" : "NOT SET");
     printf("  Dual A/B:   %s\n", AB_ENABLED ? "yes" : "no");
-    printf("  Reconnect:  %s\n", RECONNECT_ENABLED ? "yes" : "no");
+    printf("  Reconnect:  yes (required)\n");
     if (run_forever) {
         printf("  Timeout:    FOREVER (Ctrl+C to stop)\n");
     } else {
@@ -224,8 +226,7 @@ int main(int argc, char* argv[]) {
     }
     printf("==============================================\n\n");
 
-    // Setup pipeline
-    WebSocketPipeline<BinanceSBETraits> pipeline;
+    WebSocketPipeline<BinanceSBEInlineWSTraits> pipeline;
 
     if (!pipeline.setup(interface, bpf_path)) {
         fprintf(stderr, "\nFATAL: Setup failed\n");
@@ -234,7 +235,6 @@ int main(int argc, char* argv[]) {
 
     g_conn_state = pipeline.conn_state();
 
-    // Set subscription JSON
     pipeline.set_subscription_json(
         R"({"method":"SUBSCRIBE","params":["btcusdt@trade"],"id":1})");
 
@@ -244,10 +244,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Give processes time to stabilize
-    usleep(500000);  // 500ms
+    usleep(500000);  // 500ms stabilization
 
-    // Start periodic profiling save thread
     std::thread prof_thread(profiling_save_thread<decltype(pipeline)>,
                             std::ref(pipeline));
 
@@ -257,7 +255,6 @@ int main(int argc, char* argv[]) {
 
     constexpr size_t NUM_CONN = AB_ENABLED ? 2 : 1;
 
-    // Create consumer for WS_FRAME_INFO ring
     IPCRingConsumer<WSFrameInfo> ws_frame_cons(*pipeline.ws_frame_info_region());
 
     uint64_t tsc_freq = pipeline.conn_state()->tsc_freq_hz;
@@ -269,7 +266,7 @@ int main(int argc, char* argv[]) {
     uint64_t binary_frames = 0;
     uint64_t sbe_decode_errors = 0;
 
-    printf("\n--- SBE Stream Test (%s) ---\n",
+    printf("\n--- SBE InlineWS Stream Test (%s) ---\n",
            run_forever ? "FOREVER MODE - Ctrl+C to stop" :
            (std::to_string(g_timeout_ms) + "ms").c_str());
 
@@ -284,8 +281,9 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        if (!pipeline.conn_state()->is_running(PROC_WEBSOCKET)) {
-            fprintf(stderr, "[SBE] WebSocket process exited during streaming\n");
+        // InlineWS: check PROC_TRANSPORT (no separate WS process)
+        if (!pipeline.conn_state()->is_running(PROC_TRANSPORT)) {
+            fprintf(stderr, "[SBE] Transport process exited during streaming\n");
             break;
         }
 
@@ -296,13 +294,11 @@ int main(int argc, char* argv[]) {
             uint8_t ci = frame.connection_id;
             const uint8_t* payload = pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset);
 
-            // Extract exchange event time from SBE binary frames
             int64_t event_time_ms = 0;
             if (frame.opcode == 0x02 && frame.payload_len >= sbe::HEADER_SIZE + 8) {
                 binary_frames++;
                 sbe::SBEHeader hdr;
                 if (sbe::decode_header(payload, frame.payload_len, hdr)) {
-                    // All Binance SBE stream types have eventTime (utcTimestampUs) at body offset 0
                     int64_t event_time_us = sbe::read_i64(payload + sbe::HEADER_SIZE);
                     event_time_ms = event_time_us / 1000;
                 } else {
@@ -322,51 +318,7 @@ int main(int argc, char* argv[]) {
         prev_total = total_frames;
     }
 
-    // Drain remaining frames after loop exit
-    {
-        WSFrameInfo frame;
-        while (ws_frame_cons.try_consume(frame)) {
-            total_frames++;
-            uint8_t ci = frame.connection_id;
-            const uint8_t* payload = pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset);
-
-            int64_t event_time_ms = 0;
-            if (frame.opcode == 0x02 && frame.payload_len >= sbe::HEADER_SIZE + 8) {
-                binary_frames++;
-                sbe::SBEHeader hdr;
-                if (sbe::decode_header(payload, frame.payload_len, hdr)) {
-                    // All Binance SBE stream types have eventTime (utcTimestampUs) at body offset 0
-                    event_time_ms = sbe::read_i64(payload + sbe::HEADER_SIZE) / 1000;
-                } else {
-                    sbe_decode_errors++;
-                }
-            } else if (frame.opcode == 0x01) {
-                text_frames++;
-            }
-
-            frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci],
-                                 prev_latest_poll_cycle[ci], payload, event_time_ms);
-            prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);
-            prev_latest_poll_cycle[ci] = frame.latest_poll_cycle;
-        }
-    }
-
-    auto actual_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start_time).count();
-
-    // ========================================================================
-    // Shutdown summary (write to buffer, then tty fallback for broken pipes)
-    // ========================================================================
-
-    g_shutdown.store(true, std::memory_order_release);
-    pipeline.conn_state()->shutdown_all();
-
-    // Stop periodic profiling thread
-    if (prof_thread.joinable()) prof_thread.join();
-
-    usleep(200000);  // 200ms for processes to quiesce
-
-    // Drain remaining frames after shutdown
+    // Drain remaining
     {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
@@ -377,8 +329,31 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Save profiling data before shutdown (processes still alive, shared memory valid)
-    // Redirect stdout to /dev/tty so save_profiling_data() printf is visible
+    auto actual_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_time).count();
+
+    // ========================================================================
+    // Shutdown summary
+    // ========================================================================
+
+    g_shutdown.store(true, std::memory_order_release);
+    pipeline.conn_state()->shutdown_all();
+
+    if (prof_thread.joinable()) prof_thread.join();
+
+    usleep(200000);  // 200ms for processes to quiesce
+
+    // Drain remaining after shutdown
+    {
+        WSFrameInfo frame;
+        while (ws_frame_cons.try_consume(frame)) {
+            total_frames++;
+            if (frame.opcode == 0x02) binary_frames++;
+            else if (frame.opcode == 0x01) text_frames++;
+        }
+    }
+
+    // Save profiling data
     fflush(stdout);
     int saved_stdout = dup(STDOUT_FILENO);
     int tty_fd = open("/dev/tty", O_WRONLY);
@@ -387,69 +362,54 @@ int main(int argc, char* argv[]) {
         close(tty_fd);
     }
     pipeline.save_profiling_data();
-    // Restore stdout
     if (saved_stdout >= 0) {
         dup2(saved_stdout, STDOUT_FILENO);
         close(saved_stdout);
     }
 
-    // Ring buffer status
+    // Ring buffer status (InlineWS: only ws_frame_info and msg_outbox rings)
     auto* ws_fi_region = pipeline.ws_frame_info_region();
     int64_t ws_frame_prod = ws_fi_region->producer_published()->load(std::memory_order_acquire);
     int64_t ws_frame_cons_seq = ws_frame_cons.sequence();
-
-    auto* meta_region = pipeline.msg_metadata_region(0);
-    int64_t meta_prod = meta_region->producer_published()->load(std::memory_order_acquire);
-    int64_t meta_cons = meta_region->consumer_sequence(0)->load(std::memory_order_acquire);
 
     auto* outbox_region = pipeline.msg_outbox_region();
     int64_t outbox_prod = outbox_region->producer_published()->load(std::memory_order_acquire);
     int64_t outbox_cons = outbox_region->consumer_sequence(0)->load(std::memory_order_acquire);
 
-    auto* pongs_reg = pipeline.pongs_region();
-    int64_t pongs_prod = pongs_reg->producer_published()->load(std::memory_order_acquire);
-    int64_t pongs_cons = pongs_reg->consumer_sequence(0)->load(std::memory_order_acquire);
-
-    // Build summary in stack buffer (survives broken pipes from tee + Ctrl+C)
     char summary[4096];
     int pos = 0;
     pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== Shutting down ===\n");
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== SBE Test Results ===\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== SBE InlineWS Test Results ===\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Duration:        %ld ms\n", actual_duration);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Total frames:    %lu\n", total_frames);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Binary (SBE):    %lu\n", binary_frames);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Text (JSON):     %lu\n", text_frames);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  SBE errors:      %lu\n", sbe_decode_errors);
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n--- Ring Buffer Status ---\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n--- Ring Buffer Status (InlineWS) ---\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  WS_FRAME_INFO producer: %ld, consumer: %ld (%s)\n",
            ws_frame_prod, ws_frame_cons_seq, (ws_frame_cons_seq >= ws_frame_prod) ? "ok" : "BEHIND");
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  MSG_METADATA  producer: %ld, consumer: %ld (%s)\n",
-           meta_prod, meta_cons, (meta_cons >= meta_prod - 1) ? "ok" : "BEHIND");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  MSG_OUTBOX    producer: %ld, consumer: %ld (%s)\n",
            outbox_prod, outbox_cons, (outbox_cons >= outbox_prod) ? "ok" : "BEHIND");
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  PONGS         producer: %ld, consumer: %ld (%s)\n",
-           pongs_prod, pongs_cons, (pongs_cons >= pongs_prod) ? "ok" : "BEHIND");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  (No msg_metadata/pongs rings — InlineWS)\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "====================\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "\n==============================================\n");
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  SBE TEST COMPLETE\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  SBE INLINE_WS TEST COMPLETE\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "==============================================\n");
 
-    // Try stdout first; fall back to /dev/tty if pipe is broken
     fflush(stdout);
     fflush(stderr);
     ssize_t wr = write(STDOUT_FILENO, summary, pos);
     if (wr <= 0) {
-        int tty_fd = open("/dev/tty", O_WRONLY);
-        if (tty_fd >= 0) {
-            (void)write(tty_fd, summary, pos);
-            close(tty_fd);
+        int tty_fd2 = open("/dev/tty", O_WRONLY);
+        if (tty_fd2 >= 0) {
+            (void)write(tty_fd2, summary, pos);
+            close(tty_fd2);
         }
     }
 
-    // Also save to /tmp for persistence
     {
         char path[256];
-        snprintf(path, sizeof(path), "/tmp/sbe_summary_%d.txt", getpid());
+        snprintf(path, sizeof(path), "/tmp/sbe_inline_ws_summary_%d.txt", getpid());
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
             (void)write(fd, summary, pos);
@@ -465,8 +425,8 @@ int main(int argc, char* argv[]) {
 #else  // !USE_XDP
 
 int main() {
-    fprintf(stderr, "Error: Build with USE_XDP=1 USE_WOLFSSL=1\n");
-    fprintf(stderr, "Example: make build-test-pipeline-binance_sbe_xdp XDP_INTERFACE=enp108s0 USE_WOLFSSL=1\n");
+    fprintf(stderr, "Error: Build with USE_XDP=1 USE_WOLFSSL=1 ENABLE_AB=1 ENABLE_RECONNECT=1\n");
+    fprintf(stderr, "Example: make build-test-pipeline-binance_sbe_xdp_inline_ws XDP_INTERFACE=enp108s0 USE_WOLFSSL=1 ENABLE_AB=1 ENABLE_RECONNECT=1\n");
     return 1;
 }
 

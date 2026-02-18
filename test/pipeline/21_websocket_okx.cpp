@@ -428,7 +428,7 @@ int main(int argc, char* argv[]) {
     IPCRingConsumer<WSFrameInfo> ws_frame_cons(*pipeline.ws_frame_info_region());
 
     // Tracking metrics
-    uint64_t total_frames = 0;
+    uint64_t total_frames = 0, prev_total = 0;
     uint64_t text_frames = 0;
     uint64_t binary_frames = 0;
     uint64_t ping_frames = 0;
@@ -531,7 +531,8 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        __builtin_ia32_pause();
+        if (total_frames == prev_total) usleep(1000);
+        prev_total = total_frames;
     }
 
     // Drain remaining frames

@@ -201,10 +201,12 @@ public:
             return false;
         }
 
+        // MSG_OUTBOX: always created (parent may send custom WS frames at runtime)
+        if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
+                         sizeof(MsgOutboxEvent), 1)) return false;
+
         // Transport <-> WebSocket IPC rings (skip in InlineWS mode — no WS process)
         if constexpr (!IsInlineWS) {
-            if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
-                             sizeof(MsgOutboxEvent), 1)) return false;
             if (!create_ring("msg_metadata_a", MSG_METADATA_SIZE * sizeof(MsgMetadata),
                              sizeof(MsgMetadata), 1)) return false;
             if constexpr (EnableAB) {
@@ -360,7 +362,7 @@ public:
         SSLPolicyType,
         IOPolicyType,
         SSLThreadingType,
-        NullRingAdapter,
+        IPCRingConsumer<MsgOutboxEvent>,
         NullRingAdapter,
         NullRingAdapter,
         EnableAB, AutoReconnect,
@@ -500,8 +502,9 @@ public:
 
         // Open shared regions
         try {
+            // MSG_OUTBOX always opened (parent may send custom WS frames)
+            msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
             if constexpr (!InlineWS) {
-                msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
                 msg_metadata_region_[0] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_a"));
                 if constexpr (EnableAB) {
                     msg_metadata_region_[1] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_b"));
@@ -537,7 +540,7 @@ public:
                 fprintf(stderr, "FAIL: InlineWS handshake timeout\n");
                 return false;
             }
-            printf("[PIPELINE] InlineWS transport ready (1 process, no IPC)\n");
+            printf("[PIPELINE] InlineWS transport ready (1 process, MSG_OUTBOX for client sends)\n");
         } else {
             // Standard 2-process mode: fork Transport, then fork WS
             transport_pid_ = fork();
@@ -605,8 +608,8 @@ public:
         }
 
         // Cleanup shared regions
+        delete msg_outbox_region_; msg_outbox_region_ = nullptr;
         if constexpr (!InlineWS) {
-            delete msg_outbox_region_; msg_outbox_region_ = nullptr;
             for (size_t i = 0; i < NUM_CONN; i++) {
                 delete msg_metadata_region_[i]; msg_metadata_region_[i] = nullptr;
             }
@@ -656,6 +659,9 @@ private:
         static_assert(InlineWS, "run_inline_transport_process() only valid when INLINE_WS=true");
         bsd_pipeline_helpers::pin_to_cpu(Traits::TRANSPORT_CORE);
 
+        // MSG_OUTBOX consumer — parent → transport (client-initiated WS sends)
+        IPCRingConsumer<MsgOutboxEvent> msg_outbox_cons(*msg_outbox_region_);
+
         // WSFrameInfo producer — transport → parent
         std::unique_ptr<IPCRingProducer<WSFrameInfo>> ws_frame_info_prod_holder;
         if constexpr (!HasAppHandler) {
@@ -666,16 +672,16 @@ private:
         InlineTransportType transport;
         transport.inline_app_handler() = app_handler_;
 
-        // init() for InlineTransportType: NullRingAdapter pointers are unused
+        // init(): MSG_OUTBOX consumer is real, metadata/pongs are NullRingAdapter (unused)
         if constexpr (EnableAB) {
             bool ok = transport.init(Traits::WSS_HOST, Traits::WSS_PORT,
-                                     nullptr, nullptr, nullptr,
+                                     &msg_outbox_cons, nullptr, nullptr,
                                      msg_inbox_[0], conn_state_,
                                      msg_inbox_[1], nullptr);
             if (!ok) { conn_state_->shutdown_all(); return; }
         } else {
             bool ok = transport.init(Traits::WSS_HOST, Traits::WSS_PORT,
-                                     nullptr, nullptr, nullptr,
+                                     &msg_outbox_cons, nullptr, nullptr,
                                      msg_inbox_[0], conn_state_);
             if (!ok) { conn_state_->shutdown_all(); return; }
         }

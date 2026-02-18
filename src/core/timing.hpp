@@ -185,29 +185,31 @@ static inline bool enable_hw_timestamping(int sockfd) {
     ifr.ifr_data = (char*)&hwconfig;
 
     if (ioctl(sockfd, SIOCSHWTSTAMP, &ifr) < 0) {
-        printf("[TIMESTAMP] Warning: Failed to configure NIC hardware timestamping on %s: %s\n",
+        fprintf(stderr, "[TIMESTAMP] Warning: Failed to configure NIC hardware timestamping on %s: %s\n",
                nic_interface, strerror(errno));
-        printf("[TIMESTAMP] Continuing anyway - timestamps may not be available\n");
-        printf("[TIMESTAMP] Tip: Set WS_NIC_INTERFACE env var to your network interface name\n");
+        fprintf(stderr, "[TIMESTAMP] Continuing anyway - software timestamps will be used as fallback\n");
+        fprintf(stderr, "[TIMESTAMP] Tip: Set WS_NIC_INTERFACE env var to your network interface name\n");
     } else {
-        printf("[TIMESTAMP] Configured NIC %s for hardware RX timestamping\n", nic_interface);
+        fprintf(stderr, "[TIMESTAMP] Configured NIC %s for hardware RX timestamping\n", nic_interface);
     }
 
-    // Step 2: Request hardware timestamping on socket
+    // Step 2: Request hardware + software timestamping on socket
     // SOF_TIMESTAMPING_RX_HARDWARE: Hardware RX timestamp from NIC
-    // SOF_TIMESTAMPING_SOFTWARE: Transforms hardware timestamp to system clock (CLOCK_REALTIME)
+    // SOF_TIMESTAMPING_RX_SOFTWARE: Kernel software RX timestamp (fallback when HW unavailable)
+    // SOF_TIMESTAMPING_SOFTWARE: Report timestamps in system clock domain (CLOCK_REALTIME)
     // SOF_TIMESTAMPING_RAW_HARDWARE: Use raw hardware clock (required for some NICs)
     int flags = SOF_TIMESTAMPING_RX_HARDWARE |
+                SOF_TIMESTAMPING_RX_SOFTWARE |
                 SOF_TIMESTAMPING_SOFTWARE |
                 SOF_TIMESTAMPING_RAW_HARDWARE;
 
     if (setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags)) == 0) {
-        printf("[TIMESTAMP] Enabled hardware timestamping on socket\n");
+        fprintf(stderr, "[TIMESTAMP] Enabled hardware+software timestamping on socket\n");
         return true;
     }
 
     // Hardware timestamping failed
-    printf("[TIMESTAMP] Failed to enable timestamping: %s\n", strerror(errno));
+    fprintf(stderr, "[TIMESTAMP] Failed to enable timestamping: %s\n", strerror(errno));
     return false;
 #else
     (void)sockfd;

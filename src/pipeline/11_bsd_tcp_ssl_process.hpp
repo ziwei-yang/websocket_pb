@@ -598,15 +598,6 @@ struct BSDReconnectCtx {
 };
 
 // ============================================================================
-// NullRingAdapter - Sentinel type for unused IPC rings (InlineWS mode)
-// ============================================================================
-
-struct NullRingAdapter {
-    // Satisfies ring consumer/producer concepts structurally but is never used.
-    // InlineWS mode skips all outbox/pongs/metadata ring access at compile time.
-};
-
-// ============================================================================
 // BSDSocketTransportProcess - Unified BSD Socket Transport
 // ============================================================================
 
@@ -2193,12 +2184,8 @@ private:
             } // if (ready > 0)
 
             // ── TX Phase ──
-            if constexpr (InlineWS) {
-                // InlineWS: TX is handled by DirectTXSink (ssl_.write from WSCore).
-                // Idle tick: ping/pong/watchdog
-                inline_ws_.ws_core.idle_tick();
-            } else {
-                // IPC mode: MSG_OUTBOX + PONGS — no locks needed
+            // MSG_OUTBOX: always consumed (parent may send custom WS frames)
+            {
                 size_t processed = msg_outbox_cons_->process_manually(
                     [&](MsgOutboxEvent& event, int64_t seq, bool end_of_batch) {
                         (void)seq;
@@ -2260,9 +2247,15 @@ private:
                 if (processed > 0) {
                     msg_outbox_cons_->commit_manually();
                 }
+            }
 
-                // Process PONGS
-                processed = pongs_cons_->process_manually(
+            if constexpr (InlineWS) {
+                // InlineWS: pongs handled by WSCore internally via DirectTXSink.
+                // Idle tick: ping/pong/watchdog
+                inline_ws_.ws_core.idle_tick();
+            } else {
+                // IPC mode: PONGS from WS process
+                size_t processed = pongs_cons_->process_manually(
                     [&](PongFrameAligned& pong, int64_t seq, bool end_of_batch) {
                         (void)seq;
                         (void)end_of_batch;

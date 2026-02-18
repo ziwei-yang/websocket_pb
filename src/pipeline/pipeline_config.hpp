@@ -251,4 +251,13 @@ constexpr uint64_t frame_idx_to_addr(uint32_t frame_idx, uint32_t frame_size) {
     return static_cast<uint64_t>(frame_idx) * frame_size;
 }
 
+// ============================================================================
+// NullRingAdapter - Sentinel type for unused IPC rings (InlineWS mode)
+// ============================================================================
+
+struct NullRingAdapter {
+    // Satisfies ring consumer/producer concepts structurally but is never used.
+    // InlineWS mode skips all outbox/pongs/metadata ring access at compile time.
+};
+
 }  // namespace websocket::pipeline

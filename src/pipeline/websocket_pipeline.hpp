@@ -50,6 +50,7 @@
 #include "00_xdp_poll_process.hpp"
 #include "10_tcp_ssl_process.hpp"
 #include "20_ws_process.hpp"
+#include "21_ws_core.hpp"
 #include "msg_inbox.hpp"
 #include "../core/http.hpp"
 #include "../net/ip_probe.hpp"
@@ -91,6 +92,9 @@ concept PipelineTraitsConcept = requires {
     { T::PROBE_COUNT }             -> std::convertible_to<uint32_t>;
     { T::PROBE_TIMEOUT_MS }        -> std::convertible_to<uint32_t>;
     { T::DUAL_DEAD_THRESHOLD_MS }  -> std::convertible_to<uint64_t>;
+
+    // ── InlineWS toggle ──
+    { T::INLINE_WS }              -> std::convertible_to<bool>;
 };
 
 // ============================================================================
@@ -111,6 +115,9 @@ struct DefaultPipelineConfig {
     static constexpr uint32_t PROBE_COUNT            = 3;
     static constexpr uint32_t PROBE_TIMEOUT_MS       = 200;
     static constexpr uint64_t DUAL_DEAD_THRESHOLD_MS = 3000;  // 3s
+
+    // ── InlineWS ──
+    static constexpr bool INLINE_WS = false;
 };
 
 // ============================================================================
@@ -317,7 +324,7 @@ public:
         return true;
     }
 
-    template<bool EnableAB, bool HasAppHandler>
+    template<bool EnableAB, bool HasAppHandler, bool IsInlineWS = false>
     bool create_all_rings() {
         mkdir("/dev/shm/hft", 0755);
         std::string full_dir = "/dev/shm/hft/" + ipc_ring_dir_;
@@ -326,23 +333,27 @@ public:
             return false;
         }
 
-        // XDP Poll <-> Transport rings
+        // XDP Poll <-> Transport rings (always needed)
         if (!create_ring("raw_inbox", RAW_INBOX_SIZE * sizeof(PacketFrameDescriptor),
                          sizeof(PacketFrameDescriptor), 1)) return false;
         if (!create_ring("raw_outbox", RAW_OUTBOX_SIZE * sizeof(PacketFrameDescriptor),
                          sizeof(PacketFrameDescriptor), 1)) return false;
 
-        // Transport <-> WebSocket rings
+        // MSG_OUTBOX: always created (parent may send custom WS frames at runtime)
         if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
                          sizeof(MsgOutboxEvent), 1)) return false;
-        if (!create_ring("msg_metadata_a", MSG_METADATA_SIZE * sizeof(MsgMetadata),
-                         sizeof(MsgMetadata), 1)) return false;
-        if constexpr (EnableAB) {
-            if (!create_ring("msg_metadata_b", MSG_METADATA_SIZE * sizeof(MsgMetadata),
+
+        // Transport <-> WebSocket IPC rings (skip in InlineWS mode — no WS process)
+        if constexpr (!IsInlineWS) {
+            if (!create_ring("msg_metadata_a", MSG_METADATA_SIZE * sizeof(MsgMetadata),
                              sizeof(MsgMetadata), 1)) return false;
+            if constexpr (EnableAB) {
+                if (!create_ring("msg_metadata_b", MSG_METADATA_SIZE * sizeof(MsgMetadata),
+                                 sizeof(MsgMetadata), 1)) return false;
+            }
+            if (!create_ring("pongs", PONGS_SIZE * sizeof(PongFrameAligned),
+                             sizeof(PongFrameAligned), 1)) return false;
         }
-        if (!create_ring("pongs", PONGS_SIZE * sizeof(PongFrameAligned),
-                         sizeof(PongFrameAligned), 1)) return false;
 
         // WebSocket <-> Parent ring (skip when AppHandler replaces it)
         if constexpr (!HasAppHandler) {
@@ -387,8 +398,13 @@ public:
     static constexpr bool EnableAB       = Traits::ENABLE_AB;
     static constexpr bool AutoReconnect  = Traits::AUTO_RECONNECT;
     static constexpr bool Prof           = Traits::PROFILING;
+    static constexpr bool InlineWS       = Traits::INLINE_WS;
     static constexpr size_t NUM_CONN     = EnableAB ? 2 : 1;
     static constexpr bool HasAppHandler  = Traits::AppHandler::enabled;
+
+    // InlineWS requires AutoReconnect
+    static_assert(!InlineWS || AutoReconnect,
+                  "INLINE_WS requires AUTO_RECONNECT=true");
 
     // ── Process type aliases ──
     using SSLPolicyType = typename Traits::SSLPolicy;
@@ -401,6 +417,7 @@ public:
         Traits::TRICKLE_ENABLED,
         Prof>;
 
+    // --- IPC mode types (non-InlineWS) ---
     using TransportType = TransportProcess<
         SSLPolicyType,
         IPCRingProducer<MsgMetadata>,
@@ -415,6 +432,21 @@ public:
         EnableAB, AutoReconnect, Prof,
         AppHandlerType,
         UpgradeCustomizerType>;
+
+    // --- Inline mode types (InlineWS) ---
+    using InlineWSCoreType = WSCore<
+        DirectTXSink<SSLPolicyType, EnableAB>,
+        IPCRingProducer<WSFrameInfo>,
+        EnableAB, AutoReconnect, Prof,
+        AppHandlerType,
+        UpgradeCustomizerType>;
+
+    using InlineTransportType = TransportProcess<
+        SSLPolicyType,
+        NullRingAdapter,
+        NullRingAdapter,
+        EnableAB, AutoReconnect, Prof,
+        InlineWSCoreType>;
 
     // ========================================================================
     // Lifecycle
@@ -432,9 +464,12 @@ public:
         interface_ = interface;
         bpf_path_ = bpf_path;
 
-        printf("\n=== Setting up WebSocket Pipeline ===\n");
+        printf("\n=== Setting up WebSocket Pipeline%s ===\n", InlineWS ? " (InlineWS)" : "");
         printf("Interface:   %s\n", interface_);
         printf("BPF Path:    %s\n", bpf_path_);
+        if constexpr (InlineWS) {
+            printf("Mode:        InlineWS (transport + WS in single process, 2-process total)\n");
+        }
 
         // IP Probe: resolve all IPs, measure RTT, rank
         {
@@ -529,8 +564,8 @@ public:
                gateway_mac_[0], gateway_mac_[1], gateway_mac_[2],
                gateway_mac_[3], gateway_mac_[4], gateway_mac_[5]);
 
-        // Create IPC rings
-        if (!ipc_manager_.template create_all_rings<EnableAB, HasAppHandler>()) {
+        // Create IPC rings (InlineWS skips transport↔WS rings)
+        if (!ipc_manager_.template create_all_rings<EnableAB, HasAppHandler, InlineWS>()) {
             fprintf(stderr, "FAIL: Cannot create IPC rings\n");
             return false;
         }
@@ -622,12 +657,15 @@ public:
         try {
             raw_inbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_inbox"));
             raw_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_outbox"));
+            // MSG_OUTBOX always opened (parent may send custom WS frames)
             msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
-            msg_metadata_region_[0] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_a"));
-            if constexpr (EnableAB) {
-                msg_metadata_region_[1] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_b"));
+            if constexpr (!InlineWS) {
+                msg_metadata_region_[0] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_a"));
+                if constexpr (EnableAB) {
+                    msg_metadata_region_[1] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_b"));
+                }
+                pongs_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pongs"));
             }
-            pongs_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pongs"));
             if constexpr (!HasAppHandler) {
                 ws_frame_info_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("ws_frame_info"));
             }
@@ -653,38 +691,60 @@ public:
             return false;
         }
 
-        // Fork Transport process
-        transport_pid_ = fork();
-        if (transport_pid_ < 0) { fprintf(stderr, "FAIL: fork() for Transport\n"); return false; }
-        if (transport_pid_ == 0) { run_transport_process(); _exit(0); }
-        printf("[PIPELINE] Forked Transport (PID %d, core %d, %s)\n",
-               transport_pid_, Traits::TRANSPORT_CORE, SSLPolicyType::name());
+        // Flush before fork
+        fflush(stdout);
 
-        // Wait for TLS ready
-        auto start = std::chrono::steady_clock::now();
-        while (!conn_state_->is_handshake_tls_ready()) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start).count();
-            if (elapsed > 15000) { fprintf(stderr, "FAIL: TLS handshake timeout\n"); return false; }
-            if (!conn_state_->is_running(PROC_TRANSPORT)) {
-                fprintf(stderr, "FAIL: Transport exited during TLS handshake\n"); return false;
+        if constexpr (InlineWS) {
+            // InlineWS: single Transport+WS child process (2 total with XDP Poll)
+            transport_pid_ = fork();
+            if (transport_pid_ < 0) { fprintf(stderr, "FAIL: fork() for InlineWS Transport\n"); return false; }
+            if (transport_pid_ == 0) { run_inline_transport_process(); _exit(0); }
+            printf("[PIPELINE] Forked InlineWS Transport (PID %d, core %d, %s)\n",
+                   transport_pid_, Traits::TRANSPORT_CORE, SSLPolicyType::name());
+
+            // Wait for WS ready (transport handles TLS + WS handshake internally)
+            if (!conn_state_->wait_for_handshake_ws_ready(30000000)) {
+                fprintf(stderr, "FAIL: InlineWS handshake timeout\n");
+                return false;
             }
-            usleep(1000);
-        }
+            printf("[PIPELINE] InlineWS transport ready (2 processes, MSG_OUTBOX for client sends)\n");
+        } else {
+            // Standard 3-process mode: XDP Poll + Transport + WS
+            transport_pid_ = fork();
+            if (transport_pid_ < 0) { fprintf(stderr, "FAIL: fork() for Transport\n"); return false; }
+            if (transport_pid_ == 0) { run_transport_process(); _exit(0); }
+            printf("[PIPELINE] Forked Transport (PID %d, core %d, %s)\n",
+                   transport_pid_, Traits::TRANSPORT_CORE, SSLPolicyType::name());
 
-        // Fork WebSocket process
-        websocket_pid_ = fork();
-        if (websocket_pid_ < 0) { fprintf(stderr, "FAIL: fork() for WebSocket\n"); return false; }
-        if (websocket_pid_ == 0) { run_websocket_process(); _exit(0); }
-        printf("[PIPELINE] Forked WebSocket (PID %d, core %d)\n",
-               websocket_pid_, Traits::WEBSOCKET_CORE);
+            // Wait for TLS ready
+            auto start = std::chrono::steady_clock::now();
+            while (!conn_state_->is_handshake_tls_ready()) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                if (elapsed > 15000) { fprintf(stderr, "FAIL: TLS handshake timeout\n"); return false; }
+                if (!conn_state_->is_running(PROC_TRANSPORT)) {
+                    fprintf(stderr, "FAIL: Transport exited during TLS handshake\n"); return false;
+                }
+                usleep(1000);
+            }
 
-        // Wait for WS ready
-        if (!conn_state_->wait_for_handshake_ws_ready(30000000)) {
-            fprintf(stderr, "FAIL: WebSocket handshake timeout\n");
-            return false;
+            // Flush before fork
+            fflush(stdout);
+
+            // Fork WebSocket process
+            websocket_pid_ = fork();
+            if (websocket_pid_ < 0) { fprintf(stderr, "FAIL: fork() for WebSocket\n"); return false; }
+            if (websocket_pid_ == 0) { run_websocket_process(); _exit(0); }
+            printf("[PIPELINE] Forked WebSocket (PID %d, core %d)\n",
+                   websocket_pid_, Traits::WEBSOCKET_CORE);
+
+            // Wait for WS ready
+            if (!conn_state_->wait_for_handshake_ws_ready(30000000)) {
+                fprintf(stderr, "FAIL: WebSocket handshake timeout\n");
+                return false;
+            }
+            printf("[PIPELINE] All processes ready\n");
         }
-        printf("[PIPELINE] All processes ready\n");
         return true;
     }
 
@@ -708,16 +768,20 @@ public:
         };
         reap(xdp_pid_, "XDP-Poll");
         reap(transport_pid_, "Transport");
-        reap(websocket_pid_, "WebSocket");
+        if constexpr (!InlineWS) {
+            reap(websocket_pid_, "WebSocket");
+        }
 
         // Cleanup shared regions
         delete raw_inbox_region_; raw_inbox_region_ = nullptr;
         delete raw_outbox_region_; raw_outbox_region_ = nullptr;
         delete msg_outbox_region_; msg_outbox_region_ = nullptr;
-        for (size_t i = 0; i < NUM_CONN; i++) {
-            delete msg_metadata_region_[i]; msg_metadata_region_[i] = nullptr;
+        if constexpr (!InlineWS) {
+            for (size_t i = 0; i < NUM_CONN; i++) {
+                delete msg_metadata_region_[i]; msg_metadata_region_[i] = nullptr;
+            }
+            delete pongs_region_; pongs_region_ = nullptr;
         }
-        delete pongs_region_; pongs_region_ = nullptr;
         delete ws_frame_info_region_; ws_frame_info_region_ = nullptr;
 
         if (conn_state_ && conn_state_ != MAP_FAILED) {
@@ -927,6 +991,50 @@ private:
         }
 
         ws_process.run_with_handshake();
+    }
+
+    void run_inline_transport_process() {
+        static_assert(InlineWS, "run_inline_transport_process() only valid when INLINE_WS=true");
+        pipeline_helpers::pin_to_cpu(Traits::TRANSPORT_CORE);
+
+        IPCRingConsumer<PacketFrameDescriptor> raw_inbox_cons(*raw_inbox_region_);
+        IPCRingProducer<PacketFrameDescriptor> raw_outbox_prod(*raw_outbox_region_);
+        IPCRingConsumer<MsgOutboxEvent> msg_outbox_cons(*msg_outbox_region_);
+
+        // WSFrameInfo producer — transport → parent
+        std::unique_ptr<IPCRingProducer<WSFrameInfo>> ws_frame_info_prod_holder;
+        if constexpr (!HasAppHandler) {
+            ws_frame_info_prod_holder = std::make_unique<IPCRingProducer<WSFrameInfo>>(
+                *ws_frame_info_region_);
+        }
+
+        char url[512];
+        snprintf(url, sizeof(url), "wss://%s:%u%s",
+                 Traits::WSS_HOST, Traits::WSS_PORT, Traits::WSS_PATH);
+
+        // InlineTransportType: MsgMetadataProd=NullRingAdapter, LowPrioCons=NullRingAdapter
+        // MsgOutboxCons is real (parent sends), WSProcessor=InlineWSCoreType
+        InlineTransportType transport(url, umem_area_, FRAME_SIZE,
+            &raw_inbox_cons, &raw_outbox_prod,
+            msg_inbox_[0], nullptr, nullptr,
+            conn_state_, &msg_outbox_cons,
+            EnableAB ? msg_inbox_[1] : nullptr, nullptr);
+        transport.inline_app_handler() = app_handler_;
+
+        if constexpr (Prof) transport.set_profiling_data(&profiling_->transport);
+        if (!transport.init()) { conn_state_->shutdown_all(); return; }
+
+        // Wire WSCore to msg_inbox, ws_frame_info_prod, DirectTXSink
+        if constexpr (EnableAB) {
+            transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_,
+                                  msg_inbox_[0], msg_inbox_[1]);
+        } else {
+            transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_,
+                                  msg_inbox_[0]);
+        }
+
+        transport.run();
+        transport.cleanup();
     }
 
     // Helper to conditionally create WSFrameInfo producer

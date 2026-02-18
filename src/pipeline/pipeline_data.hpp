@@ -443,13 +443,23 @@ struct alignas(64) WSFrameInfo {
         }
         bool is_bsd_mode = (first_bpf_entry_ns == 0 && first_poll_cycle > 0);
         if (is_bsd_mode) {
+            // NIC timestamp column: show nic-to-publish latency when available
+            char nic_col[32] = "";
+            if (first_byte_ts > 0 && publish_time_ts > first_byte_ts) {
+                double nic_us = static_cast<double>(publish_time_ts - first_byte_ts) / 1000.0;
+                char nv[16];
+                fmt(nv, nic_us);
+                std::snprintf(nic_col, sizeof(nic_col), "| nic %6s ", nv);
+                // Use NIC-to-publish as total (more accurate than poll-to-publish)
+                fmt(tot, nic_us);
+            }
             fprintf(stderr,
-                    "%s%s"
+                    "%s%s%s"
                     "| socket %5u %10s "
                     "| ssl %u %s %4s~%6s "
                     "| WS %3u %6s "
                     "| \xce\xa3%6s |%s%s%s\n",
-                    line_color, bpf_prefix,
+                    line_color, bpf_prefix, nic_col,
                     nic_packet_ct, t[1],
                     ssl_read_ct, sz, t[2], t[3],
                     ssl_read_batch_num, t[4], tot, late, exch_diff, line_reset);

@@ -1132,6 +1132,35 @@ else
 endif
 
 # ============================================================================
+# Binance SBE XDP InlineWS Test (Transport + WS in single process, XDP)
+# 2 processes total: XDP Poll + InlineWS Transport
+# ============================================================================
+
+PIPELINE_XDP_SBE_INLINE_SRC := test/pipeline/29_binance_sbe_xdp_inline_ws.cpp
+PIPELINE_XDP_SBE_INLINE_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_xdp_inline_ws
+
+$(PIPELINE_XDP_SBE_INLINE_BIN): $(PIPELINE_XDP_SBE_INLINE_SRC) $(PIPELINE_HEADERS) src/pipeline/21_ws_core.hpp src/msg/binance_sbe.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling XDP Binance SBE InlineWS test..."
+ifdef USE_XDP
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ XDP Binance SBE InlineWS test build complete: $@"
+else
+	@echo "❌ Error: XDP Binance SBE InlineWS test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
+	@exit 1
+endif
+else
+	@echo "❌ Error: XDP Binance SBE InlineWS test requires USE_XDP=1"
+	@exit 1
+endif
+
+build-test-pipeline-binance_sbe_xdp_inline_ws: $(PIPELINE_XDP_SBE_INLINE_BIN)
+
+test-pipeline-binance-sbe-xdp-inline-ws: $(PIPELINE_XDP_SBE_INLINE_BIN) bpf
+	@echo "🧪 Running XDP Binance SBE InlineWS test via script..."
+	./scripts/test_xdp.sh 29_binance_sbe_xdp_inline_ws.cpp
+
+# ============================================================================
 # Unified XDP+TCP+SSL+WS Pipeline Test (Single-Process)
 # Tests unified pipeline: all layers in one process, outputs to IPC rings
 # ============================================================================
