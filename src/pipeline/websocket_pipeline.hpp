@@ -95,6 +95,7 @@ concept PipelineTraitsConcept = requires {
 
     // ── InlineWS toggle ──
     { T::INLINE_WS }              -> std::convertible_to<bool>;
+    { T::WS_FRAME_INFO_RING }     -> std::convertible_to<bool>;
 };
 
 // ============================================================================
@@ -118,6 +119,7 @@ struct DefaultPipelineConfig {
 
     // ── InlineWS ──
     static constexpr bool INLINE_WS = false;
+    static constexpr bool WS_FRAME_INFO_RING = false;
 };
 
 // ============================================================================
@@ -324,7 +326,7 @@ public:
         return true;
     }
 
-    template<bool EnableAB, bool HasAppHandler, bool IsInlineWS = false>
+    template<bool EnableAB, bool NeedWSFrameInfoRing, bool IsInlineWS = false>
     bool create_all_rings() {
         mkdir("/dev/shm/hft", 0755);
         std::string full_dir = "/dev/shm/hft/" + ipc_ring_dir_;
@@ -355,8 +357,8 @@ public:
                              sizeof(PongFrameAligned), 1)) return false;
         }
 
-        // WebSocket <-> Parent ring (skip when AppHandler replaces it)
-        if constexpr (!HasAppHandler) {
+        // WebSocket -> Parent ring
+        if constexpr (NeedWSFrameInfoRing) {
             if (!create_ring("ws_frame_info", WS_FRAME_INFO_SIZE * sizeof(WSFrameInfo),
                              sizeof(WSFrameInfo), 1)) return false;
         }
@@ -383,6 +385,123 @@ public:
         return ipc_ring_dir_ + "/" + ring;
     }
 
+    // Create a standalone ring at /dev/shm/hft/<name>.{hdr,dat} (not in pipeline subdirectory).
+    static bool create_standalone_ring(const char* name, size_t buffer_size,
+                                        size_t event_size, uint8_t max_consumers = 1) {
+        std::string base_path = std::string("/dev/shm/hft/") + name;
+        std::string hdr_path = base_path + ".hdr";
+        std::string dat_path = base_path + ".dat";
+
+        uint32_t producer_offset = hftshm::default_producer_offset();
+        uint32_t consumer_0_offset = hftshm::default_consumer_0_offset();
+        uint32_t header_size = hftshm::header_segment_size(max_consumers);
+
+        int hdr_fd = open(hdr_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (hdr_fd < 0) {
+            fprintf(stderr, "[IPC] Failed to create standalone header: %s\n", hdr_path.c_str());
+            return false;
+        }
+        if (ftruncate(hdr_fd, header_size) < 0) { close(hdr_fd); return false; }
+        void* hdr_ptr = mmap(nullptr, header_size, PROT_READ | PROT_WRITE, MAP_SHARED, hdr_fd, 0);
+        close(hdr_fd);
+        if (hdr_ptr == MAP_FAILED) return false;
+
+        hftshm::metadata_init(hdr_ptr, max_consumers, event_size, buffer_size,
+                              producer_offset, consumer_0_offset, header_size);
+
+        auto* cursor = reinterpret_cast<std::atomic<int64_t>*>(
+            static_cast<char*>(hdr_ptr) + producer_offset);
+        auto* published = reinterpret_cast<std::atomic<int64_t>*>(
+            static_cast<char*>(hdr_ptr) + producer_offset + hftshm::CACHE_LINE);
+        cursor->store(-1, std::memory_order_relaxed);
+        published->store(-1, std::memory_order_relaxed);
+
+        for (uint8_t i = 0; i < max_consumers; ++i) {
+            auto* cons_seq = reinterpret_cast<std::atomic<int64_t>*>(
+                static_cast<char*>(hdr_ptr) + consumer_0_offset + i * 2 * hftshm::CACHE_LINE);
+            cons_seq->store(-1, std::memory_order_relaxed);
+        }
+
+        munmap(hdr_ptr, header_size);
+
+        int dat_fd = open(dat_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
+        if (dat_fd < 0) {
+            fprintf(stderr, "[IPC] Failed to create standalone data: %s\n", dat_path.c_str());
+            unlink(hdr_path.c_str());
+            return false;
+        }
+        if (ftruncate(dat_fd, buffer_size) < 0) {
+            close(dat_fd);
+            unlink(hdr_path.c_str());
+            return false;
+        }
+        void* dat_ptr = mmap(nullptr, buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, dat_fd, 0);
+        close(dat_fd);
+        if (dat_ptr == MAP_FAILED) { unlink(hdr_path.c_str()); return false; }
+        memset(dat_ptr, 0, buffer_size);
+        munmap(dat_ptr, buffer_size);
+
+        return true;
+    }
+
+    // Reopen an existing standalone ring, or create fresh if it doesn't exist or is invalid.
+    // On reopen: sets cursor = published (discard in-flight claims from a crash).
+    static bool open_or_create_standalone_ring(const char* name, size_t buffer_size,
+                                               size_t event_size, uint8_t max_consumers = 1) {
+        std::string base_path = std::string("/dev/shm/hft/") + name;
+        std::string hdr_path = base_path + ".hdr";
+        std::string dat_path = base_path + ".dat";
+
+        uint32_t producer_offset = hftshm::default_producer_offset();
+        uint32_t consumer_0_offset = hftshm::default_consumer_0_offset();
+        uint32_t header_size = hftshm::header_segment_size(max_consumers);
+
+        // Try to open existing header file (no O_CREAT, no O_TRUNC)
+        int hdr_fd = open(hdr_path.c_str(), O_RDWR);
+        if (hdr_fd >= 0) {
+            // Validate file size
+            struct stat st;
+            if (fstat(hdr_fd, &st) == 0 && static_cast<size_t>(st.st_size) == header_size) {
+                void* hdr_ptr = mmap(nullptr, header_size, PROT_READ | PROT_WRITE, MAP_SHARED, hdr_fd, 0);
+                close(hdr_fd);
+                if (hdr_ptr != MAP_FAILED) {
+                    auto* meta = static_cast<const hftshm::metadata*>(hdr_ptr);
+                    if (hftshm::metadata_validate(hdr_ptr) &&
+                        meta->max_consumers == max_consumers &&
+                        meta->event_size == static_cast<uint16_t>(event_size) &&
+                        meta->buffer_size == static_cast<uint32_t>(buffer_size) &&
+                        meta->producer_offset == producer_offset &&
+                        meta->consumer_0_offset == consumer_0_offset &&
+                        meta->header_size == header_size) {
+                        // Validate data file
+                        struct stat dst;
+                        if (stat(dat_path.c_str(), &dst) == 0 &&
+                            static_cast<size_t>(dst.st_size) == buffer_size) {
+                            // Recovery: set cursor = published (discard in-flight claims)
+                            auto* cursor = reinterpret_cast<std::atomic<int64_t>*>(
+                                static_cast<char*>(hdr_ptr) + producer_offset);
+                            auto* published = reinterpret_cast<std::atomic<int64_t>*>(
+                                static_cast<char*>(hdr_ptr) + producer_offset + hftshm::CACHE_LINE);
+                            int64_t pub_val = published->load(std::memory_order_relaxed);
+                            cursor->store(pub_val, std::memory_order_relaxed);
+
+                            printf("[IPC] Reopened existing ring '%s' (published=%ld)\n",
+                                   name, pub_val);
+                            munmap(hdr_ptr, header_size);
+                            return true;
+                        }
+                    }
+                    munmap(hdr_ptr, header_size);
+                }
+            } else {
+                close(hdr_fd);
+            }
+        }
+
+        // Fall through: create fresh
+        return create_standalone_ring(name, buffer_size, event_size, max_consumers);
+    }
+
 private:
     std::string ipc_ring_dir_;
 };
@@ -401,6 +520,8 @@ public:
     static constexpr bool InlineWS       = Traits::INLINE_WS;
     static constexpr size_t NUM_CONN     = EnableAB ? 2 : 1;
     static constexpr bool HasAppHandler  = Traits::AppHandler::enabled;
+    static constexpr bool WSFrameInfoRing = Traits::WS_FRAME_INFO_RING;
+    static constexpr bool NeedWSFrameInfoRing = !HasAppHandler || WSFrameInfoRing;
 
     // InlineWS requires AutoReconnect
     static_assert(!InlineWS || AutoReconnect,
@@ -439,7 +560,8 @@ public:
         IPCRingProducer<WSFrameInfo>,
         EnableAB, AutoReconnect, Prof,
         AppHandlerType,
-        UpgradeCustomizerType>;
+        UpgradeCustomizerType,
+        WSFrameInfoRing>;
 
     using InlineTransportType = TransportProcess<
         SSLPolicyType,
@@ -565,7 +687,7 @@ public:
                gateway_mac_[3], gateway_mac_[4], gateway_mac_[5]);
 
         // Create IPC rings (InlineWS skips transport↔WS rings)
-        if (!ipc_manager_.template create_all_rings<EnableAB, HasAppHandler, InlineWS>()) {
+        if (!ipc_manager_.template create_all_rings<EnableAB, NeedWSFrameInfoRing, InlineWS>()) {
             fprintf(stderr, "FAIL: Cannot create IPC rings\n");
             return false;
         }
@@ -653,6 +775,16 @@ public:
             profiling_->init();
         }
 
+        // Create standalone MktEvent ring (for external consumers like mkt_event_reader)
+        if constexpr (EnableAB) {
+            if (!IPCRingManager::open_or_create_standalone_ring("mkt_event.Binance.BTC-USDT",
+                    MKT_EVENT_RING_SIZE * sizeof(websocket::msg::MktEvent),
+                    sizeof(websocket::msg::MktEvent), 1)) {
+                fprintf(stderr, "FAIL: Cannot create mkt_event ring\n");
+                return false;
+            }
+        }
+
         // Open shared regions
         try {
             raw_inbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_inbox"));
@@ -666,8 +798,11 @@ public:
                 }
                 pongs_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pongs"));
             }
-            if constexpr (!HasAppHandler) {
+            if constexpr (NeedWSFrameInfoRing) {
                 ws_frame_info_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("ws_frame_info"));
+            }
+            if constexpr (EnableAB) {
+                mkt_event_region_ = new disruptor::ipc::shared_region("mkt_event.Binance.BTC-USDT");
             }
         } catch (const std::exception& e) {
             fprintf(stderr, "FAIL: Cannot open shared regions: %s\n", e.what());
@@ -783,6 +918,11 @@ public:
             delete pongs_region_; pongs_region_ = nullptr;
         }
         delete ws_frame_info_region_; ws_frame_info_region_ = nullptr;
+        delete mkt_event_region_; mkt_event_region_ = nullptr;
+
+        // mkt_event ring files are intentionally NOT unlinked —
+        // they persist across restarts so external consumers (mkt_viewer, mkt_event_reader)
+        // keep their mmap and resume without reconnection.
 
         if (conn_state_ && conn_state_ != MAP_FAILED) {
             munmap(conn_state_, sizeof(ConnStateShm)); conn_state_ = nullptr;
@@ -813,9 +953,9 @@ public:
     const std::string& local_ip() const { return local_ip_; }
     const std::string& wss_target_ip() const { return wss_target_ip_; }
 
-    // WSFrameInfo region — only available when !HasAppHandler
+    // WSFrameInfo region — available when !HasAppHandler or WS_FRAME_INFO_RING=true
     disruptor::ipc::shared_region* ws_frame_info_region() {
-        static_assert(!HasAppHandler, "No WSFrameInfo ring when AppHandler is active");
+        static_assert(NeedWSFrameInfoRing, "No WSFrameInfo ring (AppHandler active, WS_FRAME_INFO_RING=false)");
         return ws_frame_info_region_;
     }
 
@@ -826,6 +966,8 @@ public:
 
     // Pre-fork handler config
     AppHandlerType& app_handler() { return app_handler_; }
+
+    disruptor::ipc::shared_region* mkt_event_region() { return mkt_event_region_; }
 
     // IPC ring manager (for ring name access, e.g. subscription_json)
     void set_subscription_json(const char* json) {
@@ -969,8 +1111,7 @@ private:
                 *msg_metadata_region_[1]);
         }
 
-        // WSFrameInfo producer — created always (template param requires the type),
-        // but only wired to the ring when !HasAppHandler
+        // WSFrameInfo producer — created when ring is needed
         WSFrameInfoProdHelper ws_frame_info_prod_holder(ws_frame_info_region_);
 
         WebSocketType ws_process;
@@ -1003,7 +1144,7 @@ private:
 
         // WSFrameInfo producer — transport → parent
         std::unique_ptr<IPCRingProducer<WSFrameInfo>> ws_frame_info_prod_holder;
-        if constexpr (!HasAppHandler) {
+        if constexpr (NeedWSFrameInfoRing) {
             ws_frame_info_prod_holder = std::make_unique<IPCRingProducer<WSFrameInfo>>(
                 *ws_frame_info_region_);
         }
@@ -1011,6 +1152,15 @@ private:
         char url[512];
         snprintf(url, sizeof(url), "wss://%s:%u%s",
                  Traits::WSS_HOST, Traits::WSS_PORT, Traits::WSS_PATH);
+
+        // MktEvent producer — transport → standalone ring (for external consumers)
+        std::unique_ptr<IPCRingProducer<websocket::msg::MktEvent>> mkt_event_prod_holder;
+        if constexpr (EnableAB) {
+            if (mkt_event_region_) {
+                mkt_event_prod_holder = std::make_unique<IPCRingProducer<websocket::msg::MktEvent>>(
+                    *mkt_event_region_);
+            }
+        }
 
         // InlineTransportType: MsgMetadataProd=NullRingAdapter, LowPrioCons=NullRingAdapter
         // MsgOutboxCons is real (parent sends), WSProcessor=InlineWSCoreType
@@ -1020,6 +1170,12 @@ private:
             conn_state_, &msg_outbox_cons,
             EnableAB ? msg_inbox_[1] : nullptr, nullptr);
         transport.inline_app_handler() = app_handler_;
+
+        // Wire MktEvent producer and ConnStateShm to app_handler
+        if constexpr (EnableAB) {
+            transport.inline_app_handler().mkt_event_prod = mkt_event_prod_holder.get();
+            transport.inline_app_handler().conn_state = conn_state_;
+        }
 
         if constexpr (Prof) transport.set_profiling_data(&profiling_->transport);
         if (!transport.init()) { conn_state_->shutdown_all(); return; }
@@ -1033,6 +1189,11 @@ private:
                                   msg_inbox_[0]);
         }
 
+        // Wire active connection pointer for priority ordering
+        if constexpr (EnableAB) {
+            transport.set_active_conn_ptr(&transport.inline_app_handler().active_ci_);
+        }
+
         transport.run();
         transport.cleanup();
     }
@@ -1043,7 +1204,7 @@ private:
         std::unique_ptr<IPCRingProducer<WSFrameInfo>> owned_;
 
         explicit WSFrameInfoProdHelper(disruptor::ipc::shared_region* region) {
-            if constexpr (!HasAppHandler) {
+            if constexpr (NeedWSFrameInfoRing) {
                 if (region) {
                     owned_ = std::make_unique<IPCRingProducer<WSFrameInfo>>(*region);
                     prod_ = owned_.get();
@@ -1085,6 +1246,7 @@ private:
     disruptor::ipc::shared_region* msg_metadata_region_[NUM_CONN]{};
     disruptor::ipc::shared_region* pongs_region_ = nullptr;
     disruptor::ipc::shared_region* ws_frame_info_region_ = nullptr;
+    disruptor::ipc::shared_region* mkt_event_region_ = nullptr;
 
     pid_t xdp_pid_ = 0;
     pid_t transport_pid_ = 0;

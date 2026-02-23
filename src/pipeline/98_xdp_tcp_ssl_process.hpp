@@ -462,7 +462,8 @@ private:
         meta.decrypted_len = len;
         meta.nic_packet_ct = timing.hw_timestamp_count;
         meta.ssl_last_op_cycle = last_op_cycle_;
-        meta.tls_record_end = tls_record_end;
+        meta.flags = 0;
+        meta.set_tls_record_end(tls_record_end);
         meta.first_pkt_mem_idx = timing.oldest_pkt_mem_idx;
         meta.last_pkt_mem_idx = timing.latest_pkt_mem_idx;
         msg_metadata_prod_->publish(seq);

@@ -346,7 +346,7 @@ concept AppHandlerConcept = requires(T handler,
                                      uint8_t opcode,
                                      const uint8_t* payload,
                                      uint32_t payload_len,
-                                     const WSFrameInfo& info) {
+                                     WSFrameInfo& info) {
     { T::enabled } -> std::convertible_to<bool>;
     { handler.on_ws_frame(connection_id, opcode, payload, payload_len, info) };
 };
@@ -354,7 +354,7 @@ concept AppHandlerConcept = requires(T handler,
 // Default: no-op handler that compiles away entirely
 struct NullAppHandler {
     static constexpr bool enabled = false;
-    void on_ws_frame(uint8_t, uint8_t, const uint8_t*, uint32_t, const WSFrameInfo&) {}
+    void on_ws_frame(uint8_t, uint8_t, const uint8_t*, uint32_t, WSFrameInfo&) {}
 };
 
 static_assert(AppHandlerConcept<NullAppHandler>);
@@ -1080,7 +1080,7 @@ private:
                 }
 
                 bool is_last_in_data = (ps.parse_offset + consumed >= ps.data_accumulated);
-                ps.pending_tls_record_end = is_last_in_data && ps.current_metadata.tls_record_end;
+                ps.pending_tls_record_end = is_last_in_data && ps.current_metadata.tls_record_end();
 
                 handle_complete_frame(ci);
 
@@ -1133,6 +1133,10 @@ private:
         info.set_fragmented(true);
         info.set_last_fragment(false);
         info.connection_id = ci;
+        if constexpr (EnableAB) {
+            if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
+                info.set_active_conn(true);
+        }
 
         populate_timestamps(info, ps);
         info.set_tls_record_end(false);
@@ -1525,6 +1529,10 @@ private:
             info.set_fragmented(is_fragmented);
             info.set_last_fragment(is_last_fragment);
             info.connection_id = ci;
+            if constexpr (EnableAB) {
+                if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
+                    info.set_active_conn(true);
+            }
             populate_timestamps(info, ps);
             info.set_tls_record_end(ps.pending_tls_record_end);
             info.ws_parse_cycle = parse_cycle;
@@ -1561,6 +1569,10 @@ private:
             info.set_fragmented(is_fragmented);
             info.set_last_fragment(is_last_fragment);
             info.connection_id = ci;
+            if constexpr (EnableAB) {
+                if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
+                    info.set_active_conn(true);
+            }
 
             populate_timestamps(info, ps);
             info.set_tls_record_end(ps.pending_tls_record_end);

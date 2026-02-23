@@ -2,16 +2,18 @@
 # XDP Preparation Script
 # Prepares the NIC and environment for AF_XDP zero-copy operation
 #
-# Usage: ./scripts/xdp_prepare.sh [--reload] [--domain <hostname>] [--enable-gro] <interface>
+# Usage: ./scripts/xdp_prepare.sh [--reload] [--domain <hostname>] [--enable-gro] [--napi-core <N>] <interface>
 # Example: ./scripts/xdp_prepare.sh enp108s0
 #          ./scripts/xdp_prepare.sh --reload enp108s0  # Reload NIC driver first
 #          ./scripts/xdp_prepare.sh --domain stream.binance.com enp108s0
 #          ./scripts/xdp_prepare.sh --enable-gro enp108s0  # Enable GRO for packet coalescing
+#          ./scripts/xdp_prepare.sh --napi-core 10 enp108s0  # Pin NAPI poll to core 10
 #
 # Options:
 #   --reload              Reload NIC driver to reset stuck XDP state
 #   --domain <hostname>   Update /etc/hosts with latest DNS for hostname
 #   --enable-gro          Enable GRO for packet coalescing (prevents OOO during TLS handshake)
+#   --napi-core <N>       Pin NAPI poll IRQ and kthread to core N (default: 8)
 #
 # The --reload flag is useful when XDP gets stuck after a previous session.
 # This is a known issue with the igc driver.
@@ -26,6 +28,7 @@ RELOAD_DRIVER=0
 IFACE="enp108s0"
 DOMAIN=""
 ENABLE_GRO=0
+NAPI_CORE=8
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -40,6 +43,10 @@ while [[ $# -gt 0 ]]; do
         --enable-gro)
             ENABLE_GRO=1
             shift
+            ;;
+        --napi-core)
+            NAPI_CORE="$2"
+            shift 2
             ;;
         *)
             IFACE="$1"
@@ -72,6 +79,21 @@ print_header() {
     echo "  XDP Preparation: $IFACE"
     echo "========================================"
     echo ""
+}
+
+# Reserve huge pages for UMEM (16MB = 8x 2MB pages, reserve 16 for headroom)
+reserve_huge_pages() {
+    echo "Checking huge page reservation..."
+    local current_hp=$(cat /proc/sys/vm/nr_hugepages)
+    if [ "$current_hp" -lt 16 ]; then
+        if echo 16 > /proc/sys/vm/nr_hugepages 2>/dev/null; then
+            print_status "Reserved 16 huge pages (was: $current_hp)"
+        else
+            print_warning "Could not reserve huge pages (need root). UMEM will use 4KB pages."
+        fi
+    else
+        print_status "Huge pages already reserved ($current_hp >= 16)"
+    fi
 }
 
 # Update /etc/hosts with latest DNS result for a domain
@@ -287,6 +309,103 @@ disable_coalescing() {
     else
         print_status "Disabled coalescing on $changes parameter(s)"
     fi
+}
+
+# Pin NAPI poll IRQ and kthread to a specific CPU core
+pin_napi_to_core() {
+    echo "Pinning NAPI poll to core $NAPI_CORE..."
+
+    # Stop irqbalance to prevent it from overriding our affinity settings
+    if systemctl is-active --quiet irqbalance 2>/dev/null; then
+        if sudo systemctl stop irqbalance 2>/dev/null; then
+            print_status "Stopped irqbalance service"
+        else
+            print_warning "Could not stop irqbalance"
+        fi
+    else
+        print_status "irqbalance already inactive"
+    fi
+
+    # Find IRQ numbers for this interface from /proc/interrupts
+    local irqs=$(grep "$IFACE" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' ')
+
+    if [[ -z "$irqs" ]]; then
+        print_warning "No IRQs found for $IFACE in /proc/interrupts"
+        return 0
+    fi
+
+    # Pin each IRQ to the target core
+    local pinned=0
+    for irq in $irqs; do
+        if echo "$NAPI_CORE" > /proc/irq/$irq/smp_affinity_list 2>/dev/null; then
+            local irq_name=$(grep "^\s*${irq}:" /proc/interrupts | awk '{print $NF}')
+            print_status "IRQ $irq ($irq_name) → core $NAPI_CORE"
+            ((pinned++)) || true
+        else
+            print_warning "Could not pin IRQ $irq to core $NAPI_CORE"
+        fi
+    done
+
+    if [[ $pinned -eq 0 ]]; then
+        print_warning "No IRQs pinned for $IFACE"
+        return 0
+    fi
+
+    # Enable NAPI threaded mode (creates per-NAPI kthreads)
+    local threaded_path="/sys/class/net/$IFACE/threaded"
+    if [[ -f "$threaded_path" ]]; then
+        if echo 1 > "$threaded_path" 2>/dev/null; then
+            print_status "NAPI threaded mode enabled"
+        else
+            print_warning "Could not enable NAPI threaded mode"
+            return 0
+        fi
+    else
+        print_warning "NAPI threaded mode not supported ($threaded_path not found)"
+        return 0
+    fi
+
+    # Wait briefly for kthreads to spawn
+    sleep 0.5
+
+    # Find NAPI kthreads for this interface and pin them
+    local napi_pids=$(ps -eo pid,comm | grep "napi/${IFACE}" | awk '{print $1}')
+
+    if [[ -z "$napi_pids" ]]; then
+        print_warning "No NAPI kthreads found for $IFACE"
+        return 0
+    fi
+
+    for pid in $napi_pids; do
+        local comm=$(ps -p "$pid" -o comm= 2>/dev/null)
+
+        # Pin to core
+        if taskset -p -c "$NAPI_CORE" "$pid" >/dev/null 2>&1; then
+            print_status "NAPI kthread $pid ($comm) pinned to core $NAPI_CORE"
+        else
+            print_warning "Could not pin NAPI kthread $pid to core $NAPI_CORE"
+            continue
+        fi
+
+        # Set SCHED_FIFO priority 50
+        if chrt -f -p 50 "$pid" 2>/dev/null; then
+            print_status "NAPI kthread $pid set to SCHED_FIFO priority 50"
+        else
+            print_warning "Could not set SCHED_FIFO on NAPI kthread $pid"
+        fi
+    done
+
+    # Verify
+    echo ""
+    echo "  NAPI pinning summary:"
+    for pid in $napi_pids; do
+        local psr=$(ps -p "$pid" -o psr= 2>/dev/null | tr -d ' ')
+        local comm=$(ps -p "$pid" -o comm= 2>/dev/null)
+        local policy=$(chrt -p "$pid" 2>/dev/null | grep "scheduling policy" | awk -F: '{print $2}' | tr -d ' ')
+        local prio=$(chrt -p "$pid" 2>/dev/null | grep "scheduling priority" | awk -F: '{print $2}' | tr -d ' ')
+        echo "    PID $pid ($comm): core=$psr policy=$policy prio=$prio"
+    done
+    echo ""
 }
 
 # Enable hardware timestamping for XDP metadata kfuncs
@@ -561,6 +680,7 @@ start_clock_sync() {
 print_header
 check_interface
 check_root
+reserve_huge_pages
 update_domain_hosts
 reload_nic_driver
 check_xdp_support
@@ -568,6 +688,7 @@ set_nic_queue
 set_ring_buffers_max
 disable_gro_lro
 disable_coalescing
+pin_napi_to_core
 enable_hw_timestamp
 detach_xdp
 refresh_gateway_arp

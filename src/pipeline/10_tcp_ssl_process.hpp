@@ -388,8 +388,31 @@ public:
                 [this]{ return process_msg_outbox(); }, slot, 1,
                 msg_outbox_cons_ != nullptr);
 
-            // ── Per-connection state machine dispatch ──
-            for (uint8_t ci = 0; ci < NUM_CONN; ci++) {
+            // ── Per-connection state machine dispatch (active connection first) ──
+            uint8_t conn_order[NUM_CONN];
+            conn_order[0] = 0;
+            if constexpr (EnableAB) {
+                if (active_conn_ptr_) {
+                    uint8_t a = *active_conn_ptr_;
+                    if (a < NUM_CONN) conn_order[0] = a;
+                }
+                conn_order[1] = 1 - conn_order[0];
+            }
+
+            // Prefetch both connections' recv buffer UMEM head frames early.
+            // The poll() above processes RX frames across many UMEM addresses,
+            // potentially evicting the head frame data from L2/L3 cache.
+            // Issuing prefetches here gives ~1-5us (outbox + ci=0 processing)
+            // for the DRAM fetch (~100-200ns) to complete before ssl_read_by_chunk.
+            if constexpr (EnableAB) {
+                get_transport(0).prefetch_recv_head();
+                get_transport(1).prefetch_recv_head();
+            } else {
+                get_transport(0).prefetch_recv_head();
+            }
+
+            for (uint8_t i = 0; i < NUM_CONN; i++) {
+                uint8_t ci = conn_order[i];
                 if constexpr (AutoReconnect) {
                     // Check WS-initiated reconnect request
                     if (conn_state_->get_reconnect_request(ci)) {
@@ -853,10 +876,12 @@ private:
         meta.decrypted_len = len;
         meta.nic_packet_ct = timing.hw_timestamp_count;
         meta.ssl_last_op_cycle = last_op_cycle_;
-        meta.tls_record_end = tls_record_end;
+        meta.set_tls_record_end(tls_record_end);
         meta.first_pkt_mem_idx = timing.oldest_pkt_mem_idx;
         meta.last_pkt_mem_idx = timing.latest_pkt_mem_idx;
         meta.event_type = static_cast<uint8_t>(MetaEventType::DATA);
+        if (active_conn_ptr_ && ci == *active_conn_ptr_)
+            meta.set_active_conn(true);
 
         if constexpr (InlineWS) {
             inline_ws_.ws_core.feed(ci, meta);
@@ -1142,6 +1167,9 @@ private:
     uint64_t ssl_read_count_ = 0;
     uint64_t low_prio_tx_count_ = 0;
 
+    // Active connection pointer (for priority ordering — points to SBEAppHandler::active_ci_)
+    const uint8_t* active_conn_ptr_ = nullptr;
+
     // ========================================================================
     // InlineWS State (conditional)
     // ========================================================================
@@ -1181,6 +1209,12 @@ public:
         static_assert(InlineWS);
         return inline_ws_.ws_core.app_handler();
     }
+
+    /**
+     * Set pointer to active connection index (for priority ordering).
+     * Points to SBEAppHandler::active_ci_ — local memory, not shared memory.
+     */
+    void set_active_conn_ptr(const uint8_t* p) { active_conn_ptr_ = p; }
 };
 
 }  // namespace websocket::pipeline

@@ -1,23 +1,17 @@
-// msg/binance_sbe.hpp
-// Zero-copy SBE (Simple Binary Encoding) decoders for Binance binary market data
+// msg/00_binance_spot_sbe.hpp
+// Binance Spot SBE market data: zero-copy wire decoders + policy-based stream decoder
 //
-// All little-endian (x86 native — no byte swap). Reads directly from WS
-// payload buffer via const uint8_t* — no copies, no allocations.
+// websocket::sbe — Zero-copy SBE decoders for Binance binary market data.
+//   All little-endian (x86 native). Reads directly from WS payload via const uint8_t*.
+//   Supported messages:
+//     templateId 10000 = TradesStreamEvent
+//     templateId 10001 = BestBidAskStreamEvent
+//     templateId 10002 = DepthSnapshotStreamEvent
+//     templateId 10003 = DepthDiffStreamEvent
 //
-// Supported messages:
-//   templateId 10000 = TradesStreamEvent
-//   templateId 10001 = BestBidAskStreamEvent
-//   templateId 10002 = DepthSnapshotStreamEvent
-//   templateId 10003 = DepthDiffStreamEvent
-//
-// Usage:
-//   sbe::SBEHeader hdr;
-//   if (!sbe::decode_header(payload, len, hdr)) return;
-//   const uint8_t* body = payload + sbe::HEADER_SIZE;
-//   size_t body_len = len - sbe::HEADER_SIZE;
-//   switch (hdr.template_id) {
-//     case sbe::TRADES_STREAM: { sbe::TradesView tv; ... }
-//   }
+//   BinanceSpotSBEDecoder — StreamDecoderPolicy implementation for two-step decode:
+//     1. decode_essential() — extract msg_type + sequence from SBE header (fast)
+//     2. Full decode via *View structs — only if sequence is fresh
 #pragma once
 
 #include <cstdint>
@@ -25,6 +19,12 @@
 #include <cstring>
 #include <cmath>
 #include <string_view>
+
+#include "stream_decoder.hpp"
+
+// ============================================================================
+// Part 1: Zero-copy SBE wire decoders
+// ============================================================================
 
 namespace websocket::sbe {
 
@@ -361,5 +361,91 @@ struct DepthDiffView {
         return true;
     }
 };
+
+// ── BinanceSpotSBEDecoder — StreamDecoderPolicy for two-step decode ──────
+
+struct BinanceSpotSBEDecoder {
+    struct Essential {
+        uint16_t       msg_type = 0;        // SBE template_id
+        int64_t        sequence = 0;        // book_update_id or last trade_id
+        const uint8_t* body = nullptr;      // payload after 8-byte SBE header
+        size_t         body_len = 0;
+        uint16_t       block_length = 0;    // SBE root block length
+        uint16_t       count = 0;           // Element count (trades, bid+ask levels)
+        bool           valid = false;
+    };
+
+    static Essential decode_essential(const uint8_t* payload, uint32_t len) {
+        Essential e;
+        SBEHeader hdr;
+        if (len < HEADER_SIZE || !decode_header(payload, len, hdr)) return e;
+
+        e.msg_type = hdr.template_id;
+        e.body = payload + HEADER_SIZE;
+        e.body_len = len - HEADER_SIZE;
+        e.block_length = hdr.block_length;
+        e.valid = true;
+
+        const uint8_t* after_root = e.body + hdr.block_length;
+        size_t remaining = (e.body_len > hdr.block_length) ? e.body_len - hdr.block_length : 0;
+
+        switch (hdr.template_id) {
+        case TRADES_STREAM:
+            // groupSizeEncoding (6 bytes): u16 block_length, u32 num_in_group
+            if (remaining >= 6) {
+                uint16_t entry_block = read_u16(after_root);
+                uint32_t num_trades = read_u32(after_root + 2);
+                e.count = static_cast<uint16_t>(num_trades);
+                // Last entry's trade_id as sequence for dedup
+                if (num_trades > 0) {
+                    size_t last_entry_offset = 6 + static_cast<size_t>(num_trades - 1) * entry_block;
+                    if (remaining >= last_entry_offset + 8)
+                        e.sequence = read_i64(after_root + last_entry_offset);
+                }
+            }
+            break;
+        case BEST_BID_ASK_STREAM:
+            // book_update_id at body+8
+            if (e.body_len >= 16) e.sequence = read_i64(e.body + 8);
+            e.count = 2;  // always 1 bid + 1 ask
+            break;
+        case DEPTH_SNAPSHOT_STREAM:
+            // book_update_id at body+8
+            if (e.body_len >= 16) e.sequence = read_i64(e.body + 8);
+            // Two groupSize16Encoding: bids then asks (need to skip bid entries)
+            if (remaining >= 4) {
+                uint16_t bid_block = read_u16(after_root);
+                uint16_t bid_count = read_u16(after_root + 2);
+                size_t bids_end = 4 + static_cast<size_t>(bid_count) * bid_block;
+                if (remaining >= bids_end + 4) {
+                    uint16_t ask_count = read_u16(after_root + bids_end + 2);
+                    e.count = bid_count + ask_count;
+                } else {
+                    e.count = bid_count;
+                }
+            }
+            break;
+        case DEPTH_DIFF_STREAM:
+            // last_book_update_id at body+16
+            if (e.body_len >= 24) e.sequence = read_i64(e.body + 16);
+            // Two groupSize16Encoding: bids then asks
+            if (remaining >= 4) {
+                uint16_t bid_block = read_u16(after_root);
+                uint16_t bid_count = read_u16(after_root + 2);
+                size_t bids_end = 4 + static_cast<size_t>(bid_count) * bid_block;
+                if (remaining >= bids_end + 4) {
+                    uint16_t ask_count = read_u16(after_root + bids_end + 2);
+                    e.count = bid_count + ask_count;
+                } else {
+                    e.count = bid_count;
+                }
+            }
+            break;
+        }
+        return e;
+    }
+};
+
+static_assert(websocket::msg::StreamDecoderPolicy<BinanceSpotSBEDecoder>);
 
 }  // namespace websocket::sbe

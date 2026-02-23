@@ -910,7 +910,7 @@ test-pipeline-websocket-binance: $(PIPELINE_WEBSOCKET_BINANCE_BIN) bpf
 PIPELINE_BINANCE_SBE_SRC := test/pipeline/24_binance_sbe_xdp.cpp
 PIPELINE_BINANCE_SBE_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_xdp
 
-$(PIPELINE_BINANCE_SBE_BIN): $(PIPELINE_BINANCE_SBE_SRC) $(PIPELINE_HEADERS) src/msg/binance_sbe.hpp | $(BUILD_DIR)
+$(PIPELINE_BINANCE_SBE_BIN): $(PIPELINE_BINANCE_SBE_SRC) $(PIPELINE_HEADERS) src/msg/00_binance_spot_sbe.hpp | $(BUILD_DIR)
 	@echo "🔨 Compiling Binance SBE test..."
 ifdef USE_XDP
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
@@ -1027,7 +1027,7 @@ endif
 PIPELINE_BSD_SBE_BINANCE_1T_SRC := test/pipeline/27_binance_sbe_bsdsocket_1thread.cpp
 PIPELINE_BSD_SBE_BINANCE_1T_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_bsdsocket_1thread
 
-$(PIPELINE_BSD_SBE_BINANCE_1T_BIN): $(PIPELINE_BSD_SBE_BINANCE_1T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/binance_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
+$(PIPELINE_BSD_SBE_BINANCE_1T_BIN): $(PIPELINE_BSD_SBE_BINANCE_1T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/00_binance_spot_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling BSD Socket Binance SBE 1-thread test..."
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL),$(USE_LIBRESSL)))
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
@@ -1055,7 +1055,7 @@ endif
 PIPELINE_BSD_SBE_BINANCE_2T_SRC := test/pipeline/25_binance_sbe_bsdsocket_2thread.cpp
 PIPELINE_BSD_SBE_BINANCE_2T_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_bsdsocket_2thread
 
-$(PIPELINE_BSD_SBE_BINANCE_2T_BIN): $(PIPELINE_BSD_SBE_BINANCE_2T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/binance_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
+$(PIPELINE_BSD_SBE_BINANCE_2T_BIN): $(PIPELINE_BSD_SBE_BINANCE_2T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/00_binance_spot_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling BSD Socket Binance SBE 2-thread test..."
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL),$(USE_LIBRESSL)))
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
@@ -1083,7 +1083,7 @@ endif
 PIPELINE_BSD_SBE_BINANCE_3T_SRC := test/pipeline/26_binance_sbe_bsdsocket_3thread.cpp
 PIPELINE_BSD_SBE_BINANCE_3T_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_bsdsocket_3thread
 
-$(PIPELINE_BSD_SBE_BINANCE_3T_BIN): $(PIPELINE_BSD_SBE_BINANCE_3T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/binance_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
+$(PIPELINE_BSD_SBE_BINANCE_3T_BIN): $(PIPELINE_BSD_SBE_BINANCE_3T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/00_binance_spot_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling BSD Socket Binance SBE 3-thread test..."
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL),$(USE_LIBRESSL)))
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
@@ -1111,7 +1111,7 @@ endif
 PIPELINE_BSD_SBE_BINANCE_INLINE_SRC := test/pipeline/28_binance_sbe_bsdsocket_inline_ws.cpp
 PIPELINE_BSD_SBE_BINANCE_INLINE_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_bsdsocket_inline_ws
 
-$(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN): $(PIPELINE_BSD_SBE_BINANCE_INLINE_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/21_ws_core.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/binance_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
+$(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN): $(PIPELINE_BSD_SBE_BINANCE_INLINE_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/21_ws_core.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/00_binance_spot_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling BSD Socket Binance SBE InlineWS test..."
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL),$(USE_LIBRESSL)))
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
@@ -1139,7 +1139,7 @@ endif
 PIPELINE_XDP_SBE_INLINE_SRC := test/pipeline/29_binance_sbe_xdp_inline_ws.cpp
 PIPELINE_XDP_SBE_INLINE_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_xdp_inline_ws
 
-$(PIPELINE_XDP_SBE_INLINE_BIN): $(PIPELINE_XDP_SBE_INLINE_SRC) $(PIPELINE_HEADERS) src/pipeline/21_ws_core.hpp src/msg/binance_sbe.hpp | $(BUILD_DIR)
+$(PIPELINE_XDP_SBE_INLINE_BIN): $(PIPELINE_XDP_SBE_INLINE_SRC) $(PIPELINE_HEADERS) src/pipeline/21_ws_core.hpp src/msg/00_binance_spot_sbe.hpp | $(BUILD_DIR)
 	@echo "🔨 Compiling XDP Binance SBE InlineWS test..."
 ifdef USE_XDP
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
@@ -1159,6 +1159,36 @@ build-test-pipeline-binance_sbe_xdp_inline_ws: $(PIPELINE_XDP_SBE_INLINE_BIN)
 test-pipeline-binance-sbe-xdp-inline-ws: $(PIPELINE_XDP_SBE_INLINE_BIN) bpf
 	@echo "🧪 Running XDP Binance SBE InlineWS test via script..."
 	./scripts/test_xdp.sh 29_binance_sbe_xdp_inline_ws.cpp
+
+# ============================================================================
+# MktEvent Ring Reader Tool
+# Standalone utility to read and print MktEvent shared memory ring
+# ============================================================================
+
+MKT_EVENT_READER_SRC := tools/mkt_event_reader.cpp
+MKT_EVENT_READER_BIN := $(BUILD_DIR)/mkt_event_reader
+
+$(MKT_EVENT_READER_BIN): $(MKT_EVENT_READER_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+	@echo "🔨 Compiling MktEvent reader..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ MktEvent reader build complete: $@"
+
+build-mkt-event-reader: $(MKT_EVENT_READER_BIN)
+
+# ============================================================================
+# MktEvent Full-Screen Viewer Tool
+# Live TUI: orderbook + trades + event log from MktEvent shared memory ring
+# ============================================================================
+
+MKT_VIEWER_SRC := tools/mkt_viewer.cpp
+MKT_VIEWER_BIN := $(BUILD_DIR)/mkt_viewer
+
+$(MKT_VIEWER_BIN): $(MKT_VIEWER_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+	@echo "🔨 Compiling MktEvent viewer..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ MktEvent viewer build complete: $@"
+
+build-mkt-viewer: $(MKT_VIEWER_BIN)
 
 # ============================================================================
 # Unified XDP+TCP+SSL+WS Pipeline Test (Single-Process)

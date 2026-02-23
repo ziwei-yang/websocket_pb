@@ -1048,7 +1048,7 @@ private:
         meta.ssl_read_id = ssl_read_count_[ci];
         meta.msg_inbox_offset = write_pos;
         meta.decrypted_len = decrypted_len;
-        meta.tls_record_end = tls_record_end;
+        meta.set_tls_record_end(tls_record_end);
         meta.nic_packet_ct = (stats.total_hw_count > 0)
             ? stats.total_hw_count
             : (stats.total_seg_delta > 0)
@@ -1060,6 +1060,8 @@ private:
             meta.latest_nic_timestamp_ns = stats.latest_hw_ns;
         }
 #endif
+        if (active_conn_ptr_ && static_cast<uint8_t>(ci) == *active_conn_ptr_)
+            meta.set_active_conn(true);
         if constexpr (InlineWS) {
             inline_ws_.ws_core.feed(static_cast<uint8_t>(ci), meta);
         } else {
@@ -2080,8 +2082,20 @@ private:
             }
 
             // ── RX Phase: unified poll + per-connection recv/decrypt ──
+            // Active connection appears first in pfds[] for priority processing
             int nfds = 0;
-            for (size_t ci = 0; ci < NUM_CONN; ci++) {
+            uint8_t conn_order[NUM_CONN];
+            conn_order[0] = 0;
+            if constexpr (EnableAB) {
+                if (active_conn_ptr_) {
+                    uint8_t a = *active_conn_ptr_;
+                    if (a < NUM_CONN) conn_order[0] = a;
+                }
+                conn_order[1] = 1 - conn_order[0];
+            }
+
+            for (size_t i = 0; i < NUM_CONN; i++) {
+                size_t ci = conn_order[i];
                 if (sockfd_[ci] < 0) continue;
                 if constexpr (AutoReconnect) {
                     if (reconn_[ci].phase != BSDConnPhase::ACTIVE) continue;
@@ -2934,6 +2948,12 @@ public:
         return inline_ws_.ws_core.app_handler();
     }
 
+    /**
+     * Set pointer to active connection index (for priority ordering).
+     * Points to SBEAppHandler::active_ci_ — local memory, not shared memory.
+     */
+    void set_active_conn_ptr(const uint8_t* p) { active_conn_ptr_ = p; }
+
 private:
     // ========================================================================
     // Member Variables
@@ -2972,6 +2992,9 @@ private:
 
     // Shared state
     ConnStateShm* conn_state_ = nullptr;
+
+    // Active connection pointer (for priority ordering — points to SBEAppHandler::active_ci_)
+    const uint8_t* active_conn_ptr_ = nullptr;
 
     // Thread management
     std::thread rx_thread_;

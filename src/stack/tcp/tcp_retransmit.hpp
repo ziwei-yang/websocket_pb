@@ -289,30 +289,32 @@ struct ZeroCopyReceiveBuffer {
         while (total_read < max_len && count_ > 0) {
             FrameRef& frame = frames_[head_];
 
-            // Track stats when starting to read from a new frame (offset == 0)
+            // Track timestamps for ALL frames (including partially-consumed at offset > 0).
+            // A partially-consumed frame's timestamps are still valid — they represent
+            // when that packet's data arrived. Without this, reset_recv_stats() between
+            // SSL reads causes latest_bpf_entry_ns=0 when only offset>0 frames remain.
+            if (frame.bpf_entry_ns > 0) {
+                if (last_read_stats_.oldest_bpf_entry_ns == 0)
+                    last_read_stats_.oldest_bpf_entry_ns = frame.bpf_entry_ns;
+                last_read_stats_.latest_bpf_entry_ns = frame.bpf_entry_ns;
+            }
+            if (frame.hw_timestamp_ns > 0) {
+                if (last_read_stats_.oldest_timestamp_ns == 0)
+                    last_read_stats_.oldest_timestamp_ns = frame.hw_timestamp_ns;
+                last_read_stats_.latest_timestamp_ns = frame.hw_timestamp_ns;
+            }
+            if (frame.poll_cycle > 0) {
+                if (last_read_stats_.oldest_poll_cycle == 0)
+                    last_read_stats_.oldest_poll_cycle = frame.poll_cycle;
+                last_read_stats_.latest_poll_cycle = frame.poll_cycle;
+            }
+
+            // Packet count & mem index only at first touch (avoid double-counting)
             if (frame.offset == 0) {
-                if (frame.hw_timestamp_ns > 0) {
+                if (frame.hw_timestamp_ns > 0)
                     last_read_stats_.packet_count++;
-                    if (last_read_stats_.oldest_timestamp_ns == 0) {
-                        last_read_stats_.oldest_timestamp_ns = frame.hw_timestamp_ns;
-                    }
-                    last_read_stats_.latest_timestamp_ns = frame.hw_timestamp_ns;
-                }
-                if (frame.bpf_entry_ns > 0) {
-                    if (last_read_stats_.oldest_bpf_entry_ns == 0) {
-                        last_read_stats_.oldest_bpf_entry_ns = frame.bpf_entry_ns;
-                    }
-                    last_read_stats_.latest_bpf_entry_ns = frame.bpf_entry_ns;
-                }
-                if (frame.poll_cycle > 0) {
-                    if (last_read_stats_.oldest_poll_cycle == 0) {
-                        last_read_stats_.oldest_poll_cycle = frame.poll_cycle;
-                    }
-                    last_read_stats_.latest_poll_cycle = frame.poll_cycle;
-                }
-                if (last_read_stats_.oldest_pkt_mem_idx == 0) {
+                if (last_read_stats_.oldest_pkt_mem_idx == 0)
                     last_read_stats_.oldest_pkt_mem_idx = static_cast<uint16_t>(frame.frame_idx);
-                }
                 last_read_stats_.latest_pkt_mem_idx = static_cast<uint16_t>(frame.frame_idx);
             }
 
@@ -350,12 +352,28 @@ struct ZeroCopyReceiveBuffer {
     // Get stats from the last read() operation
     const ReadStats& get_last_read_stats() const { return last_read_stats_; }
 
+    // Prefetch head frame's UMEM data into cache.
+    // Call early (before processing another connection) to hide DRAM latency.
+    void prefetch_head() const {
+        if (count_ == 0) return;
+        const FrameRef& frame = frames_[head_];
+        const uint8_t* read_ptr = frame.data + frame.offset;
+        __builtin_prefetch(read_ptr, 0, 1);
+        __builtin_prefetch(read_ptr + 64, 0, 1);
+    }
+
     // Get total available bytes across all frames
     size_t available() const {
         size_t total = 0;
         size_t idx = head_;
         for (size_t i = 0; i < count_; i++) {
-            total += frames_[idx].len - frames_[idx].offset;
+            size_t remaining = frames_[idx].len - frames_[idx].offset;
+            total += remaining;
+            // Prefetch UMEM frame data for upcoming read()
+            const uint8_t* read_ptr = frames_[idx].data + frames_[idx].offset;
+            __builtin_prefetch(read_ptr, 0, 0);
+            if (remaining > 64)
+                __builtin_prefetch(read_ptr + 64, 0, 0);
             idx = (idx + 1) % MAX_FRAMES;
         }
         return total;

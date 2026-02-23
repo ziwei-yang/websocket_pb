@@ -33,7 +33,7 @@
 
 #include "../../src/pipeline/bsd_websocket_pipeline.hpp"
 #include "../../src/policy/ssl.hpp"
-#include "../../src/msg/binance_sbe.hpp"
+#include "../../src/msg/00_binance_spot_sbe.hpp"
 
 using namespace websocket::pipeline;
 namespace sbe = websocket::sbe;

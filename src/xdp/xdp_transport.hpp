@@ -1,3 +1,8 @@
+// For memfd_create on Linux
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 // xdp/xdp_transport.hpp
 // AF_XDP (eXpress Data Path) Transport Layer
 //
@@ -50,6 +55,7 @@
 #include <net/if.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <linux/memfd.h>   // MFD_HUGE_2MB
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <unistd.h>
@@ -249,43 +255,54 @@ struct XDPTransport {
         // With MAP_PRIVATE, copy-on-write semantics prevent children from seeing XDP RX data
         umem_size_ = config_.num_frames * config_.frame_size;
 
-        // Create shared memory file for UMEM
-        char umem_path[256];
-        snprintf(umem_path, sizeof(umem_path), "/dev/shm/xdp_umem_%d_%s",
-                 getpid(), config_.interface);
-        umem_fd_ = open(umem_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
-        if (umem_fd_ < 0) {
-            throw std::runtime_error(std::string("Failed to create UMEM file: ") + strerror(errno));
+        // Use memfd_create for UMEM — inheritable across fork() like a file,
+        // but supports MFD_HUGETLB for 2MB huge pages (unlike /dev/shm which is tmpfs)
+        bool umem_huge_pages = false;
+        umem_fd_ = memfd_create("xdp_umem", MFD_HUGETLB | MFD_HUGE_2MB);
+        if (umem_fd_ >= 0) {
+            if (ftruncate(umem_fd_, umem_size_) < 0) {
+                // Huge page memfd created but ftruncate failed (not enough huge pages?)
+                ::close(umem_fd_);
+                umem_fd_ = -1;
+            } else {
+                umem_area_ = mmap(nullptr, umem_size_,
+                                  PROT_READ | PROT_WRITE,
+                                  MAP_SHARED | MAP_HUGETLB,
+                                  umem_fd_, 0);
+                if (umem_area_ == MAP_FAILED) {
+                    ::close(umem_fd_);
+                    umem_fd_ = -1;
+                    umem_area_ = nullptr;
+                } else {
+                    umem_huge_pages = true;
+                }
+            }
         }
-        // Mark for deletion on close (will be cleaned up when all processes exit)
-        unlink(umem_path);
 
-        // Resize the file
-        if (ftruncate(umem_fd_, umem_size_) < 0) {
-            ::close(umem_fd_);
-            throw std::runtime_error(std::string("Failed to resize UMEM file: ") + strerror(errno));
-        }
-
-        // Try with huge pages first (MAP_SHARED + MAP_HUGETLB)
-        umem_area_ = mmap(nullptr, umem_size_,
-                          PROT_READ | PROT_WRITE,
-                          MAP_SHARED | MAP_HUGETLB,
-                          umem_fd_, 0);
-
-        if (umem_area_ == MAP_FAILED) {
-            // Fallback to regular pages if huge pages fail
+        // Fallback: regular memfd without huge pages
+        if (!umem_huge_pages) {
+            umem_fd_ = memfd_create("xdp_umem", 0);
+            if (umem_fd_ < 0) {
+                throw std::runtime_error(std::string("Failed to create UMEM memfd: ") + strerror(errno));
+            }
+            if (ftruncate(umem_fd_, umem_size_) < 0) {
+                ::close(umem_fd_);
+                throw std::runtime_error(std::string("Failed to resize UMEM memfd: ") + strerror(errno));
+            }
             umem_area_ = mmap(nullptr, umem_size_,
                               PROT_READ | PROT_WRITE,
                               MAP_SHARED,
                               umem_fd_, 0);
         }
 
-        if (umem_area_ == MAP_FAILED) {
+        if (umem_area_ == MAP_FAILED || umem_area_ == nullptr) {
             ::close(umem_fd_);
             throw std::runtime_error(std::string("Failed to mmap UMEM: ") + strerror(errno));
         }
 
-        printf("[XDP] UMEM allocated: %zu bytes (MAP_SHARED) at %p\n", umem_size_, umem_area_);
+        printf("[XDP] UMEM allocated: %zu bytes at %p (%s)\n",
+               umem_size_, umem_area_,
+               umem_huge_pages ? "2MB huge pages" : "4KB pages, huge pages unavailable");
 
         // Configure UMEM
         struct xsk_umem_config umem_cfg;

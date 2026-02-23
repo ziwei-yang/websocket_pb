@@ -53,7 +53,7 @@ static constexpr bool RECONNECT_ENABLED = false;
 
 #include "../../src/pipeline/websocket_pipeline.hpp"
 #include "../../src/policy/ssl.hpp"
-#include "../../src/msg/binance_sbe.hpp"
+#include "../../src/msg/00_binance_spot_sbe.hpp"
 
 using namespace websocket::pipeline;
 using namespace websocket::ssl;

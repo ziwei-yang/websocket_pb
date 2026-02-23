@@ -638,6 +638,7 @@ private:
         info.ssl_read_total_bytes = current_ssl_read_bytes_;
         info.ws_last_op_cycle = last_op_cycle_;
         info.ws_parse_cycle = parse_cycle;
+        info.debug_validate(0);
 
         info.ws_frame_publish_cycle = rdtscp();
         {

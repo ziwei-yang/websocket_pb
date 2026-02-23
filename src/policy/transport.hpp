@@ -1792,6 +1792,9 @@ struct PacketTransport {
     const uint8_t* get_local_mac() const { return stack_.get_local_mac(); }
     const uint8_t* get_gateway_mac() const { return stack_.get_gateway_mac(); }
 
+    // Prefetch recv buffer head frame's UMEM data into cache
+    void prefetch_recv_head() const { recv_buffer_.prefetch_head(); }
+
     // Debug accessors (for AB diagnostics)
     size_t recv_buffer_available() const { return recv_buffer_.available(); }
     uint32_t dbg_rx_total() const { return dbg_rx_total_; }
