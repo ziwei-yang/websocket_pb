@@ -1349,7 +1349,7 @@ private:
      */
     void step_tls_handshake(size_t ci) {
         using HR = typename SSLPolicy::HandshakeResult;
-        auto result = ssl_[ci].step_bsd_handshake();
+        auto result = ssl_[ci].step_bsd_handshake_non_block();
 
         if (result == HR::SUCCESS) {
             struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
@@ -1931,35 +1931,30 @@ private:
                             }
                         }
 
-                        ssize_t total_sent = 0;
-                        while (total_sent < event.data_len) {
-                            ssize_t sent;
-                            if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
-                                sent = ssl_[ci].write(
-                                    event.data + total_sent,
-                                    event.data_len - total_sent
-                                );
-                            } else {
-                                sent = ::send(sockfd_[ci],
-                                    event.data + total_sent,
-                                    event.data_len - total_sent,
-                                    MSG_NOSIGNAL);
-                            }
+                        ssize_t sent;
+                        if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
+                            sent = ssl_[ci].write(event.data, event.data_len);
+                        } else {
+                            sent = ::send(sockfd_[ci], event.data, event.data_len, MSG_NOSIGNAL);
+                        }
 
-                            if (sent < 0) {
-                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                    std::this_thread::yield();
-                                    continue;
-                                }
-                                printf("[TX] send error (conn %zu): %s\n", ci, strerror(errno));
-                                if constexpr (AutoReconnect) {
-                                    break;  // Don't shut down, let RX handle reconnect
-                                } else {
-                                    running_.store(false, std::memory_order_release);
-                                    return false;
-                                }
+                        if (sent == static_cast<ssize_t>(event.data_len)) {
+                            // fully sent, commit
+                        } else if (sent > 0) {
+                            // partial send — shift remaining, retry next iteration
+                            event.data_len -= sent;
+                            memmove(event.data, event.data + sent, event.data_len);
+                            return false;  // stop, don't commit — retry next loop
+                        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            return false;  // stop, retry next loop
+                        } else {
+                            printf("[TX] send error (conn %zu): %s\n", ci, strerror(errno));
+                            if constexpr (AutoReconnect) {
+                                // Drop this event, let RX handle reconnect
+                            } else {
+                                running_.store(false, std::memory_order_release);
+                                return false;
                             }
-                            total_sent += sent;
                         }
                     }
 
@@ -2215,35 +2210,30 @@ private:
                                 }
                             }
 
-                            ssize_t total_sent = 0;
-                            while (total_sent < event.data_len) {
-                                ssize_t sent;
-                                if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
-                                    sent = ssl_[ci].write(
-                                        event.data + total_sent,
-                                        event.data_len - total_sent
-                                    );
-                                } else {
-                                    sent = ::send(sockfd_[ci],
-                                        event.data + total_sent,
-                                        event.data_len - total_sent,
-                                        MSG_NOSIGNAL);
-                                }
+                            ssize_t sent;
+                            if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
+                                sent = ssl_[ci].write(event.data, event.data_len);
+                            } else {
+                                sent = ::send(sockfd_[ci], event.data, event.data_len, MSG_NOSIGNAL);
+                            }
 
-                                if (sent < 0) {
-                                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                        std::this_thread::yield();
-                                        continue;
-                                    }
-                                    printf("[1T] send error (conn %zu): %s\n", ci, strerror(errno));
-                                    if constexpr (AutoReconnect) {
-                                        break;
-                                    } else {
-                                        running_.store(false, std::memory_order_release);
-                                        return false;
-                                    }
+                            if (sent == static_cast<ssize_t>(event.data_len)) {
+                                // fully sent, commit
+                            } else if (sent > 0) {
+                                // partial send — shift remaining, retry next iteration
+                                event.data_len -= sent;
+                                memmove(event.data, event.data + sent, event.data_len);
+                                return false;  // stop, don't commit — retry next loop
+                            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                return false;  // stop, retry next loop
+                            } else {
+                                printf("[1T] send error (conn %zu): %s\n", ci, strerror(errno));
+                                if constexpr (AutoReconnect) {
+                                    // Drop this event, let RX handle reconnect
+                                } else {
+                                    running_.store(false, std::memory_order_release);
+                                    return false;
                                 }
-                                total_sent += sent;
                             }
                         }
 
@@ -2941,16 +2931,16 @@ public:
     }
 
     /**
-     * Access the inline WSCore's app_handler (for AppHandler propagation).
+     * Access the inline WSCore's mkt_event_handler (for MktEventHandler propagation).
      */
-    auto& inline_app_handler() {
+    auto& inline_mkt_event_handler() {
         static_assert(InlineWS);
-        return inline_ws_.ws_core.app_handler();
+        return inline_ws_.ws_core.mkt_event_handler();
     }
 
     /**
      * Set pointer to active connection index (for priority ordering).
-     * Points to SBEAppHandler::active_ci_ — local memory, not shared memory.
+     * Points to SBEMktEventHandler::active_ci_ — local memory, not shared memory.
      */
     void set_active_conn_ptr(const uint8_t* p) { active_conn_ptr_ = p; }
 
@@ -2993,7 +2983,7 @@ private:
     // Shared state
     ConnStateShm* conn_state_ = nullptr;
 
-    // Active connection pointer (for priority ordering — points to SBEAppHandler::active_ci_)
+    // Active connection pointer (for priority ordering — points to SBEMktEventHandler::active_ci_)
     const uint8_t* active_conn_ptr_ = nullptr;
 
     // Thread management

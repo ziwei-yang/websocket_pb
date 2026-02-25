@@ -79,7 +79,7 @@ struct BinanceSBE3ThreadTraits : DefaultBSDPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
     using IOPolicy           = DefaultBlockingIO;
     using SSLThreadingPolicy = DedicatedSSL;
-    using AppHandler         = NullAppHandler;
+    using MktEventHandler         = NullMktEventHandler;
     using UpgradeCustomizer  = BinanceUpgradeCustomizer;
 
     static constexpr int TRANSPORT_CORE = -1;
@@ -390,7 +390,7 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBE3ThreadTraits>& pipeline) {
         }
         last_sequence = current_seq;
 
-        auto* inbox = pipeline.msg_inbox(frame.connection_id);
+        auto* inbox = pipeline.msg_inbox(frame.connection_id());
         const uint8_t* payload = inbox->data_at(frame.msg_inbox_offset);
 
         // Extract SBE event time from binary payload (all Binance SBE messages
@@ -412,7 +412,7 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBE3ThreadTraits>& pipeline) {
         if (frame.is_fragmented() && !frame.is_last_fragment()) {
             if (frame.opcode == 0x02) {
                 int64_t et = extract_sbe_event_time_ms(payload, frame.payload_len);
-                if (et > 0) pending_event_time_ms[frame.connection_id] = et;
+                if (et > 0) pending_event_time_ms[frame.connection_id()] = et;
             }
             prev_publish_mono_ns = frame.ssl_read_end_mono_ns(tsc_freq);
             prev_latest_poll_cycle = frame.latest_poll_cycle;
@@ -423,8 +423,8 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBE3ThreadTraits>& pipeline) {
         // For complete binary frames, extract from payload; for last fragments, use carried value
         int64_t event_time_ms = 0;
         if (frame.is_fragmented() && frame.is_last_fragment()) {
-            event_time_ms = pending_event_time_ms[frame.connection_id];
-            pending_event_time_ms[frame.connection_id] = 0;
+            event_time_ms = pending_event_time_ms[frame.connection_id()];
+            pending_event_time_ms[frame.connection_id()] = 0;
         } else if (frame.opcode == 0x02) {
             event_time_ms = extract_sbe_event_time_ms(payload, frame.payload_len);
         }

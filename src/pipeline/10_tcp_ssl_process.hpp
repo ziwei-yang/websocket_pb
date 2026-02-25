@@ -417,31 +417,33 @@ public:
                     // Check WS-initiated reconnect request
                     if (conn_state_->get_reconnect_request(ci)) {
                         conn_state_->clear_reconnect_request(ci);
-                        if (reconn_[ci].phase == ConnPhase::ACTIVE) {
-                            if constexpr (EnableAB) {
-                                uint8_t other = 1 - ci;
-                                struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
-                                fprintf(stderr, "[%ld.%06ld] [RECONNECT] WS-watchdog triggered conn %u "
-                                        "(other conn %u phase=%u)\n",
-                                        _ts.tv_sec, _ts.tv_nsec / 1000, ci, other,
-                                        static_cast<unsigned>(reconn_[other].phase));
-                            }
-                            start_reconnect(ci);
-                        } else {
-                            // Already reconnecting — request arrived during intermediate phase
+                        if constexpr (EnableAB) {
+                            uint8_t other = 1 - ci;
                             struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
-                            fprintf(stderr, "[%ld.%06ld] [RECONNECT] Ignoring WS reconnect request for conn %u "
-                                    "(already in phase %u)\n",
+                            fprintf(stderr, "[%ld.%06ld] [RECONNECT] WS-watchdog triggered conn %u "
+                                    "(phase=%u, other conn %u phase=%u)\n",
                                     _ts.tv_sec, _ts.tv_nsec / 1000, ci,
-                                    static_cast<unsigned>(reconn_[ci].phase));
+                                    static_cast<unsigned>(reconn_[ci].phase), other,
+                                    static_cast<unsigned>(reconn_[other].phase));
                         }
+                        start_reconnect(ci);
                     }
 
-                    // Check transport-level TCP failure
-                    if (reconn_[ci].phase == ConnPhase::ACTIVE) {
+                    // Check transport-level TCP failure (RST, FIN, retransmit FATAL)
+                    // Must check in ALL phases — RETX FATAL can fire during TLS_READY
+                    // (e.g. HTTP upgrade segment times out). Without this, the connection
+                    // gets stuck forever and its retransmit queue frames leak.
+                    {
                         auto& conn = get_transport(ci);
                         if (conn.needs_reconnect()) {
                             conn.clear_reconnect_flag();
+                            if (reconn_[ci].phase != ConnPhase::ACTIVE) {
+                                struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                                fprintf(stderr, "[%ld.%06ld] [RECONNECT] Transport failure in phase %u "
+                                        "for conn %u, restarting\n",
+                                        _ts.tv_sec, _ts.tv_nsec / 1000,
+                                        static_cast<unsigned>(reconn_[ci].phase), ci);
+                            }
                             start_reconnect(ci);
                         }
                     }
@@ -461,6 +463,15 @@ public:
                         if (conn_state_->get_ws_handshake_done(ci)) {
                             conn_state_->clear_ws_handshake_done(ci);
                             switch_to_direct_decrypt(ci);
+                        } else {
+                            uint64_t elapsed = rdtsc() - reconn_[ci].phase_start_cycle;
+                            if (elapsed > 15ULL * tsc_freq_hz_) {
+                                struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                                fprintf(stderr, "[%ld.%06ld] [RECONNECT] TLS_READY timeout for conn %u "
+                                        "(WS handshake not completed in 15s), restarting\n",
+                                        _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+                                start_reconnect(ci);
+                            }
                         }
                         break;
                     case ConnPhase::WAITING_RETRY:
@@ -702,7 +713,7 @@ private:
 
             // Prepare TLS handshake
             if (ssl_[ci].init() != 0 ||
-                ssl_[ci].prepare_handshake(&conn, parsed_url_.host.c_str()) != 0) {
+                ssl_[ci].prepare_handshake_non_block(&conn, parsed_url_.host.c_str()) != 0) {
                 fprintf(stderr, "[RECONNECT] TLS init failed for conn %u, restarting\n", ci);
                 if (should_backoff(ci)) {
                     reconn_[ci].phase = ConnPhase::WAITING_RETRY;
@@ -731,7 +742,7 @@ private:
 
     void step_tls_handshake(uint8_t ci) {
         // Single step of wolfSSL_connect (need poll first for data)
-        auto result = ssl_[ci].step_handshake();
+        auto result = ssl_[ci].step_handshake_non_block();
 
         using HR = typename SSLPolicy::HandshakeResult;
         if (result == HR::SUCCESS) {
@@ -1021,44 +1032,42 @@ private:
     // ========================================================================
 
     int32_t process_low_prio_outbox() {
-        int32_t count = 0;
-        PongFrameAligned pong;
-        while (low_prio_cons_->try_consume(pong)) {
-            if (pong.data_len == 0) continue;
+        size_t processed = low_prio_cons_->process_manually(
+            [&](PongFrameAligned& pong, int64_t /*seq*/, bool /*eob*/) -> bool {
+                if (pong.data_len == 0) return true;  // skip empty, commit
 
-            uint8_t ci = EnableAB ? pong.connection_id : 0;
+                uint8_t ci = EnableAB ? pong.connection_id : 0;
 
-            // Skip if connection is not in a sendable state
-            if constexpr (AutoReconnect) {
-                if (reconn_[ci].phase != ConnPhase::ACTIVE &&
-                    reconn_[ci].phase != ConnPhase::TLS_READY) {
-                    continue;  // Drop: connection not ready
+                if constexpr (AutoReconnect) {
+                    if (reconn_[ci].phase != ConnPhase::ACTIVE &&
+                        reconn_[ci].phase != ConnPhase::TLS_READY) {
+                        return true;  // drop: conn not ready, commit to advance
+                    }
                 }
-            }
 
-            size_t total_sent = 0;
-            int retries = 0;
-            static constexpr int MAX_WRITE_RETRIES = 50;  // 50 * 100us = 5ms max
-            while (total_sent < pong.data_len) {
                 transport_.poll();
-                ssize_t sent = ssl_[ci].write(pong.data + total_sent, pong.data_len - total_sent);
-                if (sent > 0) {
-                    total_sent += sent;
-                    retries = 0;
-                } else if (sent < 0 && errno != EAGAIN) {
-                    break;
-                } else if (++retries >= MAX_WRITE_RETRIES) {
-                    fprintf(stderr, "[TRANSPORT] Low-prio send stalled (conn %u, %zu/%u bytes)\n",
-                            ci, total_sent, pong.data_len);
-                    break;
+                ssize_t sent = ssl_[ci].write(pong.data, pong.data_len);
+                if (sent == static_cast<ssize_t>(pong.data_len)) {
+                    low_prio_tx_count_++;
+                    return true;  // fully sent, commit
                 }
-                usleep(100);
-            }
-
-            low_prio_tx_count_++;
-            count++;
+                if (sent > 0) {
+                    // partial send — shift remaining data, retry next iteration
+                    pong.data_len -= sent;
+                    memmove(pong.data, pong.data + sent, pong.data_len);
+                    return false;  // stop, don't commit — retry this event next loop
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return false;  // stop, retry next loop
+                }
+                return true;  // fatal error, commit to skip
+            },
+            16
+        );
+        if (processed > 0) {
+            low_prio_cons_->commit_manually();
         }
-        return count;
+        return static_cast<int32_t>(processed);
     }
 
     // ========================================================================
@@ -1066,42 +1075,41 @@ private:
     // ========================================================================
 
     int32_t process_msg_outbox() {
-        int32_t count = 0;
-        MsgOutboxEvent evt;
-        while (msg_outbox_cons_->try_consume(evt)) {
-            if (evt.data_len == 0) continue;
+        size_t processed = msg_outbox_cons_->process_manually(
+            [&](MsgOutboxEvent& evt, int64_t /*seq*/, bool /*eob*/) -> bool {
+                if (evt.data_len == 0) return true;  // skip empty, commit
 
-            uint8_t ci = EnableAB ? evt.connection_id : 0;
+                uint8_t ci = EnableAB ? evt.connection_id : 0;
 
-            // Skip if connection is not in a sendable state
-            if constexpr (AutoReconnect) {
-                if (reconn_[ci].phase != ConnPhase::ACTIVE &&
-                    reconn_[ci].phase != ConnPhase::TLS_READY) {
-                    continue;  // Drop: connection not ready
+                if constexpr (AutoReconnect) {
+                    if (reconn_[ci].phase != ConnPhase::ACTIVE &&
+                        reconn_[ci].phase != ConnPhase::TLS_READY) {
+                        return true;  // drop: conn not ready, commit to advance
+                    }
                 }
-            }
 
-            size_t total_sent = 0;
-            int retries = 0;
-            static constexpr int MAX_WRITE_RETRIES = 50;
-            while (total_sent < evt.data_len) {
                 transport_.poll();
-                ssize_t sent = ssl_[ci].write(evt.data + total_sent, evt.data_len - total_sent);
-                if (sent > 0) {
-                    total_sent += sent;
-                    retries = 0;
-                } else if (sent < 0 && errno != EAGAIN) {
-                    break;
-                } else if (++retries >= MAX_WRITE_RETRIES) {
-                    fprintf(stderr, "[TRANSPORT] MSG_OUTBOX send stalled (conn %u, %zu/%u bytes)\n",
-                            ci, total_sent, evt.data_len);
-                    break;
+                ssize_t sent = ssl_[ci].write(evt.data, evt.data_len);
+                if (sent == static_cast<ssize_t>(evt.data_len)) {
+                    return true;  // fully sent, commit
                 }
-                usleep(100);
-            }
-            count++;
+                if (sent > 0) {
+                    // partial send — shift remaining data, retry next iteration
+                    evt.data_len -= sent;
+                    memmove(evt.data, evt.data + sent, evt.data_len);
+                    return false;  // stop, don't commit — retry this event next loop
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return false;  // stop, retry next loop
+                }
+                return true;  // fatal error, commit to skip
+            },
+            16
+        );
+        if (processed > 0) {
+            msg_outbox_cons_->commit_manually();
         }
-        return count;
+        return static_cast<int32_t>(processed);
     }
 
     // ========================================================================
@@ -1167,7 +1175,7 @@ private:
     uint64_t ssl_read_count_ = 0;
     uint64_t low_prio_tx_count_ = 0;
 
-    // Active connection pointer (for priority ordering — points to SBEAppHandler::active_ci_)
+    // Active connection pointer (for priority ordering — points to SBEMktEventHandler::active_ci_)
     const uint8_t* active_conn_ptr_ = nullptr;
 
     // ========================================================================
@@ -1203,16 +1211,16 @@ public:
     }
 
     /**
-     * Access the inline WSCore's app_handler (for AppHandler propagation).
+     * Access the inline WSCore's mkt_event_handler (for MktEventHandler propagation).
      */
-    auto& inline_app_handler() {
+    auto& inline_mkt_event_handler() {
         static_assert(InlineWS);
-        return inline_ws_.ws_core.app_handler();
+        return inline_ws_.ws_core.mkt_event_handler();
     }
 
     /**
      * Set pointer to active connection index (for priority ordering).
-     * Points to SBEAppHandler::active_ci_ — local memory, not shared memory.
+     * Points to SBEMktEventHandler::active_ci_ — local memory, not shared memory.
      */
     void set_active_conn_ptr(const uint8_t* p) { active_conn_ptr_ = p; }
 };

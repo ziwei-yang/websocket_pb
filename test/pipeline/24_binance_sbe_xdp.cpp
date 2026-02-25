@@ -11,7 +11,7 @@
 // - Sends X-MBX-APIKEY header via UpgradeCustomizer (BINANCE_API_KEY env var)
 // - Subscribes to btcusdt@trade stream
 // - Parent consumes WSFrameInfo from disruptor ring, decodes SBE, prints timeline
-// - WS process uses NullAppHandler (publishes WSFrameInfo to ring, no inline decode)
+// - WS process uses NullMktEventHandler (publishes WSFrameInfo to ring, no inline decode)
 
 #include <cstdio>
 #include <cstdlib>
@@ -88,7 +88,7 @@ struct BinanceUpgradeCustomizer {
 
 struct BinanceSBETraits : DefaultPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
-    using AppHandler         = NullAppHandler;
+    using MktEventHandler         = NullMktEventHandler;
     using UpgradeCustomizer  = BinanceUpgradeCustomizer;
 
     static constexpr int XDP_POLL_CORE   = 2;
@@ -293,7 +293,7 @@ int main(int argc, char* argv[]) {
         bool end_of_batch;
         while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
             total_frames++;
-            uint8_t ci = frame.connection_id;
+            uint8_t ci = frame.connection_id();
             const uint8_t* payload = pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset);
 
             // Extract exchange event time from SBE binary frames
@@ -327,7 +327,7 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            uint8_t ci = frame.connection_id;
+            uint8_t ci = frame.connection_id();
             const uint8_t* payload = pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset);
 
             int64_t event_time_ms = 0;
@@ -371,7 +371,7 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            uint8_t ci = frame.connection_id;
+            uint8_t ci = frame.connection_id();
             if (frame.opcode == 0x02) binary_frames++;
             else if (frame.opcode == 0x01) text_frames++;
         }

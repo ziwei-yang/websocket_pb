@@ -55,7 +55,7 @@ struct BinanceBSD2ThreadTraits : DefaultBSDPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
     using IOPolicy           = DefaultBlockingIO;
     using SSLThreadingPolicy = InlineSSL;
-    using AppHandler         = NullAppHandler;
+    using MktEventHandler         = NullMktEventHandler;
 
     static constexpr int TRANSPORT_CORE = -1;
     static constexpr int WEBSOCKET_CORE = -1;

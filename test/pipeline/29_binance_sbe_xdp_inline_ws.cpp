@@ -87,242 +87,7 @@ struct BinanceUpgradeCustomizer {
     }
 };
 
-// ============================================================================
-// SBEAppHandler — inline market data processing in WS core
-// ============================================================================
-
-struct SBEAppHandler {
-    static constexpr bool enabled = true;
-    IPCRingProducer<websocket::msg::MktEvent>* mkt_event_prod = nullptr;
-    ConnStateShm* conn_state = nullptr;
-    int64_t last_book_seq_ = 0;
-    int64_t last_trade_id_ = 0;
-    uint8_t active_ci_ = 0xFF;
-    WSFrameInfo* current_info_ = nullptr;
-
-    void on_ws_frame(uint8_t ci, uint8_t, const uint8_t* payload,
-                     uint32_t len, WSFrameInfo& info) {
-        auto e = sbe::BinanceSpotSBEDecoder::decode_essential(payload, len);
-        if (!e.valid) {
-            info.set_mkt_event_info(
-                static_cast<uint8_t>(websocket::msg::EventType::SYSTEM_STATUS), 0);
-            return;
-        }
-
-        // Set type early from decode_essential — full decode may refine count later
-        switch (e.msg_type) {
-        case sbe::TRADES_STREAM:
-            info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY),
-                                    static_cast<uint8_t>(e.count));
-            break;
-        case sbe::BEST_BID_ASK_STREAM:
-        case sbe::DEPTH_SNAPSHOT_STREAM:
-            info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT),
-                                    static_cast<uint8_t>(e.count));
-            break;
-        case sbe::DEPTH_DIFF_STREAM:
-            info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA),
-                                    static_cast<uint8_t>(e.count));
-            break;
-        default:
-            info.set_mkt_event_info(
-                static_cast<uint8_t>(websocket::msg::EventType::SYSTEM_STATUS), 0);
-            break;
-        }
-
-        // Fast-path: skip stale messages without full decode
-        if (e.sequence > 0) {
-            bool stale = (e.msg_type == sbe::TRADES_STREAM)
-                ? (e.sequence <= last_trade_id_)
-                : (e.sequence <= last_book_seq_);
-            if (stale) {
-                info.set_discard_early(true);
-                return;
-            }
-        }
-
-        current_info_ = &info;
-
-        switch (e.msg_type) {
-        case sbe::TRADES_STREAM: {
-            sbe::TradesView tv;
-            if (sbe::TradesView::decode(e.body, e.body_len, e.block_length, tv)) {
-                info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY),
-                                        static_cast<uint8_t>(tv.count()));
-                publish_trades(ci, tv);
-            }
-            break;
-        }
-        case sbe::BEST_BID_ASK_STREAM: {
-            sbe::BestBidAskView bv;
-            if (sbe::BestBidAskView::decode(e.body, e.body_len, e.block_length, bv)) {
-                info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT), 1);
-                publish_bbo(ci, bv);
-            }
-            break;
-        }
-        case sbe::DEPTH_SNAPSHOT_STREAM: {
-            sbe::DepthSnapshotView sv;
-            if (sbe::DepthSnapshotView::decode(e.body, e.body_len, e.block_length, sv)) {
-                info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT),
-                                        static_cast<uint8_t>(sv.bids().count + sv.asks().count));
-                publish_depth_snapshot(ci, sv);
-            }
-            break;
-        }
-        case sbe::DEPTH_DIFF_STREAM: {
-            sbe::DepthDiffView dv;
-            if (sbe::DepthDiffView::decode(e.body, e.body_len, e.block_length, dv)) {
-                info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA),
-                                        static_cast<uint8_t>(dv.bids().count + dv.asks().count));
-                publish_depth_diff(ci, dv);
-            }
-            break;
-        }
-        }
-        current_info_ = nullptr;
-    }
-
-    void publish_bbo(uint8_t ci, const sbe::BestBidAskView& bv) {
-        int64_t seq = bv.book_update_id();
-        if (seq <= last_book_seq_) return;
-        last_book_seq_ = seq;
-        record_win(ci);
-        publish_event([&](websocket::msg::MktEvent& e) {
-            e.event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT);
-            e.src_seq = seq;
-            e.event_ts_ns = bv.event_time_us() * 1000;
-            e.count = 1;
-            e.count2 = 1;
-            e.payload.snapshot.levels[0] = { bv.bid_price_mantissa(), bv.bid_qty_mantissa() };
-            e.payload.snapshot.levels[1] = { bv.ask_price_mantissa(), bv.ask_qty_mantissa() };
-        });
-    }
-
-    void publish_depth_snapshot(uint8_t ci, const sbe::DepthSnapshotView& sv) {
-        int64_t seq = sv.book_update_id();
-        if (seq <= last_book_seq_) return;
-        last_book_seq_ = seq;
-        record_win(ci);
-        publish_event([&](websocket::msg::MktEvent& e) {
-            e.event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT);
-            e.flags = websocket::msg::EventFlags::SNAPSHOT;
-            e.src_seq = seq;
-            e.event_ts_ns = sv.event_time_us() * 1000;
-            auto& sb = sv.bids();
-            auto& sa = sv.asks();
-            e.count = static_cast<uint8_t>(std::min<uint16_t>(sb.count, websocket::msg::MAX_BOOK_LEVELS / 2));
-            e.count2 = static_cast<uint8_t>(std::min<uint16_t>(sa.count, websocket::msg::MAX_BOOK_LEVELS / 2));
-            for (uint8_t i = 0; i < e.count; i++) {
-                auto lv = sb.level(i);
-                e.payload.snapshot.levels[i] = { lv.price_mantissa(), lv.qty_mantissa() };
-            }
-            for (uint8_t i = 0; i < e.count2; i++) {
-                auto lv = sa.level(i);
-                e.payload.snapshot.levels[e.count + i] = { lv.price_mantissa(), lv.qty_mantissa() };
-            }
-        });
-    }
-
-    void publish_depth_diff(uint8_t ci, const sbe::DepthDiffView& dv) {
-        int64_t seq = dv.last_book_update_id();
-        if (seq <= last_book_seq_) return;
-        last_book_seq_ = seq;
-        record_win(ci);
-        publish_event([&](websocket::msg::MktEvent& e) {
-            e.event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA);
-            e.src_seq = seq;
-            e.event_ts_ns = dv.event_time_us() * 1000;
-            auto& db = dv.bids();
-            auto& da = dv.asks();
-            uint8_t n = 0;
-            for (uint16_t i = 0; i < db.count && n < websocket::msg::MAX_DELTAS; i++, n++) {
-                auto lv = db.level(i);
-                auto& de = e.payload.deltas.entries[n];
-                de.price = lv.price_mantissa();
-                de.qty = lv.qty_mantissa();
-                de.action = (lv.qty_mantissa() == 0)
-                    ? static_cast<uint8_t>(websocket::msg::DeltaAction::DELETE)
-                    : static_cast<uint8_t>(websocket::msg::DeltaAction::UPDATE);
-                de.flags = 0;  // bid
-            }
-            for (uint16_t i = 0; i < da.count && n < websocket::msg::MAX_DELTAS; i++, n++) {
-                auto lv = da.level(i);
-                auto& de = e.payload.deltas.entries[n];
-                de.price = lv.price_mantissa();
-                de.qty = lv.qty_mantissa();
-                de.action = (lv.qty_mantissa() == 0)
-                    ? static_cast<uint8_t>(websocket::msg::DeltaAction::DELETE)
-                    : static_cast<uint8_t>(websocket::msg::DeltaAction::UPDATE);
-                de.flags = websocket::msg::DeltaFlags::SIDE_ASK;
-            }
-            e.count = n;
-        });
-    }
-
-    void publish_trades(uint8_t ci, const sbe::TradesView& tv) {
-        if (tv.count() == 0) return;
-        int64_t max_id = tv.trade(tv.count() - 1).id();
-        if (max_id <= last_trade_id_) return;
-        last_trade_id_ = max_id;
-        record_win(ci);
-        publish_event([&](websocket::msg::MktEvent& e) {
-            e.event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY);
-            e.src_seq = max_id;
-            e.event_ts_ns = tv.event_time_us() * 1000;
-            uint8_t n = static_cast<uint8_t>(std::min<uint32_t>(tv.count(), websocket::msg::MAX_TRADES));
-            e.count = n;
-            for (uint8_t i = 0; i < n; i++) {
-                auto t = tv.trade(i);
-                auto& te = e.payload.trades.entries[i];
-                te.price = t.price_mantissa();
-                te.qty = t.qty_mantissa();
-                te.trade_id = t.id();
-                te.trade_time_ns = tv.event_time_us() * 1000;
-                te.flags = t.is_buyer_maker() ? 0 : websocket::msg::TradeFlags::IS_BUYER;
-            }
-        });
-    }
-
-    template<typename F>
-    void publish_event(F&& build) {
-        if (!mkt_event_prod) return;
-        int64_t slot = mkt_event_prod->try_claim();
-        if (slot < 0) return;
-        auto& e = (*mkt_event_prod)[slot];
-        e.clear();
-        e.venue_id = static_cast<uint8_t>(websocket::msg::VenueId::BINANCE);
-        struct timespec ts_real, ts_mono;
-        clock_gettime(CLOCK_REALTIME, &ts_real);
-        clock_gettime(CLOCK_MONOTONIC, &ts_mono);
-        int64_t real_ns = static_cast<int64_t>(ts_real.tv_sec) * 1000000000LL + ts_real.tv_nsec;
-        int64_t mono_ns = static_cast<int64_t>(ts_mono.tv_sec) * 1000000000LL + ts_mono.tv_nsec;
-        e.recv_ts_ns = real_ns;
-        // Convert CLOCK_MONOTONIC NIC arrival time to CLOCK_REALTIME.
-        // XDP: bpf_entry_ns (bpf_ktime_get_ns) is CLOCK_MONOTONIC.
-        //      first_byte_ts = raw NIC PHC clock (NOT CLOCK_MONOTONIC) — last resort only.
-        // BSD: first_byte_ts (drain_hw_timestamps converts REAL→MONO) is CLOCK_MONOTONIC.
-        if (current_info_) {
-            int64_t mono_arrival = 0;
-            if (current_info_->latest_bpf_entry_ns > 0)
-                mono_arrival = static_cast<int64_t>(current_info_->latest_bpf_entry_ns);
-            else if (current_info_->first_byte_ts > 0)
-                mono_arrival = static_cast<int64_t>(current_info_->first_byte_ts);
-            if (mono_arrival > 0)
-                e.nic_ts_ns = real_ns - (mono_ns - mono_arrival);
-        }
-        build(e);
-        mkt_event_prod->publish(slot);
-    }
-
-    void record_win(uint8_t ci) {
-        if (ci != active_ci_) {
-            active_ci_ = ci;
-            if (conn_state)
-                conn_state->conn_priority.active_connection.store(ci, std::memory_order_release);
-        }
-    }
-};
+using SBEMktEventHandler = websocket::sbe::BinanceSBEHandler;
 
 // ============================================================================
 // PipelineTraits for Binance SBE (InlineWS)
@@ -330,7 +95,7 @@ struct SBEAppHandler {
 
 struct BinanceSBEInlineWSTraits : DefaultPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
-    using AppHandler         = SBEAppHandler;
+    using MktEventHandler         = SBEMktEventHandler;
     using UpgradeCustomizer  = BinanceUpgradeCustomizer;
 
     static constexpr int XDP_POLL_CORE   = 2;
@@ -341,7 +106,7 @@ struct BinanceSBEInlineWSTraits : DefaultPipelineConfig {
     static constexpr bool AUTO_RECONNECT = true;   // required for InlineWS
     static constexpr bool PROFILING      = true;
     static constexpr bool INLINE_WS      = true;   // key toggle
-    static constexpr bool WS_FRAME_INFO_RING = true;  // publish to ring even with AppHandler
+    static constexpr bool WS_FRAME_INFO_RING = true;  // publish to ring even with MktEventHandler
 
     static constexpr const char* WSS_HOST = "stream-sbe.binance.com";
     static constexpr uint16_t WSS_PORT    = 443;
@@ -535,7 +300,7 @@ int main(int argc, char* argv[]) {
         bool end_of_batch;
         while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
             total_frames++;
-            uint8_t ci = frame.connection_id;
+            uint8_t ci = frame.connection_id();
             const uint8_t* payload = pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset);
 
             int64_t event_time_ms = 0;
@@ -545,7 +310,7 @@ int main(int argc, char* argv[]) {
                 if (sbe::decode_header(payload, frame.payload_len, hdr)) {
                     int64_t event_time_us = sbe::read_i64(payload + sbe::HEADER_SIZE);
                     event_time_ms = event_time_us / 1000;
-                    // mkt.on_ws_frame() now runs inline in WSCore via SBEAppHandler
+                    // mkt.on_ws_frame() now runs inline in WSCore via SBEMktEventHandler
                 } else {
                     sbe_decode_errors++;
                 }
@@ -561,7 +326,19 @@ int main(int argc, char* argv[]) {
             if (mkt_event_cons) {
                 websocket::msg::MktEvent mkt;
                 while (mkt_event_cons->try_consume(mkt)) {
-                    mkt.print();
+                    if (mkt.is_system_status()) {
+                        auto& st = mkt.payload.status;
+                        const char* type_str =
+                            st.status_type == 0 ? "HEARTBEAT" :
+                            st.status_type == 1 ? "DISCONNECTED" :
+                            st.status_type == 2 ? "RECONNECTED" : "UNKNOWN";
+                        struct timespec ts;
+                        clock_gettime(CLOCK_REALTIME, &ts);
+                        fprintf(stderr, "[%ld.%06ld] [STATUS] %s conn=%u %s\n",
+                                ts.tv_sec, ts.tv_nsec / 1000, type_str, st.connection_id, st.message);
+                    } else {
+                        mkt.print();
+                    }
                 }
             }
         }
@@ -575,7 +352,7 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            uint8_t ci = frame.connection_id;
+            uint8_t ci = frame.connection_id();
             if (frame.opcode == 0x02) binary_frames++;
             else if (frame.opcode == 0x01) text_frames++;
         }
@@ -607,7 +384,19 @@ int main(int argc, char* argv[]) {
     if (mkt_event_cons) {
         websocket::msg::MktEvent mkt;
         while (mkt_event_cons->try_consume(mkt)) {
-            mkt.print();
+            if (mkt.is_system_status()) {
+                auto& st = mkt.payload.status;
+                const char* type_str =
+                    st.status_type == 0 ? "HEARTBEAT" :
+                    st.status_type == 1 ? "DISCONNECTED" :
+                    st.status_type == 2 ? "RECONNECTED" : "UNKNOWN";
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                fprintf(stderr, "[%ld.%06ld] [STATUS] %s conn=%u %s\n",
+                        ts.tv_sec, ts.tv_nsec / 1000, type_str, st.connection_id, st.message);
+            } else {
+                mkt.print();
+            }
         }
     }
 

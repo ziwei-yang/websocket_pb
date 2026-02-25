@@ -78,7 +78,7 @@ using SSLPolicyType = WolfSSLPolicy;
 
 struct OKXTraits : DefaultPipelineConfig {
     using SSLPolicy  = SSLPolicyType;
-    using AppHandler = NullAppHandler;
+    using MktEventHandler = NullMktEventHandler;
 
     static constexpr int XDP_POLL_CORE   = 2;
     static constexpr int TRANSPORT_CORE  = 4;
@@ -470,7 +470,7 @@ int main(int argc, char* argv[]) {
         bool end_of_batch;
         while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
             total_frames++;
-            uint8_t ci = frame.connection_id;
+            uint8_t ci = frame.connection_id();
             frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci], prev_latest_poll_cycle[ci],
                                  pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset));
             prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);
@@ -540,7 +540,7 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            uint8_t ci = frame.connection_id;
+            uint8_t ci = frame.connection_id();
             frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci], prev_latest_poll_cycle[ci],
                                  pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset));
             prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);

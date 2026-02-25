@@ -104,6 +104,16 @@ int main(int argc, char* argv[]) {
                            t.price, t.qty, t.trade_id);
                 }
                 if (evt.count > 3) printf(" ...");
+            } else if (evt.is_system_status()) {
+                auto& st = evt.payload.status;
+                const char* st_name =
+                    st.status_type == 0 ? "HEARTBEAT" :
+                    st.status_type == 1 ? "DISCONNECTED" :
+                    st.status_type == 2 ? "RECONNECTED" : "UNKNOWN";
+                printf(" status=%s conn=%u detail=%ld",
+                       st_name, st.connection_id, st.detail_code);
+                if (st.message[0] != '\0')
+                    printf(" msg=\"%s\"", st.message);
             }
             printf("\n");
         }

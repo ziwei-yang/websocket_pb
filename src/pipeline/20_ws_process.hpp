@@ -333,15 +333,15 @@ inline void generate_mask_key(uint8_t* mask_key) {
 // ============================================================================
 
 // ============================================================================
-// AppHandler Concept + NullAppHandler
+// MktEventHandler Concept + NullMktEventHandler
 //
-// AppHandler is an inline callback invoked by WebSocketProcess for each
-// complete TEXT/BINARY frame. When AppHandler::enabled is true, the
+// MktEventHandler is an inline callback invoked by WebSocketProcess for each
+// complete TEXT/BINARY frame. When MktEventHandler::enabled is true, the
 // WSFrameInfo ring is skipped entirely — the handler replaces it.
 // ============================================================================
 
 template<typename T>
-concept AppHandlerConcept = requires(T handler,
+concept MktEventHandlerConcept = requires(T handler,
                                      uint8_t connection_id,
                                      uint8_t opcode,
                                      const uint8_t* payload,
@@ -349,15 +349,23 @@ concept AppHandlerConcept = requires(T handler,
                                      WSFrameInfo& info) {
     { T::enabled } -> std::convertible_to<bool>;
     { handler.on_ws_frame(connection_id, opcode, payload, payload_len, info) };
+    { handler.on_heartbeat(connection_id, opcode) };
+    { handler.on_disconnected(connection_id) };
+    { handler.on_reconnected(connection_id) };
+    { handler.on_batch_end(connection_id) };
 };
 
 // Default: no-op handler that compiles away entirely
-struct NullAppHandler {
+struct NullMktEventHandler {
     static constexpr bool enabled = false;
     void on_ws_frame(uint8_t, uint8_t, const uint8_t*, uint32_t, WSFrameInfo&) {}
+    void on_heartbeat(uint8_t, uint8_t) {}
+    void on_disconnected(uint8_t) {}
+    void on_reconnected(uint8_t) {}
+    void on_batch_end(uint8_t) {}
 };
 
-static_assert(AppHandlerConcept<NullAppHandler>);
+static_assert(MktEventHandlerConcept<NullMktEventHandler>);
 
 // ============================================================================
 // UpgradeCustomizer Concept + NullUpgradeCustomizer
@@ -433,12 +441,12 @@ template<typename MsgMetadataCons,     // IPCRingConsumer<MsgMetadata>
          bool EnableAB = false,
          bool AutoReconnect = false,
          bool Profiling = false,
-         AppHandlerConcept AppHandler = NullAppHandler,
+         MktEventHandlerConcept MktEventHandler = NullMktEventHandler,
          UpgradeCustomizerConcept UpgradeCustomizer = NullUpgradeCustomizer>
 struct WebSocketProcess {
 public:
     static constexpr size_t NUM_CONN = EnableAB ? 2 : 1;
-    static constexpr bool HasAppHandler = AppHandler::enabled;
+    static constexpr bool HasMktEventHandler = MktEventHandler::enabled;
 
     // ========================================================================
     // Initialization
@@ -455,7 +463,7 @@ public:
 
         msg_inbox_[0] = msg_inbox;
         msg_metadata_cons_[0] = msg_metadata_cons;
-        if constexpr (!HasAppHandler) {
+        if constexpr (!HasMktEventHandler) {
             ws_frame_info_prod_ = ws_frame_info_prod;
         }
         pongs_prod_ = pongs_prod;
@@ -842,6 +850,7 @@ private:
                 _ts.tv_sec, _ts.tv_nsec / 1000, ci);
 
         ws_phase_[ci] = WsConnPhase::DISCONNECTED;
+        notify_disconnected(ci);
 
         // Reset per-connection parse state
         parse_state_[ci] = PerConnParseState{};
@@ -893,6 +902,7 @@ private:
                     _ts.tv_sec, _ts.tv_nsec / 1000, ci);
             // Request full reconnect cycle
             ws_phase_[ci] = WsConnPhase::DISCONNECTED;
+            notify_disconnected(ci);
             conn_state_->set_reconnect_request(ci);
             return;
         }
@@ -909,6 +919,7 @@ private:
 
         // Transition to ACTIVE
         ws_phase_[ci] = WsConnPhase::ACTIVE;
+        notify_reconnected(ci);
 
         // Reset parse state for clean start
         parse_state_[ci] = PerConnParseState{};
@@ -1024,7 +1035,7 @@ private:
 
                 if (!pending_frame_[ci].header_complete) {
                     ps.parse_offset += consumed;
-                    return;
+                    break;
                 }
 
                 size_t available_for_payload = linear_avail - consumed;
@@ -1039,7 +1050,7 @@ private:
                 if (total_received < total_needed) {
                     publish_partial_frame_info(ci);
                     ps.parse_offset += consumed;
-                    return;
+                    break;
                 }
 
                 frame_complete = true;
@@ -1051,7 +1062,7 @@ private:
 
                 if (!pending_frame_[ci].header_complete) {
                     ps.parse_offset += consumed;
-                    return;
+                    break;
                 }
 
                 uint64_t total_needed = pending_frame_[ci].expected_header_len + pending_frame_[ci].payload_len;
@@ -1063,7 +1074,7 @@ private:
 
                     publish_partial_frame_info(ci);
                     ps.parse_offset += linear_avail;
-                    return;
+                    break;
                 }
 
                 pending_frame_[ci].payload_bytes_received = pending_frame_[ci].payload_len;
@@ -1079,7 +1090,8 @@ private:
                     ps.first_packet_metadata = ps.accumulated_metadata[0];
                 }
 
-                bool is_last_in_data = (ps.parse_offset + consumed >= ps.data_accumulated);
+                ps.is_last_in_batch = (ps.parse_offset + consumed >= ps.data_accumulated);
+                bool is_last_in_data = ps.is_last_in_batch;
                 ps.pending_tls_record_end = is_last_in_data && ps.current_metadata.tls_record_end();
 
                 handle_complete_frame(ci);
@@ -1101,9 +1113,14 @@ private:
             }
         }
 
-        // All data consumed - reset for next batch
-        ps.data_accumulated = 0;
-        ps.parse_offset = 0;
+        // Flush any pending handler state before resetting
+        if constexpr (HasMktEventHandler) mkt_event_handler_.on_batch_end(ci);
+
+        // All data consumed - reset for next batch (preserve partial frame state)
+        if (!has_pending_frame_[ci]) {
+            ps.data_accumulated = 0;
+            ps.parse_offset = 0;
+        }
     }
 
     // ========================================================================
@@ -1111,8 +1128,8 @@ private:
     // ========================================================================
 
     void publish_partial_frame_info(uint8_t ci) {
-        // Partial frames are never delivered to AppHandler — skip entirely
-        if constexpr (HasAppHandler) return;
+        // Partial frames are never delivered to MktEventHandler — skip entirely
+        if constexpr (HasMktEventHandler) return;
 
         auto& ps = parse_state_[ci];
 
@@ -1132,7 +1149,7 @@ private:
         info.set_fin(pending_frame_[ci].fin);
         info.set_fragmented(true);
         info.set_last_fragment(false);
-        info.connection_id = ci;
+        info.set_connection_id(ci);
         if constexpr (EnableAB) {
             if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
                 info.set_active_conn(true);
@@ -1325,8 +1342,8 @@ private:
             }
         }
 
-        // Publish WSFrameInfo for PING (skip when AppHandler is active)
-        if constexpr (!HasAppHandler) {
+        // Publish WSFrameInfo for PING (skip when MktEventHandler is active)
+        if constexpr (!HasMktEventHandler) {
             int64_t ws_seq = ws_frame_info_prod_->try_claim();
             if (ws_seq < 0) {
                 fprintf(stderr, "[WS-PROCESS] FATAL: WS_FRAME_INFO full\n");
@@ -1342,7 +1359,7 @@ private:
             info.set_fin(true);
             info.set_fragmented(false);
             info.set_last_fragment(false);
-            info.connection_id = ci;
+            info.set_connection_id(ci);
 
             populate_timestamps(info, ps);
             info.ws_parse_cycle = parse_cycle;
@@ -1365,6 +1382,7 @@ private:
         pending_ping_[ci].payload_offset = ps.current_payload_offset;
         pending_ping_[ci].payload_len = static_cast<uint16_t>(payload_len);
         has_pending_ping_[ci] = true;
+        if constexpr (HasMktEventHandler) mkt_event_handler_.on_heartbeat(ci, 0);
     }
 
     void handle_close(uint8_t ci, uint64_t payload_len) {
@@ -1441,6 +1459,7 @@ private:
             fprintf(stderr, "[%ld.%06ld] [WS-PONG] Received PONG (conn %u) len=%lu payload=\"%s\"\n",
                     _ts.tv_sec, _ts.tv_nsec / 1000, ci, (unsigned long)payload_len, payload_str);
         }
+        if constexpr (HasMktEventHandler) mkt_event_handler_.on_heartbeat(ci, 1);
     }
 
     void maybe_send_client_ping(uint8_t ci) {
@@ -1484,6 +1503,7 @@ private:
         if (should_reconnect) {
             trigger_watchdog_reconnect(ci, now_cycle, tsc_freq);
             ws_phase_[ci] = WsConnPhase::DISCONNECTED;
+            notify_disconnected(ci);
             return;
         }
 
@@ -1518,8 +1538,8 @@ private:
                            uint64_t parse_cycle, bool is_fragmented, bool is_last_fragment) {
         auto& ps = parse_state_[ci];
 
-        if constexpr (HasAppHandler) {
-            // AppHandler replaces WSFrameInfo ring — build info on stack, call handler
+        if constexpr (HasMktEventHandler) {
+            // MktEventHandler replaces WSFrameInfo ring — build info on stack, call handler
             WSFrameInfo info{};
             info.clear();
             info.msg_inbox_offset = ps.current_payload_offset;
@@ -1528,13 +1548,14 @@ private:
             info.set_fin(!is_fragmented || is_last_fragment);
             info.set_fragmented(is_fragmented);
             info.set_last_fragment(is_last_fragment);
-            info.connection_id = ci;
+            info.set_connection_id(ci);
             if constexpr (EnableAB) {
                 if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
                     info.set_active_conn(true);
             }
             populate_timestamps(info, ps);
             info.set_tls_record_end(ps.pending_tls_record_end);
+            info.set_last_in_batch(ps.is_last_in_batch);
             info.ws_parse_cycle = parse_cycle;
             info.ws_frame_publish_cycle = rdtscp();
             {
@@ -1547,7 +1568,7 @@ private:
             if (opcode == 0x01 || opcode == 0x02) {
                 if (!is_fragmented || is_last_fragment) {
                     const uint8_t* payload = msg_inbox_[ci]->data_at(info.msg_inbox_offset);
-                    app_handler_.on_ws_frame(ci, opcode, payload,
+                    mkt_event_handler_.on_ws_frame(ci, opcode, payload,
                                              static_cast<uint32_t>(payload_len), info);
                 }
             }
@@ -1568,7 +1589,7 @@ private:
             info.set_fin(!is_fragmented || is_last_fragment);
             info.set_fragmented(is_fragmented);
             info.set_last_fragment(is_last_fragment);
-            info.connection_id = ci;
+            info.set_connection_id(ci);
             if constexpr (EnableAB) {
                 if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
                     info.set_active_conn(true);
@@ -1684,6 +1705,7 @@ private:
             // Stale data will be correctly drained by on_event().
             ws_phase_[0] = WsConnPhase::DISCONNECTED;
             ws_phase_[1] = WsConnPhase::DISCONNECTED;
+            notify_disconnected(0);
         }
     }
 
@@ -1708,11 +1730,42 @@ private:
                         _ts.tv_sec, _ts.tv_nsec / 1000, ci, (unsigned long)elapsed_ms);
 
                 ws_phase_[ci] = WsConnPhase::DISCONNECTED;
+                notify_disconnected(ci);
                 upgrade_sent_cycle_[ci] = 0;
                 conn_state_->set_reconnect_request(ci);
             }
         }
     }
+    // ========================================================================
+    // Connection Status Notification Helpers
+    // ========================================================================
+
+    void notify_disconnected(uint8_t ci) {
+        if constexpr (!HasMktEventHandler) return;
+        if constexpr (EnableAB) {
+            bool all_down = true;
+            for (size_t i = 0; i < NUM_CONN; i++)
+                if (ws_phase_[i] != WsConnPhase::DISCONNECTED) { all_down = false; break; }
+            if (all_down && !all_disconnected_) {
+                all_disconnected_ = true;
+                mkt_event_handler_.on_disconnected(0xFF);
+            }
+        } else {
+            if (!all_disconnected_) {
+                all_disconnected_ = true;
+                mkt_event_handler_.on_disconnected(ci);
+            }
+        }
+    }
+
+    void notify_reconnected(uint8_t ci) {
+        if constexpr (!HasMktEventHandler) return;
+        if (all_disconnected_) {
+            all_disconnected_ = false;
+            mkt_event_handler_.on_reconnected(ci);
+        }
+    }
+
 
     // ========================================================================
     // Timestamp Helpers
@@ -1824,6 +1877,7 @@ private:
         uint32_t current_payload_offset = 0;
         uint32_t frame_start_parse_offset = 0;  // parse_offset when frame header started
         bool pending_tls_record_end = false;
+        bool is_last_in_batch = false;
 
         // Wrap-around buffer for WS headers spanning MSG_INBOX wrap point
         uint8_t ws_header_wrap_buffer[64];
@@ -1857,17 +1911,18 @@ private:
     WsConnPhase ws_phase_[NUM_CONN]{};
     PartialHttpResponse http_response_[NUM_CONN]{};
 
-    // Shared ring buffer interfaces (ws_frame_info_prod_ unused when HasAppHandler)
+    // Shared ring buffer interfaces (ws_frame_info_prod_ unused when HasMktEventHandler)
     WSFrameInfoProd* ws_frame_info_prod_ = nullptr;
     PongsProd* pongs_prod_ = nullptr;
     MsgOutboxProd* msg_outbox_prod_ = nullptr;
     ConnStateShm* conn_state_ = nullptr;
 
-    // AppHandler (inline callback, replaces WSFrameInfo ring when enabled)
-    [[no_unique_address]] AppHandler app_handler_{};
+    // MktEventHandler (inline callback, replaces WSFrameInfo ring when enabled)
+    [[no_unique_address]] MktEventHandler mkt_event_handler_{};
 
     // AutoReconnect startup signal
     bool ws_ready_signaled_ = false;
+    bool all_disconnected_ = false;
 
     // Profiling (compile-time gated via Profiling template param)
     CycleSampleBuffer* profiling_data_ = nullptr;
@@ -1875,7 +1930,7 @@ private:
     uint64_t last_op_cycle_ = 0;
 public:
     void set_profiling_data(CycleSampleBuffer* data) { profiling_data_ = data; }
-    AppHandler& app_handler() { return app_handler_; }
+    MktEventHandler& mkt_event_handler() { return mkt_event_handler_; }
 private:
 
     // Per-connection watchdog state

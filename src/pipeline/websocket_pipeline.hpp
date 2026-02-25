@@ -7,7 +7,7 @@
 // Usage:
 //   struct MyTraits : DefaultPipelineConfig {
 //       using SSLPolicy  = WolfSSLPolicy;
-//       using AppHandler = NullAppHandler;
+//       using MktEventHandler = NullMktEventHandler;
 //       static constexpr int XDP_POLL_CORE = 2;
 //       static constexpr int TRANSPORT_CORE = 4;
 //       static constexpr int WEBSOCKET_CORE = 6;
@@ -18,7 +18,7 @@
 //   WebSocketPipeline<MyTraits> pipeline;
 //   pipeline.setup(interface, bpf_path);
 //   pipeline.start();
-//   // ... consume ws_frame_info or AppHandler handles inline ...
+//   // ... consume ws_frame_info or MktEventHandler handles inline ...
 //   pipeline.shutdown();
 //
 // C++20, policy-based design, single-thread HFT focus
@@ -67,8 +67,8 @@ template<typename T>
 concept PipelineTraitsConcept = requires {
     // ── Type policies (required, no default) ──
     typename T::SSLPolicy;
-    typename T::AppHandler;
-    requires AppHandlerConcept<typename T::AppHandler>;
+    typename T::MktEventHandler;
+    requires MktEventHandlerConcept<typename T::MktEventHandler>;
     typename T::UpgradeCustomizer;
     requires UpgradeCustomizerConcept<typename T::UpgradeCustomizer>;
 
@@ -519,9 +519,9 @@ public:
     static constexpr bool Prof           = Traits::PROFILING;
     static constexpr bool InlineWS       = Traits::INLINE_WS;
     static constexpr size_t NUM_CONN     = EnableAB ? 2 : 1;
-    static constexpr bool HasAppHandler  = Traits::AppHandler::enabled;
+    static constexpr bool HasMktEventHandler  = Traits::MktEventHandler::enabled;
     static constexpr bool WSFrameInfoRing = Traits::WS_FRAME_INFO_RING;
-    static constexpr bool NeedWSFrameInfoRing = !HasAppHandler || WSFrameInfoRing;
+    static constexpr bool NeedWSFrameInfoRing = !HasMktEventHandler || WSFrameInfoRing;
 
     // InlineWS requires AutoReconnect
     static_assert(!InlineWS || AutoReconnect,
@@ -529,7 +529,7 @@ public:
 
     // ── Process type aliases ──
     using SSLPolicyType = typename Traits::SSLPolicy;
-    using AppHandlerType = typename Traits::AppHandler;
+    using MktEventHandlerType = typename Traits::MktEventHandler;
     using UpgradeCustomizerType = typename Traits::UpgradeCustomizer;
 
     using XDPPollType = XDPPollProcess<
@@ -551,7 +551,7 @@ public:
         IPCRingProducer<PongFrameAligned>,
         IPCRingProducer<MsgOutboxEvent>,
         EnableAB, AutoReconnect, Prof,
-        AppHandlerType,
+        MktEventHandlerType,
         UpgradeCustomizerType>;
 
     // --- Inline mode types (InlineWS) ---
@@ -559,7 +559,7 @@ public:
         DirectTXSink<SSLPolicyType, EnableAB>,
         IPCRingProducer<WSFrameInfo>,
         EnableAB, AutoReconnect, Prof,
-        AppHandlerType,
+        MktEventHandlerType,
         UpgradeCustomizerType,
         WSFrameInfoRing>;
 
@@ -953,9 +953,9 @@ public:
     const std::string& local_ip() const { return local_ip_; }
     const std::string& wss_target_ip() const { return wss_target_ip_; }
 
-    // WSFrameInfo region — available when !HasAppHandler or WS_FRAME_INFO_RING=true
+    // WSFrameInfo region — available when !HasMktEventHandler or WS_FRAME_INFO_RING=true
     disruptor::ipc::shared_region* ws_frame_info_region() {
-        static_assert(NeedWSFrameInfoRing, "No WSFrameInfo ring (AppHandler active, WS_FRAME_INFO_RING=false)");
+        static_assert(NeedWSFrameInfoRing, "No WSFrameInfo ring (MktEventHandler active, WS_FRAME_INFO_RING=false)");
         return ws_frame_info_region_;
     }
 
@@ -965,7 +965,7 @@ public:
     disruptor::ipc::shared_region* pongs_region() { return pongs_region_; }
 
     // Pre-fork handler config
-    AppHandlerType& app_handler() { return app_handler_; }
+    MktEventHandlerType& mkt_event_handler() { return mkt_event_handler_; }
 
     disruptor::ipc::shared_region* mkt_event_region() { return mkt_event_region_; }
 
@@ -1115,7 +1115,7 @@ private:
         WSFrameInfoProdHelper ws_frame_info_prod_holder(ws_frame_info_region_);
 
         WebSocketType ws_process;
-        ws_process.app_handler() = app_handler_;
+        ws_process.mkt_event_handler() = mkt_event_handler_;
 
         if constexpr (Prof) ws_process.set_profiling_data(&profiling_->ws_process);
 
@@ -1169,12 +1169,12 @@ private:
             msg_inbox_[0], nullptr, nullptr,
             conn_state_, &msg_outbox_cons,
             EnableAB ? msg_inbox_[1] : nullptr, nullptr);
-        transport.inline_app_handler() = app_handler_;
+        transport.inline_mkt_event_handler() = mkt_event_handler_;
 
-        // Wire MktEvent producer and ConnStateShm to app_handler
+        // Wire MktEvent producer and ConnStateShm to mkt_event_handler
         if constexpr (EnableAB) {
-            transport.inline_app_handler().mkt_event_prod = mkt_event_prod_holder.get();
-            transport.inline_app_handler().conn_state = conn_state_;
+            transport.inline_mkt_event_handler().mkt_event_prod = mkt_event_prod_holder.get();
+            transport.inline_mkt_event_handler().conn_state = conn_state_;
         }
 
         if constexpr (Prof) transport.set_profiling_data(&profiling_->transport);
@@ -1191,7 +1191,7 @@ private:
 
         // Wire active connection pointer for priority ordering
         if constexpr (EnableAB) {
-            transport.set_active_conn_ptr(&transport.inline_app_handler().active_ci_);
+            transport.set_active_conn_ptr(&transport.inline_mkt_event_handler().active_ci_);
         }
 
         transport.run();
@@ -1252,7 +1252,7 @@ private:
     pid_t transport_pid_ = 0;
     pid_t websocket_pid_ = 0;
 
-    [[no_unique_address]] AppHandlerType app_handler_{};
+    [[no_unique_address]] MktEventHandlerType mkt_event_handler_{};
 };
 
 }  // namespace websocket::pipeline

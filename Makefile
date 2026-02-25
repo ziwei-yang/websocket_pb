@@ -252,6 +252,8 @@ TEST_TCP_STATE_SRC := $(TEST_DIR)/test_tcp_state.cpp
 TEST_RETRANSMIT_QUEUE_SRC := $(TEST_DIR)/test_retransmit_queue.cpp
 TEST_SSL_POLICY_SRC := $(TEST_DIR)/test_ssl_policy.cpp
 TEST_WS_PARSER_SRC := $(TEST_DIR)/test_ws_parser.cpp
+TEST_SBE_DECODER_SRC := $(TEST_DIR)/test_sbe_decoder.cpp
+TEST_SBE_HANDLER_SRC := $(TEST_DIR)/test_sbe_handler.cpp
 
 # Integration test source files
 TEST_BINANCE_SRC := $(INTEGRATION_DIR)/binance.cpp
@@ -287,8 +289,10 @@ TEST_TCP_STATE_BIN := $(BUILD_DIR)/test_tcp_state
 TEST_RETRANSMIT_QUEUE_BIN := $(BUILD_DIR)/test_retransmit_queue
 TEST_SSL_POLICY_BIN := $(BUILD_DIR)/test_ssl_policy
 TEST_WS_PARSER_BIN := $(BUILD_DIR)/test_ws_parser
+TEST_SBE_DECODER_BIN := $(BUILD_DIR)/test_sbe_decoder
+TEST_SBE_HANDLER_BIN := $(BUILD_DIR)/test_sbe_handler
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread build-test-pipeline-binance_sbe_bsdsocket_1thread test-pipeline-binance-sbe-bsdsocket-1thread
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread build-test-pipeline-binance_sbe_bsdsocket_1thread test-pipeline-binance-sbe-bsdsocket-1thread
 
 all: $(EXAMPLE_BIN)
 
@@ -560,6 +564,28 @@ $(TEST_WS_PARSER_BIN): $(TEST_WS_PARSER_SRC) | $(BUILD_DIR)
 test-ws-parser: $(TEST_WS_PARSER_BIN)
 	@echo "🧪 Running WS parser unit tests..."
 	./$(TEST_WS_PARSER_BIN)
+
+# Build SBE decoder tests
+$(TEST_SBE_DECODER_BIN): $(TEST_SBE_DECODER_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling SBE decoder unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run SBE decoder tests
+test-sbe-decoder: $(TEST_SBE_DECODER_BIN)
+	@echo "🧪 Running SBE decoder unit tests..."
+	./$(TEST_SBE_DECODER_BIN)
+
+# Build SBE handler tests
+$(TEST_SBE_HANDLER_BIN): $(TEST_SBE_HANDLER_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling SBE handler unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run SBE handler tests
+test-sbe-handler: $(TEST_SBE_HANDLER_BIN)
+	@echo "🧪 Running SBE handler unit tests..."
+	./$(TEST_SBE_HANDLER_BIN)
 
 # ============================================================================
 # Pipeline Integration Tests (Multi-Process AF_XDP WebSocket)
@@ -1533,7 +1559,7 @@ test-simulator: $(SIMULATOR_BIN)
 # Unified Test Target - Run All Unit Tests
 # ============================================================================
 
-test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser
+test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler
 	@echo ""
 	@echo "╔════════════════════════════════════════════════════════════════════╗"
 	@echo "║                    ALL UNIT TESTS COMPLETED                        ║"

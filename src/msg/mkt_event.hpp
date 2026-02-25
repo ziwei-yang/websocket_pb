@@ -50,6 +50,7 @@ namespace EventFlags {
     inline constexpr uint16_t SNAPSHOT      = 1 << 0;
     inline constexpr uint16_t CONTINUATION  = 1 << 1;  // not first in multi-event batch
     inline constexpr uint16_t LAST_IN_BATCH = 1 << 2;  // last in multi-event batch
+    inline constexpr uint16_t BBO           = 1 << 3;  // bestBidAsk (vs depth snapshot)
 }
 
 namespace DeltaFlags {
@@ -210,13 +211,24 @@ struct alignas(512) MktEvent {
     // ========================================================================
 
     void print(int padding = 93) const {
+        if (is_system_status()) {
+            const char* st_name =
+                payload.status.status_type == 0 ? "HEARTBEAT" :
+                payload.status.status_type == 1 ? "DISCONNECTED" :
+                payload.status.status_type == 2 ? "RECONNECTED" : "UNKNOWN";
+            std::fprintf(stderr,
+                "\033[2m%*s| STATUS %s conn=%u %s\033[0m\n",
+                padding, "", st_name, payload.status.connection_id,
+                payload.status.message);
+            return;
+        }
+
         char mkt_cnt[4] = "";
         char mkt_typ[4] = "";
         switch (event_type) {
         case 0: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", count); std::snprintf(mkt_typ, sizeof(mkt_typ), "Dp"); break;
-        case 1: std::snprintf(mkt_typ, sizeof(mkt_typ), "OB"); break;
+        case 1: std::snprintf(mkt_typ, sizeof(mkt_typ), (flags & EventFlags::BBO) ? "Bo" : "OB"); break;
         case 2: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", count); std::snprintf(mkt_typ, sizeof(mkt_typ), "Td"); break;
-        case 3: std::snprintf(mkt_typ, sizeof(mkt_typ), "Sy"); break;
         }
 
         char lat[16] = "     -";

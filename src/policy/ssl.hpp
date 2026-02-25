@@ -504,13 +504,130 @@ struct OpenSSLPolicy {
         return -1;
     }
 
-    // Non-blocking handshake stubs (OpenSSL: delegate to blocking for now)
+    // Non-blocking TLS handshake for XDP userspace transport reconnect
     enum class HandshakeResult : uint8_t { IN_PROGRESS = 0, SUCCESS = 1, ERROR = 2 };
+
+    /**
+     * One-time setup: create SSL object, set SNI, create BIO, set connect state.
+     * Call once before calling step_handshake_non_block() in a loop.
+     * Does NOT block — extracts setup portion of handshake_userspace_transport().
+     *
+     * @return 0 on success, -1 on failure
+     */
     template<typename TransportPolicy>
-    int prepare_handshake(TransportPolicy* transport, const char* hostname) {
-        return handshake_userspace_transport(transport, hostname);
+    int prepare_handshake_non_block(TransportPolicy* transport, const char* hostname) {
+        if (!transport) {
+            fprintf(stderr, "[TLS] Transport is null in prepare_handshake_non_block\n");
+            return -1;
+        }
+
+        // If ctx_ is null, initialize (first connection or after full cleanup)
+        if (!ctx_) {
+            if (init() != 0) return -1;
+        }
+
+        keylog_lines_.clear();
+
+        ssl_ = SSL_new(ctx_);
+        if (!ssl_) {
+            // ctx_ might be stale after reconnect, try reinitializing
+            if (ctx_) {
+                SSL_CTX_free(ctx_);
+                ctx_ = nullptr;
+            }
+            if (init() != 0) return -1;
+            ssl_ = SSL_new(ctx_);
+        }
+
+        if (!ssl_) {
+            unsigned long err = ERR_get_error();
+            char err_buf[256];
+            ERR_error_string_n(err, err_buf, sizeof(err_buf));
+            fprintf(stderr, "[TLS] SSL_new() failed: %s\n", err_buf);
+            return -1;
+        }
+
+        // Store policy pointer in SSL ex_data for keylog callback
+        SSL_set_ex_data(ssl_, get_ex_data_index(), this);
+
+        // Set SNI hostname for virtual hosting
+        if (hostname) {
+            SSL_set_tlsext_host_name(ssl_, hostname);
+        }
+
+        // Create custom BIO for userspace transport (reuse across reconnects)
+        if (!bio_method_) {
+            bio_method_ = websocket::policy::UserspaceTransportBIO<TransportPolicy>::create_bio_method();
+            if (!bio_method_) {
+                SSL_free(ssl_);
+                ssl_ = nullptr;
+                fprintf(stderr, "[TLS] Failed to create userspace transport BIO method\n");
+                return -1;
+            }
+        }
+
+        BIO* bio = websocket::policy::UserspaceTransportBIO<TransportPolicy>::create_bio(bio_method_, transport);
+        if (!bio) {
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+            fprintf(stderr, "[TLS] Failed to create userspace transport BIO\n");
+            return -1;
+        }
+
+        // Associate BIO with SSL object
+        SSL_set_bio(ssl_, bio, bio);
+
+        // Set client mode for handshake
+        SSL_set_connect_state(ssl_);
+
+        return 0;
     }
-    HandshakeResult step_handshake() { return HandshakeResult::SUCCESS; }
+
+    /**
+     * Perform one step of the TLS handshake (single SSL_do_handshake() call).
+     * Returns IN_PROGRESS if not done, SUCCESS when handshake complete,
+     * ERROR on fatal failure.
+     *
+     * Caller must call transport->poll() before each call.
+     */
+    HandshakeResult step_handshake_non_block() {
+        if (!ssl_) return HandshakeResult::ERROR;
+
+        int ret = SSL_do_handshake(ssl_);
+
+        if (ret == 1) {
+            ktls_enabled_ = false;
+
+            const char* version = SSL_get_version(ssl_);
+            const char* cipher = SSL_CIPHER_get_name(SSL_get_current_cipher(ssl_));
+            fprintf(stderr, "[TLS] Handshake SUCCESS (non-blocking)\n");
+            fprintf(stderr, "[TLS]   Version: %s\n", version ? version : "unknown");
+            fprintf(stderr, "[TLS]   Cipher:  %s\n", cipher ? cipher : "unknown");
+
+            server_record_count_ = 0;
+            return HandshakeResult::SUCCESS;
+        }
+
+        int err = SSL_get_error(ssl_, ret);
+
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            return HandshakeResult::IN_PROGRESS;
+        }
+
+        if (err == SSL_ERROR_SYSCALL) {
+            if (errno == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+                return HandshakeResult::IN_PROGRESS;
+            }
+        }
+
+        // Fatal error
+        char err_buf[256];
+        ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
+        fprintf(stderr, "[TLS] step_handshake_non_block() fatal error: %s\n", err_buf);
+        SSL_free(ssl_);
+        ssl_ = nullptr;
+        return HandshakeResult::ERROR;
+    }
 
     /**
      * Prepare a fresh SSL session on an existing socket for BSD reconnection.
@@ -537,7 +654,7 @@ struct OpenSSLPolicy {
      * One non-blocking SSL_connect() attempt for BSD socket reconnection.
      * @return HandshakeResult::SUCCESS, IN_PROGRESS, or ERROR
      */
-    HandshakeResult step_bsd_handshake() {
+    HandshakeResult step_bsd_handshake_non_block() {
         if (!ssl_) return HandshakeResult::ERROR;
         int ret = SSL_connect(ssl_);
         if (ret == 1) { server_record_count_ = 0; return HandshakeResult::SUCCESS; }
@@ -1675,13 +1792,128 @@ struct LibreSSLPolicy {
         return -1;
     }
 
-    // Non-blocking handshake stubs (LibreSSL: delegate to blocking for now)
+    // Non-blocking TLS handshake for XDP userspace transport reconnect
     enum class HandshakeResult : uint8_t { IN_PROGRESS = 0, SUCCESS = 1, ERROR = 2 };
+
+    /**
+     * One-time setup: create SSL object, set SNI, create BIO, set connect state.
+     * Call once before calling step_handshake_non_block() in a loop.
+     * Does NOT block — extracts setup portion of handshake_userspace_transport().
+     *
+     * @return 0 on success, -1 on failure
+     */
     template<typename TransportPolicy>
-    int prepare_handshake(TransportPolicy* transport, const char* hostname) {
-        return handshake_userspace_transport(transport, hostname);
+    int prepare_handshake_non_block(TransportPolicy* transport, const char* hostname) {
+        if (!transport) {
+            fprintf(stderr, "[TLS] Transport is null in prepare_handshake_non_block\n");
+            return -1;
+        }
+
+        // If ctx_ is null, initialize (first connection or after full cleanup)
+        if (!ctx_) {
+            if (init() != 0) return -1;
+        }
+
+        keylog_lines_.clear();
+
+        ssl_ = SSL_new(ctx_);
+        if (!ssl_) {
+            // ctx_ might be stale after reconnect, try reinitializing
+            if (ctx_) {
+                SSL_CTX_free(ctx_);
+                ctx_ = nullptr;
+            }
+            if (init() != 0) return -1;
+            ssl_ = SSL_new(ctx_);
+        }
+
+        if (!ssl_) {
+            unsigned long err = ERR_get_error();
+            char err_buf[256];
+            ERR_error_string_n(err, err_buf, sizeof(err_buf));
+            fprintf(stderr, "[TLS] SSL_new() failed: %s\n", err_buf);
+            return -1;
+        }
+
+        // Store policy pointer in SSL ex_data for keylog callback
+        SSL_set_ex_data(ssl_, libressl_get_ex_data_index(), this);
+
+        // Set SNI hostname for virtual hosting
+        if (hostname) {
+            SSL_set_tlsext_host_name(ssl_, hostname);
+        }
+
+        // Create custom BIO for userspace transport (reuse across reconnects)
+        if (!bio_method_) {
+            bio_method_ = websocket::policy::UserspaceTransportBIO<TransportPolicy>::create_bio_method();
+            if (!bio_method_) {
+                SSL_free(ssl_);
+                ssl_ = nullptr;
+                fprintf(stderr, "[TLS] Failed to create userspace transport BIO method\n");
+                return -1;
+            }
+        }
+
+        BIO* bio = websocket::policy::UserspaceTransportBIO<TransportPolicy>::create_bio(bio_method_, transport);
+        if (!bio) {
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+            fprintf(stderr, "[TLS] Failed to create userspace transport BIO\n");
+            return -1;
+        }
+
+        // Associate BIO with SSL object
+        SSL_set_bio(ssl_, bio, bio);
+
+        // Set client mode for handshake
+        SSL_set_connect_state(ssl_);
+
+        return 0;
     }
-    HandshakeResult step_handshake() { return HandshakeResult::SUCCESS; }
+
+    /**
+     * Perform one step of the TLS handshake (single SSL_do_handshake() call).
+     * Returns IN_PROGRESS if not done, SUCCESS when handshake complete,
+     * ERROR on fatal failure.
+     *
+     * Caller must call transport->poll() before each call.
+     */
+    HandshakeResult step_handshake_non_block() {
+        if (!ssl_) return HandshakeResult::ERROR;
+
+        int ret = SSL_do_handshake(ssl_);
+
+        if (ret == 1) {
+            const char* version = SSL_get_version(ssl_);
+            const char* cipher = SSL_CIPHER_get_name(SSL_get_current_cipher(ssl_));
+            fprintf(stderr, "[TLS] Handshake SUCCESS (non-blocking)\n");
+            fprintf(stderr, "[TLS]   Version: %s\n", version ? version : "unknown");
+            fprintf(stderr, "[TLS]   Cipher:  %s\n", cipher ? cipher : "unknown");
+
+            server_record_count_ = 0;
+            return HandshakeResult::SUCCESS;
+        }
+
+        int err = SSL_get_error(ssl_, ret);
+
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            return HandshakeResult::IN_PROGRESS;
+        }
+
+        if (err == SSL_ERROR_SYSCALL) {
+            if (errno == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+                return HandshakeResult::IN_PROGRESS;
+            }
+        }
+
+        // Fatal error
+        char err_buf[256];
+        ERR_error_string_n(ERR_get_error(), err_buf, sizeof(err_buf));
+        fprintf(stderr, "[TLS] step_handshake_non_block() fatal error: %s\n", err_buf);
+        SSL_free(ssl_);
+        ssl_ = nullptr;
+        return HandshakeResult::ERROR;
+    }
 
     /**
      * Prepare a fresh SSL session on an existing socket for BSD reconnection.
@@ -1708,7 +1940,7 @@ struct LibreSSLPolicy {
      * One non-blocking SSL_connect() attempt for BSD socket reconnection.
      * @return HandshakeResult::SUCCESS, IN_PROGRESS, or ERROR
      */
-    HandshakeResult step_bsd_handshake() {
+    HandshakeResult step_bsd_handshake_non_block() {
         if (!ssl_) return HandshakeResult::ERROR;
         int ret = SSL_connect(ssl_);
         if (ret == 1) { server_record_count_ = 0; return HandshakeResult::SUCCESS; }
@@ -2704,14 +2936,14 @@ struct WolfSSLPolicy {
 
     /**
      * One-time setup: create SSL object, set SNI, set I/O context.
-     * Call once before calling step_handshake() in a loop.
+     * Call once before calling step_handshake_non_block() in a loop.
      *
      * @return 0 on success, -1 on failure
      */
     template<typename TransportPolicy>
-    int prepare_handshake(TransportPolicy* transport, const char* hostname) {
+    int prepare_handshake_non_block(TransportPolicy* transport, const char* hostname) {
         if (!transport) {
-            fprintf(stderr, "[TLS] Transport is null in prepare_handshake\n");
+            fprintf(stderr, "[TLS] Transport is null in prepare_handshake_non_block\n");
             return -1;
         }
 
@@ -2733,7 +2965,7 @@ struct WolfSSLPolicy {
             ssl_ = wolfSSL_new(ctx_);
         }
         if (!ssl_) {
-            fprintf(stderr, "[TLS] wolfSSL_new() failed in prepare_handshake\n");
+            fprintf(stderr, "[TLS] wolfSSL_new() failed in prepare_handshake_non_block\n");
             return -1;
         }
 
@@ -2753,7 +2985,7 @@ struct WolfSSLPolicy {
      *
      * Caller must call transport->poll() before each call.
      */
-    HandshakeResult step_handshake() {
+    HandshakeResult step_handshake_non_block() {
         if (!ssl_) return HandshakeResult::ERROR;
 
         int ret = wolfSSL_connect(ssl_);
@@ -2783,7 +3015,7 @@ struct WolfSSLPolicy {
         // Fatal error
         char err_buf[256];
         wolfSSL_ERR_error_string(err, err_buf);
-        fprintf(stderr, "[TLS] step_handshake() fatal error: %s\n", err_buf);
+        fprintf(stderr, "[TLS] step_handshake_non_block() fatal error: %s\n", err_buf);
         wolfSSL_free(ssl_);
         ssl_ = nullptr;
         return HandshakeResult::ERROR;
@@ -2818,7 +3050,7 @@ struct WolfSSLPolicy {
      * One non-blocking wolfSSL_connect() attempt for BSD socket reconnection.
      * @return HandshakeResult::SUCCESS, IN_PROGRESS, or ERROR
      */
-    HandshakeResult step_bsd_handshake() {
+    HandshakeResult step_bsd_handshake_non_block() {
         if (!ssl_) return HandshakeResult::ERROR;
         int ret = wolfSSL_connect(ssl_);
         if (ret == SSL_SUCCESS) {
@@ -3418,16 +3650,16 @@ struct NoSSLPolicy {
     // Non-blocking handshake stubs (NoSSL: immediate success)
     enum class HandshakeResult : uint8_t { IN_PROGRESS = 0, SUCCESS = 1, ERROR = 2 };
     template<typename TransportPolicy>
-    int prepare_handshake(TransportPolicy* transport, const char* hostname) {
+    int prepare_handshake_non_block(TransportPolicy* transport, const char* hostname) {
         handshake_userspace_transport(transport, hostname);
         return 0;
     }
-    HandshakeResult step_handshake() { return HandshakeResult::SUCCESS; }
+    HandshakeResult step_handshake_non_block() { return HandshakeResult::SUCCESS; }
 
     // BSD reconnect: no-op for NoSSL.
     int reconnect_bsd(int /*fd*/) { return 0; }
     // BSD handshake step: no-op for NoSSL, always succeeds immediately.
-    HandshakeResult step_bsd_handshake() { return HandshakeResult::SUCCESS; }
+    HandshakeResult step_bsd_handshake_non_block() { return HandshakeResult::SUCCESS; }
 
     // No-op: no encryption to bypass
     void switch_to_viewring_read_bio_for_bsdsocket(int /*sockfd*/) {}
