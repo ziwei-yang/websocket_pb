@@ -483,9 +483,11 @@ private:
 } // namespace websocket
 
 // Include XDP headers outside namespace to avoid conflicts
+#if defined(USE_XDP) || defined(USE_DPDK)
 #ifdef USE_XDP
 #include "../xdp/xdp_packet_io.hpp"
 #include "../xdp/xdp_frame.hpp"
+#endif
 #include "../stack/userspace_stack.hpp"
 #include "../pipeline/pipeline_data.hpp"
 #include <net/if.h>
@@ -495,7 +497,7 @@ private:
 namespace websocket {
 namespace transport {
 
-#ifdef USE_XDP
+#if defined(USE_XDP) || defined(USE_DPDK)
 
 // NOTE: Legacy XDPUserspaceTransport has been removed.
 // Use PacketTransport<XDPPacketIO> instead (see below).
@@ -669,7 +671,22 @@ struct PacketTransport {
         uint32_t local_ip, gateway_ip, netmask;
 
         if (!get_interface_config(interface, local_mac, &local_ip, &gateway_ip, &netmask)) {
-            throw std::runtime_error("Failed to get interface configuration");
+            // Fallback: DPDK-bound NIC has no kernel interface — read from ConnStateShm
+            bool fallback_ok = false;
+            if constexpr (requires { config.conn_state; }) {
+                auto* cs = config.conn_state;
+                if (cs && cs->local_ip != 0) {
+                    local_ip = ntohl(cs->local_ip);
+                    memcpy(local_mac, cs->local_mac, 6);
+                    netmask = 0xFFFFFF00;  // /24 default
+                    gateway_ip = (local_ip & netmask) | 1;
+                    fallback_ok = true;
+                    fprintf(stderr, "[PacketTransport] Using ConnStateShm config (NIC bound to DPDK)\n");
+                }
+            }
+            if (!fallback_ok) {
+                throw std::runtime_error("Failed to get interface configuration");
+            }
         }
 
         // Initialize stack
@@ -718,7 +735,22 @@ struct PacketTransport {
         uint32_t local_ip, gateway_ip, netmask;
 
         if (!get_interface_config(interface, local_mac, &local_ip, &gateway_ip, &netmask)) {
-            throw std::runtime_error("Failed to get interface configuration");
+            // Fallback: DPDK-bound NIC has no kernel interface — read from ConnStateShm
+            bool fallback_ok = false;
+            if constexpr (requires { config.conn_state; }) {
+                auto* cs = config.conn_state;
+                if (cs && cs->local_ip != 0) {
+                    local_ip = ntohl(cs->local_ip);
+                    memcpy(local_mac, cs->local_mac, 6);
+                    netmask = 0xFFFFFF00;  // /24 default
+                    gateway_ip = (local_ip & netmask) | 1;
+                    fallback_ok = true;
+                    fprintf(stderr, "[PacketTransport] init_stack_only: Using ConnStateShm config (NIC bound to DPDK)\n");
+                }
+            }
+            if (!fallback_ok) {
+                throw std::runtime_error("Failed to get interface configuration");
+            }
         }
 
         // Initialize stack
@@ -2025,7 +2057,7 @@ public:
     }
 };
 
-#endif  // USE_XDP
+#endif  // USE_XDP || USE_DPDK
 
 } // namespace transport
 } // namespace websocket

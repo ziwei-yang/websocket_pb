@@ -102,9 +102,7 @@ struct PacketTransportAB {
             });
         // Service retransmit queues for both connections
         a.check_retransmit();
-        if (b.is_connected()) {
-            b.check_retransmit();
-        }
+        b.check_retransmit();
 
         // Periodic demux stats log (every ~10s)
         uint64_t now = rdtscp();

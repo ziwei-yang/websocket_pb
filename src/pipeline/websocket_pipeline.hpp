@@ -47,7 +47,11 @@
 
 #include "pipeline_data.hpp"
 #include "pipeline_config.hpp"
+#ifdef USE_DPDK
+#include "01_dpdk_poll_process.hpp"
+#else
 #include "00_xdp_poll_process.hpp"
+#endif
 #include "10_tcp_ssl_process.hpp"
 #include "20_ws_process.hpp"
 #include "21_ws_core.hpp"
@@ -130,71 +134,168 @@ namespace pipeline_helpers {
 
 inline bool get_interface_mac(const char* interface, uint8_t* mac_out) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return false;
-    struct ifreq ifr = {};
-    strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
-    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) { close(fd); return false; }
-    close(fd);
-    memcpy(mac_out, ifr.ifr_hwaddr.sa_data, 6);
-    return true;
+    if (fd >= 0) {
+        struct ifreq ifr = {};
+        strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
+        if (ioctl(fd, SIOCGIFHWADDR, &ifr) == 0) {
+            close(fd);
+            memcpy(mac_out, ifr.ifr_hwaddr.sa_data, 6);
+            return true;
+        }
+        close(fd);
+    }
+#ifdef USE_DPDK
+    // DPDK: NIC bound to vfio-pci, read cached MAC from dpdk_bind.sh
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/dpdk_mac_%s", interface);
+    FILE* f = fopen(path, "r");
+    if (f) {
+        char mac_str[32];
+        if (fgets(mac_str, sizeof(mac_str), f)) {
+            fclose(f);
+            mac_str[strcspn(mac_str, "\n")] = '\0';
+            unsigned int m[6];
+            if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                       &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                for (int i = 0; i < 6; i++) mac_out[i] = (uint8_t)m[i];
+                printf("[DPDK] Loaded cached MAC for %s\n", interface);
+                return true;
+            }
+        } else {
+            fclose(f);
+        }
+    }
+#endif
+    return false;
 }
 
 inline bool get_interface_ip(const char* interface, std::string& ip_out) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return false;
-    struct ifreq ifr = {};
-    strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
-    ifr.ifr_addr.sa_family = AF_INET;
-    if (ioctl(fd, SIOCGIFADDR, &ifr) < 0) { close(fd); return false; }
-    close(fd);
-    struct sockaddr_in* addr = (struct sockaddr_in*)&ifr.ifr_addr;
-    ip_out = inet_ntoa(addr->sin_addr);
-    return true;
+    if (fd >= 0) {
+        struct ifreq ifr = {};
+        strncpy(ifr.ifr_name, interface, IFNAMSIZ - 1);
+        ifr.ifr_addr.sa_family = AF_INET;
+        if (ioctl(fd, SIOCGIFADDR, &ifr) == 0) {
+            close(fd);
+            struct sockaddr_in* addr = (struct sockaddr_in*)&ifr.ifr_addr;
+            ip_out = inet_ntoa(addr->sin_addr);
+            return true;
+        }
+        close(fd);
+    }
+#ifdef USE_DPDK
+    // DPDK: NIC bound to vfio-pci, read cached IP from dpdk_bind.sh
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/dpdk_ip_%s", interface);
+    FILE* f = fopen(path, "r");
+    if (f) {
+        char ip_str[32];
+        if (fgets(ip_str, sizeof(ip_str), f)) {
+            fclose(f);
+            ip_str[strcspn(ip_str, "\n")] = '\0';
+            if (ip_str[0]) {
+                ip_out = ip_str;
+                printf("[DPDK] Loaded cached IP for %s\n", interface);
+                return true;
+            }
+        } else {
+            fclose(f);
+        }
+    }
+#endif
+    return false;
 }
 
 inline bool get_default_gateway(const char* interface, std::string& gateway_out) {
     FILE* fp = fopen("/proc/net/route", "r");
-    if (!fp) return false;
-    char line[256];
-    if (!fgets(line, sizeof(line), fp)) { fclose(fp); return false; }
-    while (fgets(line, sizeof(line), fp)) {
-        char iface[32];
-        unsigned int dest, gateway, flags;
-        if (sscanf(line, "%31s %x %x %x", iface, &dest, &gateway, &flags) >= 4) {
-            if (strcmp(iface, interface) == 0 && dest == 0 && gateway != 0) {
-                struct in_addr addr;
-                addr.s_addr = gateway;
-                gateway_out = inet_ntoa(addr);
-                fclose(fp);
-                return true;
+    if (fp) {
+        char line[256];
+        if (fgets(line, sizeof(line), fp)) {  // skip header
+            while (fgets(line, sizeof(line), fp)) {
+                char iface[32];
+                unsigned int dest, gateway, flags;
+                if (sscanf(line, "%31s %x %x %x", iface, &dest, &gateway, &flags) >= 4) {
+                    if (strcmp(iface, interface) == 0 && dest == 0 && gateway != 0) {
+                        struct in_addr addr;
+                        addr.s_addr = gateway;
+                        gateway_out = inet_ntoa(addr);
+                        fclose(fp);
+                        return true;
+                    }
+                }
             }
         }
+        fclose(fp);
     }
-    fclose(fp);
+#ifdef USE_DPDK
+    // DPDK: NIC removed from kernel, read cached gateway from dpdk_bind.sh
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/dpdk_gw_%s", interface);
+    FILE* f = fopen(path, "r");
+    if (f) {
+        char ip_str[32];
+        if (fgets(ip_str, sizeof(ip_str), f)) {
+            fclose(f);
+            ip_str[strcspn(ip_str, "\n")] = '\0';
+            if (ip_str[0]) {
+                gateway_out = ip_str;
+                printf("[DPDK] Loaded cached gateway for %s\n", interface);
+                return true;
+            }
+        } else {
+            fclose(f);
+        }
+    }
+#endif
     return false;
 }
 
 inline bool get_gateway_mac(const char* interface, const char* gateway_ip, uint8_t* mac_out) {
     FILE* fp = fopen("/proc/net/arp", "r");
-    if (!fp) return false;
-    char line[256];
-    if (!fgets(line, sizeof(line), fp)) { fclose(fp); return false; }
-    while (fgets(line, sizeof(line), fp)) {
-        char ip[64], hw_type[16], flags[16], mac_str[32], mask[16], dev[32];
-        if (sscanf(line, "%63s %15s %15s %31s %15s %31s",
-                   ip, hw_type, flags, mac_str, mask, dev) == 6) {
-            if (strcmp(ip, gateway_ip) == 0 && strcmp(dev, interface) == 0) {
-                unsigned int m[6];
-                if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
-                           &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
-                    for (int i = 0; i < 6; i++) mac_out[i] = (uint8_t)m[i];
-                    fclose(fp);
-                    return true;
+    if (fp) {
+        char line[256];
+        if (fgets(line, sizeof(line), fp)) {  // skip header
+            while (fgets(line, sizeof(line), fp)) {
+                char ip[64], hw_type[16], flags[16], mac_str[32], mask[16], dev[32];
+                if (sscanf(line, "%63s %15s %15s %31s %15s %31s",
+                           ip, hw_type, flags, mac_str, mask, dev) == 6) {
+                    if (strcmp(ip, gateway_ip) == 0 && strcmp(dev, interface) == 0) {
+                        unsigned int m[6];
+                        if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                                   &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                            for (int i = 0; i < 6; i++) mac_out[i] = (uint8_t)m[i];
+                            fclose(fp);
+                            return true;
+                        }
+                    }
                 }
             }
         }
+        fclose(fp);
     }
-    fclose(fp);
+#ifdef USE_DPDK
+    // DPDK: NIC removed from kernel, read cached gateway MAC from dpdk_bind.sh
+    (void)gateway_ip;
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/dpdk_gw_mac_%s", interface);
+    FILE* f = fopen(path, "r");
+    if (f) {
+        char mac_str[32];
+        if (fgets(mac_str, sizeof(mac_str), f)) {
+            fclose(f);
+            mac_str[strcspn(mac_str, "\n")] = '\0';
+            unsigned int m[6];
+            if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
+                       &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                for (int i = 0; i < 6; i++) mac_out[i] = (uint8_t)m[i];
+                printf("[DPDK] Loaded cached gateway MAC for %s\n", interface);
+                return true;
+            }
+        } else {
+            fclose(f);
+        }
+    }
+#endif
     return false;
 }
 
@@ -532,11 +633,18 @@ public:
     using MktEventHandlerType = typename Traits::MktEventHandler;
     using UpgradeCustomizerType = typename Traits::UpgradeCustomizer;
 
-    using XDPPollType = XDPPollProcess<
+#ifdef USE_DPDK
+    using PollProcessType = DPDKPollProcess<
+        IPCRingProducer<PacketFrameDescriptor>,
+        IPCRingConsumer<PacketFrameDescriptor>,
+        Prof>;
+#else
+    using PollProcessType = XDPPollProcess<
         IPCRingProducer<PacketFrameDescriptor>,
         IPCRingConsumer<PacketFrameDescriptor>,
         Traits::TRICKLE_ENABLED,
         Prof>;
+#endif
 
     // --- IPC mode types (non-InlineWS) ---
     using TransportType = TransportProcess<
@@ -694,6 +802,25 @@ public:
 
         // Allocate UMEM
         umem_size_ = UMEM_TOTAL_SIZE;
+#ifdef USE_DPDK
+        // DPDK requires UMEM at low VA (< 512 GB) due to Intel IOMMU SAGAW=39.
+        // DPDK_UMEM_BASE_VA (8 GB) keeps all DMA addresses within the 39-bit limit.
+        umem_area_ = mmap(reinterpret_cast<void*>(DPDK_UMEM_BASE_VA), umem_size_,
+                         PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB | MAP_FIXED_NOREPLACE,
+                         -1, 0);
+        if (umem_area_ == MAP_FAILED) {
+            printf("WARN: Huge pages not available at low VA, trying regular pages\n");
+            umem_area_ = mmap(reinterpret_cast<void*>(DPDK_UMEM_BASE_VA), umem_size_,
+                              PROT_READ | PROT_WRITE,
+                              MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                              -1, 0);
+            if (umem_area_ == MAP_FAILED) {
+                fprintf(stderr, "FAIL: Cannot allocate UMEM at low VA for DPDK\n");
+                return false;
+            }
+        }
+#else
         umem_area_ = mmap(nullptr, umem_size_, PROT_READ | PROT_WRITE,
                          MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
         if (umem_area_ == MAP_FAILED) {
@@ -705,6 +832,7 @@ public:
                 return false;
             }
         }
+#endif
         printf("UMEM: %p (%zu bytes)\n", umem_area_, umem_size_);
 
         // Allocate MsgInbox per connection
@@ -1032,18 +1160,19 @@ private:
 
         IPCRingProducer<PacketFrameDescriptor> raw_inbox_prod(*raw_inbox_region_);
         IPCRingConsumer<PacketFrameDescriptor> raw_outbox_cons(*raw_outbox_region_);
-        XDPPollType xdp_poll(interface_);
+        PollProcessType poll(interface_);
 
         if constexpr (Prof) {
-            xdp_poll.set_profiling_data(&profiling_->xdp_poll);
-            xdp_poll.set_nic_latency_data(&profiling_->nic_latency);
+            poll.set_profiling_data(&profiling_->xdp_poll);
+            poll.set_nic_latency_data(&profiling_->nic_latency);
         }
 
-        bool ok = xdp_poll.init(umem_area_, umem_size_, bpf_path_,
-                                &raw_inbox_prod, &raw_outbox_cons, conn_state_);
+        bool ok = poll.init(umem_area_, umem_size_, bpf_path_,
+                            &raw_inbox_prod, &raw_outbox_cons, conn_state_);
         if (!ok) { conn_state_->shutdown_all(); return; }
 
-        auto* bpf = xdp_poll.get_bpf_loader();
+#ifndef USE_DPDK
+        auto* bpf = poll.get_bpf_loader();
         if (bpf) {
             bpf->set_local_ip(local_ip_.c_str());
             // Add ALL resolved IPs to BPF filter (not just the primary target)
@@ -1054,9 +1183,10 @@ private:
             }
             bpf->add_exchange_port(Traits::WSS_PORT);
         }
+#endif
 
-        xdp_poll.run();
-        xdp_poll.cleanup();
+        poll.run();
+        poll.cleanup();
     }
 
     void run_transport_process() {
@@ -1114,8 +1244,26 @@ private:
         // WSFrameInfo producer — created when ring is needed
         WSFrameInfoProdHelper ws_frame_info_prod_holder(ws_frame_info_region_);
 
+        // MktEvent producer — must outlive ws_process.run(), declared at function scope
+        std::unique_ptr<IPCRingProducer<websocket::msg::MktEvent>> mkt_event_prod_holder;
+        if constexpr (HasMktEventHandler && EnableAB) {
+            if (mkt_event_region_) {
+                mkt_event_prod_holder = std::make_unique<IPCRingProducer<websocket::msg::MktEvent>>(
+                    *mkt_event_region_);
+            }
+        }
+
         WebSocketType ws_process;
         ws_process.mkt_event_handler() = mkt_event_handler_;
+
+        // Wire MktEvent producer, conn_state, and ws_frame_info_prod to handler
+        if constexpr (HasMktEventHandler && EnableAB) {
+            ws_process.mkt_event_handler().mkt_event_prod = mkt_event_prod_holder.get();
+            ws_process.mkt_event_handler().conn_state = conn_state_;
+        }
+        if constexpr (HasMktEventHandler && NeedWSFrameInfoRing) {
+            ws_process.mkt_event_handler().ws_frame_info_prod_ = ws_frame_info_prod_holder.get();
+        }
 
         if constexpr (Prof) ws_process.set_profiling_data(&profiling_->ws_process);
 

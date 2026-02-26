@@ -103,13 +103,42 @@ ifeq ($(UNAME_S),Linux)
     # Transport Layer Selection
     # Note: These are mutually exclusive - only one can be active at a time
 
-    # Auto-enable USE_XDP if XDP_INTERFACE is provided
+    # Auto-enable USE_XDP if XDP_INTERFACE is provided (but not when USE_DPDK is set)
     ifdef XDP_INTERFACE
-        USE_XDP := 1
+        ifndef USE_DPDK
+            USE_XDP := 1
+        endif
     endif
 
+    # DPDK Support (Linux only)
+    ifdef USE_DPDK
+        ifdef USE_XDP
+            $(error Cannot use both USE_DPDK=1 and USE_XDP=1 simultaneously)
+        endif
+        ifdef USE_SOCKET
+            $(error Cannot use both USE_DPDK=1 and USE_SOCKET=1 simultaneously)
+        endif
+        HAS_LIBDPDK := $(shell pkg-config --exists libdpdk && echo 1 || echo 0)
+        ifeq ($(HAS_LIBDPDK),1)
+            CXXFLAGS += -DUSE_DPDK $(shell pkg-config --cflags libdpdk)
+            LDFLAGS += $(shell pkg-config --libs libdpdk)
+            TRANSPORT_INFO := DPDK (PMD)
+            ifndef DPDK_INTERFACE
+                DPDK_INTERFACE := enp108s0
+            endif
+            CXXFLAGS += -DDPDK_INTERFACE='"$(DPDK_INTERFACE)"'
+            $(info DPDK Interface: $(DPDK_INTERFACE))
+            ifndef NIC_MTU
+                NIC_MTU := $(shell cat /sys/class/net/$(DPDK_INTERFACE)/mtu 2>/dev/null || echo 1500)
+            endif
+            CXXFLAGS += -DNIC_MTU=$(NIC_MTU)
+            $(info DPDK MTU: $(NIC_MTU))
+            $(info Building with DPDK support enabled)
+        else
+            $(error DPDK requested but libdpdk not found. Install dpdk-dev or check PKG_CONFIG_PATH)
+        endif
     # XDP Support (Linux only)
-    ifdef USE_XDP
+    else ifdef USE_XDP
         ifdef USE_SOCKET
             $(error Cannot use both USE_XDP=1 and USE_SOCKET=1 simultaneously)
         endif
@@ -595,6 +624,7 @@ test-sbe-handler: $(TEST_SBE_HANDLER_BIN)
 # When any header changes, affected tests will be rebuilt
 PIPELINE_HEADERS := \
     src/pipeline/00_xdp_poll_process.hpp \
+    src/pipeline/01_dpdk_poll_process.hpp \
     src/pipeline/10_tcp_ssl_process.hpp \
     src/pipeline/20_ws_process.hpp \
     src/pipeline/98_xdp_tcp_ssl_process.hpp \
@@ -729,6 +759,44 @@ build-test-pipeline-03_disruptor_packetio_tcp: $(PIPELINE_DISRUPTOR_PACKETIO_TCP
 
 test-pipeline-03-disruptor-packetio-tcp: $(PIPELINE_DISRUPTOR_PACKETIO_TCP_BIN) bpf
 	./scripts/build_xdp.sh 03_disruptor_packetio_tcp.cpp
+
+# ============================================================================
+# DPDK Poll ICMP Ping Test (DPDKPollProcess standalone test)
+# ============================================================================
+
+PIPELINE_DPDK_POLL_PING_SRC := test/pipeline/04_dpdk_poll_ping.cpp
+PIPELINE_DPDK_POLL_PING_BIN := $(BUILD_DIR)/test_pipeline_04_dpdk_poll_ping
+
+$(PIPELINE_DPDK_POLL_PING_BIN): $(PIPELINE_DPDK_POLL_PING_SRC) $(PIPELINE_HEADERS) \
+    src/pipeline/01_dpdk_poll_process.hpp | $(BUILD_DIR)
+ifdef USE_DPDK
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ DPDK Poll Ping test build complete: $@"
+else
+	@echo "❌ Error: DPDK Poll Ping test requires USE_DPDK=1"
+	@exit 1
+endif
+
+build-test-pipeline-04_dpdk_poll_ping: $(PIPELINE_DPDK_POLL_PING_BIN)
+
+# ============================================================================
+# DPDK DisruptorPacketIO TCP Test (2-Process: DPDK Poll + PacketTransport<DisruptorPacketIO>)
+# ============================================================================
+
+PIPELINE_DPDK_DISRUPTOR_TCP_SRC := test/pipeline/05_dpdk_disruptor_packetio_tcp.cpp
+PIPELINE_DPDK_DISRUPTOR_TCP_BIN := $(BUILD_DIR)/test_pipeline_05_dpdk_disruptor_packetio_tcp
+
+$(PIPELINE_DPDK_DISRUPTOR_TCP_BIN): $(PIPELINE_DPDK_DISRUPTOR_TCP_SRC) $(PIPELINE_HEADERS) \
+    src/pipeline/disruptor_packet_io.hpp src/pipeline/01_dpdk_poll_process.hpp src/policy/transport.hpp | $(BUILD_DIR)
+ifdef USE_DPDK
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ DPDK DisruptorPacketIO TCP test build complete: $@"
+else
+	@echo "❌ Error: DPDK DisruptorPacketIO TCP test requires USE_DPDK=1"
+	@exit 1
+endif
+
+build-test-pipeline-05_dpdk_disruptor_packetio_tcp: $(PIPELINE_DPDK_DISRUPTOR_TCP_BIN)
 
 # ============================================================================
 # Transport TCP Test (NoSSLPolicy with forked XDP Poll + Transport)
@@ -909,7 +977,7 @@ PIPELINE_WEBSOCKET_BINANCE_BIN := $(BUILD_DIR)/test_pipeline_websocket_binance
 
 $(PIPELINE_WEBSOCKET_BINANCE_BIN): $(PIPELINE_WEBSOCKET_BINANCE_SRC) $(PIPELINE_HEADERS) $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling WebSocket Binance test..."
-ifdef USE_XDP
+ifneq (,$(or $(USE_XDP),$(USE_DPDK)))
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 	@echo "✅ WebSocket Binance test build complete: $@"
@@ -918,7 +986,7 @@ else
 	@exit 1
 endif
 else
-	@echo "❌ Error: WebSocket Binance test requires USE_XDP=1"
+	@echo "❌ Error: WebSocket Binance test requires USE_XDP=1 or USE_DPDK=1"
 	@exit 1
 endif
 
@@ -956,6 +1024,30 @@ build-test-pipeline-binance_sbe_xdp: $(PIPELINE_BINANCE_SBE_BIN)
 test-pipeline-binance-sbe: $(PIPELINE_BINANCE_SBE_BIN) bpf
 	@echo "🧪 Running Binance SBE test via script..."
 	./scripts/test_xdp.sh 24_binance_sbe_xdp.cpp
+
+# ============================================================================
+# DPDK Binance SBE Binary Protocol Test
+# ============================================================================
+
+PIPELINE_DPDK_BINANCE_SBE_SRC := test/pipeline/30_binance_sbe_dpdk.cpp
+PIPELINE_DPDK_BINANCE_SBE_BIN := $(BUILD_DIR)/test_pipeline_30_binance_sbe_dpdk
+
+$(PIPELINE_DPDK_BINANCE_SBE_BIN): $(PIPELINE_DPDK_BINANCE_SBE_SRC) $(PIPELINE_HEADERS) src/msg/00_binance_spot_sbe.hpp | $(BUILD_DIR)
+	@echo "🔨 Compiling DPDK Binance SBE test..."
+ifdef USE_DPDK
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ DPDK Binance SBE test build complete: $@"
+else
+	@echo "❌ Error: DPDK Binance SBE test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
+	@exit 1
+endif
+else
+	@echo "❌ Error: DPDK Binance SBE test requires USE_DPDK=1"
+	@exit 1
+endif
+
+build-test-pipeline-30_binance_sbe_dpdk: $(PIPELINE_DPDK_BINANCE_SBE_BIN)
 
 # ============================================================================
 # WebSocket OKX Test (WebSocketProcess with OKX WSS stream)
