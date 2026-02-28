@@ -348,7 +348,7 @@ struct DPDKPollProcess {
             desc.consumed = 0;
             desc.acked = 0;
 
-            desc.nic_timestamp_ns = 0;
+            desc.nic_timestamp_ns = mono_ns;
             desc.bpf_entry_ns = mono_ns;
 
             if (i == 0) {

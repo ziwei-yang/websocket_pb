@@ -468,9 +468,25 @@ struct BinanceSBEHandler {
     websocket::pipeline::ConnStateShm* conn_state = nullptr;
     bool merge_enabled = true;
     int64_t last_book_seq_ = 0;
+    int64_t last_bbo_seq_ = 0;
     int64_t last_trade_id_ = 0;
     uint8_t active_ci_ = 0xFF;
     websocket::pipeline::WSFrameInfo* current_info_ = nullptr;
+
+    // A/B failover state
+    static constexpr uint32_t FAILOVER_LOSS_THRESHOLD = 10;
+    static constexpr uint64_t FAILOVER_LOCK_MS = 5000;
+    static constexpr uint64_t STALE_THRESHOLD_MS = 500;
+
+    uint32_t conn_win_count_[2] = {};
+    uint32_t conn_loss_streak_[2] = {};
+    uint64_t conn_last_win_cycle_[2] = {};
+    uint64_t conn_last_data_cycle_[2] = {};
+    uint8_t  primary_ci_ = 0;
+    bool     failover_locked_ = false;
+    uint64_t failover_lock_until_cycle_ = 0;
+    uint64_t failover_lock_cycles_ = 0;
+    uint64_t stale_threshold_cycles_ = 0;
 
     // Ring producer for clearing M flag on published (winning) frames
     websocket::pipeline::IPCRingProducer<websocket::pipeline::WSFrameInfo>* ws_frame_info_prod_ = nullptr;  // set by WSCore::init()
@@ -478,10 +494,13 @@ struct BinanceSBEHandler {
     int64_t pending_trades_ring_seq_ = -1;   // ring seq of last trade frame that entered buffer
     int64_t* pending_ring_seq_slot_ = nullptr; // WSCore writes published seq here after ring publish
 
-    // Pending BBO buffer — defers publish until batch boundary or non-BBO book message
+    // Pending BBO accumulation buffer — merges consecutive BEST_BID_ASK_STREAM frames
     bool has_pending_bbo_ = false;
     uint8_t pending_bbo_ci_ = 0;
-    BestBidAskView pending_bbo_{};
+    uint8_t pending_bbo_count_ = 0;
+    websocket::msg::BboEntry pending_bbo_entries_[websocket::msg::MAX_BBOS];
+    int64_t pending_bbo_max_seq_ = 0;
+    int64_t pending_bbo_event_ts_ns_ = 0;
     websocket::pipeline::WSFrameInfo pending_bbo_info_{};
 
     // Pending trade accumulation buffer — merges consecutive TRADES_STREAM frames
@@ -493,36 +512,60 @@ struct BinanceSBEHandler {
     int64_t pending_trades_max_id_ = 0;
     websocket::pipeline::WSFrameInfo pending_trades_info_{};
 
+    // Lightweight fragment parser: populate WSFrameInfo fields from SBE header
+    // without producing MktEvents. Called for intermediate WS fragments only.
+    void on_ws_fragment(const uint8_t* payload, uint32_t len, websocket::pipeline::WSFrameInfo& info) {
+        auto e = BinanceSpotSBEDecoder::decode_essential(payload, len);
+        if (!e.valid) return;
+        switch (e.msg_type) {
+        case TRADES_STREAM:       info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY); break;
+        case BEST_BID_ASK_STREAM: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BBO_ARRAY); break;
+        case DEPTH_SNAPSHOT_STREAM: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT); break;
+        case DEPTH_DIFF_STREAM:   info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA); break;
+        default: return;
+        }
+        info.mkt_event_count = static_cast<uint16_t>(e.count);
+        info.mkt_event_seq = e.sequence;
+        if (len >= HEADER_SIZE + 8)
+            info.exchange_event_time_us = read_i64(payload + HEADER_SIZE);
+    }
+
     void on_ws_frame(uint8_t ci, uint8_t, const uint8_t* payload,
                      uint32_t len, websocket::pipeline::WSFrameInfo& info) {
         auto e = BinanceSpotSBEDecoder::decode_essential(payload, len);
         pending_ring_seq_slot_ = nullptr;  // reset per frame; WSCore fills after ring publish
         if (!e.valid) {
-            info.set_mkt_event_info(
-                static_cast<uint8_t>(websocket::msg::EventType::SYSTEM_STATUS), 0);
+            info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::SYSTEM_STATUS);
             return;
         }
 
         switch (e.msg_type) {
         case TRADES_STREAM:
-            info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY),
-                                    static_cast<uint16_t>(e.count));
+            info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY);
+            info.mkt_event_count = static_cast<uint16_t>(e.count);
+            info.mkt_event_seq = e.sequence;
+            info.exchange_event_time_us = read_i64(payload + HEADER_SIZE);
             break;
         case BEST_BID_ASK_STREAM:
-            info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT),
-                                    static_cast<uint16_t>(e.count), true);
+            info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BBO_ARRAY);
+            info.mkt_event_count = static_cast<uint16_t>(e.count);
+            info.mkt_event_seq = e.sequence;
+            info.exchange_event_time_us = read_i64(payload + HEADER_SIZE);
             break;
         case DEPTH_SNAPSHOT_STREAM:
-            info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT),
-                                    static_cast<uint16_t>(e.count));
+            info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT);
+            info.mkt_event_count = static_cast<uint16_t>(e.count);
+            info.mkt_event_seq = e.sequence;
+            info.exchange_event_time_us = read_i64(payload + HEADER_SIZE);
             break;
         case DEPTH_DIFF_STREAM:
-            info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA),
-                                    static_cast<uint16_t>(e.count));
+            info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA);
+            info.mkt_event_count = static_cast<uint16_t>(e.count);
+            info.mkt_event_seq = e.sequence;
+            info.exchange_event_time_us = read_i64(payload + HEADER_SIZE);
             break;
         default:
-            info.set_mkt_event_info(
-                static_cast<uint8_t>(websocket::msg::EventType::SYSTEM_STATUS), 0);
+            info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::SYSTEM_STATUS);
             break;
         }
 
@@ -531,9 +574,8 @@ struct BinanceSBEHandler {
             flush_pending_trades();
         }
 
-        // Flush pending BBO before any book-domain message (delta/snapshot share last_book_seq_)
-        if (has_pending_bbo_ &&
-            (e.msg_type == DEPTH_DIFF_STREAM || e.msg_type == DEPTH_SNAPSHOT_STREAM)) {
+        // Flush pending BBO before any non-BBO message (symmetric with trade flush above)
+        if (has_pending_bbo_ && e.msg_type != BEST_BID_ASK_STREAM) {
             flush_pending_bbo();
         }
 
@@ -565,8 +607,7 @@ struct BinanceSBEHandler {
                     info.set_discard_early(true);
                     break;
                 }
-                info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY),
-                                        static_cast<uint16_t>(tv.count()));
+                info.mkt_event_count = static_cast<uint16_t>(tv.count());
 
                 uint32_t total_trades = tv.count();
                 if (merge_enabled) {
@@ -633,21 +674,41 @@ struct BinanceSBEHandler {
             BestBidAskView bv;
             if (BestBidAskView::decode(e.body, e.body_len, e.block_length, bv)) {
                 int64_t seq = bv.book_update_id();
-                if (seq <= last_book_seq_) {
+                int64_t eff_book_seq = has_pending_bbo_
+                    ? std::max(std::max(last_book_seq_, last_bbo_seq_), pending_bbo_max_seq_)
+                    : std::max(last_book_seq_, last_bbo_seq_);
+                if (seq <= eff_book_seq) {
                     info.set_discard_early(true);
                     break;
                 }
-                info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT), 1, true);
+                info.mkt_event_count = 1;
                 if (merge_enabled) {
-                    // Buffer: newer BBO replaces any previously pending one
-                    pending_bbo_ = bv;
-                    pending_bbo_ci_ = ci;
-                    pending_bbo_info_ = info;
-                    has_pending_bbo_ = true;
-                    info.set_merged(true);  // optimistic: assume will be superseded
-                    pending_ring_seq_slot_ = &pending_bbo_ring_seq_;  // WSCore fills ring seq
+                    if (!has_pending_bbo_) {
+                        has_pending_bbo_ = true;
+                        pending_bbo_ci_ = ci;
+                        pending_bbo_count_ = 0;
+                        pending_bbo_info_ = info;
+                    }
+                    if (pending_bbo_count_ >= websocket::msg::MAX_BBOS) {
+                        flush_pending_bbo();
+                        has_pending_bbo_ = true;
+                        pending_bbo_ci_ = ci;
+                        pending_bbo_count_ = 0;
+                        pending_bbo_info_ = info;
+                    }
+                    auto& be = pending_bbo_entries_[pending_bbo_count_++];
+                    be.bid_price = bv.bid_price_mantissa();
+                    be.bid_qty = bv.bid_qty_mantissa();
+                    be.ask_price = bv.ask_price_mantissa();
+                    be.ask_qty = bv.ask_qty_mantissa();
+                    be.event_time_ns = bv.event_time_us() * 1000;
+                    be.book_update_id = seq;
+                    pending_bbo_max_seq_ = seq;
+                    pending_bbo_event_ts_ns_ = bv.event_time_us() * 1000;
+                    info.set_merged(true);
+                    pending_ring_seq_slot_ = &pending_bbo_ring_seq_;
                 } else {
-                    publish_bbo(ci, bv);
+                    publish_bbo_single(ci, bv);
                 }
             }
             break;
@@ -655,8 +716,7 @@ struct BinanceSBEHandler {
         case DEPTH_SNAPSHOT_STREAM: {
             DepthSnapshotView sv;
             if (DepthSnapshotView::decode(e.body, e.body_len, e.block_length, sv)) {
-                info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT),
-                                        static_cast<uint16_t>(sv.bids().count + sv.asks().count));
+                info.mkt_event_count = static_cast<uint16_t>(sv.bids().count + sv.asks().count);
                 publish_depth_snapshot(ci, sv);
             }
             break;
@@ -664,8 +724,7 @@ struct BinanceSBEHandler {
         case DEPTH_DIFF_STREAM: {
             DepthDiffView dv;
             if (DepthDiffView::decode(e.body, e.body_len, e.block_length, dv)) {
-                info.set_mkt_event_info(static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA),
-                                        static_cast<uint16_t>(dv.bids().count + dv.asks().count));
+                info.mkt_event_count = static_cast<uint16_t>(dv.bids().count + dv.asks().count);
                 publish_depth_diff(ci, dv);
             }
             break;
@@ -675,16 +734,25 @@ struct BinanceSBEHandler {
     }
 
     void flush_pending_bbo() {
-        if (!has_pending_bbo_) return;
+        if (!has_pending_bbo_ || pending_bbo_count_ == 0) return;
         has_pending_bbo_ = false;
-        // Clear M on the winning frame — it IS being published, not superseded
-        if (ws_frame_info_prod_ && pending_bbo_ring_seq_ >= 0) {
+        if (ws_frame_info_prod_ && pending_bbo_ring_seq_ >= 0)
             (*ws_frame_info_prod_)[pending_bbo_ring_seq_].set_merged(false);
-        }
         pending_bbo_ring_seq_ = -1;
+        last_bbo_seq_ = pending_bbo_max_seq_;
+        record_win(pending_bbo_ci_);
         current_info_ = &pending_bbo_info_;
-        publish_bbo(pending_bbo_ci_, pending_bbo_);
+        publish_event([&](websocket::msg::MktEvent& ev) {
+            ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::BBO_ARRAY);
+            ev.src_seq = pending_bbo_entries_[pending_bbo_count_ - 1].book_update_id;
+            ev.event_ts_ns = pending_bbo_event_ts_ns_;
+            ev.count = pending_bbo_count_;
+            ev.count2 = 0;
+            std::memcpy(ev.payload.bbo_array.entries, pending_bbo_entries_,
+                        pending_bbo_count_ * sizeof(websocket::msg::BboEntry));
+        });
         current_info_ = nullptr;
+        pending_bbo_count_ = 0;
     }
 
     void flush_pending_trades(bool clear_merged = true) {
@@ -713,6 +781,23 @@ struct BinanceSBEHandler {
     void on_batch_end(uint8_t) {
         flush_pending_bbo();
         flush_pending_trades();
+
+        // Stale connection check: if primary hasn't won recently, switch
+        if (conn_state && stale_threshold_cycles_ > 0) {
+            uint64_t now = __rdtsc();
+            uint8_t other = primary_ci_ ^ 1;
+            bool primary_stale = conn_last_data_cycle_[primary_ci_] > 0
+                && (now - conn_last_data_cycle_[primary_ci_]) > stale_threshold_cycles_;
+            bool other_active = conn_last_data_cycle_[other] > 0
+                && (now - conn_last_data_cycle_[other]) < stale_threshold_cycles_;
+            if (primary_stale && other_active && !failover_locked_) {
+                uint8_t old = primary_ci_;
+                primary_ci_ = other;
+                failover_locked_ = true;
+                failover_lock_until_cycle_ = now + failover_lock_cycles_;
+                on_failover(old, other, "stale");
+            }
+        }
     }
 
     void on_heartbeat(uint8_t ci, uint8_t type) {
@@ -750,20 +835,24 @@ struct BinanceSBEHandler {
         mkt_event_prod->publish(slot);
     }
 
-    void publish_bbo(uint8_t ci, const BestBidAskView& bv) {
+    void publish_bbo_single(uint8_t ci, const BestBidAskView& bv) {
         int64_t seq = bv.book_update_id();
-        if (seq <= last_book_seq_) return;
-        last_book_seq_ = seq;
+        if (seq <= std::max(last_book_seq_, last_bbo_seq_)) return;
+        last_bbo_seq_ = seq;
         record_win(ci);
-        publish_event([&](websocket::msg::MktEvent& e) {
-            e.event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT);
-            e.flags |= websocket::msg::EventFlags::BBO;
-            e.src_seq = seq;
-            e.event_ts_ns = bv.event_time_us() * 1000;
-            e.count = 1;
-            e.count2 = 1;
-            e.payload.snapshot.levels[0] = { bv.bid_price_mantissa(), bv.bid_qty_mantissa() };
-            e.payload.snapshot.levels[1] = { bv.ask_price_mantissa(), bv.ask_qty_mantissa() };
+        publish_event([&](websocket::msg::MktEvent& ev) {
+            ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::BBO_ARRAY);
+            ev.src_seq = seq;
+            ev.event_ts_ns = bv.event_time_us() * 1000;
+            ev.count = 1;
+            ev.count2 = 0;
+            auto& be = ev.payload.bbo_array.entries[0];
+            be.bid_price = bv.bid_price_mantissa();
+            be.bid_qty = bv.bid_qty_mantissa();
+            be.ask_price = bv.ask_price_mantissa();
+            be.ask_qty = bv.ask_qty_mantissa();
+            be.event_time_ns = bv.event_time_us() * 1000;
+            be.book_update_id = seq;
         });
     }
 
@@ -855,11 +944,50 @@ struct BinanceSBEHandler {
         mkt_event_prod->publish(slot);
     }
 
+    void init_failover(uint64_t tsc_hz) {
+        if (tsc_hz > 0) {
+            failover_lock_cycles_ = FAILOVER_LOCK_MS * tsc_hz / 1000;
+            stale_threshold_cycles_ = STALE_THRESHOLD_MS * tsc_hz / 1000;
+        }
+    }
+
+    void on_failover(uint8_t old_ci, uint8_t new_ci, const char* reason) {
+        publish_status(websocket::msg::SystemStatusType::FAILOVER, new_ci, 0, reason);
+        fprintf(stderr, "[FAILOVER] %c → %c (%s)\n",
+                'A' + old_ci, 'A' + new_ci, reason);
+    }
+
     void record_win(uint8_t ci) {
+        uint64_t now = __rdtsc();
+        conn_win_count_[ci]++;
+        conn_loss_streak_[ci] = 0;
+        conn_last_win_cycle_[ci] = now;
+        conn_last_data_cycle_[ci] = now;
+
+        uint8_t other = ci ^ 1;
+        conn_loss_streak_[other]++;
+
+        // Update active_ci_ (for is_active_conn flag on WSFrameInfo)
         if (ci != active_ci_) {
             active_ci_ = ci;
             if (conn_state)
                 conn_state->conn_priority.active_connection.store(ci, std::memory_order_release);
+        }
+
+        // Failover: switch primary if non-primary wins consistently
+        if (ci != primary_ci_ && !failover_locked_) {
+            if (conn_loss_streak_[primary_ci_] >= FAILOVER_LOSS_THRESHOLD) {
+                uint8_t old = primary_ci_;
+                primary_ci_ = ci;
+                failover_locked_ = true;
+                failover_lock_until_cycle_ = now + failover_lock_cycles_;
+                on_failover(old, ci, "loss_streak");
+            }
+        }
+
+        // Unlock after grace period
+        if (failover_locked_ && now >= failover_lock_until_cycle_) {
+            failover_locked_ = false;
         }
     }
 };

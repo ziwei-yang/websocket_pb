@@ -618,6 +618,8 @@ private:
         info.set_fin(true);
         info.set_fragmented(false);
         info.set_last_fragment(false);
+        info.connection_id = 0;
+        info.transport_mode = static_cast<uint8_t>(TransportMode::XDP);
 
         // Use accumulated "first" timing, current "latest" timing
         info.first_byte_ts = accum_first_timing_.hw_timestamp_oldest_ns;

@@ -349,20 +349,24 @@ concept MktEventHandlerConcept = requires(T handler,
                                      WSFrameInfo& info) {
     { T::enabled } -> std::convertible_to<bool>;
     { handler.on_ws_frame(connection_id, opcode, payload, payload_len, info) };
+    { handler.on_ws_fragment(payload, payload_len, info) };
     { handler.on_heartbeat(connection_id, opcode) };
     { handler.on_disconnected(connection_id) };
     { handler.on_reconnected(connection_id) };
     { handler.on_batch_end(connection_id) };
+    { handler.on_failover(connection_id, connection_id, (const char*)"reason") };
 };
 
 // Default: no-op handler that compiles away entirely
 struct NullMktEventHandler {
     static constexpr bool enabled = false;
     void on_ws_frame(uint8_t, uint8_t, const uint8_t*, uint32_t, WSFrameInfo&) {}
+    void on_ws_fragment(const uint8_t*, uint32_t, WSFrameInfo&) {}
     void on_heartbeat(uint8_t, uint8_t) {}
     void on_disconnected(uint8_t) {}
     void on_reconnected(uint8_t) {}
     void on_batch_end(uint8_t) {}
+    void on_failover(uint8_t, uint8_t, const char*) {}
 };
 
 static_assert(MktEventHandlerConcept<NullMktEventHandler>);
@@ -595,6 +599,7 @@ public:
                     }, MAX_ACCUMULATED_METADATA);
                 if (p > 0) {
                     msg_metadata_cons_[0]->commit_manually();
+                    if constexpr (HasMktEventHandler) mkt_event_handler_.on_batch_end(0);
                     last_op_cycle_ = rdtscp();
                 }
                 return static_cast<int32_t>(p);
@@ -614,6 +619,7 @@ public:
                         }, MAX_ACCUMULATED_METADATA);
                     if (p > 0) {
                         msg_metadata_cons_[1]->commit_manually();
+                        if constexpr (HasMktEventHandler) mkt_event_handler_.on_batch_end(1);
                         last_op_cycle_ = rdtscp();
                     }
                     return static_cast<int32_t>(p);
@@ -1113,8 +1119,7 @@ private:
             }
         }
 
-        // Flush any pending handler state before resetting
-        if constexpr (HasMktEventHandler) mkt_event_handler_.on_batch_end(ci);
+        // (flush deferred to on_batch_end() at end of batch in run())
 
         // All data consumed - reset for next batch (preserve partial frame state)
         if (!has_pending_frame_[ci]) {
@@ -1149,7 +1154,8 @@ private:
         info.set_fin(pending_frame_[ci].fin);
         info.set_fragmented(true);
         info.set_last_fragment(false);
-        info.set_connection_id(ci);
+        info.connection_id = ci;
+        info.transport_mode = transport_mode_;
         if constexpr (EnableAB) {
             if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
                 info.set_active_conn(true);
@@ -1359,7 +1365,8 @@ private:
             info.set_fin(true);
             info.set_fragmented(false);
             info.set_last_fragment(false);
-            info.set_connection_id(ci);
+            info.connection_id = ci;
+        info.transport_mode = transport_mode_;
 
             populate_timestamps(info, ps);
             info.ws_parse_cycle = parse_cycle;
@@ -1548,7 +1555,8 @@ private:
             info.set_fin(!is_fragmented || is_last_fragment);
             info.set_fragmented(is_fragmented);
             info.set_last_fragment(is_last_fragment);
-            info.set_connection_id(ci);
+            info.connection_id = ci;
+        info.transport_mode = transport_mode_;
             if constexpr (EnableAB) {
                 if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
                     info.set_active_conn(true);
@@ -1570,6 +1578,11 @@ private:
                     const uint8_t* payload = msg_inbox_[ci]->data_at(info.msg_inbox_offset);
                     mkt_event_handler_.on_ws_frame(ci, opcode, payload,
                                              static_cast<uint32_t>(payload_len), info);
+                } else if (opcode == 0x02) {
+                    const uint8_t* payload = msg_inbox_[ci]->data_at(ps.fragment_start_offset);
+                    uint32_t avail = ps.fragment_total_len;
+                    if (avail >= 16)
+                        mkt_event_handler_.on_ws_fragment(payload, avail, info);
                 }
             }
         } else {
@@ -1589,7 +1602,8 @@ private:
             info.set_fin(!is_fragmented || is_last_fragment);
             info.set_fragmented(is_fragmented);
             info.set_last_fragment(is_last_fragment);
-            info.set_connection_id(ci);
+            info.connection_id = ci;
+        info.transport_mode = transport_mode_;
             if constexpr (EnableAB) {
                 if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
                     info.set_active_conn(true);
@@ -1916,6 +1930,7 @@ private:
     PongsProd* pongs_prod_ = nullptr;
     MsgOutboxProd* msg_outbox_prod_ = nullptr;
     ConnStateShm* conn_state_ = nullptr;
+    uint8_t transport_mode_ = 0;
 
     // MktEventHandler (inline callback, replaces WSFrameInfo ring when enabled)
     [[no_unique_address]] MktEventHandler mkt_event_handler_{};
@@ -1930,6 +1945,7 @@ private:
     uint64_t last_op_cycle_ = 0;
 public:
     void set_profiling_data(CycleSampleBuffer* data) { profiling_data_ = data; }
+    void set_transport_mode(uint8_t mode) { transport_mode_ = mode; }
     MktEventHandler& mkt_event_handler() { return mkt_event_handler_; }
 private:
 

@@ -493,6 +493,12 @@ public:
                             if (!AutoReconnect && ssl_bytes < 0) {
                                 running_ = false;
                             }
+                            if constexpr (InlineWS) {
+                                if (ssl_bytes > 0) {
+                                    // Drain: read remaining TLS records
+                                    while (process_ssl_read_for_conn(ci, timing[ci]) > 0) {}
+                                }
+                            }
                         }
                         break;
                     }
@@ -508,6 +514,14 @@ public:
                     if (ssl_bytes < 0) {
                         running_ = false;
                     }
+                    if constexpr (InlineWS) {
+                        if (ssl_bytes > 0) {
+                            while (process_ssl_read_for_conn(ci, timing[ci]) > 0) {}
+                        }
+                    }
+                }
+                if constexpr (InlineWS) {
+                    inline_ws_.ws_core.end_rx_cycle(ci);
                 }
             }
 
@@ -936,12 +950,14 @@ private:
         timing.recv_end_cycle = rdtscp();
 
         if (read_len > 0) {
+            // Always update SSL timing (independent of HW timestamps)
+            last_valid_ssl_start_cycle_ = timing.recv_start_cycle;
+            last_valid_ssl_end_cycle_ = timing.recv_end_cycle;
+
             timing.hw_timestamp_count = conn.get_recv_packet_count();
             if (timing.hw_timestamp_count > 0) {
                 timing.hw_timestamp_oldest_ns = conn.get_recv_oldest_timestamp();
                 timing.hw_timestamp_latest_ns = conn.get_recv_latest_timestamp();
-                last_valid_ssl_start_cycle_ = timing.recv_start_cycle;
-                last_valid_ssl_end_cycle_ = timing.recv_end_cycle;
             } else {
                 timing.hw_timestamp_oldest_ns = 0;
                 timing.hw_timestamp_latest_ns = 0;
@@ -999,12 +1015,14 @@ private:
         timing.recv_end_cycle = rdtscp();
 
         if (read_len > 0) {
+            // Always update SSL timing (independent of HW timestamps)
+            last_valid_ssl_start_cycle_ = timing.recv_start_cycle;
+            last_valid_ssl_end_cycle_ = timing.recv_end_cycle;
+
             timing.hw_timestamp_count = conn.get_recv_packet_count();
             if (timing.hw_timestamp_count > 0) {
                 timing.hw_timestamp_oldest_ns = conn.get_recv_oldest_timestamp();
                 timing.hw_timestamp_latest_ns = conn.get_recv_latest_timestamp();
-                last_valid_ssl_start_cycle_ = timing.recv_start_cycle;
-                last_valid_ssl_end_cycle_ = timing.recv_end_cycle;
             } else {
                 timing.hw_timestamp_oldest_ns = 0;
                 timing.hw_timestamp_latest_ns = 0;
@@ -1208,6 +1226,11 @@ public:
             inline_ws_.ws_core.init(msg_inbox_a, ws_frame_info_prod,
                                     &inline_ws_.tx_sink, conn_state);
         }
+#ifdef USE_DPDK
+        inline_ws_.ws_core.set_transport_mode(static_cast<uint8_t>(TransportMode::DPDK_DISRUPTOR));
+#else
+        inline_ws_.ws_core.set_transport_mode(static_cast<uint8_t>(TransportMode::XDP_DISRUPTOR));
+#endif
     }
 
     /**

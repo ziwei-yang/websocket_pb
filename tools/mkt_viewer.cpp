@@ -19,6 +19,7 @@
 
 #include "pipeline/pipeline_data.hpp"
 #include "msg/mkt_event.hpp"
+#include "msg/orderbook.hpp"
 
 using namespace websocket::msg;
 using namespace websocket::pipeline;
@@ -43,6 +44,9 @@ static constexpr const char* YELLOW = "\033[33m";
 static constexpr const char* RED    = "\033[31m";
 static constexpr const char* CYAN   = "\033[36m";
 static constexpr const char* DIM    = "\033[2m";
+static constexpr const char* BG_GREEN  = "\033[42m";
+static constexpr const char* BG_YELLOW = "\033[43m";
+static constexpr const char* BG_RED    = "\033[41m";
 
 // ============================================================================
 // Data structures
@@ -51,9 +55,7 @@ static constexpr const char* DIM    = "\033[2m";
 static constexpr int MAX_LATENCY_SAMPLES = 65536;
 
 struct ViewerState {
-    BookLevel bids[MAX_BOOK], asks[MAX_BOOK];
-    uint8_t   bid_count = 0, ask_count = 0;
-    int64_t   book_seq = 0;
+    OrderBook ob;
 
     static constexpr size_t TRADE_BUF = 65536;
     static constexpr size_t TRADE_MASK = TRADE_BUF - 1;
@@ -226,48 +228,15 @@ static void pad_to_decimals(char* s, int target) {
 }
 
 // ============================================================================
-// Book delta application
-// ============================================================================
-
-static void apply_delta(const DeltaEntry& d, BookLevel* levels, uint8_t& count, bool is_bid) {
-    for (uint8_t i = 0; i < count; i++) {
-        if (levels[i].price == d.price) {
-            if (d.qty == 0) {
-                if (i + 1 < count)
-                    std::memmove(&levels[i], &levels[i + 1], (count - i - 1) * sizeof(BookLevel));
-                count--;
-            } else {
-                levels[i].qty = d.qty;
-            }
-            return;
-        }
-    }
-    if (d.qty > 0 && count < MAX_BOOK) {
-        uint8_t pos = count;
-        for (uint8_t i = 0; i < count; i++) {
-            if (is_bid ? (d.price > levels[i].price) : (d.price < levels[i].price)) {
-                pos = i;
-                break;
-            }
-        }
-        if (pos < count)
-            std::memmove(&levels[pos + 1], &levels[pos], (count - pos) * sizeof(BookLevel));
-        levels[pos].price = d.price;
-        levels[pos].qty = d.qty;
-        count++;
-    }
-}
-
-// ============================================================================
 // Depth sampling (rolling 1-min average via segments)
 // ============================================================================
 
 static void sample_depth(ViewerState& s, int64_t ts_ns) {
     double inst_depth = 0;
-    for (int i = 0; i < 10 && i < s.bid_count; i++)
-        inst_depth += mantissa_to_double(s.bids[i].qty, QTY_EXP);
-    for (int i = 0; i < 10 && i < s.ask_count; i++)
-        inst_depth += mantissa_to_double(s.asks[i].qty, QTY_EXP);
+    for (int i = 0; i < 10 && i < s.ob.bid_count; i++)
+        inst_depth += mantissa_to_double(s.ob.bids[i].qty, QTY_EXP);
+    for (int i = 0; i < 10 && i < s.ob.ask_count; i++)
+        inst_depth += mantissa_to_double(s.ob.asks[i].qty, QTY_EXP);
 
     // Advance depth segments
     if (s.depth_seg_start_ns == 0)
@@ -364,38 +333,15 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
     }
 
     if (evt.is_book_snapshot()) {
-        if (evt.flags & EventFlags::SNAPSHOT) {
-            auto b = evt.bids(), a = evt.asks();
-            s.bid_count = std::min<uint8_t>(b.count, MAX_BOOK);
-            s.ask_count = std::min<uint8_t>(a.count, MAX_BOOK);
-            std::memcpy(s.bids, b.data, s.bid_count * sizeof(BookLevel));
-            std::memcpy(s.asks, a.data, s.ask_count * sizeof(BookLevel));
-            s.book_seq = evt.src_seq;
-            s.snap_count++;
-            sample_depth(s, evt.recv_ts_ns);
-        } else {
-            auto b = evt.bids(), a = evt.asks();
-            if (b.count > 0) {
-                if (s.bid_count == 0) s.bid_count = 1;
-                s.bids[0] = b.data[0];
-            }
-            if (a.count > 0) {
-                if (s.ask_count == 0) s.ask_count = 1;
-                s.asks[0] = a.data[0];
-            }
-            s.book_seq = evt.src_seq;
-            s.bbo_count++;
-            sample_depth(s, evt.recv_ts_ns);
-        }
+        s.ob.apply_snapshot(evt);
+        s.snap_count++;
+        sample_depth(s, evt.recv_ts_ns);
+    } else if (evt.is_bbo_array()) {
+        s.ob.apply_bbo(evt);
+        s.bbo_count++;
+        sample_depth(s, evt.recv_ts_ns);
     } else if (evt.is_book_delta()) {
-        for (uint8_t i = 0; i < evt.count; i++) {
-            const auto& d = evt.payload.deltas.entries[i];
-            if (d.is_bid())
-                apply_delta(d, s.bids, s.bid_count, true);
-            else
-                apply_delta(d, s.asks, s.ask_count, false);
-        }
-        s.book_seq = evt.src_seq;
+        s.ob.apply_deltas(evt);
         s.delta_count++;
         sample_depth(s, evt.recv_ts_ns);
     } else if (evt.is_trade_array()) {
@@ -706,26 +652,28 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
         int used = 1 + static_cast<int>(std::strlen(s.exchange)) + 1 + static_cast<int>(std::strlen(s.symbol));
         pos = fb_puts(fb, pos, RST);
 
-        // Status indicator
+        // Connection badge with server latency: background-colored " connA:+1.5ms "
         if (s.last_status_type != 0xFF) {
-            const char* st_name =
-                s.last_status_type == 0 ? "Heartbt" :
-                s.last_status_type == 1 ? "Disconn" :
-                s.last_status_type == 2 ? "Reconn" : "?";
-            const char* dot_color = (s.last_status_type == 1) ? RED : GREEN;
-            double age_s = 0;
-            if (s.last_recv_ts_ns > 0 && s.last_status_ts_ns > 0)
-                age_s = (s.last_recv_ts_ns - s.last_status_ts_ns) / 1e9;
-            char st_buf[48];
-            int st_len = snprintf(st_buf, sizeof(st_buf), " %s %.1fs", st_name, age_s);
+            const char* conn_name = s.last_status_conn == 0 ? "connA" : "connB";
+            // Base color: RED for Disconn(1), GREEN for Heartbt(0)/Reconn(2)/Failovr(3)
+            const char* bg_color = (s.last_status_type == 1) ? BG_RED : BG_GREEN;
+            char badge[48];
+            int badge_len;
+            if (s.last_recv_ts_ns > 0 && s.last_event_ts_ns > 0) {
+                double srv_ms = (s.last_recv_ts_ns - s.last_event_ts_ns) / 1e6;
+                // Override: YELLOW when srv > 100ms (and not disconnected)
+                if (s.last_status_type != 1 && srv_ms > 100.0)
+                    bg_color = BG_YELLOW;
+                badge_len = snprintf(badge, sizeof(badge), " %s:%+.1fms ", conn_name, srv_ms);
+            } else {
+                badge_len = snprintf(badge, sizeof(badge), " %s ", conn_name);
+            }
             pos = fb_puts(fb, pos, " ");
-            pos = fb_puts(fb, pos, dot_color);
-            pos = fb_put(fb, pos, "\xe2\x97\x8f", 3);  // ●
+            pos = fb_puts(fb, pos, "\033[97m");  // bright white fg
+            pos = fb_puts(fb, pos, bg_color);
+            pos = fb_put(fb, pos, badge, badge_len);
             pos = fb_puts(fb, pos, RST);
-            pos = fb_puts(fb, pos, DIM);
-            pos = fb_put(fb, pos, st_buf, st_len);
-            pos = fb_puts(fb, pos, RST);
-            used += 2 + st_len;  // dot + space + text
+            used += 1 + badge_len;
         }
 
         // Update frequency (rolling 60s)
@@ -738,18 +686,6 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
             pos = fb_puts(fb, pos, DIM);
             pos = fb_put(fb, pos, upd, upd_len);
             used += upd_len;
-        }
-
-        // Server latency (local CLOCK_REALTIME - exchange event_ts)
-        if (s.last_recv_ts_ns > 0 && s.last_event_ts_ns > 0 &&
-            s.last_recv_ts_ns > s.last_event_ts_ns) {
-            double srv_ms = (s.last_recv_ts_ns - s.last_event_ts_ns) / 1e6;
-            char srv[32];
-            int srv_len = snprintf(srv, sizeof(srv), " srv:%.1fms", srv_ms);
-            pos = fb_puts(fb, pos, DIM);
-            pos = fb_put(fb, pos, srv, srv_len);
-            pos = fb_puts(fb, pos, RST);
-            used += srv_len;
         }
 
         // Right part: latency stats + latest value (if available)
@@ -808,15 +744,15 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
     for (int i = 0; i < book_rows; i++) {
         auto& f = fl[i];
         f.bp[0] = f.bq[0] = f.ap[0] = f.aq[0] = '\0';
-        if (i < s.bid_count) {
-            fmt_price(f.bp, sizeof(f.bp), s.bids[i].price, PRICE_EXP);
-            fmt_qty(f.bq, sizeof(f.bq), s.bids[i].qty, QTY_EXP);
+        if (i < s.ob.bid_count) {
+            fmt_price(f.bp, sizeof(f.bp), s.ob.bids[i].price, PRICE_EXP);
+            fmt_qty(f.bq, sizeof(f.bq), s.ob.bids[i].qty, QTY_EXP);
             max_pdec = std::max(max_pdec, decimal_digits(f.bp));
             max_qdec = std::max(max_qdec, decimal_digits(f.bq));
         }
-        if (i < s.ask_count) {
-            fmt_price(f.ap, sizeof(f.ap), s.asks[i].price, PRICE_EXP);
-            fmt_qty(f.aq, sizeof(f.aq), s.asks[i].qty, QTY_EXP);
+        if (i < s.ob.ask_count) {
+            fmt_price(f.ap, sizeof(f.ap), s.ob.asks[i].price, PRICE_EXP);
+            fmt_qty(f.aq, sizeof(f.aq), s.ob.asks[i].qty, QTY_EXP);
             max_pdec = std::max(max_pdec, decimal_digits(f.ap));
             max_qdec = std::max(max_qdec, decimal_digits(f.aq));
         }
@@ -1151,14 +1087,14 @@ int main(int argc, char* argv[]) {
 
             // Reclaim unused book/trade rows for logs
             if (wide_mode) {
-                int data_depth = std::max({(int)state.bid_count, (int)state.ask_count, (int)state.trade_count});
+                int data_depth = std::max({(int)state.ob.bid_count, (int)state.ob.ask_count, (int)state.trade_count});
                 int needed = std::max(data_depth, BOOK_MIN);
                 if (needed < book_rows) {
                     log_rows += book_rows - needed;
                     book_rows = needed;
                 }
             } else {
-                int book_depth = std::max((int)state.bid_count, (int)state.ask_count);
+                int book_depth = std::max((int)state.ob.bid_count, (int)state.ob.ask_count);
                 int needed_book = std::max(book_depth, BOOK_MIN);
                 if (needed_book < book_rows) {
                     log_rows += book_rows - needed_book;

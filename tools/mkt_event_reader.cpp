@@ -51,6 +51,7 @@ int main(int argc, char* argv[]) {
                 evt.is_book_snapshot() ? "SNAPSHOT" :
                 evt.is_book_delta()    ? "DELTA" :
                 evt.is_trade_array()   ? "TRADE" :
+                evt.is_bbo_array()     ? "BBO" :
                 evt.is_system_status() ? "STATUS" : "?";
 
             // Compute delays
@@ -67,7 +68,7 @@ int main(int argc, char* argv[]) {
                    evt.recv_ts_ns, evt.event_ts_ns, evt.nic_ts_ns, evt.flags);
 
             // Monotonicity check per domain
-            if (evt.is_book_snapshot() || evt.is_book_delta()) {
+            if (evt.is_book_snapshot() || evt.is_book_delta() || evt.is_bbo_array()) {
                 bool ok = evt.src_seq > last_book_seq;
                 printf(" book_mono=%s", ok ? "OK" : "FAIL");
                 if (!ok) printf(" (prev=%ld)", last_book_seq);
@@ -102,6 +103,14 @@ int main(int argc, char* argv[]) {
                     printf(" [%s %ld@%ld id=%ld]",
                            t.is_buyer() ? "BUY" : "SELL",
                            t.price, t.qty, t.trade_id);
+                }
+                if (evt.count > 3) printf(" ...");
+            } else if (evt.is_bbo_array()) {
+                printf(" bbos=%u", evt.count);
+                for (uint8_t i = 0; i < evt.count && i < 3; i++) {
+                    auto& b = evt.payload.bbo_array.entries[i];
+                    printf(" [bid=%ld@%ld ask=%ld@%ld seq=%ld]",
+                           b.bid_price, b.bid_qty, b.ask_price, b.ask_qty, b.book_update_id);
                 }
                 if (evt.count > 3) printf(" ...");
             } else if (evt.is_system_status()) {

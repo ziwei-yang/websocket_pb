@@ -1893,6 +1893,9 @@ private:
                         prev_tcp_segs_in_[ci] = poll.segs_before;
                     }
                 }
+                if constexpr (InlineWS) {
+                    inline_ws_.ws_core.end_rx_cycle(static_cast<uint8_t>(ci));
+                }
             } // for each connection
         }
 
@@ -2189,6 +2192,9 @@ private:
                             else { running_.store(false, std::memory_order_release); }
                         }
                     }
+                    if constexpr (InlineWS) {
+                        inline_ws_.ws_core.end_rx_cycle(static_cast<uint8_t>(ci));
+                    }
                 } // for each ready pfd
             } // if (ready > 0)
 
@@ -2480,6 +2486,9 @@ private:
                     // Drain TLS records via AES-CTR decryption into MSG_INBOX
                     if (aes_ctr_decrypt_loop(ci, cs.chunk_pool_buf))
                         did_work = true;
+                }
+                if constexpr (InlineWS) {
+                    inline_ws_.ws_core.end_rx_cycle(static_cast<uint8_t>(ci));
                 }
             } // for each connection
 
@@ -2928,6 +2937,7 @@ public:
             inline_ws_.ws_core.init(msg_inbox_a, ws_frame_info_prod,
                                     &inline_ws_.tx_sink, conn_state);
         }
+        inline_ws_.ws_core.set_transport_mode(static_cast<uint8_t>(TransportMode::BSD_1THREAD));
     }
 
     /**

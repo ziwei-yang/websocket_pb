@@ -468,7 +468,7 @@ int main(int argc, char* argv[]) {
         bool end_of_batch;
         while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
             total_frames++;
-            uint8_t ci = frame.connection_id();
+            uint8_t ci = frame.connection_id;
             frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci], prev_latest_poll_cycle[ci],
                                  pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset));
             prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);
@@ -495,7 +495,7 @@ int main(int argc, char* argv[]) {
                 case 0x01:  // TEXT
                     text_frames++;
                     if (frame.payload_len > 0) {
-                        const uint8_t* payload = pipeline.msg_inbox(frame.connection_id())->data_at(frame.msg_inbox_offset);
+                        const uint8_t* payload = pipeline.msg_inbox(frame.connection_id)->data_at(frame.msg_inbox_offset);
                         if (is_valid_trade_json(reinterpret_cast<const char*>(payload), frame.payload_len)) {
                             valid_trades++;
                         }
@@ -529,7 +529,7 @@ int main(int argc, char* argv[]) {
             WSFrameInfo frame;
             while (ws_frame_cons.try_consume(frame)) {
                 total_frames++;
-                uint8_t ci = frame.connection_id();
+                uint8_t ci = frame.connection_id;
                 frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci], prev_latest_poll_cycle[ci],
                                      pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset));
                 prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);
@@ -560,7 +560,7 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            uint8_t ci = frame.connection_id();
+            uint8_t ci = frame.connection_id;
             frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci], prev_latest_poll_cycle[ci],
                                  pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset));
             prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);
@@ -602,7 +602,7 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            uint8_t ci = frame.connection_id();
+            uint8_t ci = frame.connection_id;
             if (frame_records.size() < MAX_FRAME_RECORDS) {
                 frame_records.push_back(frame);
             }

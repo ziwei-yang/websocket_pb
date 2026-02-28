@@ -799,6 +799,25 @@ endif
 build-test-pipeline-05_dpdk_disruptor_packetio_tcp: $(PIPELINE_DPDK_DISRUPTOR_TCP_BIN)
 
 # ============================================================================
+# DPDK PacketIO TCP Test (Single-Process: PacketTransport<DPDKPacketIO>)
+# ============================================================================
+
+PIPELINE_DPDK_PACKETIO_TCP_SRC := test/pipeline/06_dpdk_packetio_tcp.cpp
+PIPELINE_DPDK_PACKETIO_TCP_BIN := $(BUILD_DIR)/test_pipeline_06_dpdk_packetio_tcp
+
+$(PIPELINE_DPDK_PACKETIO_TCP_BIN): $(PIPELINE_DPDK_PACKETIO_TCP_SRC) $(PIPELINE_HEADERS) \
+    src/pipeline/dpdk_packet_io.hpp src/policy/transport.hpp | $(BUILD_DIR)
+ifdef USE_DPDK
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "✅ DPDK PacketIO TCP test build complete: $@"
+else
+	@echo "❌ Error: DPDK PacketIO TCP test requires USE_DPDK=1"
+	@exit 1
+endif
+
+build-test-pipeline-06_dpdk_packetio_tcp: $(PIPELINE_DPDK_PACKETIO_TCP_BIN)
+
+# ============================================================================
 # Transport TCP Test (NoSSLPolicy with forked XDP Poll + Transport)
 # ============================================================================
 

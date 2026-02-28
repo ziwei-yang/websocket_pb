@@ -274,6 +274,10 @@ map_test_source() {
             TEST_BIN="build/test_pipeline_05_dpdk_disruptor_packetio_tcp"
             MAKE_TARGET="build-test-pipeline-05_dpdk_disruptor_packetio_tcp"
             ;;
+        06_dpdk_packetio_tcp)
+            TEST_BIN="build/test_pipeline_06_dpdk_packetio_tcp"
+            MAKE_TARGET="build-test-pipeline-06_dpdk_packetio_tcp"
+            ;;
         30_binance_sbe_dpdk)
             TEST_BIN="build/test_pipeline_30_binance_sbe_dpdk"
             MAKE_TARGET="build-test-pipeline-30_binance_sbe_dpdk"

@@ -150,25 +150,48 @@ inline void fmt_latency(char* b, double us) {
 }
 
 // ============================================================================
+// TransportMode — identifies which transport pipeline populated this frame
+// ============================================================================
+
+enum class TransportMode : uint8_t {
+    DPDK            = 0,  // DPDK PMD inline (single-process DPDK+WS)
+    BSD_1THREAD     = 1,
+    BSD_2THREAD     = 2,
+    BSD_3THREAD     = 3,
+    XDP             = 4,  // XDP inline (98/99 files)
+    DPDK_DISRUPTOR  = 5,  // DPDK front + DisruptorPacketIO transport (10_tcp_ssl_process)
+    XDP_DISRUPTOR   = 6,  // XDP front + DisruptorPacketIO transport (10_tcp_ssl_process)
+};
+
+// ============================================================================
 // WSFrameInfo - Passed through WS_FRAME_INFO_RING to AppClient
-// Size: 128 bytes (2 per cache line)
+// Size: 256 bytes
 // Full timestamp chain from NIC to WS frame publish
 //
-// Layout (128 bytes):
+// Layout (256 bytes):
 //   offset  0: uint32_t msg_inbox_offset     (4)
 //   offset  4: uint32_t payload_len          (4)
 //   offset  8: uint8_t  opcode               (1)
-//   offset  9: uint8_t  flags                (1)  — is_fin:0, is_fragmented:1, is_last_fragment:2, is_tls_record_end:3, discard_early:4, is_active_conn:5, is_merged:6
+//   offset  9: uint8_t  flags                (1)
 //   offset 10: uint8_t  ssl_read_ct          (1)
 //   offset 11: uint8_t  nic_packet_ct        (1)
 //   offset 12: uint16_t first_pkt_mem_idx    (2)
 //   offset 14: uint16_t last_pkt_mem_idx     (2)
-//   offset 16: [10 x uint64_t fields]       (80) — publish_time_ts replaces first_ssl_read_end_cycle
+//   offset 16: [10 x uint64_t fields]       (80)
 //   offset 96: uint16_t ssl_read_batch_num  (2)
-//   offset 98: uint16_t mkt_event_info      (2)  — bit 15: connection_id, bits 14-13: EventType, bit 12: is_bbo, bits 11-0: count
+//   offset 98: uint8_t  transport_mode       (1)
+//   offset 99: uint8_t  connection_id        (1)
 //   offset100: uint32_t ssl_read_total_bytes(4)
 //   offset104: [3 x uint64_t timestamps]   (24)
-//   offset128: total                        (128)
+//   --- new fields at offset 128 ---
+//   offset128: uint8_t  mkt_event_type       (1)   EventType enum
+//   offset129: uint8_t  _pad1                (1)
+//   offset130: uint16_t mkt_event_count      (2)   element count
+//   offset132: uint32_t conn_target_ip       (4)   resolved IP (network order)
+//   offset136: int64_t  mkt_event_seq        (8)   exchange sequence
+//   offset144: int64_t  exchange_event_time_us(8)  exchange event time (us)
+//   offset152: uint8_t  reserved[104]       (104)
+//   offset256: total
 // ============================================================================
 
 struct alignas(64) WSFrameInfo {
@@ -216,7 +239,8 @@ struct alignas(64) WSFrameInfo {
 
     // Batch correlation
     uint16_t ssl_read_batch_num;           // 1-based index of this WS frame within SSL_read batch
-    uint16_t mkt_event_info;               // Bit 15: connection_id, Bits 14-13: EventType, Bit 12: is_bbo, Bits 11-0: count
+    uint8_t  transport_mode;               // TransportMode enum
+    uint8_t  connection_id;                // 0=A, 1=B
     uint32_t ssl_read_total_bytes;         // Total decrypted bytes from the SSL_read batch
     uint64_t ws_last_op_cycle;             // WS process rdtscp after previous operation completed
 
@@ -225,6 +249,15 @@ struct alignas(64) WSFrameInfo {
 
     // Stage 6: WS frame publish (stamped just before ring publish)
     uint64_t ws_frame_publish_cycle;       // rdtscp() immediately before publish()
+
+    // --- New fields at offset 128 ---
+    uint8_t  mkt_event_type;               // EventType enum (BBO=4 added)
+    uint8_t  _pad1;                        // alignment padding
+    uint16_t mkt_event_count;              // parsed element count
+    uint32_t conn_target_ip;               // resolved target IP (network byte order)
+    int64_t  mkt_event_seq;                // exchange sequence (book_update_id or trade_id)
+    int64_t  exchange_event_time_us;       // exchange event timestamp (microseconds)
+    uint8_t  reserved[104];               // zero-initialized, future expansion
 
     // Flag accessors
     bool is_fin() const { return flags & 0x01; }
@@ -243,21 +276,6 @@ struct alignas(64) WSFrameInfo {
     void set_merged(bool v) { if (v) flags |= 0x40; else flags &= ~0x40; }
     bool is_last_in_batch() const { return flags & 0x80; }
     void set_last_in_batch(bool v) { if (v) flags |= 0x80; else flags &= ~0x80; }
-
-    // MktEvent info accessors
-    // Bit 15: connection_id, Bits 14-13: EventType (0-3), Bit 12: is_bbo, Bits 11-0: count (0-4095)
-    uint8_t connection_id() const { return mkt_event_info >> 15; }
-    void set_connection_id(uint8_t ci) {
-        mkt_event_info = (mkt_event_info & 0x7FFF) | (static_cast<uint16_t>(ci & 1) << 15);
-    }
-    uint8_t mkt_event_type() const { return (mkt_event_info >> 13) & 0x3; }
-    bool is_bbo() const { return mkt_event_info & 0x1000; }
-    uint16_t mkt_event_count() const { return mkt_event_info & 0xFFF; }
-    void set_mkt_event_info(uint8_t type, uint16_t count, bool bbo = false) {
-        uint16_t ci_bit = mkt_event_info & 0x8000;  // preserve connection_id
-        mkt_event_info = ci_bit | (static_cast<uint16_t>(type & 0x3) << 13)
-                       | (bbo ? 0x1000 : 0) | (count & 0xFFF);
-    }
 
     void clear() {
         msg_inbox_offset = 0;
@@ -279,11 +297,19 @@ struct alignas(64) WSFrameInfo {
         ssl_last_op_cycle = 0;
         latest_ssl_read_end_cycle = 0;
         ssl_read_batch_num = 0;
-        mkt_event_info = 0;
+        transport_mode = 0;
+        connection_id = 0;
         ssl_read_total_bytes = 0;
         ws_last_op_cycle = 0;
         ws_parse_cycle = 0;
         ws_frame_publish_cycle = 0;
+        mkt_event_type = 0;
+        _pad1 = 0;
+        mkt_event_count = 0;
+        conn_target_ip = 0;
+        mkt_event_seq = 0;
+        exchange_event_time_us = 0;
+        std::memset(reserved, 0, sizeof(reserved));
     }
 
     void debug_validate(uint8_t ci) const {
@@ -319,8 +345,7 @@ struct alignas(64) WSFrameInfo {
     void print_timeline(uint64_t tsc_freq_hz,
                         uint64_t prev_publish_mono_ns = 0,
                         uint64_t prev_latest_poll_cycle = 0,
-                        const uint8_t* payload_data = nullptr,
-                        int64_t exchange_event_time_ms = 0) const {
+                        const uint8_t* payload_data = nullptr) const {
         uint64_t ref = ws_frame_publish_cycle;
         if (ref == 0) return;
         double to_us = 1e6 / static_cast<double>(tsc_freq_hz);
@@ -412,14 +437,19 @@ struct alignas(64) WSFrameInfo {
         fmt(tot, total_us);
         char mkt_cnt[8] = "";
         char mkt_typ[4] = "";
-        if (mkt_event_info != 0) {
-            uint8_t et = mkt_event_type();
-            uint16_t cnt = mkt_event_count();
-            switch (et) {
-            case 0: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Dp"); break;
-            case 1: std::snprintf(mkt_typ, sizeof(mkt_typ), is_bbo() ? "Bo" : "OB"); break;
-            case 2: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Td"); break;
-            case 3: std::snprintf(mkt_typ, sizeof(mkt_typ), "Sy");     break;
+        if (mkt_event_type != 0 || mkt_event_count != 0) {
+            if (is_fragmented() && !is_last_fragment()) {
+                std::snprintf(mkt_typ, sizeof(mkt_typ), "Fg");
+            } else {
+                uint8_t et = mkt_event_type;
+                uint16_t cnt = mkt_event_count;
+                switch (et) {
+                case 0: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Dp"); break;
+                case 1: std::snprintf(mkt_typ, sizeof(mkt_typ), "OB"); break;
+                case 2: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Td"); break;
+                case 3: std::snprintf(mkt_typ, sizeof(mkt_typ), "Sy");     break;
+                case 4: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Bo"); break;
+                }
             }
         } else if (is_fragmented() && !is_last_fragment()) {
             std::snprintf(mkt_typ, sizeof(mkt_typ), "Fg");
@@ -433,7 +463,7 @@ struct alignas(64) WSFrameInfo {
         if (mkt_typ[0] == '\0') {
             int dp = 0;
             dp += std::snprintf(dbg_suffix + dp, sizeof(dbg_suffix) - dp,
-                                " [op=%02x fl=%02x ei=%04x", opcode, flags, mkt_event_info);
+                                " [op=%02x fl=%02x et=%u", opcode, flags, mkt_event_type);
             if (payload_data != nullptr && payload_len > 0) {
                 dp += std::snprintf(dbg_suffix + dp, sizeof(dbg_suffix) - dp, " d=");
                 uint32_t show = payload_len < 16 ? payload_len : 16;
@@ -448,37 +478,10 @@ struct alignas(64) WSFrameInfo {
         int n = std::snprintf(sz, sizeof(sz), "%u/%u", payload_len, ssl_read_total_bytes);
         while (n < 10 && n < (int)sizeof(sz) - 1) sz[n++] = ' ';
         sz[n] = '\0';
-        char late[160] = "";
-        int late_pos = 0;
-        double ns_per_cycle = (tsc_freq_hz > 0) ? 1e9 / static_cast<double>(tsc_freq_hz) : 0.0;
-        auto append_late = [&](const char* label, double us) {
-            char v[16];
-            fmt(v, us);
-            late_pos += std::snprintf(late + late_pos, sizeof(late) - late_pos,
-                " \033[31m%s %s\033[0m", label, v);
-        };
-        // main_late: to_time(ws_last_op_cycle) - poll_ref (skip for batch continuations)
-        uint64_t late_ref_cycle = is_chunk_mode ? latest_poll_cycle : first_poll_cycle;
-        if (!is_batch_continuation && ws_last_op_cycle > 0 && late_ref_cycle > 0 && first_bpf_entry_ns > 0 && ns_per_cycle > 0.0) {
-            double main_late_ns = static_cast<double>(static_cast<int64_t>(ws_last_op_cycle - late_ref_cycle)) * ns_per_cycle;
-            double main_late_us = main_late_ns / 1000.0;
-            if (main_late_us > 0.0) append_late("main_late", main_late_us);
-        }
-        // ssl_late: to_time(ssl_last_op_cycle) - poll_ref
-        if (ssl_last_op_cycle > 0 && late_ref_cycle > 0 && first_bpf_entry_ns > 0 && ns_per_cycle > 0.0) {
-            double ssl_late_ns = static_cast<double>(static_cast<int64_t>(ssl_last_op_cycle - late_ref_cycle)) * ns_per_cycle;
-            double ssl_late_us = ssl_late_ns / 1000.0;
-            if (ssl_late_us > 0.0) append_late("ssl_late", ssl_late_us);
-        }
-        // ws_late: ws_last_op_cycle - latest_ssl_read_end_cycle
-        if (!is_batch_continuation && ws_last_op_cycle > 0 && latest_ssl_read_end_cycle > 0 && ns_per_cycle > 0.0) {
-            double ws_late_ns = static_cast<double>(static_cast<int64_t>(ws_last_op_cycle - latest_ssl_read_end_cycle)) * ns_per_cycle;
-            double ws_late_us = ws_late_ns / 1000.0;
-            if (ws_late_us > 0.0) append_late("ws_late", ws_late_us);
-        }
         // Exchange event time → local clock diff display
         char exch_diff[24] = "";
-        auto compute_exch_diff = [&](int64_t e_ms) {
+        if (exchange_event_time_us > 0) {
+            int64_t e_ms = exchange_event_time_us / 1000;
             if (e_ms > 1000000000000LL) {  // sanity: after 2001
                 struct timespec rts;
                 clock_gettime(CLOCK_REALTIME, &rts);
@@ -487,10 +490,6 @@ struct alignas(64) WSFrameInfo {
                 int64_t diff = local_ms - e_ms;
                 std::snprintf(exch_diff, sizeof(exch_diff), " %+ldms", diff);
             }
-        };
-        if (exchange_event_time_ms > 0) {
-            // Caller provided event time (e.g., SBE binary frames)
-            compute_exch_diff(exchange_event_time_ms);
         } else if (opcode == 0x01 && payload_data != nullptr && payload_len > 10) {
             // Parse Binance "E" (event time) from JSON payload
             const char* p = reinterpret_cast<const char*>(payload_data);
@@ -503,15 +502,27 @@ struct alignas(64) WSFrameInfo {
                         e_ms = e_ms * 10 + (*d - '0');
                         ++d;
                     }
-                    compute_exch_diff(e_ms);
+                    if (e_ms > 1000000000000LL) {
+                        struct timespec rts;
+                        clock_gettime(CLOCK_REALTIME, &rts);
+                        int64_t local_ms = static_cast<int64_t>(rts.tv_sec) * 1000LL
+                                         + rts.tv_nsec / 1000000LL;
+                        int64_t diff = local_ms - e_ms;
+                        std::snprintf(exch_diff, sizeof(exch_diff), " %+ldms", diff);
+                    }
                     break;
                 }
             }
         }
         const char* line_color;
         const char* line_reset;
-        bool is_mkt = (mkt_event_info != 0 && !is_discard_early() && !is_merged());
-        if (connection_id() == 0) {
+        // Seq suffix for matching WSFrameInfo with MktEvent Σ lines
+        char seq_suffix[40] = "";
+        if (mkt_event_seq != 0) {
+            std::snprintf(seq_suffix, sizeof(seq_suffix), " | seq %ld", mkt_event_seq);
+        }
+        bool is_mkt = ((mkt_event_type != 0 || mkt_event_count != 0) && !is_discard_early() && !is_merged());
+        if (connection_id == 0) {
             line_color = is_mkt ? "\033[34m" : "";
             line_reset = is_mkt ? "\033[0m" : "";
         } else {
@@ -540,7 +551,7 @@ struct alignas(64) WSFrameInfo {
                     line_color, bpf_prefix, nic_col,
                     nic_packet_ct, t[1],
                     ssl_prefix, ssl_read_ct, sz, t[2], t[3],
-                    ssl_read_batch_num, t[4], discard_mark, mkt_cnt, mkt_typ, tot, late, exch_diff, dbg_suffix, line_reset);
+                    ssl_read_batch_num, t[4], discard_mark, mkt_cnt, mkt_typ, tot, exch_diff, seq_suffix, dbg_suffix, line_reset);
         } else {
             fprintf(stderr,
                     "%s%s"
@@ -551,11 +562,11 @@ struct alignas(64) WSFrameInfo {
                     line_color, bpf_prefix,
                     nic_packet_ct, last_pkt_mem_idx, t[0], t[1],
                     ssl_prefix, ssl_read_ct, sz, t[2], t[3],
-                    ssl_read_batch_num, t[4], discard_mark, mkt_cnt, mkt_typ, tot, late, exch_diff, dbg_suffix, line_reset);
+                    ssl_read_batch_num, t[4], discard_mark, mkt_cnt, mkt_typ, tot, exch_diff, seq_suffix, dbg_suffix, line_reset);
         }
     }
 };
-static_assert(sizeof(WSFrameInfo) == 128, "WSFrameInfo must be 128 bytes");
+static_assert(sizeof(WSFrameInfo) == 256, "WSFrameInfo must be 256 bytes");
 
 // ============================================================================
 // PongFrameAligned - Pre-framed PONG data passed through PONGS ring

@@ -293,7 +293,7 @@ int main(int argc, char* argv[]) {
         bool end_of_batch;
         while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
             total_frames++;
-            uint8_t ci = frame.connection_id();
+            uint8_t ci = frame.connection_id;
             const uint8_t* payload = pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset);
 
             // Extract exchange event time from SBE binary frames
@@ -313,7 +313,7 @@ int main(int argc, char* argv[]) {
             }
 
             frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci],
-                                 prev_latest_poll_cycle[ci], payload, event_time_ms);
+                                 prev_latest_poll_cycle[ci], payload);
             prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);
             prev_latest_poll_cycle[ci] = frame.latest_poll_cycle;
         }
@@ -327,7 +327,7 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            uint8_t ci = frame.connection_id();
+            uint8_t ci = frame.connection_id;
             const uint8_t* payload = pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset);
 
             int64_t event_time_ms = 0;
@@ -345,7 +345,7 @@ int main(int argc, char* argv[]) {
             }
 
             frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci],
-                                 prev_latest_poll_cycle[ci], payload, event_time_ms);
+                                 prev_latest_poll_cycle[ci], payload);
             prev_publish_mono_ns[ci] = frame.ssl_read_end_mono_ns(tsc_freq);
             prev_latest_poll_cycle[ci] = frame.latest_poll_cycle;
         }
@@ -371,7 +371,7 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            uint8_t ci = frame.connection_id();
+            uint8_t ci = frame.connection_id;
             if (frame.opcode == 0x02) binary_frames++;
             else if (frame.opcode == 0x01) text_frames++;
         }

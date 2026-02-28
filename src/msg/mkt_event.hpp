@@ -22,6 +22,7 @@ enum class EventType : uint8_t {
     BOOK_SNAPSHOT = 1,
     TRADE_ARRAY   = 2,
     SYSTEM_STATUS = 3,
+    BBO_ARRAY     = 4,
 };
 
 enum class VenueId : uint8_t {
@@ -40,6 +41,7 @@ enum class SystemStatusType : uint8_t {
     HEARTBEAT    = 0,
     DISCONNECTED = 1,
     RECONNECTED  = 2,
+    FAILOVER     = 3,
 };
 
 // ============================================================================
@@ -50,7 +52,6 @@ namespace EventFlags {
     inline constexpr uint16_t SNAPSHOT      = 1 << 0;
     inline constexpr uint16_t CONTINUATION  = 1 << 1;  // not first in multi-event batch
     inline constexpr uint16_t LAST_IN_BATCH = 1 << 2;  // last in multi-event batch
-    inline constexpr uint16_t BBO           = 1 << 3;  // bestBidAsk (vs depth snapshot)
 }
 
 namespace DeltaFlags {
@@ -101,6 +102,16 @@ struct TradeEntry {
 };
 static_assert(sizeof(TradeEntry) == 40);
 
+struct BboEntry {
+    int64_t bid_price;      // bid price mantissa
+    int64_t bid_qty;        // bid qty mantissa
+    int64_t ask_price;      // ask price mantissa
+    int64_t ask_qty;        // ask qty mantissa
+    int64_t event_time_ns;  // per-BBO exchange timestamp (ns)
+    int64_t book_update_id; // exchange sequence
+};
+static_assert(sizeof(BboEntry) == 48);
+
 // ============================================================================
 // Payload types (all exactly 472 bytes)
 // ============================================================================
@@ -135,6 +146,15 @@ struct TradeArrayPayload {
 };
 static_assert(sizeof(TradeArrayPayload) == PAYLOAD_SIZE);
 
+// BBO: header.count = number of BBOs (max 9)
+static constexpr size_t MAX_BBOS = PAYLOAD_SIZE / sizeof(BboEntry);  // 9
+
+struct BboArrayPayload {
+    BboEntry entries[MAX_BBOS];
+    uint8_t _pad[PAYLOAD_SIZE - MAX_BBOS * sizeof(BboEntry)];
+};
+static_assert(sizeof(BboArrayPayload) == PAYLOAD_SIZE);
+
 // SYSTEM_STATUS: header.count = 0
 struct SystemStatusPayload {
     uint8_t  status_type;      // SystemStatusType
@@ -167,6 +187,7 @@ struct alignas(512) MktEvent {
         BookDeltaPayload    deltas;
         BookSnapshotPayload snapshot;
         TradeArrayPayload   trades;
+        BboArrayPayload     bbo_array;
         SystemStatusPayload status;
     } payload;
 
@@ -178,6 +199,7 @@ struct alignas(512) MktEvent {
     bool is_book_snapshot() const { return event_type == static_cast<uint8_t>(EventType::BOOK_SNAPSHOT); }
     bool is_trade_array()   const { return event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY); }
     bool is_system_status() const { return event_type == static_cast<uint8_t>(EventType::SYSTEM_STATUS); }
+    bool is_bbo_array()   const { return event_type == static_cast<uint8_t>(EventType::BBO_ARRAY); }
 
     // ========================================================================
     // Event flag queries
@@ -205,6 +227,14 @@ struct alignas(512) MktEvent {
         return { payload.snapshot.levels + count, count2 };
     }
 
+    struct BboSpan {
+        const BboEntry* data;
+        uint8_t count;
+    };
+    BboSpan bbo_entries() const {
+        return { payload.bbo_array.entries, count };
+    }
+
     // ========================================================================
     // Print — dim MKT line aligned with WSFrameInfo::print_timeline() tail
     // Σ = total latency: NIC/BPF arrival to event publish
@@ -227,8 +257,9 @@ struct alignas(512) MktEvent {
         char mkt_typ[4] = "";
         switch (event_type) {
         case 0: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", count); std::snprintf(mkt_typ, sizeof(mkt_typ), "Dp"); break;
-        case 1: std::snprintf(mkt_typ, sizeof(mkt_typ), (flags & EventFlags::BBO) ? "Bo" : "OB"); break;
+        case 1: std::snprintf(mkt_typ, sizeof(mkt_typ), "OB"); break;
         case 2: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", count); std::snprintf(mkt_typ, sizeof(mkt_typ), "Td"); break;
+        case 4: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", count); std::snprintf(mkt_typ, sizeof(mkt_typ), "Bo"); break;
         }
 
         char lat[16] = "     -";
@@ -275,5 +306,6 @@ static_assert(std::is_standard_layout_v<MktEvent>);
 static_assert(std::is_trivially_copyable_v<DeltaEntry>);
 static_assert(std::is_trivially_copyable_v<BookLevel>);
 static_assert(std::is_trivially_copyable_v<TradeEntry>);
+static_assert(std::is_trivially_copyable_v<BboEntry>);
 
 }  // namespace websocket::msg

@@ -627,7 +627,7 @@ public:
         if constexpr (EnableAB) {
             if (!BSDIPCRingManager::open_or_create_standalone_ring("mkt_event.Binance.BTC-USDT",
                     MKT_EVENT_RING_SIZE * sizeof(websocket::msg::MktEvent),
-                    sizeof(websocket::msg::MktEvent), 1)) {
+                    sizeof(websocket::msg::MktEvent), 8)) {
                 fprintf(stderr, "FAIL: Cannot create mkt_event ring\n");
                 return false;
             }
@@ -942,6 +942,12 @@ private:
                 conn_state_);
             if (!ok) { conn_state_->shutdown_all(); return; }
         }
+        if constexpr (SSLThreadingType::has_ssl_thread)
+            ws_process.set_transport_mode(static_cast<uint8_t>(TransportMode::BSD_3THREAD));
+        else if constexpr (SSLThreadingType::is_single_thread)
+            ws_process.set_transport_mode(static_cast<uint8_t>(TransportMode::BSD_1THREAD));
+        else
+            ws_process.set_transport_mode(static_cast<uint8_t>(TransportMode::BSD_2THREAD));
 
         ws_process.run_with_handshake();
     }
