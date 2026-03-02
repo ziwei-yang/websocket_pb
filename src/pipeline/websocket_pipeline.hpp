@@ -49,8 +49,10 @@
 #include "pipeline_config.hpp"
 #ifdef USE_DPDK
 #include "01_dpdk_poll_process.hpp"
+#include "dpdk_packet_io.hpp"
 #else
 #include "00_xdp_poll_process.hpp"
+#include "../xdp/xdp_packet_io.hpp"
 #endif
 #include "10_tcp_ssl_process.hpp"
 #include "20_ws_process.hpp"
@@ -427,7 +429,7 @@ public:
         return true;
     }
 
-    template<bool EnableAB, bool NeedWSFrameInfoRing, bool IsInlineWS = false>
+    template<bool EnableAB, bool NeedWSFrameInfoRing, bool IsInlineWS = false, bool IsDirectIO = false>
     bool create_all_rings() {
         mkdir("/dev/shm/hft", 0755);
         std::string full_dir = "/dev/shm/hft/" + ipc_ring_dir_;
@@ -436,11 +438,13 @@ public:
             return false;
         }
 
-        // XDP Poll <-> Transport rings (always needed)
-        if (!create_ring("raw_inbox", RAW_INBOX_SIZE * sizeof(PacketFrameDescriptor),
-                         sizeof(PacketFrameDescriptor), 1)) return false;
-        if (!create_ring("raw_outbox", RAW_OUTBOX_SIZE * sizeof(PacketFrameDescriptor),
-                         sizeof(PacketFrameDescriptor), 1)) return false;
+        // XDP Poll <-> Transport rings (not needed in DirectIO — PacketIO handles NIC)
+        if constexpr (!IsDirectIO) {
+            if (!create_ring("raw_inbox", RAW_INBOX_SIZE * sizeof(PacketFrameDescriptor),
+                             sizeof(PacketFrameDescriptor), 1)) return false;
+            if (!create_ring("raw_outbox", RAW_OUTBOX_SIZE * sizeof(PacketFrameDescriptor),
+                             sizeof(PacketFrameDescriptor), 1)) return false;
+        }
 
         // MSG_OUTBOX: always created (parent may send custom WS frames at runtime)
         if (!create_ring("msg_outbox", MSG_OUTBOX_SIZE * sizeof(MsgOutboxEvent),
@@ -624,6 +628,14 @@ public:
     static constexpr bool WSFrameInfoRing = Traits::WS_FRAME_INFO_RING;
     static constexpr bool NeedWSFrameInfoRing = !HasMktEventHandler || WSFrameInfoRing;
 
+    // DirectIO: PacketIO handles NIC I/O directly (no poll process, no raw IPC rings)
+    static constexpr bool DirectIO = []() consteval -> bool {
+        if constexpr (requires { typename Traits::PacketIOType; })
+            return !std::is_same_v<typename Traits::PacketIOType, DisruptorPacketIO>;
+        else
+            return false;
+    }();
+
     // InlineWS requires AutoReconnect
     static_assert(!InlineWS || AutoReconnect,
                   "INLINE_WS requires AUTO_RECONNECT=true");
@@ -678,6 +690,24 @@ public:
         EnableAB, AutoReconnect, Prof,
         InlineWSCoreType>;
 
+    // --- Direct IO mode types (no poll process, PacketIO handles NIC) ---
+    // Helper to extract Traits::PacketIOType (defaults to DisruptorPacketIO when absent)
+    template<typename T, typename Default = DisruptorPacketIO>
+    struct get_packet_io_type { using type = Default; };
+    template<typename T, typename Default>
+        requires requires { typename T::PacketIOType; }
+    struct get_packet_io_type<T, Default> { using type = typename T::PacketIOType; };
+
+    using DirectIOPacketIOType = typename get_packet_io_type<Traits>::type;
+
+    using DirectIOTransportType = TransportProcess<
+        SSLPolicyType,
+        NullRingAdapter,
+        NullRingAdapter,
+        EnableAB, AutoReconnect, Prof,
+        InlineWSCoreType,
+        DirectIOPacketIOType>;
+
     // ========================================================================
     // Lifecycle
     // ========================================================================
@@ -694,10 +724,14 @@ public:
         interface_ = interface;
         bpf_path_ = bpf_path;
 
-        printf("\n=== Setting up WebSocket Pipeline%s ===\n", InlineWS ? " (InlineWS)" : "");
+        printf("\n=== Setting up WebSocket Pipeline%s%s ===\n",
+               InlineWS ? " (InlineWS)" : "",
+               DirectIO ? " (DirectIO)" : "");
         printf("Interface:   %s\n", interface_);
         printf("BPF Path:    %s\n", bpf_path_);
-        if constexpr (InlineWS) {
+        if constexpr (DirectIO && InlineWS) {
+            printf("Mode:        DirectIO + InlineWS (single child process, no poll process)\n");
+        } else if constexpr (InlineWS) {
             printf("Mode:        InlineWS (transport + WS in single process, 2-process total)\n");
         }
 
@@ -794,46 +828,48 @@ public:
                gateway_mac_[0], gateway_mac_[1], gateway_mac_[2],
                gateway_mac_[3], gateway_mac_[4], gateway_mac_[5]);
 
-        // Create IPC rings (InlineWS skips transport↔WS rings)
-        if (!ipc_manager_.template create_all_rings<EnableAB, NeedWSFrameInfoRing, InlineWS>()) {
+        // Create IPC rings (InlineWS skips transport↔WS rings, DirectIO skips raw rings)
+        if (!ipc_manager_.template create_all_rings<EnableAB, NeedWSFrameInfoRing, InlineWS, DirectIO>()) {
             fprintf(stderr, "FAIL: Cannot create IPC rings\n");
             return false;
         }
 
-        // Allocate UMEM
-        umem_size_ = UMEM_TOTAL_SIZE;
+        // Allocate UMEM (DirectIO: PacketIO manages its own UMEM)
+        if constexpr (!DirectIO) {
+            umem_size_ = UMEM_TOTAL_SIZE;
 #ifdef USE_DPDK
-        // DPDK requires UMEM at low VA (< 512 GB) due to Intel IOMMU SAGAW=39.
-        // DPDK_UMEM_BASE_VA (8 GB) keeps all DMA addresses within the 39-bit limit.
-        umem_area_ = mmap(reinterpret_cast<void*>(DPDK_UMEM_BASE_VA), umem_size_,
-                         PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB | MAP_FIXED_NOREPLACE,
-                         -1, 0);
-        if (umem_area_ == MAP_FAILED) {
-            printf("WARN: Huge pages not available at low VA, trying regular pages\n");
+            // DPDK requires UMEM at low VA (< 512 GB) due to Intel IOMMU SAGAW=39.
+            // DPDK_UMEM_BASE_VA (8 GB) keeps all DMA addresses within the 39-bit limit.
             umem_area_ = mmap(reinterpret_cast<void*>(DPDK_UMEM_BASE_VA), umem_size_,
-                              PROT_READ | PROT_WRITE,
-                              MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-                              -1, 0);
+                             PROT_READ | PROT_WRITE,
+                             MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB | MAP_FIXED_NOREPLACE,
+                             -1, 0);
             if (umem_area_ == MAP_FAILED) {
-                fprintf(stderr, "FAIL: Cannot allocate UMEM at low VA for DPDK\n");
-                return false;
+                printf("WARN: Huge pages not available at low VA, trying regular pages\n");
+                umem_area_ = mmap(reinterpret_cast<void*>(DPDK_UMEM_BASE_VA), umem_size_,
+                                  PROT_READ | PROT_WRITE,
+                                  MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                                  -1, 0);
+                if (umem_area_ == MAP_FAILED) {
+                    fprintf(stderr, "FAIL: Cannot allocate UMEM at low VA for DPDK\n");
+                    return false;
+                }
             }
-        }
 #else
-        umem_area_ = mmap(nullptr, umem_size_, PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-        if (umem_area_ == MAP_FAILED) {
-            printf("WARN: Huge pages not available, using regular pages\n");
             umem_area_ = mmap(nullptr, umem_size_, PROT_READ | PROT_WRITE,
-                              MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+                             MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
             if (umem_area_ == MAP_FAILED) {
-                fprintf(stderr, "FAIL: Cannot allocate UMEM\n");
-                return false;
+                printf("WARN: Huge pages not available, using regular pages\n");
+                umem_area_ = mmap(nullptr, umem_size_, PROT_READ | PROT_WRITE,
+                                  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+                if (umem_area_ == MAP_FAILED) {
+                    fprintf(stderr, "FAIL: Cannot allocate UMEM\n");
+                    return false;
+                }
             }
-        }
 #endif
-        printf("UMEM: %p (%zu bytes)\n", umem_area_, umem_size_);
+            printf("UMEM: %p (%zu bytes)\n", umem_area_, umem_size_);
+        }
 
         // Allocate MsgInbox per connection
         for (size_t i = 0; i < NUM_CONN; i++) {
@@ -915,8 +951,10 @@ public:
 
         // Open shared regions
         try {
-            raw_inbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_inbox"));
-            raw_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_outbox"));
+            if constexpr (!DirectIO) {
+                raw_inbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_inbox"));
+                raw_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("raw_outbox"));
+            }
             // MSG_OUTBOX always opened (parent may send custom WS frames)
             msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
             if constexpr (!InlineWS) {
@@ -942,22 +980,39 @@ public:
     }
 
     bool start() {
-        // Fork XDP Poll process
-        xdp_pid_ = fork();
-        if (xdp_pid_ < 0) { fprintf(stderr, "FAIL: fork() for XDP Poll\n"); return false; }
-        if (xdp_pid_ == 0) { run_xdp_poll_process(); _exit(0); }
-        printf("[PIPELINE] Forked XDP Poll (PID %d, core %d)\n", xdp_pid_, Traits::XDP_POLL_CORE);
+        if constexpr (!DirectIO) {
+            // Fork XDP Poll process (not needed in DirectIO — PacketIO handles NIC)
+            xdp_pid_ = fork();
+            if (xdp_pid_ < 0) { fprintf(stderr, "FAIL: fork() for XDP Poll\n"); return false; }
+            if (xdp_pid_ == 0) { run_xdp_poll_process(); _exit(0); }
+            printf("[PIPELINE] Forked XDP Poll (PID %d, core %d)\n", xdp_pid_, Traits::XDP_POLL_CORE);
 
-        // Wait for XDP ready
-        if (!conn_state_->wait_for_handshake_xdp_ready(10000000)) {
-            fprintf(stderr, "FAIL: Timeout waiting for XDP Poll ready\n");
-            return false;
+            // Wait for XDP ready
+            if (!conn_state_->wait_for_handshake_xdp_ready(10000000)) {
+                fprintf(stderr, "FAIL: Timeout waiting for XDP Poll ready\n");
+                return false;
+            }
         }
 
         // Flush before fork
         fflush(stdout);
 
-        if constexpr (InlineWS) {
+        if constexpr (DirectIO && InlineWS) {
+            // DirectIO + InlineWS: single child process (transport handles NIC + WS)
+            static_assert(InlineWS, "DirectIO requires InlineWS=true");
+            transport_pid_ = fork();
+            if (transport_pid_ < 0) { fprintf(stderr, "FAIL: fork() for DirectIO Transport\n"); return false; }
+            if (transport_pid_ == 0) { run_direct_io_transport_process(); _exit(0); }
+            printf("[PIPELINE] Forked DirectIO Transport (PID %d, core %d, %s)\n",
+                   transport_pid_, Traits::TRANSPORT_CORE, SSLPolicyType::name());
+
+            // Wait for WS ready
+            if (!conn_state_->wait_for_handshake_ws_ready(30000000)) {
+                fprintf(stderr, "FAIL: DirectIO handshake timeout\n");
+                return false;
+            }
+            printf("[PIPELINE] DirectIO transport ready (1 child process, no poll process)\n");
+        } else if constexpr (InlineWS) {
             // InlineWS: single Transport+WS child process (2 total with XDP Poll)
             transport_pid_ = fork();
             if (transport_pid_ < 0) { fprintf(stderr, "FAIL: fork() for InlineWS Transport\n"); return false; }
@@ -1029,15 +1084,19 @@ public:
             }
             pid = 0;
         };
-        reap(xdp_pid_, "XDP-Poll");
+        if constexpr (!DirectIO) {
+            reap(xdp_pid_, "XDP-Poll");
+        }
         reap(transport_pid_, "Transport");
         if constexpr (!InlineWS) {
             reap(websocket_pid_, "WebSocket");
         }
 
         // Cleanup shared regions
-        delete raw_inbox_region_; raw_inbox_region_ = nullptr;
-        delete raw_outbox_region_; raw_outbox_region_ = nullptr;
+        if constexpr (!DirectIO) {
+            delete raw_inbox_region_; raw_inbox_region_ = nullptr;
+            delete raw_outbox_region_; raw_outbox_region_ = nullptr;
+        }
         delete msg_outbox_region_; msg_outbox_region_ = nullptr;
         if constexpr (!InlineWS) {
             for (size_t i = 0; i < NUM_CONN; i++) {
@@ -1065,8 +1124,10 @@ public:
                 munmap(profiling_, sizeof(ProfilingShm)); profiling_ = nullptr;
             }
         }
-        if (umem_area_ && umem_area_ != MAP_FAILED) {
-            munmap(umem_area_, umem_size_); umem_area_ = nullptr;
+        if constexpr (!DirectIO) {
+            if (umem_area_ && umem_area_ != MAP_FAILED) {
+                munmap(umem_area_, umem_size_); umem_area_ = nullptr;
+            }
         }
     }
 
@@ -1315,6 +1376,69 @@ private:
         // MsgOutboxCons is real (parent sends), WSProcessor=InlineWSCoreType
         InlineTransportType transport(url, umem_area_, FRAME_SIZE,
             &raw_inbox_cons, &raw_outbox_prod,
+            msg_inbox_[0], nullptr, nullptr,
+            conn_state_, &msg_outbox_cons,
+            EnableAB ? msg_inbox_[1] : nullptr, nullptr);
+        transport.inline_mkt_event_handler() = mkt_event_handler_;
+
+        // Wire MktEvent producer and ConnStateShm to mkt_event_handler
+        if constexpr (EnableAB) {
+            transport.inline_mkt_event_handler().mkt_event_prod = mkt_event_prod_holder.get();
+            transport.inline_mkt_event_handler().conn_state = conn_state_;
+        }
+
+        if constexpr (Prof) transport.set_profiling_data(&profiling_->transport);
+        if (!transport.init()) { conn_state_->shutdown_all(); return; }
+
+        // Wire WSCore to msg_inbox, ws_frame_info_prod, DirectTXSink
+        if constexpr (EnableAB) {
+            transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_,
+                                  msg_inbox_[0], msg_inbox_[1]);
+        } else {
+            transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_,
+                                  msg_inbox_[0]);
+        }
+
+        // Wire active connection pointer for priority ordering
+        if constexpr (EnableAB) {
+            transport.set_active_conn_ptr(&transport.inline_mkt_event_handler().active_ci_);
+        }
+
+        transport.run();
+        transport.cleanup();
+    }
+
+    void run_direct_io_transport_process() {
+        static_assert(DirectIO && InlineWS,
+            "run_direct_io_transport_process() requires DirectIO + InlineWS");
+        pipeline_helpers::pin_to_cpu(Traits::TRANSPORT_CORE);
+
+        // No raw_inbox/raw_outbox rings — PacketIO handles NIC directly
+        IPCRingConsumer<MsgOutboxEvent> msg_outbox_cons(*msg_outbox_region_);
+
+        // WSFrameInfo producer — transport → parent
+        std::unique_ptr<IPCRingProducer<WSFrameInfo>> ws_frame_info_prod_holder;
+        if constexpr (NeedWSFrameInfoRing) {
+            ws_frame_info_prod_holder = std::make_unique<IPCRingProducer<WSFrameInfo>>(
+                *ws_frame_info_region_);
+        }
+
+        char url[512];
+        snprintf(url, sizeof(url), "wss://%s:%u%s",
+                 Traits::WSS_HOST, Traits::WSS_PORT, Traits::WSS_PATH);
+
+        // MktEvent producer — transport → standalone ring (for external consumers)
+        std::unique_ptr<IPCRingProducer<websocket::msg::MktEvent>> mkt_event_prod_holder;
+        if constexpr (EnableAB) {
+            if (mkt_event_region_) {
+                mkt_event_prod_holder = std::make_unique<IPCRingProducer<websocket::msg::MktEvent>>(
+                    *mkt_event_region_);
+            }
+        }
+
+        // DirectIOTransportType: PacketIO handles NIC, no raw rings needed
+        DirectIOTransportType transport(url, nullptr, 0,
+            nullptr, nullptr,  // no raw inbox/outbox
             msg_inbox_[0], nullptr, nullptr,
             conn_state_, &msg_outbox_cons,
             EnableAB ? msg_inbox_[1] : nullptr, nullptr);

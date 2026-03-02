@@ -654,11 +654,16 @@ struct PacketTransport {
     void init_with_pio_config(const ConfigT& config) {
         pio().init(config);
 
-        // Get interface name from conn_state if available
+        // Get interface name from conn_state or config.interface
         const char* interface = nullptr;
         if constexpr (requires { config.conn_state; }) {
             if (config.conn_state && config.conn_state->interface_name[0] != '\0') {
                 interface = config.conn_state->interface_name;
+            }
+        }
+        if (!interface) {
+            if constexpr (requires { config.interface; }) {
+                interface = config.interface;
             }
         }
 
@@ -700,6 +705,11 @@ struct PacketTransport {
         // Initialize TCP params
         tcp_params_.local_ip = local_ip;
 
+        // Set local IP in BPF filter (if BPF enabled)
+        if (pio().is_bpf_enabled()) {
+            pio().set_local_ip(local_ip_str);
+        }
+
         // Set up zero-copy receive buffer callback
         recv_buffer_.set_release_callback(frame_release_callback, this);
 
@@ -718,11 +728,16 @@ struct PacketTransport {
      */
     template<typename ConfigT>
     void init_stack_only(const ConfigT& config) {
-        // Get interface name from conn_state if available
+        // Get interface name from conn_state or config.interface
         const char* interface = nullptr;
         if constexpr (requires { config.conn_state; }) {
             if (config.conn_state && config.conn_state->interface_name[0] != '\0') {
                 interface = config.conn_state->interface_name;
+            }
+        }
+        if (!interface) {
+            if constexpr (requires { config.interface; }) {
+                interface = config.interface;
             }
         }
 

@@ -1082,6 +1082,54 @@ endif
 build-test-pipeline-30_binance_sbe_dpdk: $(PIPELINE_DPDK_BINANCE_SBE_BIN)
 
 # ============================================================================
+# DPDK DirectIO Binance SBE Test (no poll process, DPDKPacketIO in transport)
+# ============================================================================
+
+PIPELINE_DPDK_DIRECTIO_SBE_SRC := test/pipeline/31_binance_sbe_dpdk_packetio.cpp
+PIPELINE_DPDK_DIRECTIO_SBE_BIN := $(BUILD_DIR)/test_pipeline_31_binance_sbe_dpdk_packetio
+
+$(PIPELINE_DPDK_DIRECTIO_SBE_BIN): $(PIPELINE_DPDK_DIRECTIO_SBE_SRC) $(PIPELINE_HEADERS) src/msg/00_binance_spot_sbe.hpp | $(BUILD_DIR)
+	@echo "Compiling DPDK DirectIO Binance SBE test..."
+ifdef USE_DPDK
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "DPDK DirectIO Binance SBE test build complete: $@"
+else
+	@echo "Error: DPDK DirectIO SBE test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
+	@exit 1
+endif
+else
+	@echo "Error: DPDK DirectIO SBE test requires USE_DPDK=1"
+	@exit 1
+endif
+
+build-test-pipeline-31_binance_sbe_dpdk_packetio: $(PIPELINE_DPDK_DIRECTIO_SBE_BIN)
+
+# ============================================================================
+# XDP DirectIO Binance SBE Test (no poll process, XDPPacketIO in transport)
+# ============================================================================
+
+PIPELINE_XDP_DIRECTIO_SBE_SRC := test/pipeline/32_binance_sbe_xdp_packetio.cpp
+PIPELINE_XDP_DIRECTIO_SBE_BIN := $(BUILD_DIR)/test_pipeline_32_binance_sbe_xdp_packetio
+
+$(PIPELINE_XDP_DIRECTIO_SBE_BIN): $(PIPELINE_XDP_DIRECTIO_SBE_SRC) $(PIPELINE_HEADERS) src/msg/00_binance_spot_sbe.hpp | $(BUILD_DIR)
+	@echo "Compiling XDP DirectIO Binance SBE test..."
+ifdef USE_XDP
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+	@echo "XDP DirectIO Binance SBE test build complete: $@"
+else
+	@echo "Error: XDP DirectIO SBE test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
+	@exit 1
+endif
+else
+	@echo "Error: XDP DirectIO SBE test requires USE_XDP=1"
+	@exit 1
+endif
+
+build-test-pipeline-32_binance_sbe_xdp_packetio: $(PIPELINE_XDP_DIRECTIO_SBE_BIN)
+
+# ============================================================================
 # WebSocket OKX Test (WebSocketProcess with OKX WSS stream)
 # Tests full pipeline: XDP Poll + Transport + WebSocket processes
 # ============================================================================

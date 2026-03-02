@@ -282,6 +282,10 @@ map_test_source() {
             TEST_BIN="build/test_pipeline_30_binance_sbe_dpdk"
             MAKE_TARGET="build-test-pipeline-30_binance_sbe_dpdk"
             ;;
+        31_binance_sbe_dpdk_packetio)
+            TEST_BIN="build/test_pipeline_31_binance_sbe_dpdk_packetio"
+            MAKE_TARGET="build-test-pipeline-31_binance_sbe_dpdk_packetio"
+            ;;
         *)
             # Generic pattern: NN_name.cpp -> test_pipeline_NN_name
             TEST_BIN="build/test_pipeline_${base}"

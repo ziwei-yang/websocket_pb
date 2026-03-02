@@ -158,10 +158,14 @@ template<typename SSLPolicy,
          bool EnableAB = false,
          bool AutoReconnect = false,
          bool Profiling = false,
-         typename WSProcessor = void>
+         typename WSProcessor = void,
+         typename PacketIO = DisruptorPacketIO>
 struct TransportProcess {
     // InlineWS: transport embeds WS processing directly (no IPC to WS process)
     static constexpr bool InlineWS = !std::is_same_v<WSProcessor, void>;
+
+    // DirectIO: PacketIO handles NIC I/O directly (no poll process, no IPC rings)
+    static constexpr bool DirectIO = !std::is_same_v<PacketIO, DisruptorPacketIO>;
 
     // InlineWS requires AutoReconnect (event-driven handshake, no blocking metadata poll)
     static_assert(!InlineWS || AutoReconnect, "InlineWS requires AutoReconnect=true");
@@ -174,8 +178,8 @@ public:
 
     // Transport type: PacketTransportAB when EnableAB, single PacketTransport otherwise
     using TransportType = std::conditional_t<EnableAB,
-        websocket::transport::PacketTransportAB<DisruptorPacketIO>,
-        websocket::transport::PacketTransport<DisruptorPacketIO>>;
+        websocket::transport::PacketTransportAB<PacketIO>,
+        websocket::transport::PacketTransport<PacketIO>>;
 
     // ========================================================================
     // Initialization
@@ -243,25 +247,57 @@ public:
             conn_state_->tsc_freq_hz = tsc_freq_hz_;
         }
 
-        // Wait for XDP Poll to be ready
-        printf("[TRANSPORT] Waiting for XDP Poll to be ready...\n");
-        if (!conn_state_->wait_for_handshake_xdp_ready(10000000)) {  // 10 second timeout
-            fprintf(stderr, "[TRANSPORT] Timeout waiting for XDP Poll ready\n");
-            return false;
+        if constexpr (DirectIO) {
+            // Direct PacketIO mode: no poll process, we handle NIC I/O directly
+            printf("[TRANSPORT] Direct PacketIO mode (no poll process)\n");
+            conn_state_->set_handshake_xdp_ready();
+
+            typename PacketIO::config_type pio_config;
+            pio_config.interface = conn_state_->interface_name;
+            pio_config.bpf_path = conn_state_->bpf_path;
+            if constexpr (requires { pio_config.conn_state; })
+                pio_config.conn_state = conn_state_;
+
+            transport_.init_with_pio_config(pio_config);
+            transport_.set_conn_state(conn_state_);
+
+            // Configure BPF/software filter with exchange IPs and port
+            // (In non-DirectIO mode, the poll process handles this)
+            auto& pio_transport = [&]() -> auto& {
+                if constexpr (EnableAB) return transport_.a;
+                else return transport_;
+            }();
+
+            for (uint8_t i = 0; i < conn_state_->exchange_ip_count; i++) {
+                char ip_str[INET_ADDRSTRLEN];
+                struct in_addr addr;
+                addr.s_addr = conn_state_->exchange_ips[i];
+                inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+                pio_transport.add_exchange_ip(ip_str);
+            }
+            pio_transport.add_exchange_port(parsed_url_.port);
+            printf("[TRANSPORT] BPF filter configured: %u exchange IPs, port %u\n",
+                   conn_state_->exchange_ip_count, parsed_url_.port);
+        } else {
+            // DisruptorPacketIO mode: wait for poll process, configure IPC rings
+            printf("[TRANSPORT] Waiting for XDP Poll to be ready...\n");
+            if (!conn_state_->wait_for_handshake_xdp_ready(10000000)) {  // 10 second timeout
+                fprintf(stderr, "[TRANSPORT] Timeout waiting for XDP Poll ready\n");
+                return false;
+            }
+            printf("[TRANSPORT] XDP Poll ready\n");
+
+            printf("[TRANSPORT] Phase 1: DisruptorPacketIO Init\n");
+            DisruptorPacketIOConfig pio_config;
+            pio_config.umem_area = umem_area_;
+            pio_config.frame_size = frame_size_;
+            pio_config.raw_inbox_cons = raw_inbox_cons_;
+            pio_config.raw_outbox_prod = raw_outbox_prod_;
+            pio_config.conn_state = conn_state_;
+
+            transport_.init_with_pio_config(pio_config);
+            transport_.set_conn_state(conn_state_);
         }
-        printf("[TRANSPORT] XDP Poll ready\n");
-
-        // Phase 1: Configure DisruptorPacketIO
-        printf("[TRANSPORT] Phase 1: DisruptorPacketIO Init\n");
-        DisruptorPacketIOConfig pio_config;
-        pio_config.umem_area = umem_area_;
-        pio_config.frame_size = frame_size_;
-        pio_config.raw_inbox_cons = raw_inbox_cons_;
-        pio_config.raw_outbox_prod = raw_outbox_prod_;
-        pio_config.conn_state = conn_state_;
-
-        transport_.init_with_pio_config(pio_config);
-        transport_.set_conn_state(conn_state_);
 
         // Resolve hostname
         auto ips = resolve_hostname(parsed_url_.host.c_str());

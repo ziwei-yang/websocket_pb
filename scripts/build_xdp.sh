@@ -364,6 +364,10 @@ map_test_source() {
             TEST_BIN="build/test_pipeline_96_websocket_binance"
             MAKE_TARGET="build-test-pipeline-96_websocket_binance"
             ;;
+        32_binance_sbe_xdp_packetio)
+            TEST_BIN="build/test_pipeline_32_binance_sbe_xdp_packetio"
+            MAKE_TARGET="build-test-pipeline-32_binance_sbe_xdp_packetio"
+            ;;
         *)
             # Generic pattern: NN_name.cpp -> test_pipeline_name
             local name="${base#*_}"  # Remove NN_ prefix

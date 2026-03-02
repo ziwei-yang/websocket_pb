@@ -62,8 +62,11 @@ namespace websocket::pipeline {
 // DPDK reserves 4 × 16 GB VA blocks for memseg lists, so it needs
 // 16 GB + 64 GB = 80 GB range — all below the 512 GB IOMMU limit.
 // UMEM at 8 GB is safely before DPDK's 16 GB start.
+#ifndef DPDK_PACKET_IO_VA_CONSTANTS
+#define DPDK_PACKET_IO_VA_CONSTANTS
 inline constexpr uintptr_t DPDK_UMEM_BASE_VA  = 0x200000000ULL;  // 8 GB
 inline constexpr uintptr_t DPDK_BASE_VIRTADDR = 0x400000000ULL;  // 16 GB
+#endif
 
 // ============================================================================
 // DPDKPollProcess - DPDK PMD packet I/O handler
