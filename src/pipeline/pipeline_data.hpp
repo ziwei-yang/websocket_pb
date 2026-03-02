@@ -437,19 +437,16 @@ struct alignas(64) WSFrameInfo {
         fmt(tot, total_us);
         char mkt_cnt[8] = "";
         char mkt_typ[4] = "";
-        if (mkt_event_type != 0 || mkt_event_count != 0) {
-            if (is_fragmented() && !is_last_fragment()) {
-                std::snprintf(mkt_typ, sizeof(mkt_typ), "Fg");
-            } else {
-                uint8_t et = mkt_event_type;
-                uint16_t cnt = mkt_event_count;
-                switch (et) {
-                case 0: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Dp"); break;
-                case 1: std::snprintf(mkt_typ, sizeof(mkt_typ), "OB"); break;
-                case 2: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Td"); break;
-                case 3: std::snprintf(mkt_typ, sizeof(mkt_typ), "Sy");     break;
-                case 4: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Bo"); break;
-                }
+        if (mkt_event_type != 0 || mkt_event_count != 0 || exchange_event_time_us != 0) {
+            uint8_t et = mkt_event_type;
+            uint16_t cnt = mkt_event_count;
+            bool show_cnt = (cnt > 0);
+            switch (et) {
+            case 0: if (show_cnt) std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Dp"); break;
+            case 1: std::snprintf(mkt_typ, sizeof(mkt_typ), "OB"); break;
+            case 2: if (show_cnt) std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Td"); break;
+            case 3: std::snprintf(mkt_typ, sizeof(mkt_typ), "Sy");     break;
+            case 4: if (show_cnt) std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Bo"); break;
             }
         } else if (is_fragmented() && !is_last_fragment()) {
             std::snprintf(mkt_typ, sizeof(mkt_typ), "Fg");
@@ -478,16 +475,24 @@ struct alignas(64) WSFrameInfo {
         int n = std::snprintf(sz, sizeof(sz), "%u/%u", payload_len, ssl_read_total_bytes);
         while (n < 10 && n < (int)sizeof(sz) - 1) sz[n++] = ' ';
         sz[n] = '\0';
+        // Compute MONOTONIC→REALTIME offset for publish-time diff
+        int64_t publish_realtime_ms = 0;
+        if (publish_time_ts > 0) {
+            struct timespec mono_now, real_now;
+            clock_gettime(CLOCK_MONOTONIC, &mono_now);
+            clock_gettime(CLOCK_REALTIME, &real_now);
+            int64_t mono_ns = static_cast<int64_t>(mono_now.tv_sec) * 1000000000LL + mono_now.tv_nsec;
+            int64_t real_ns = static_cast<int64_t>(real_now.tv_sec) * 1000000000LL + real_now.tv_nsec;
+            int64_t offset_ns = real_ns - mono_ns;  // REALTIME - MONOTONIC
+            int64_t publish_real_ns = static_cast<int64_t>(publish_time_ts) + offset_ns;
+            publish_realtime_ms = publish_real_ns / 1000000LL;
+        }
         // Exchange event time → local clock diff display
         char exch_diff[24] = "";
         if (exchange_event_time_us > 0) {
             int64_t e_ms = exchange_event_time_us / 1000;
-            if (e_ms > 1000000000000LL) {  // sanity: after 2001
-                struct timespec rts;
-                clock_gettime(CLOCK_REALTIME, &rts);
-                int64_t local_ms = static_cast<int64_t>(rts.tv_sec) * 1000LL
-                                 + rts.tv_nsec / 1000000LL;
-                int64_t diff = local_ms - e_ms;
+            if (e_ms > 1000000000000LL && publish_realtime_ms > 0) {
+                int64_t diff = publish_realtime_ms - e_ms;
                 std::snprintf(exch_diff, sizeof(exch_diff), " %+ldms", diff);
             }
         } else if (opcode == 0x01 && payload_data != nullptr && payload_len > 10) {
@@ -502,12 +507,8 @@ struct alignas(64) WSFrameInfo {
                         e_ms = e_ms * 10 + (*d - '0');
                         ++d;
                     }
-                    if (e_ms > 1000000000000LL) {
-                        struct timespec rts;
-                        clock_gettime(CLOCK_REALTIME, &rts);
-                        int64_t local_ms = static_cast<int64_t>(rts.tv_sec) * 1000LL
-                                         + rts.tv_nsec / 1000000LL;
-                        int64_t diff = local_ms - e_ms;
+                    if (e_ms > 1000000000000LL && publish_realtime_ms > 0) {
+                        int64_t diff = publish_realtime_ms - e_ms;
                         std::snprintf(exch_diff, sizeof(exch_diff), " %+ldms", diff);
                     }
                     break;
@@ -521,7 +522,15 @@ struct alignas(64) WSFrameInfo {
         if (mkt_event_seq != 0) {
             std::snprintf(seq_suffix, sizeof(seq_suffix), " | seq %ld", mkt_event_seq);
         }
-        bool is_mkt = ((mkt_event_type != 0 || mkt_event_count != 0) && !is_discard_early() && !is_merged());
+        const char* frag_ul_on = "";
+        const char* frag_ul_off = "";
+        char frag_suffix[8] = "";
+        if (is_fragmented() && !is_last_fragment() && (mkt_event_type != 0 || mkt_event_count != 0 || exchange_event_time_us != 0)) {
+            frag_ul_on = "\033[4m";
+            frag_ul_off = "\033[24m";
+            std::snprintf(frag_suffix, sizeof(frag_suffix), " Fg");
+        }
+        bool is_mkt = ((mkt_event_type != 0 || mkt_event_count != 0 || exchange_event_time_us != 0) && !is_discard_early() && !is_merged());
         if (connection_id == 0) {
             line_color = is_mkt ? "\033[34m" : "";
             line_reset = is_mkt ? "\033[0m" : "";
@@ -547,22 +556,22 @@ struct alignas(64) WSFrameInfo {
                     "| socket %5u %10s "
                     "|%s %u %s %4s~%6s "
                     "| WS %3u %6s "
-                    "|%s%2s %-2s @%6s |%s%s%s%s\n",
+                    "|%s%s%2s %-2s @%6s%s |%s%s%s%s%s\n",
                     line_color, bpf_prefix, nic_col,
                     nic_packet_ct, t[1],
                     ssl_prefix, ssl_read_ct, sz, t[2], t[3],
-                    ssl_read_batch_num, t[4], discard_mark, mkt_cnt, mkt_typ, tot, exch_diff, seq_suffix, dbg_suffix, line_reset);
+                    ssl_read_batch_num, t[4], discard_mark, frag_ul_on, mkt_cnt, mkt_typ, tot, frag_ul_off, exch_diff, seq_suffix, frag_suffix, dbg_suffix, line_reset);
         } else {
             fprintf(stderr,
                     "%s%s"
                     "| %u pkt %5u %4s~%6s "
                     "|%s %u %s %4s~%6s "
                     "| WS %3u %6s "
-                    "|%s%2s %-2s @%6s |%s%s%s%s\n",
+                    "|%s%s%2s %-2s @%6s%s |%s%s%s%s%s\n",
                     line_color, bpf_prefix,
                     nic_packet_ct, last_pkt_mem_idx, t[0], t[1],
                     ssl_prefix, ssl_read_ct, sz, t[2], t[3],
-                    ssl_read_batch_num, t[4], discard_mark, mkt_cnt, mkt_typ, tot, exch_diff, seq_suffix, dbg_suffix, line_reset);
+                    ssl_read_batch_num, t[4], discard_mark, frag_ul_on, mkt_cnt, mkt_typ, tot, frag_ul_off, exch_diff, seq_suffix, frag_suffix, dbg_suffix, line_reset);
         }
     }
 };

@@ -262,8 +262,10 @@ struct TestHarness {
         WSFrameInfo info{};
         info.clear();
         info.connection_id = ci;
-        handler.on_ws_frame(ci, 2 /* BINARY */, b.data(),
-                            static_cast<uint32_t>(b.size()), info);
+        handler.on_ws_data(handler.sbe_state_[ci], ci, b.data(),
+                           static_cast<uint32_t>(b.size()), info);
+        // Complete frame: reset state
+        handler.sbe_state_[ci].reset();
 
         // Mimic WSCore: publish WSFrameInfo to ring, fill pending_ring_seq_slot_
         int64_t seq = ws_prod->try_claim();
@@ -811,19 +813,25 @@ void test_bbo_does_not_block_ob_same_seq() {
 // ============================================================================
 
 void test_ob_blocks_bbo_same_seq() {
+    // BBO uses independent stale detection (last_bbo_seq_ only).
+    // OB seq=100 does NOT block BBO seq=100 — they use separate sequence trackers.
+    // But BBO seq=100 DOES block a second BBO with same seq.
     TestHarness h;
     int64_t bp[] = {50000}, bq[] = {1000};
     int64_t ap[] = {50100}, aq[] = {1500};
     auto ob = build_depth_snapshot_msg(1000, 100, -8, -8, 1, bp, bq, 1, ap, aq, "BTCUSDT");
-    auto bbo = build_bbo_msg(1000, 100, -8, -8, 50000, 1000, 50100, 2000, "BTCUSDT");
+    auto bbo1 = build_bbo_msg(1000, 100, -8, -8, 50000, 1000, 50100, 2000, "BTCUSDT");
+    auto bbo2 = build_bbo_msg(1000, 100, -8, -8, 50000, 1000, 50100, 2000, "BTCUSDT");
 
     h.feed_frame(0, ob);
-    h.feed_frame(0, bbo);
+    h.feed_frame(0, bbo1);   // BBO seq=100 accepted (last_bbo_seq_ was 0)
+    h.feed_frame(0, bbo2);   // BBO seq=100 rejected (last_bbo_seq_ is now 100)
 
     h.idle();
     auto events = h.published();
-    assert(events.size() == 1);
+    assert(events.size() == 2);  // snapshot + first BBO
     assert(events[0].is_book_snapshot());
+    assert(events[1].is_bbo_array());
 }
 
 // ============================================================================
@@ -850,7 +858,7 @@ void test_bbo_does_not_block_older_ob() {
 }
 
 // ============================================================================
-// Test 18: Fragment — 20KB trades message, on_ws_fragment reads header
+// Test 18: Fragment — 20KB trades, streaming parse with state machine
 // ============================================================================
 
 void test_fragment_trades_20kb() {
@@ -864,29 +872,27 @@ void test_fragment_trades_20kb() {
     // Verify message is large enough
     assert(b.size() > 16000);
 
-    // Simulate fragment: call on_ws_fragment with first 16000 bytes
+    // Simulate fragment: call on_ws_data with first 16000 bytes
+    SBEParseState state{};
     WSFrameInfo frag_info{};
     frag_info.clear();
-    h.handler.on_ws_fragment(b.data(), 16000, frag_info);
+    h.handler.on_ws_data(state, 0, b.data(), 16000, frag_info);
 
     assert(frag_info.mkt_event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY));
     assert(frag_info.exchange_event_time_us == event_time);
     // mkt_event_count should be the total trade count from group header (800, capped to uint16)
     assert(frag_info.mkt_event_count == 800);
-    // mkt_event_seq: last trade_id may or may not be reachable in 16KB fragment
-    // With 800 trades, last entry at offset 18+6+(799*25)=19999 from body start
-    // Fragment is 16000 bytes total, body starts at offset 8, so body_len=15992
-    // after_root = body+18, remaining = 15974
-    // last_entry_offset = 6 + 799*25 = 19981 — exceeds remaining, so seq stays 0
-    // That's fine — fragment may not contain the last trade
-    // (But the count and type are still available from the header)
+    // State should be in TRADES_ENTRIES (partially parsed)
+    assert(state.phase == SBEParseState::TRADES_ENTRIES);
+    // Some trades should have been published incrementally
+    assert(state.group_published > 0);
+    assert(state.group_published < 800);  // not all, since fragment is partial
 
-    // Verify on_ws_frame with full payload populates WSFrameInfo correctly
-    // (Use a standalone handler without ring to avoid ring overflow with 800 trades)
-    BinanceSBEHandler handler2;
+    // Now call on_ws_data with FULL payload — state machine resumes
     WSFrameInfo full_info{};
     full_info.clear();
-    handler2.on_ws_frame(0, 2, b.data(), static_cast<uint32_t>(b.size()), full_info);
+    h.handler.on_ws_data(state, 0, b.data(), static_cast<uint32_t>(b.size()), full_info);
+    state.reset();
 
     assert(full_info.mkt_event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY));
     assert(full_info.exchange_event_time_us == event_time);
@@ -895,7 +901,7 @@ void test_fragment_trades_20kb() {
 }
 
 // ============================================================================
-// Test 19: Fragment — 20KB depth snapshot, on_ws_fragment reads header
+// Test 19: Fragment — 20KB depth snapshot, streaming parse with state machine
 // ============================================================================
 
 static SBEBuilder build_large_depth_snapshot(int64_t event_time, int64_t book_update_id,
@@ -933,21 +939,25 @@ void test_fragment_depth_snapshot_20kb() {
     // Verify message is large enough
     assert(b.size() > 16000);
 
-    // Simulate fragment: call on_ws_fragment with first 16000 bytes
+    // Simulate fragment: call on_ws_data with first 16000 bytes
+    SBEParseState state{};
     WSFrameInfo frag_info{};
     frag_info.clear();
-    h.handler.on_ws_fragment(b.data(), 16000, frag_info);
+    h.handler.on_ws_data(state, 0, b.data(), 16000, frag_info);
 
     assert(frag_info.mkt_event_type == static_cast<uint8_t>(EventType::BOOK_SNAPSHOT));
     assert(frag_info.exchange_event_time_us == event_time);
     assert(frag_info.mkt_event_seq == book_update_id);
-    // mkt_event_count: at least the bid count should be readable
-    assert(frag_info.mkt_event_count > 0);
+    // State machine should have made progress
+    assert(state.phase != SBEParseState::IDLE);
+    // Some bid entries should have been parsed
+    assert(state.bids_published > 0);
 
-    // Now call on_ws_frame with the FULL payload
+    // Now call on_ws_data with FULL payload
     WSFrameInfo full_info{};
     full_info.clear();
-    h.handler.on_ws_frame(0, 2, b.data(), static_cast<uint32_t>(b.size()), full_info);
+    h.handler.on_ws_data(state, 0, b.data(), static_cast<uint32_t>(b.size()), full_info);
+    state.reset();
 
     assert(full_info.mkt_event_type == static_cast<uint8_t>(EventType::BOOK_SNAPSHOT));
     assert(full_info.exchange_event_time_us == event_time);
@@ -968,13 +978,555 @@ void test_fragment_too_small() {
     auto b = ts.build();
 
     BinanceSBEHandler handler;
-    handler.on_ws_fragment(b.data(), 4, info);  // only 4 bytes — less than 8-byte SBE header
+    SBEParseState state{};
+    handler.on_ws_data(state, 0, b.data(), 4, info);  // only 4 bytes — less than 8-byte SBE header
 
     // All fields should remain 0
     assert(info.mkt_event_type == 0);
     assert(info.mkt_event_count == 0);
     assert(info.mkt_event_seq == 0);
     assert(info.exchange_event_time_us == 0);
+    assert(state.phase == SBEParseState::IDLE);  // not advanced
+}
+
+// ============================================================================
+// Test 21: Streaming incremental — feed data in small chunks, verify progress
+// ============================================================================
+
+void test_streaming_incremental_trades() {
+    TestHarness h;
+
+    // Build a message with 5 trades
+    TradeSet ts(100, 5);
+    auto b = ts.build(1000000, 1000001);
+
+    // SBE header=8, root block=18, group header=6, 5 entries × 25 = 125
+    // Total = 8+18+6+125+symbol = ~165 bytes
+    assert(b.size() > 50);
+
+    SBEParseState state{};
+    WSFrameInfo info{};
+
+    // Feed only the SBE header (8 bytes) — not enough for root block
+    info.clear();
+    h.handler.on_ws_data(state, 0, b.data(), 8, info);
+    assert(state.phase == SBEParseState::IDLE);  // need root block too
+
+    // Feed header + root block (8+18=26 bytes) — but not group header
+    info.clear();
+    h.handler.on_ws_data(state, 0, b.data(), 26, info);
+    assert(state.phase == SBEParseState::HEADER_PARSED);
+    assert(info.mkt_event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY));
+
+    // Feed through group header (26+6=32 bytes) — should know trade count
+    info.clear();
+    h.handler.on_ws_data(state, 0, b.data(), 32, info);
+    assert(state.phase == SBEParseState::TRADES_HEADER ||
+           state.phase == SBEParseState::TRADES_ENTRIES);
+    assert(info.mkt_event_count == 5);
+
+    // Feed all data — all trades parsed
+    info.clear();
+    h.handler.on_ws_data(state, 0, b.data(), static_cast<uint32_t>(b.size()), info);
+    assert(state.phase == SBEParseState::DONE);
+    assert(info.mkt_event_seq == 104);  // last trade id = 100+4
+    state.reset();
+
+    // Verify trades were published via merge buffer
+    h.idle();
+    auto events = h.published();
+    assert(!events.empty());
+    assert(events[0].is_trade_array());
+    assert(events[0].count == 5);
+}
+
+// ============================================================================
+// Test 22: Streaming depth diff — verify deltas published incrementally
+// ============================================================================
+
+static SBEBuilder build_depth_diff_msg(int64_t event_time, int64_t first_id, int64_t last_id,
+                                        int8_t price_exp, int8_t qty_exp,
+                                        uint16_t num_bids, const int64_t* bid_prices, const int64_t* bid_qtys,
+                                        uint16_t num_asks, const int64_t* ask_prices, const int64_t* ask_qtys,
+                                        std::string_view symbol) {
+    SBEBuilder b;
+    b.write_header(26, 10003, 1, 0);  // DEPTH_DIFF_STREAM, block_length=26
+    b.write_i64(event_time);
+    b.write_i64(first_id);
+    b.write_i64(last_id);
+    b.write_i8(price_exp);
+    b.write_i8(qty_exp);
+    b.write_u16(16);  // bids group block_length
+    b.write_u16(num_bids);
+    for (uint16_t i = 0; i < num_bids; i++) { b.write_i64(bid_prices[i]); b.write_i64(bid_qtys[i]); }
+    b.write_u16(16);  // asks group block_length
+    b.write_u16(num_asks);
+    for (uint16_t i = 0; i < num_asks; i++) { b.write_i64(ask_prices[i]); b.write_i64(ask_qtys[i]); }
+    b.write_var_string8(symbol);
+    return b;
+}
+
+void test_streaming_depth_diff() {
+    TestHarness h;
+
+    // Build depth diff: 3 bids, 2 asks
+    int64_t bp[] = {50000, 49000, 48000}, bq[] = {1000, 2000, 3000};
+    int64_t ap[] = {50100, 51000}, aq[] = {1500, 2500};
+    auto b = build_depth_diff_msg(1000000, 500, 505, -8, -8,
+                                   3, bp, bq, 2, ap, aq, "BTCUSDT");
+
+    // Feed complete frame via on_ws_data
+    SBEParseState state{};
+    WSFrameInfo info{};
+    info.clear();
+    h.handler.on_ws_data(state, 0, b.data(), static_cast<uint32_t>(b.size()), info);
+    state.reset();
+
+    assert(info.mkt_event_type == static_cast<uint8_t>(EventType::BOOK_DELTA));
+    assert(info.mkt_event_seq == 505);
+    assert(info.mkt_event_count == 5);  // 3 bids + 2 asks
+
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_book_delta());
+    assert(events[0].count == 5);
+    assert(events[0].src_seq == 505);
+
+    // Verify bid/ask flags
+    for (uint8_t i = 0; i < 3; i++)
+        assert(events[0].payload.deltas.entries[i].is_bid());
+    for (uint8_t i = 3; i < 5; i++)
+        assert(events[0].payload.deltas.entries[i].is_ask());
+}
+
+// ============================================================================
+// Test 23: State reset on disconnect
+// ============================================================================
+
+void test_state_reset_on_disconnect() {
+    TestHarness h;
+
+    // Start parsing a fragmented message
+    TradeSet ts(1, 5);
+    auto b = ts.build();
+
+    // Feed partial data to set up state
+    SBEParseState& state = h.handler.sbe_state_[0];
+    WSFrameInfo info{};
+    info.clear();
+    h.handler.on_ws_data(state, 0, b.data(), 32, info);
+    assert(state.phase != SBEParseState::IDLE);
+
+    // Disconnect should reset state
+    h.handler.on_disconnected(0);
+    assert(state.phase == SBEParseState::IDLE);
+    assert(state.bytes_consumed == 0);
+
+    // Reconnect should also reset
+    state.phase = SBEParseState::HEADER_PARSED;  // simulate partial state
+    h.handler.on_reconnected(0);
+    assert(state.phase == SBEParseState::IDLE);
+}
+
+// ============================================================================
+// Test 24: DONE state repopulates info on re-call
+// ============================================================================
+
+void test_done_state_repopulates_info() {
+    TestHarness h;
+
+    // Build a complete depth diff: 2 bids, 1 ask
+    int64_t bp[] = {50000, 49000}, bq[] = {1000, 2000};
+    int64_t ap[] = {50100}, aq[] = {1500};
+    auto b = build_depth_diff_msg(1000000, 500, 505, -8, -8,
+                                   2, bp, bq, 1, ap, aq, "BTCUSDT");
+
+    // Feed complete frame to reach DONE state
+    SBEParseState state{};
+    WSFrameInfo info{};
+    info.clear();
+    h.handler.on_ws_data(state, 0, b.data(), static_cast<uint32_t>(b.size()), info);
+    assert(state.phase == SBEParseState::DONE);
+    assert(info.mkt_event_type == static_cast<uint8_t>(EventType::BOOK_DELTA));
+    assert(info.exchange_event_time_us == 1000000);
+    assert(info.mkt_event_seq == 505);
+    assert(info.mkt_event_count == 3);  // 2 bids + 1 ask
+
+    // Call again with a fresh WSFrameInfo (simulates subsequent TLS record delivery)
+    WSFrameInfo info2{};
+    info2.clear();
+    h.handler.on_ws_data(state, 0, b.data(), static_cast<uint32_t>(b.size()), info2);
+
+    // Bug 1 fix: info2 must be repopulated from state, not left at 0
+    assert(info2.mkt_event_type == static_cast<uint8_t>(EventType::BOOK_DELTA));
+    assert(info2.exchange_event_time_us == 1000000);
+    assert(info2.mkt_event_seq == 505);
+    assert(info2.mkt_event_count == 3);
+}
+
+// ============================================================================
+// Test 25: Stale depth diff preserves type and exchange time
+// ============================================================================
+
+void test_stale_depth_diff_preserves_type() {
+    TestHarness h;
+
+    // Feed a fresh depth diff (seq=100) to set last_book_seq_
+    int64_t bp[] = {50000}, bq[] = {1000};
+    int64_t ap[] = {50100}, aq[] = {1500};
+    auto b1 = build_depth_diff_msg(2000000, 90, 100, -8, -8,
+                                    1, bp, bq, 1, ap, aq, "BTCUSDT");
+    h.feed_frame(0, b1);
+
+    // Feed a stale depth diff (seq=99, lower than last_book_seq_=100)
+    auto b2 = build_depth_diff_msg(1500000, 89, 99, -8, -8,
+                                    1, bp, bq, 1, ap, aq, "BTCUSDT");
+    SBEParseState state{};
+    WSFrameInfo info{};
+    info.clear();
+    h.handler.on_ws_data(state, 0, b2.data(), static_cast<uint32_t>(b2.size()), info);
+
+    // Bug 2 fix: stale discard_early frames must still have type + exchange time
+    assert(info.mkt_event_type == static_cast<uint8_t>(EventType::BOOK_DELTA));
+    assert(info.is_discard_early() == true);
+    assert(info.exchange_event_time_us == 1500000);
+    assert(info.mkt_event_seq == 99);
+}
+
+// ============================================================================
+// Test 26: print_timeline() typed-frame check handles BOOK_DELTA=0
+// ============================================================================
+
+void test_print_timeline_book_delta_no_hex_dump() {
+    WSFrameInfo info{};
+    info.clear();
+    info.mkt_event_type = 0;  // BOOK_DELTA = 0
+    info.mkt_event_count = 0;
+    info.exchange_event_time_us = 1000000;
+    info.set_discard_early(true);
+    info.opcode = 0x02;  // binary frame
+    info.first_poll_cycle = 1;  // BSD mode: first_bpf_entry_ns==0 && first_poll_cycle>0
+    info.ws_frame_publish_cycle = 9000000000ULL;  // non-zero so print_timeline doesn't early-return
+
+    // Capture stderr output from print_timeline
+    // Redirect stderr to a pipe
+    int pipefd[2];
+    assert(pipe(pipefd) == 0);
+    int saved_stderr = dup(STDERR_FILENO);
+    dup2(pipefd[1], STDERR_FILENO);
+
+    info.print_timeline(3000000000ULL);  // 3 GHz TSC
+
+    // Flush and restore stderr
+    fflush(stderr);
+    dup2(saved_stderr, STDERR_FILENO);
+    close(saved_stderr);
+    close(pipefd[1]);
+
+    // Read captured output
+    char captured[4096] = {};
+    ssize_t n = read(pipefd[0], captured, sizeof(captured) - 1);
+    close(pipefd[0]);
+    assert(n > 0);
+    captured[n] = '\0';
+
+    // Bug 3 fix: should show "Dp" type, NOT hex dump "[op="
+    assert(strstr(captured, "Dp") != nullptr);
+    assert(strstr(captured, "[op=") == nullptr);
+}
+
+// ============================================================================
+// Test 27: print_timeline() fragment suffix for BOOK_DELTA=0
+// ============================================================================
+
+void test_print_timeline_fragment_suffix_book_delta() {
+    WSFrameInfo info{};
+    info.clear();
+    info.mkt_event_type = 0;  // BOOK_DELTA = 0
+    info.mkt_event_count = 0;
+    info.exchange_event_time_us = 1000000;
+    info.set_fragmented(true);
+    info.set_last_fragment(false);
+    info.opcode = 0x02;
+    info.first_poll_cycle = 1;
+    info.ws_frame_publish_cycle = 9000000000ULL;
+
+    int pipefd[2];
+    assert(pipe(pipefd) == 0);
+    int saved_stderr = dup(STDERR_FILENO);
+    dup2(pipefd[1], STDERR_FILENO);
+
+    info.print_timeline(3000000000ULL);
+
+    fflush(stderr);
+    dup2(saved_stderr, STDERR_FILENO);
+    close(saved_stderr);
+    close(pipefd[1]);
+
+    char captured[4096] = {};
+    ssize_t n = read(pipefd[0], captured, sizeof(captured) - 1);
+    close(pipefd[0]);
+    assert(n > 0);
+    captured[n] = '\0';
+
+    // Should show "Dp" type and "Fg" suffix, NOT hex dump
+    assert(strstr(captured, "Dp") != nullptr);
+    assert(strstr(captured, "Fg") != nullptr);
+    assert(strstr(captured, "[op=") == nullptr);
+}
+
+// ============================================================================
+// Test 28: Non-merge trades are batched (not 1-per-event)
+// ============================================================================
+
+void test_non_merge_trades_batched() {
+    TestHarness h;
+    h.handler.merge_enabled = false;
+
+    // Feed 25 trades (ids 1-25)
+    TradeSet ts(1, 25);
+    h.feed_frame(0, ts.build());
+
+    auto events = h.published();
+    // 25 trades, MAX_TRADES=11: 2 full batches (11 each) + 1 remainder (3)
+    assert(events.size() == 3);
+    assert(events[0].count == 11);
+    assert(events[1].count == 11);
+    assert(events[2].count == 3);
+
+    // src_seq = last trade_id in each batch
+    assert(events[0].src_seq == 11);   // trades 1-11
+    assert(events[1].src_seq == 22);   // trades 12-22
+    assert(events[2].src_seq == 25);   // trades 23-25
+
+    // Verify FIFO order within each batch
+    for (uint8_t i = 0; i < 11; i++)
+        assert(events[0].payload.trades.entries[i].trade_id == 1 + i);
+    for (uint8_t i = 0; i < 11; i++)
+        assert(events[1].payload.trades.entries[i].trade_id == 12 + i);
+    for (uint8_t i = 0; i < 3; i++)
+        assert(events[2].payload.trades.entries[i].trade_id == 23 + i);
+
+    // All events should be TRADE_ARRAY
+    for (auto& ev : events)
+        assert(ev.is_trade_array());
+}
+
+// ============================================================================
+// Test 29: Stale trade via fragment — discard_early with type preserved
+// ============================================================================
+
+void test_stale_trade_via_fragment() {
+    TestHarness h;
+
+    // Feed 5 fresh trades (ids 100-104) → sets last_trade_id_ = 104
+    TradeSet ts1(100, 5);
+    h.feed_frame(0, ts1.build(1000000));
+    h.idle();  // flush pending
+
+    assert(h.handler.last_trade_id_ == 104);
+
+    // Build a stale trades message (ids 100-104, same as before)
+    TradeSet ts_stale(100, 5);
+    auto b = ts_stale.build(2000000, 2000001);
+
+    // Feed incrementally: first 26 bytes (header + root block only)
+    // This parses the SBE header and sets mkt_event_type, but can't read group header yet
+    SBEParseState state{};
+    WSFrameInfo info{};
+    info.clear();
+    h.handler.on_ws_data(state, 0, b.data(), 26, info);
+    assert(state.phase == SBEParseState::HEADER_PARSED);
+    assert(info.mkt_event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY));
+    assert(info.exchange_event_time_us == 2000000);
+
+    // Feed full data — now group header + all entries are visible
+    // HEADER_PARSED → TRADES_HEADER transition reads last trade_id, triggers stale check
+    info.clear();
+    h.handler.on_ws_data(state, 0, b.data(), static_cast<uint32_t>(b.size()), info);
+    assert(info.is_discard_early() == true);
+    assert(info.mkt_event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY));
+    assert(info.exchange_event_time_us == 2000000);
+    assert(info.mkt_event_seq == 104);  // last stale trade_id
+}
+
+// ============================================================================
+// Test 30: Depth delta overflow — >MAX_DELTAS triggers mid-stream flushes
+// ============================================================================
+
+void test_depth_delta_overflow() {
+    TestHarness h;
+
+    // Build depth diff with 25 bids + 20 asks = 45 total deltas (> MAX_DELTAS=19)
+    std::vector<int64_t> bp(25), bq(25), ap(20), aq(20);
+    for (int i = 0; i < 25; i++) { bp[i] = 50000 - i * 100; bq[i] = 1000 + i; }
+    for (int i = 0; i < 20; i++) { ap[i] = 50100 + i * 100; aq[i] = 2000 + i; }
+
+    auto b = build_depth_diff_msg(1000000, 500, 505, -8, -8,
+                                   25, bp.data(), bq.data(),
+                                   20, ap.data(), aq.data(), "BTCUSDT");
+
+    h.feed_frame(0, b);
+
+    auto events = h.published();
+    // 45 deltas, MAX_DELTAS=19: 2 mid-stream flushes (19 each) + 1 final flush (7)
+    assert(events.size() == 3);
+    assert(events[0].count == 19);
+    assert(events[1].count == 19);
+    assert(events[2].count == 7);
+
+    // First 19: all bids (from 25 bids)
+    for (uint8_t i = 0; i < 19; i++)
+        assert(events[0].payload.deltas.entries[i].is_bid());
+
+    // Second 19: 6 remaining bids + 13 asks
+    for (uint8_t i = 0; i < 6; i++)
+        assert(events[1].payload.deltas.entries[i].is_bid());
+    for (uint8_t i = 6; i < 19; i++)
+        assert(events[1].payload.deltas.entries[i].is_ask());
+
+    // Third 7: remaining 7 asks
+    for (uint8_t i = 0; i < 7; i++)
+        assert(events[2].payload.deltas.entries[i].is_ask());
+
+    // All events should be BOOK_DELTA
+    for (auto& ev : events)
+        assert(ev.is_book_delta());
+}
+
+// ============================================================================
+// Test 31: Stale BBO preserves type and exchange time
+// ============================================================================
+
+void test_stale_bbo_preserves_type() {
+    TestHarness h;
+
+    // Feed fresh BBO (seq=100) to set last_bbo_seq_
+    auto bbo1 = build_bbo_msg(1000, 100, -8, -8, 50000, 1000, 50100, 2000, "BTCUSDT");
+    h.feed_frame(0, bbo1);
+    h.idle();  // flush pending BBO
+
+    // Feed stale BBO (seq=99)
+    auto bbo2 = build_bbo_msg(999, 99, -8, -8, 49000, 500, 49100, 1500, "BTCUSDT");
+    SBEParseState state{};
+    WSFrameInfo info{};
+    info.clear();
+    h.handler.on_ws_data(state, 0, bbo2.data(), static_cast<uint32_t>(bbo2.size()), info);
+
+    assert(info.mkt_event_type == static_cast<uint8_t>(EventType::BBO_ARRAY));
+    assert(info.is_discard_early() == true);
+    assert(info.exchange_event_time_us == 999);
+}
+
+// ============================================================================
+// Test 32: print_timeline() fresh BOOK_DELTA=0 gets blue highlight
+// ============================================================================
+
+void test_print_timeline_fresh_book_delta_is_mkt() {
+    WSFrameInfo info{};
+    info.clear();
+    info.mkt_event_type = 0;  // BOOK_DELTA = 0
+    info.mkt_event_count = 5;
+    info.exchange_event_time_us = 1000000;
+    // NOT discard_early, NOT merged → should be is_mkt=true
+    info.opcode = 0x02;
+    info.first_poll_cycle = 1;  // BSD mode
+    info.ws_frame_publish_cycle = 9000000000ULL;
+
+    int pipefd[2];
+    assert(pipe(pipefd) == 0);
+    int saved_stderr = dup(STDERR_FILENO);
+    dup2(pipefd[1], STDERR_FILENO);
+
+    info.print_timeline(3000000000ULL);
+
+    fflush(stderr);
+    dup2(saved_stderr, STDERR_FILENO);
+    close(saved_stderr);
+    close(pipefd[1]);
+
+    char captured[4096] = {};
+    ssize_t n = read(pipefd[0], captured, sizeof(captured) - 1);
+    close(pipefd[0]);
+    assert(n > 0);
+    captured[n] = '\0';
+
+    // Bug Fix A: fresh non-stale non-merged BOOK_DELTA should get blue ANSI color
+    assert(strstr(captured, "\033[34m") != nullptr);
+}
+
+// ============================================================================
+// Test 33: Depth snapshot streaming — verify published payload content
+// ============================================================================
+
+void test_depth_snapshot_streaming_publish_content() {
+    TestHarness h;
+
+    // Build depth snapshot with 5 bids + 5 asks (total 10, fits in one flush since MAX_DELTAS=19)
+    int64_t bp[] = {50000, 49000, 48000, 47000, 46000};
+    int64_t bq[] = {1000, 2000, 3000, 4000, 5000};
+    int64_t ap[] = {50100, 51000, 52000, 53000, 54000};
+    int64_t aq[] = {1500, 2500, 3500, 4500, 5500};
+    auto b = build_depth_snapshot_msg(1000000, 88928438912LL, -8, -8,
+                                       5, bp, bq, 5, ap, aq, "BTCUSDT");
+
+    h.feed_frame(0, b);
+
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_book_snapshot());
+    assert(events[0].count == 5);   // 5 bids
+    assert(events[0].count2 == 5);  // 5 asks
+    assert(events[0].src_seq == 88928438912LL);
+
+    // Verify bid levels (payload.snapshot.levels[0..count-1])
+    auto b_span = events[0].bids();
+    assert(b_span.count == 5);
+    for (uint8_t i = 0; i < 5; i++) {
+        assert(b_span.data[i].price == bp[i]);
+        assert(b_span.data[i].qty == bq[i]);
+    }
+    // Verify ask levels (payload.snapshot.levels[count..count+count2-1])
+    auto a_span = events[0].asks();
+    assert(a_span.count == 5);
+    for (uint8_t i = 0; i < 5; i++) {
+        assert(a_span.data[i].price == ap[i]);
+        assert(a_span.data[i].qty == aq[i]);
+    }
+}
+
+// ============================================================================
+// Test 34: Cross-type flush — trades flushed before depth
+// ============================================================================
+
+void test_cross_type_flush_trades_then_depth() {
+    TestHarness h;
+
+    // Accumulate 3 trades (pending, not yet flushed)
+    TradeSet ts(1, 3);
+    h.feed_frame(0, ts.build(1000000));
+    assert(h.published().empty());  // trades buffered via merge
+    assert(h.handler.has_pending_trades_ == true);
+    assert(h.handler.pending_trade_count_ == 3);
+
+    // Feed a depth diff → should trigger cross-type flush_pending_trades() first
+    int64_t bp[] = {50000}, bq[] = {1000};
+    int64_t ap[] = {50100}, aq[] = {1500};
+    auto depth = build_depth_diff_msg(2000000, 500, 505, -8, -8,
+                                       1, bp, bq, 1, ap, aq, "BTCUSDT");
+    h.feed_frame(0, depth);
+
+    auto events = h.published();
+    // Should have trades event (from cross-type flush) + depth event
+    assert(events.size() == 2);
+    assert(events[0].is_trade_array());
+    assert(events[0].count == 3);
+    assert(events[0].payload.trades.entries[0].trade_id == 1);
+    assert(events[0].payload.trades.entries[2].trade_id == 3);
+
+    assert(events[1].is_book_delta());
+    assert(events[1].count == 2);  // 1 bid + 1 ask
+    assert(events[1].src_seq == 505);
 }
 
 // ============================================================================
@@ -1041,7 +1593,7 @@ int main() {
     RUN_TEST(test_bbo_does_not_block_older_ob);
     cleanup_ring_files();
 
-    std::printf("\n--- Fragment parsing ---\n");
+    std::printf("\n--- Streaming fragment parsing ---\n");
     RUN_TEST(test_fragment_trades_20kb);
     cleanup_ring_files();
 
@@ -1049,6 +1601,49 @@ int main() {
     cleanup_ring_files();
 
     RUN_TEST(test_fragment_too_small);
+    cleanup_ring_files();
+
+    RUN_TEST(test_streaming_incremental_trades);
+    cleanup_ring_files();
+
+    RUN_TEST(test_streaming_depth_diff);
+    cleanup_ring_files();
+
+    RUN_TEST(test_state_reset_on_disconnect);
+    cleanup_ring_files();
+
+    std::printf("\n--- Display fix regression ---\n");
+    RUN_TEST(test_done_state_repopulates_info);
+    cleanup_ring_files();
+
+    RUN_TEST(test_stale_depth_diff_preserves_type);
+    cleanup_ring_files();
+
+    RUN_TEST(test_print_timeline_book_delta_no_hex_dump);
+
+    RUN_TEST(test_print_timeline_fragment_suffix_book_delta);
+
+    std::printf("\n--- Non-merge + regression ---\n");
+    RUN_TEST(test_non_merge_trades_batched);
+    cleanup_ring_files();
+
+    RUN_TEST(test_stale_trade_via_fragment);
+    cleanup_ring_files();
+
+    std::printf("\n--- Depth overflow + stale ---\n");
+    RUN_TEST(test_depth_delta_overflow);
+    cleanup_ring_files();
+
+    RUN_TEST(test_stale_bbo_preserves_type);
+    cleanup_ring_files();
+
+    std::printf("\n--- Display + content ---\n");
+    RUN_TEST(test_print_timeline_fresh_book_delta_is_mkt);
+
+    RUN_TEST(test_depth_snapshot_streaming_publish_content);
+    cleanup_ring_files();
+
+    RUN_TEST(test_cross_type_flush_trades_then_depth);
     cleanup_ring_files();
 
     std::printf("\n=== %d/%d tests passed ===\n", tests_passed, tests_total);

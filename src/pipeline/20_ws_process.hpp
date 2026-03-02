@@ -348,25 +348,27 @@ concept MktEventHandlerConcept = requires(T handler,
                                      uint32_t payload_len,
                                      WSFrameInfo& info) {
     { T::enabled } -> std::convertible_to<bool>;
-    { handler.on_ws_frame(connection_id, opcode, payload, payload_len, info) };
-    { handler.on_ws_fragment(payload, payload_len, info) };
+    { handler.on_ws_data(handler.sbe_state_[0], connection_id, payload, payload_len, info) };
     { handler.on_heartbeat(connection_id, opcode) };
     { handler.on_disconnected(connection_id) };
     { handler.on_reconnected(connection_id) };
     { handler.on_batch_end(connection_id) };
-    { handler.on_failover(connection_id, connection_id, (const char*)"reason") };
+};
+
+// Null parse state for NullMktEventHandler
+struct NullSBEParseState {
+    void reset() {}
 };
 
 // Default: no-op handler that compiles away entirely
 struct NullMktEventHandler {
     static constexpr bool enabled = false;
-    void on_ws_frame(uint8_t, uint8_t, const uint8_t*, uint32_t, WSFrameInfo&) {}
-    void on_ws_fragment(const uint8_t*, uint32_t, WSFrameInfo&) {}
+    NullSBEParseState sbe_state_[2]{};
+    void on_ws_data(NullSBEParseState&, uint8_t, const uint8_t*, uint32_t, WSFrameInfo&) {}
     void on_heartbeat(uint8_t, uint8_t) {}
     void on_disconnected(uint8_t) {}
     void on_reconnected(uint8_t) {}
     void on_batch_end(uint8_t) {}
-    void on_failover(uint8_t, uint8_t, const char*) {}
 };
 
 static_assert(MktEventHandlerConcept<NullMktEventHandler>);
@@ -1133,8 +1135,25 @@ private:
     // ========================================================================
 
     void publish_partial_frame_info(uint8_t ci) {
-        // Partial frames are never delivered to MktEventHandler — skip entirely
-        if constexpr (HasMktEventHandler) return;
+        if constexpr (HasMktEventHandler) {
+            // Streaming SBE parse: process available data incrementally
+            if (pending_frame_[ci].opcode == 0x02) {
+                auto& ps = parse_state_[ci];
+                uint32_t payload_offset = (ps.data_start_offset + ps.frame_start_parse_offset +
+                                           pending_frame_[ci].expected_header_len) % MSG_INBOX_SIZE;
+                uint32_t payload_len = static_cast<uint32_t>(pending_frame_[ci].payload_bytes_received);
+                if (payload_len >= 8) {
+                    const uint8_t* payload = msg_inbox_[ci]->data_at(payload_offset);
+                    WSFrameInfo frag_info{};
+                    mkt_event_handler_.on_ws_data(mkt_event_handler_.sbe_state_[ci],
+                                                  ci, payload, payload_len, frag_info);
+                }
+            }
+            // Note: opcode 0x00 continuation partials don't call on_ws_data
+            // (full-frame publish_frame_info handles it). Type info propagated
+            // there via SBE state when the complete continuation frame arrives.
+            return;
+        }
 
         auto& ps = parse_state_[ci];
 
@@ -1572,18 +1591,20 @@ private:
                 info.publish_time_ts = _ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
             }
 
-            // Call handler for complete TEXT/BINARY messages
+            // Streaming SBE parse: single code path for fragments + complete frames
             if (opcode == 0x01 || opcode == 0x02) {
-                if (!is_fragmented || is_last_fragment) {
-                    const uint8_t* payload = msg_inbox_[ci]->data_at(info.msg_inbox_offset);
-                    mkt_event_handler_.on_ws_frame(ci, opcode, payload,
-                                             static_cast<uint32_t>(payload_len), info);
-                } else if (opcode == 0x02) {
-                    const uint8_t* payload = msg_inbox_[ci]->data_at(ps.fragment_start_offset);
-                    uint32_t avail = ps.fragment_total_len;
-                    if (avail >= 16)
-                        mkt_event_handler_.on_ws_fragment(payload, avail, info);
-                }
+                const uint8_t* ws_payload = is_fragmented
+                    ? msg_inbox_[ci]->data_at(ps.fragment_start_offset)
+                    : msg_inbox_[ci]->data_at(info.msg_inbox_offset);
+                uint32_t avail = is_fragmented
+                    ? ps.fragment_total_len
+                    : static_cast<uint32_t>(payload_len);
+                if (avail >= 8)
+                    mkt_event_handler_.on_ws_data(mkt_event_handler_.sbe_state_[ci],
+                                                  ci, ws_payload, avail, info);
+                // Reset state when message is complete
+                if (!is_fragmented || is_last_fragment)
+                    mkt_event_handler_.sbe_state_[ci].reset();
             }
         } else {
             // Original path: publish to WSFrameInfo ring for parent consumer

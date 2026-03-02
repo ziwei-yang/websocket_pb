@@ -151,12 +151,6 @@ public:
         tx_sink_ = tx_sink;
         conn_state_ = conn_state;
 
-        if constexpr (HasMktEventHandler) {
-            mkt_event_handler_.conn_state = conn_state;
-            if (conn_state && conn_state->tsc_freq_hz > 0)
-                mkt_event_handler_.init_failover(conn_state->tsc_freq_hz);
-        }
-
         if constexpr (EnableAB) {
             msg_inbox_[1] = msg_inbox_b;
         }
@@ -627,6 +621,34 @@ private:
         info.set_tls_record_end(false);
         info.ws_parse_cycle = rdtscp();
 
+        if constexpr (HasMktEventHandler) {
+            if (pending_frame_[ci].opcode == 0x02 && info.payload_len >= 8) {
+                const uint8_t* payload = msg_inbox_[ci]->data_at(info.msg_inbox_offset);
+                WSFrameInfo frag_info{};
+                mkt_event_handler_.on_ws_data(mkt_event_handler_.sbe_state_[ci],
+                                              ci, payload, info.payload_len, frag_info);
+                info.mkt_event_type = frag_info.mkt_event_type;
+                info.mkt_event_count = frag_info.mkt_event_count;
+                info.mkt_event_seq = frag_info.mkt_event_seq;
+                info.exchange_event_time_us = frag_info.exchange_event_time_us;
+            } else if (pending_frame_[ci].opcode == 0x00) {
+                // Continuation frame partial: propagate type from SBE state for display
+                auto& st = mkt_event_handler_.sbe_state_[ci];
+                if (st.msg_type != 0) {
+                    switch (st.msg_type) {
+                    case 10002: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT); break;
+                    case 10003: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA); break;
+                    case 10000: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY); break;
+                    case 10001: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BBO_ARRAY); break;
+                    }
+                    info.mkt_event_seq = st.sequence;
+                    info.exchange_event_time_us = st.event_time_us;
+                    info.mkt_event_count = (st.bids_count > 0 || st.asks_count > 0)
+                        ? st.bids_count + st.asks_count : st.group_count;
+                }
+            }
+        }
+
         info.ws_frame_publish_cycle = rdtscp();
         {
             struct timespec _ts;
@@ -992,54 +1014,52 @@ private:
         int64_t saved_exchange_event_time_us = 0;
         uint8_t app_flags = 0;  // MktEventHandler-set flags (discard_early etc.)
 
-        // MktEventHandler: call inline handler for complete TEXT/BINARY frames
+        // MktEventHandler: streaming SBE parse for TEXT/BINARY frames
         if constexpr (HasMktEventHandler) {
             if (opcode == 0x01 || opcode == 0x02) {
-                if (!is_fragmented || is_last_fragment) {
-                    WSFrameInfo info{};
-                    info.clear();
-                    info.msg_inbox_offset = ps.current_payload_offset;
-                    info.payload_len = static_cast<uint32_t>(payload_len);
-                    info.opcode = opcode;
-                    info.set_fin(true);
-                    info.set_fragmented(is_fragmented);
-                    info.set_last_fragment(is_last_fragment);
-                    info.connection_id = ci;
+                WSFrameInfo info{};
+                info.clear();
+                info.msg_inbox_offset = ps.current_payload_offset;
+                info.payload_len = static_cast<uint32_t>(payload_len);
+                info.opcode = opcode;
+                info.set_fin(!is_fragmented || is_last_fragment);
+                info.set_fragmented(is_fragmented);
+                info.set_last_fragment(is_last_fragment);
+                info.connection_id = ci;
         info.transport_mode = transport_mode_;
         info.conn_target_ip = conn_state_ ? conn_state_->conn_target_ip[ci] : 0;
-                    if constexpr (EnableAB) {
-                        if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
-                            info.set_active_conn(true);
-                    }
-                    auto saved_batch_num = ps.batch_frame_num;
-                    populate_timestamps(info, ps);
-                    if constexpr (PublishRing) ps.batch_frame_num = saved_batch_num;  // ring will increment
-                    info.debug_validate(ci);
-                    info.set_tls_record_end(ps.pending_tls_record_end);
-                    info.set_last_in_batch(ps.is_last_in_batch);
-                    info.ws_parse_cycle = parse_cycle;
-
-                    const uint8_t* payload = msg_inbox_[ci]->data_at(info.msg_inbox_offset);
-                    mkt_event_handler_.on_ws_frame(ci, opcode, payload,
-                                             static_cast<uint32_t>(payload_len), info);
-                    saved_mkt_event_type = info.mkt_event_type;
-                    saved_mkt_event_count = info.mkt_event_count;
-                    saved_mkt_event_seq = info.mkt_event_seq;
-                    saved_exchange_event_time_us = info.exchange_event_time_us;
-                    app_flags = info.flags & 0xF0;  // Preserve MktEventHandler-set bits (4+)
-                } else if (opcode == 0x02) {
-                    // Fragment: lightweight SBE header parse for timeline display only
-                    const uint8_t* payload = msg_inbox_[ci]->data_at(ps.fragment_start_offset);
-                    uint32_t avail = ps.fragment_total_len;
-                    if (avail >= 16) {
-                        WSFrameInfo frag_info{};
-                        mkt_event_handler_.on_ws_fragment(payload, avail, frag_info);
-                        saved_mkt_event_type = frag_info.mkt_event_type;
-                        saved_mkt_event_count = frag_info.mkt_event_count;
-                        saved_mkt_event_seq = frag_info.mkt_event_seq;
-                        saved_exchange_event_time_us = frag_info.exchange_event_time_us;
-                    }
+                if constexpr (EnableAB) {
+                    if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
+                        info.set_active_conn(true);
                 }
+                auto saved_batch_num = ps.batch_frame_num;
+                populate_timestamps(info, ps);
+                if constexpr (PublishRing) ps.batch_frame_num = saved_batch_num;  // ring will increment
+                info.debug_validate(ci);
+                info.set_tls_record_end(ps.pending_tls_record_end);
+                info.set_last_in_batch(ps.is_last_in_batch);
+                info.ws_parse_cycle = parse_cycle;
+
+                // Single code path: pass full accumulated payload for fragments,
+                // or current payload for complete frames
+                const uint8_t* ws_payload = is_fragmented
+                    ? msg_inbox_[ci]->data_at(ps.fragment_start_offset)
+                    : msg_inbox_[ci]->data_at(info.msg_inbox_offset);
+                uint32_t avail = is_fragmented
+                    ? ps.fragment_total_len
+                    : static_cast<uint32_t>(payload_len);
+                if (avail >= 8)
+                    mkt_event_handler_.on_ws_data(mkt_event_handler_.sbe_state_[ci],
+                                                  ci, ws_payload, avail, info);
+                // Reset state when message is complete
+                if (!is_fragmented || is_last_fragment)
+                    mkt_event_handler_.sbe_state_[ci].reset();
+
+                saved_mkt_event_type = info.mkt_event_type;
+                saved_mkt_event_count = info.mkt_event_count;
+                saved_mkt_event_seq = info.mkt_event_seq;
+                saved_exchange_event_time_us = info.exchange_event_time_us;
+                app_flags = info.flags & 0xF0;  // Preserve MktEventHandler-set bits (4+)
             }
         }
 

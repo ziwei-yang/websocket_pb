@@ -283,6 +283,7 @@ TEST_SSL_POLICY_SRC := $(TEST_DIR)/test_ssl_policy.cpp
 TEST_WS_PARSER_SRC := $(TEST_DIR)/test_ws_parser.cpp
 TEST_SBE_DECODER_SRC := $(TEST_DIR)/test_sbe_decoder.cpp
 TEST_SBE_HANDLER_SRC := $(TEST_DIR)/test_sbe_handler.cpp
+TEST_ORDERBOOK_SRC := $(TEST_DIR)/test_orderbook.cpp
 
 # Integration test source files
 TEST_BINANCE_SRC := $(INTEGRATION_DIR)/binance.cpp
@@ -320,8 +321,9 @@ TEST_SSL_POLICY_BIN := $(BUILD_DIR)/test_ssl_policy
 TEST_WS_PARSER_BIN := $(BUILD_DIR)/test_ws_parser
 TEST_SBE_DECODER_BIN := $(BUILD_DIR)/test_sbe_decoder
 TEST_SBE_HANDLER_BIN := $(BUILD_DIR)/test_sbe_handler
+TEST_ORDERBOOK_BIN := $(BUILD_DIR)/test_orderbook
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread build-test-pipeline-binance_sbe_bsdsocket_1thread test-pipeline-binance-sbe-bsdsocket-1thread
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-orderbook test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread build-test-pipeline-binance_sbe_bsdsocket_1thread test-pipeline-binance-sbe-bsdsocket-1thread
 
 all: $(EXAMPLE_BIN)
 
@@ -615,6 +617,17 @@ $(TEST_SBE_HANDLER_BIN): $(TEST_SBE_HANDLER_SRC) | $(BUILD_DIR)
 test-sbe-handler: $(TEST_SBE_HANDLER_BIN)
 	@echo "🧪 Running SBE handler unit tests..."
 	./$(TEST_SBE_HANDLER_BIN)
+
+# Build OrderBook tests
+$(TEST_ORDERBOOK_BIN): $(TEST_ORDERBOOK_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling OrderBook unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run OrderBook tests
+test-orderbook: $(TEST_ORDERBOOK_BIN)
+	@echo "🧪 Running OrderBook unit tests..."
+	./$(TEST_ORDERBOOK_BIN)
 
 # ============================================================================
 # Pipeline Integration Tests (Multi-Process AF_XDP WebSocket)
@@ -1670,7 +1683,7 @@ test-simulator: $(SIMULATOR_BIN)
 # Unified Test Target - Run All Unit Tests
 # ============================================================================
 
-test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler
+test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-orderbook
 	@echo ""
 	@echo "╔════════════════════════════════════════════════════════════════════╗"
 	@echo "║                    ALL UNIT TESTS COMPLETED                        ║"

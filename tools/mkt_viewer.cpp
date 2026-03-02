@@ -332,17 +332,11 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
         s.latency_sum += lat;
     }
 
-    if (evt.is_book_snapshot()) {
-        s.ob.apply_snapshot(evt);
-        s.snap_count++;
-        sample_depth(s, evt.recv_ts_ns);
-    } else if (evt.is_bbo_array()) {
-        s.ob.apply_bbo(evt);
-        s.bbo_count++;
-        sample_depth(s, evt.recv_ts_ns);
-    } else if (evt.is_book_delta()) {
-        s.ob.apply_deltas(evt);
-        s.delta_count++;
+    if (evt.is_book_snapshot() || evt.is_bbo_array() || evt.is_book_delta()) {
+        s.ob.apply(evt);
+        if (evt.is_book_snapshot()) s.snap_count++;
+        else if (evt.is_bbo_array()) s.bbo_count++;
+        else s.delta_count++;
         sample_depth(s, evt.recv_ts_ns);
     } else if (evt.is_trade_array()) {
         // Advance volume segments based on recv_ts
@@ -383,6 +377,7 @@ static void add_log_line(ViewerState& s, const MktEvent& evt) {
 
     const char* type_str =
         evt.is_book_snapshot() ? (evt.is_snapshot() ? "SNAPSHOT" : "BBO     ") :
+        evt.is_bbo_array()     ? "BBO     " :
         evt.is_book_delta()    ? "DELTA   " :
         evt.is_system_status() ? "STATUS  " : "?       ";
 
@@ -391,6 +386,8 @@ static void add_log_line(ViewerState& s, const MktEvent& evt) {
         snprintf(counts, sizeof(counts), "%ub/%ua", evt.count, evt.count2);
     } else if (evt.is_book_delta()) {
         snprintf(counts, sizeof(counts), "%ud", evt.count);
+    } else if (evt.is_bbo_array()) {
+        snprintf(counts, sizeof(counts), "%ub", evt.count);
     } else if (evt.is_trade_array()) {
         snprintf(counts, sizeof(counts), "%ut", evt.count);
     } else if (evt.is_system_status()) {
@@ -458,11 +455,11 @@ static int render_latency_chart(const ViewerState& s, char* fb, int pos, int ter
     int visible = std::min(chart_width, (int)s.latency_count);
     // We'll render chart_width columns; leftmost may be empty if count < width
 
-    // Top row: "10│..."
+    // Top row: "10|..."
     pos = fb_puts(fb, pos, DIM);
     pos = fb_puts(fb, pos, "10");
     pos = fb_puts(fb, pos, RST);
-    pos = fb_put(fb, pos, "\xe2\x94\x82", 3);  // │
+    fb[pos++] = '|';
 
     for (int col = 0; col < chart_width; col++) {
         int sample_idx = col - (chart_width - visible);
@@ -488,11 +485,11 @@ static int render_latency_chart(const ViewerState& s, char* fb, int pos, int ter
     pos = fb_puts(fb, pos, K);
     fb[pos++] = '\n';
 
-    // Bottom row: " 0│..."
+    // Bottom row: " 0|..."
     pos = fb_puts(fb, pos, DIM);
     pos = fb_puts(fb, pos, " 0");
     pos = fb_puts(fb, pos, RST);
-    pos = fb_put(fb, pos, "\xe2\x94\x82", 3);  // │
+    fb[pos++] = '|';
 
     for (int col = 0; col < chart_width; col++) {
         int sample_idx = col - (chart_width - visible);
@@ -553,14 +550,16 @@ static const char* interval_bucket_label(int bucket) {
 
 static int render_interval_bar(char* fb, int pos, const char* label,
                                 uint32_t count, uint32_t max_count, int bar_width) {
-    // label (4 chars) + │ + bar
+    // label (5 chars) + | + bar
     pos = fb_puts(fb, pos, DIM);
     pos = fb_put(fb, pos, label, 5);
     pos = fb_puts(fb, pos, RST);
-    pos = fb_put(fb, pos, "\xe2\x94\x82", 3);  // │
+    fb[pos++] = '|';
 
-    if (count == 0 || max_count == 0 || bar_width <= 0)
+    if (count == 0 || max_count == 0 || bar_width <= 0) {
+        for (int j = 0; j < bar_width; j++) fb[pos++] = ' ';
         return pos;
+    }
 
     // Scale: count/max_count * bar_width, with 1/8 sub-column precision
     float frac = static_cast<float>(count) / static_cast<float>(max_count);
@@ -570,12 +569,17 @@ static int render_interval_bar(char* fb, int pos, const char* label,
     if (sub < 0) sub = 0;
     if (sub > 8) sub = 8;
 
+    int bar_cols = full + (sub > 0 ? 1 : 0);
+
     pos = fb_puts(fb, pos, CYAN);
     for (int j = 0; j < full && j < bar_width; j++)
         pos = fb_puts(fb, pos, HBLOCKS[8]);  // █
     if (full < bar_width && sub > 0)
         pos = fb_puts(fb, pos, HBLOCKS[sub]);
     pos = fb_puts(fb, pos, RST);
+
+    // Pad remaining columns
+    for (int j = bar_cols; j < bar_width; j++) fb[pos++] = ' ';
 
     return pos;
 }
@@ -869,30 +873,30 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
         // Bid side (green): qty right-aligned, price right-aligned
         pos = fb_puts(fb, pos, GREEN);
         if (wide_mode)
-            n = snprintf(tmp, sizeof(tmp), "%9s %9s", f.bq, f.bp);
+            n = snprintf(tmp, sizeof(tmp), "%9.9s %9.9s", f.bq, f.bp);
         else
-            n = snprintf(tmp, sizeof(tmp), "%8s %8s", f.bq, f.bp);
+            n = snprintf(tmp, sizeof(tmp), "%8.8s %8.8s", f.bq, f.bp);
         pos = fb_put(fb, pos, tmp, n);
         pos = fb_puts(fb, pos, RST);
 
         // Book separator
         if (wide_mode)
-            pos = fb_puts(fb, pos, " \xe2\x94\x82 ");   // ` │ `
+            pos = fb_puts(fb, pos, " | ");
         else
-            pos = fb_put(fb, pos, "\xe2\x94\x82", 3);    // `│`
+            fb[pos++] = '|';
 
         // Ask side (red): price left-aligned, qty right-aligned
         pos = fb_puts(fb, pos, RED);
         if (wide_mode)
-            n = snprintf(tmp, sizeof(tmp), "%-9s %9s", f.ap, f.aq);
+            n = snprintf(tmp, sizeof(tmp), "%-9.9s %9.9s", f.ap, f.aq);
         else
-            n = snprintf(tmp, sizeof(tmp), "%-8s %8s", f.ap, f.aq);
+            n = snprintf(tmp, sizeof(tmp), "%-8.8s %8.8s", f.ap, f.aq);
         pos = fb_put(fb, pos, tmp, n);
         pos = fb_puts(fb, pos, RST);
 
         // Wide: append trade column
         if (wide_mode) {
-            pos = fb_puts(fb, pos, " \xe2\x94\x82 ");    // ` │ `
+            pos = fb_puts(fb, pos, " | ");
             if (i == 0) {
                 // Sell strength bar (grows right) + volume
                 pos = render_strength_bar(fb, pos, RED, 'S', sell_strength, 32, strength_scale);
@@ -912,7 +916,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
                 if (ti < actual_trades && ft[ti].valid) {
                     auto& t = ft[ti];
                     pos = fb_puts(fb, pos, t.is_buyer ? GREEN : RED);
-                    n = snprintf(tmp, sizeof(tmp), "%c %9s %9s %12s",
+                    n = snprintf(tmp, sizeof(tmp), "%c %9.9s %9.9s %12.12s",
                                  t.is_buyer ? 'B' : 'S', t.tp, t.tq, t.tt);
                     pos = fb_put(fb, pos, tmp, n);
                     pos = fb_puts(fb, pos, RST);
@@ -920,19 +924,23 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
                     n = snprintf(tmp, sizeof(tmp), " %-5s", t.tf);
                     pos = fb_put(fb, pos, tmp, n);
                     pos = fb_puts(fb, pos, RST);
+                } else {
+                    for (int j = 0; j < 40; j++) fb[pos++] = ' ';
                 }
             }
         }
 
         // Wide + hist: append interval histogram column
         if (show_hist) {
-            pos = fb_puts(fb, pos, " \xe2\x94\x82 ");  // ` │ `
+            pos = fb_puts(fb, pos, " | ");
             if (i == 0) {
-                // Title row
+                // Title row — fills label(5)+pipe(1)+bar area
                 n = snprintf(tmp, sizeof(tmp), "INTERVALS (%u)", interval_total);
+                int title_width = hist_bar_width + 6;
                 pos = fb_puts(fb, pos, BOLD);
                 pos = fb_put(fb, pos, tmp, n);
                 pos = fb_puts(fb, pos, RST);
+                for (int j = n; j < title_width; j++) fb[pos++] = ' ';
             } else {
                 int bucket = i - 1;
                 if (bucket < ViewerState::INTERVAL_BUCKETS - 1) {
@@ -944,14 +952,19 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
                     pos = fb_puts(fb, pos, DIM);
                     pos = fb_put(fb, pos, interval_bucket_label(bucket), 5);
                     pos = fb_puts(fb, pos, RST);
-                    pos = fb_put(fb, pos, "\xe2\x94\x82", 3);  // │
+                    fb[pos++] = '|';
+                    int pct_len = 0;
                     if (cnt > 0 && interval_total > 0) {
                         float pct = 100.0f * cnt / interval_total;
-                        n = snprintf(tmp, sizeof(tmp), "%.1f%%", pct);
+                        pct_len = snprintf(tmp, sizeof(tmp), "%.1f%%", pct);
                         pos = fb_puts(fb, pos, DIM);
-                        pos = fb_put(fb, pos, tmp, n);
+                        pos = fb_put(fb, pos, tmp, pct_len);
                         pos = fb_puts(fb, pos, RST);
                     }
+                    for (int j = pct_len; j < hist_bar_width; j++) fb[pos++] = ' ';
+                } else {
+                    // Rows beyond histogram — pad full hist column width
+                    for (int j = 0; j < hist_bar_width + 6; j++) fb[pos++] = ' ';
                 }
             }
         }
@@ -987,7 +1000,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
             if (i < actual_trades && ft[i].valid) {
                 auto& t = ft[i];
                 pos = fb_puts(fb, pos, t.is_buyer ? GREEN : RED);
-                int n = snprintf(tmp, sizeof(tmp), " %c %8s %8s %8s",
+                int n = snprintf(tmp, sizeof(tmp), " %c %8.8s %8.8s %8.8s",
                                  t.is_buyer ? 'B' : 'S', t.tp, t.tq, t.tt);
                 pos = fb_put(fb, pos, tmp, n);
                 pos = fb_puts(fb, pos, RST);
@@ -1021,6 +1034,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
 // Main
 // ============================================================================
 
+#ifndef MKT_VIEWER_NO_MAIN
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         fprintf(stderr, "Usage: %s <exchange> <symbol>\n", argv[0]);
@@ -1087,14 +1101,14 @@ int main(int argc, char* argv[]) {
 
             // Reclaim unused book/trade rows for logs
             if (wide_mode) {
-                int data_depth = std::max({(int)state.ob.bid_count, (int)state.ob.ask_count, (int)state.trade_count});
+                int data_depth = std::max((int)state.ob.book_depth(), (int)state.trade_count);
                 int needed = std::max(data_depth, BOOK_MIN);
                 if (needed < book_rows) {
                     log_rows += book_rows - needed;
                     book_rows = needed;
                 }
             } else {
-                int book_depth = std::max((int)state.ob.bid_count, (int)state.ob.ask_count);
+                int book_depth = state.ob.book_depth();
                 int needed_book = std::max(book_depth, BOOK_MIN);
                 if (needed_book < book_rows) {
                     log_rows += book_rows - needed_book;
@@ -1144,3 +1158,4 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+#endif // MKT_VIEWER_NO_MAIN

@@ -41,7 +41,6 @@ enum class SystemStatusType : uint8_t {
     HEARTBEAT    = 0,
     DISCONNECTED = 1,
     RECONNECTED  = 2,
-    FAILOVER     = 3,
 };
 
 // ============================================================================

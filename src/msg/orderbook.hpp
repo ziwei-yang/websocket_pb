@@ -45,16 +45,32 @@ struct OrderBook {
         reconcile_bbo();
     }
 
-    void apply_bbo(const MktEvent& evt) {
+    bool apply_bbo(const MktEvent& evt) {
         auto entries = evt.bbo_entries();
-        if (entries.count == 0) return;
+        if (entries.count == 0) return false;
         auto& last = entries.data[entries.count - 1];
-        bbo_seq = last.book_update_id;
+        int64_t seq = last.book_update_id;
+        // Reject BBO that is stale relative to book or previous BBO
+        if (seq <= bbo_seq || seq <= book_seq) return false;
+        bbo_seq = seq;
         bbo_bid_price = last.bid_price;
         bbo_bid_qty = last.bid_qty;
         bbo_ask_price = last.ask_price;
         bbo_ask_qty = last.ask_qty;
         reconcile_bbo();
+        return true;
+    }
+
+    // Unified dispatcher — returns true if the book was modified
+    bool apply(const MktEvent& evt) {
+        if (evt.is_book_snapshot()) { apply_snapshot(evt); return true; }
+        if (evt.is_book_delta())    { apply_deltas(evt);   return true; }
+        if (evt.is_bbo_array())     return apply_bbo(evt);
+        return false;
+    }
+
+    uint8_t book_depth() const {
+        return std::max(bid_count, ask_count);
     }
 
     void reconcile_bbo() {
