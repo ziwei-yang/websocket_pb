@@ -22,11 +22,11 @@
 #
 # Examples:
 #   ./scripts/build_dpdk.sh 04_dpdk_poll_ping.cpp
-#   ./scripts/build_dpdk.sh 30_binance_sbe_dpdk.cpp
+#   ./scripts/build_dpdk.sh 262_binance_sbe_dpdk_inline_ws.cpp
 #   ./scripts/build_dpdk.sh -i enp108s0 05_dpdk_disruptor_packetio_tcp.cpp
 #
 # After running this script, run the test as root:
-#   sudo ./build/test_pipeline_30_binance_sbe_dpdk enp108s0 --timeout 10000
+#   sudo ./build/test_pipeline_262_binance_sbe_dpdk_inline_ws enp108s0 --timeout 10000
 #
 # NOTE: Do NOT run this script with sudo. It uses sudo internally where needed.
 
@@ -99,11 +99,11 @@ Options:
 
 Examples:
   $0 04_dpdk_poll_ping.cpp
-  $0 30_binance_sbe_dpdk.cpp
+  $0 262_binance_sbe_dpdk_inline_ws.cpp
   $0 -i enp108s0 05_dpdk_disruptor_packetio_tcp.cpp
 
 After running this script, run the test as root:
-  sudo ./build/test_pipeline_30_binance_sbe_dpdk enp108s0 --timeout 10000
+  sudo ./build/test_pipeline_262_binance_sbe_dpdk_inline_ws enp108s0 --timeout 10000
 
 NOTE: Do NOT run this script with sudo. It uses sudo internally where needed.
 
@@ -278,13 +278,13 @@ map_test_source() {
             TEST_BIN="build/test_pipeline_06_dpdk_packetio_tcp"
             MAKE_TARGET="build-test-pipeline-06_dpdk_packetio_tcp"
             ;;
-        30_binance_sbe_dpdk)
-            TEST_BIN="build/test_pipeline_30_binance_sbe_dpdk"
-            MAKE_TARGET="build-test-pipeline-30_binance_sbe_dpdk"
+        262_binance_sbe_dpdk_inline_ws)
+            TEST_BIN="build/test_pipeline_262_binance_sbe_dpdk_inline_ws"
+            MAKE_TARGET="build-test-pipeline-262_binance_sbe_dpdk_inline_ws"
             ;;
-        31_binance_sbe_dpdk_packetio)
-            TEST_BIN="build/test_pipeline_31_binance_sbe_dpdk_packetio"
-            MAKE_TARGET="build-test-pipeline-31_binance_sbe_dpdk_packetio"
+        263_binance_sbe_dpdk_packetio_inline_ws)
+            TEST_BIN="build/test_pipeline_263_binance_sbe_dpdk_packetio_inline_ws"
+            MAKE_TARGET="build-test-pipeline-263_binance_sbe_dpdk_packetio_inline_ws"
             ;;
         *)
             # Generic pattern: NN_name.cpp -> test_pipeline_NN_name

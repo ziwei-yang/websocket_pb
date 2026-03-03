@@ -1,17 +1,17 @@
-// test/pipeline/31_binance_sbe_dpdk_packetio.cpp
-// DPDK Direct PacketIO Binance SBE Test - Single child process (no poll process)
+// test/pipeline/264_binance_sbe_xdp_packetio_inline_ws.cpp
+// XDP Direct PacketIO Binance SBE Test - Single child process (no poll process)
 //
-// Uses WebSocketPipeline launcher with INLINE_WS=true and PacketIOType=DPDKPacketIO.
-// Transport handles NIC I/O (DPDK PMD) + TCP + SSL + WS parse directly — no IPC
+// Uses WebSocketPipeline launcher with INLINE_WS=true and PacketIOType=XDPPacketIO.
+// Transport handles NIC I/O (AF_XDP) + TCP + SSL + WS parse directly — no IPC
 // ring hop between a poll process and transport. 1 child process total.
 //
 // Architecture:
-//   - DirectIO Transport Process (core 4): DPDK PMD → recv → decrypt → WS parse → WSFrameInfo ring
+//   - DirectIO Transport Process (core 4): AF_XDP → recv → decrypt → WS parse → WSFrameInfo ring
 //   - Parent Process: consume WSFrameInfo + MktEvent rings, SBE decode + print_timeline
 //
-// Usage: sudo ./test_pipeline_31_binance_sbe_dpdk_packetio <interface> [--timeout <ms>]
+// Usage: ./test_pipeline_264_binance_sbe_xdp_packetio_inline_ws <interface> <bpf_path> [--timeout <ms>]
 //
-// Build: ENABLE_RECONNECT=1 ENABLE_AB=1 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 31_binance_sbe_dpdk_packetio.cpp
+// Build: ENABLE_RECONNECT=1 ENABLE_AB=1 USE_WOLFSSL=1 ./scripts/build_xdp.sh 264_binance_sbe_xdp_packetio_inline_ws.cpp
 
 #include <cstdio>
 #include <cstdlib>
@@ -28,7 +28,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#ifdef USE_DPDK
+#ifdef USE_XDP
 
 #define DEBUG 0
 #define DEBUG_IPC 0
@@ -88,14 +88,14 @@ struct BinanceUpgradeCustomizer {
 using SBEMktEventHandler = websocket::sbe::BinanceSBEHandler;
 
 // ============================================================================
-// PipelineTraits for Binance SBE (DPDK DirectIO — no poll process)
+// PipelineTraits for Binance SBE (XDP DirectIO — no poll process)
 // ============================================================================
 
 struct BinanceSBETraits : DefaultPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
     using MktEventHandler    = SBEMktEventHandler;
     using UpgradeCustomizer  = BinanceUpgradeCustomizer;
-    using PacketIOType       = DPDKPacketIO;  // Direct NIC I/O (no poll process)
+    using PacketIOType       = websocket::xdp::XDPPacketIO;  // Direct NIC I/O (no poll process)
 
     static constexpr int XDP_POLL_CORE   = 2;   // unused (no poll process)
     static constexpr int TRANSPORT_CORE  = 4;
@@ -184,14 +184,15 @@ void profiling_save_thread(Pipeline& pipeline) {
 // ============================================================================
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <interface> [--timeout <ms>]\n", argv[0]);
-        fprintf(stderr, "\nBinance SBE binary protocol test (DPDK DirectIO mode).\n");
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <interface> <bpf_path> [--timeout <ms>]\n", argv[0]);
+        fprintf(stderr, "\nBinance SBE binary protocol test (XDP DirectIO mode).\n");
         fprintf(stderr, "Requires BINANCE_API_KEY env var with Ed25519 API key.\n");
         return 1;
     }
 
     const char* interface = argv[1];
+    const char* bpf_path = argv[2];
 
     parse_args(argc, argv);
 
@@ -202,9 +203,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (geteuid() != 0) {
-        fprintf(stderr, "WARN: Not running as root. DPDK may fail without capabilities.\n");
-        fprintf(stderr, "      Fix: sudo setcap 'cap_ipc_lock,cap_net_admin,cap_net_raw,cap_sys_nice,cap_sys_rawio+ep' %s\n", argv[0]);
-        fprintf(stderr, "      Or:  sudo %s %s ...\n", argv[0], argv[1]);
+        fprintf(stderr, "WARN: Not running as root. AF_XDP may fail without capabilities.\n");
+        fprintf(stderr, "      Fix: sudo setcap 'cap_net_admin,cap_net_raw,cap_bpf,cap_perfmon,cap_ipc_lock,cap_sys_nice+ep' %s\n", argv[0]);
     }
 
     signal(SIGPIPE, SIG_IGN);
@@ -215,10 +215,11 @@ int main(int argc, char* argv[]) {
     bool run_forever = (g_timeout_ms <= 0);
 
     printf("==============================================\n");
-    printf("  Binance SBE Test (DPDK DirectIO)            \n");
+    printf("  Binance SBE Test (XDP DirectIO)             \n");
     printf("==============================================\n");
     printf("  Interface:  %s\n", interface);
-    printf("  I/O:        DPDK PMD (Direct — no poll process)\n");
+    printf("  BPF Path:   %s\n", bpf_path);
+    printf("  I/O:        AF_XDP (Direct — no poll process)\n");
     printf("  Target:     %s:%u (WSS)\n", BinanceSBETraits::WSS_HOST, BinanceSBETraits::WSS_PORT);
     printf("  Path:       %s\n", BinanceSBETraits::WSS_PATH);
     printf("  SSL:        %s\n", SSLPolicyType::name());
@@ -237,7 +238,7 @@ int main(int argc, char* argv[]) {
     // Setup pipeline
     WebSocketPipeline<BinanceSBETraits> pipeline;
 
-    if (!pipeline.setup(interface, "/dev/null")) {
+    if (!pipeline.setup(interface, bpf_path)) {
         fprintf(stderr, "\nFATAL: Setup failed\n");
         return 1;
     }
@@ -436,7 +437,7 @@ int main(int argc, char* argv[]) {
     char summary[4096];
     int pos = 0;
     pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== Shutting down ===\n");
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== SBE DirectIO Test Results (DPDK) ===\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== SBE DirectIO Test Results (XDP) ===\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Duration:        %ld ms\n", actual_duration);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Total frames:    %lu\n", total_frames);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Binary (SBE):    %lu\n", binary_frames);
@@ -450,7 +451,7 @@ int main(int argc, char* argv[]) {
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  (No raw_inbox/raw_outbox/metadata/pongs rings — DirectIO + InlineWS)\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "====================\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "\n==============================================\n");
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  SBE DIRECT_IO TEST COMPLETE (DPDK)\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  SBE DIRECT_IO TEST COMPLETE (XDP)\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "==============================================\n");
 
     fflush(stdout);
@@ -467,7 +468,7 @@ int main(int argc, char* argv[]) {
     // Also save to /tmp for persistence
     {
         char path[256];
-        snprintf(path, sizeof(path), "/tmp/sbe_dpdk_directio_summary_%d.txt", getpid());
+        snprintf(path, sizeof(path), "/tmp/sbe_xdp_directio_summary_%d.txt", getpid());
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
             (void)write(fd, summary, pos);
@@ -480,12 +481,12 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 
-#else  // !USE_DPDK
+#else  // !USE_XDP
 
 int main() {
-    fprintf(stderr, "Error: Build with USE_DPDK=1 USE_WOLFSSL=1 ENABLE_AB=1 ENABLE_RECONNECT=1\n");
-    fprintf(stderr, "Example: ENABLE_RECONNECT=1 ENABLE_AB=1 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 31_binance_sbe_dpdk_packetio.cpp\n");
+    fprintf(stderr, "Error: Build with USE_XDP=1 USE_WOLFSSL=1 ENABLE_AB=1 ENABLE_RECONNECT=1\n");
+    fprintf(stderr, "Example: ENABLE_RECONNECT=1 ENABLE_AB=1 USE_WOLFSSL=1 ./scripts/build_xdp.sh 264_binance_sbe_xdp_packetio_inline_ws.cpp\n");
     return 1;
 }
 
-#endif  // USE_DPDK
+#endif  // USE_XDP

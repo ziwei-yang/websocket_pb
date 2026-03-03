@@ -323,7 +323,7 @@ TEST_SBE_DECODER_BIN := $(BUILD_DIR)/test_sbe_decoder
 TEST_SBE_HANDLER_BIN := $(BUILD_DIR)/test_sbe_handler
 TEST_ORDERBOOK_BIN := $(BUILD_DIR)/test_orderbook
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-orderbook test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread build-test-pipeline-binance_sbe_bsdsocket_1thread test-pipeline-binance-sbe-bsdsocket-1thread
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-orderbook test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread build-test-pipeline-252_binance_sbe_bsdsocket_1thread test-pipeline-252-binance-sbe-bsdsocket-1thread build-test-pipeline-250_binance_sbe_bsdsocket_2thread test-pipeline-250-binance-sbe-bsdsocket-2thread build-test-pipeline-251_binance_sbe_bsdsocket_3thread test-pipeline-251-binance-sbe-bsdsocket-3thread build-test-pipeline-253_binance_sbe_bsdsocket_inline_ws test-pipeline-253-binance-sbe-bsdsocket-inline-ws build-test-pipeline-261_binance_sbe_xdp_inline_ws test-pipeline-261-binance-sbe-xdp-inline-ws build-test-pipeline-262_binance_sbe_dpdk_inline_ws build-test-pipeline-263_binance_sbe_dpdk_packetio_inline_ws build-test-pipeline-264_binance_sbe_xdp_packetio_inline_ws
 
 all: $(EXAMPLE_BIN)
 
@@ -1058,76 +1058,76 @@ test-pipeline-binance-sbe: $(PIPELINE_BINANCE_SBE_BIN) bpf
 	./scripts/test_xdp.sh 24_binance_sbe_xdp.cpp
 
 # ============================================================================
-# DPDK Binance SBE Binary Protocol Test
+# DPDK Binance SBE InlineWS Binary Protocol Test
 # ============================================================================
 
-PIPELINE_DPDK_BINANCE_SBE_SRC := test/pipeline/30_binance_sbe_dpdk.cpp
-PIPELINE_DPDK_BINANCE_SBE_BIN := $(BUILD_DIR)/test_pipeline_30_binance_sbe_dpdk
+PIPELINE_DPDK_BINANCE_SBE_SRC := test/pipeline/262_binance_sbe_dpdk_inline_ws.cpp
+PIPELINE_DPDK_BINANCE_SBE_BIN := $(BUILD_DIR)/test_pipeline_262_binance_sbe_dpdk_inline_ws
 
 $(PIPELINE_DPDK_BINANCE_SBE_BIN): $(PIPELINE_DPDK_BINANCE_SBE_SRC) $(PIPELINE_HEADERS) src/msg/00_binance_spot_sbe.hpp | $(BUILD_DIR)
-	@echo "🔨 Compiling DPDK Binance SBE test..."
+	@echo "🔨 Compiling DPDK Binance SBE InlineWS test..."
 ifdef USE_DPDK
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
-	@echo "✅ DPDK Binance SBE test build complete: $@"
+	@echo "✅ DPDK Binance SBE InlineWS test build complete: $@"
 else
-	@echo "❌ Error: DPDK Binance SBE test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
+	@echo "❌ Error: DPDK Binance SBE InlineWS test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
 	@exit 1
 endif
 else
-	@echo "❌ Error: DPDK Binance SBE test requires USE_DPDK=1"
+	@echo "❌ Error: DPDK Binance SBE InlineWS test requires USE_DPDK=1"
 	@exit 1
 endif
 
-build-test-pipeline-30_binance_sbe_dpdk: $(PIPELINE_DPDK_BINANCE_SBE_BIN)
+build-test-pipeline-262_binance_sbe_dpdk_inline_ws: $(PIPELINE_DPDK_BINANCE_SBE_BIN)
 
 # ============================================================================
-# DPDK DirectIO Binance SBE Test (no poll process, DPDKPacketIO in transport)
+# DPDK DirectIO Binance SBE InlineWS Test (no poll process, DPDKPacketIO in transport)
 # ============================================================================
 
-PIPELINE_DPDK_DIRECTIO_SBE_SRC := test/pipeline/31_binance_sbe_dpdk_packetio.cpp
-PIPELINE_DPDK_DIRECTIO_SBE_BIN := $(BUILD_DIR)/test_pipeline_31_binance_sbe_dpdk_packetio
+PIPELINE_DPDK_DIRECTIO_SBE_SRC := test/pipeline/263_binance_sbe_dpdk_packetio_inline_ws.cpp
+PIPELINE_DPDK_DIRECTIO_SBE_BIN := $(BUILD_DIR)/test_pipeline_263_binance_sbe_dpdk_packetio_inline_ws
 
 $(PIPELINE_DPDK_DIRECTIO_SBE_BIN): $(PIPELINE_DPDK_DIRECTIO_SBE_SRC) $(PIPELINE_HEADERS) src/msg/00_binance_spot_sbe.hpp | $(BUILD_DIR)
-	@echo "Compiling DPDK DirectIO Binance SBE test..."
+	@echo "Compiling DPDK DirectIO Binance SBE InlineWS test..."
 ifdef USE_DPDK
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
-	@echo "DPDK DirectIO Binance SBE test build complete: $@"
+	@echo "DPDK DirectIO Binance SBE InlineWS test build complete: $@"
 else
-	@echo "Error: DPDK DirectIO SBE test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
+	@echo "Error: DPDK DirectIO SBE InlineWS test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
 	@exit 1
 endif
 else
-	@echo "Error: DPDK DirectIO SBE test requires USE_DPDK=1"
+	@echo "Error: DPDK DirectIO SBE InlineWS test requires USE_DPDK=1"
 	@exit 1
 endif
 
-build-test-pipeline-31_binance_sbe_dpdk_packetio: $(PIPELINE_DPDK_DIRECTIO_SBE_BIN)
+build-test-pipeline-263_binance_sbe_dpdk_packetio_inline_ws: $(PIPELINE_DPDK_DIRECTIO_SBE_BIN)
 
 # ============================================================================
-# XDP DirectIO Binance SBE Test (no poll process, XDPPacketIO in transport)
+# XDP DirectIO Binance SBE InlineWS Test (no poll process, XDPPacketIO in transport)
 # ============================================================================
 
-PIPELINE_XDP_DIRECTIO_SBE_SRC := test/pipeline/32_binance_sbe_xdp_packetio.cpp
-PIPELINE_XDP_DIRECTIO_SBE_BIN := $(BUILD_DIR)/test_pipeline_32_binance_sbe_xdp_packetio
+PIPELINE_XDP_DIRECTIO_SBE_SRC := test/pipeline/264_binance_sbe_xdp_packetio_inline_ws.cpp
+PIPELINE_XDP_DIRECTIO_SBE_BIN := $(BUILD_DIR)/test_pipeline_264_binance_sbe_xdp_packetio_inline_ws
 
 $(PIPELINE_XDP_DIRECTIO_SBE_BIN): $(PIPELINE_XDP_DIRECTIO_SBE_SRC) $(PIPELINE_HEADERS) src/msg/00_binance_spot_sbe.hpp | $(BUILD_DIR)
-	@echo "Compiling XDP DirectIO Binance SBE test..."
+	@echo "Compiling XDP DirectIO Binance SBE InlineWS test..."
 ifdef USE_XDP
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
-	@echo "XDP DirectIO Binance SBE test build complete: $@"
+	@echo "XDP DirectIO Binance SBE InlineWS test build complete: $@"
 else
-	@echo "Error: XDP DirectIO SBE test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
+	@echo "Error: XDP DirectIO SBE InlineWS test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
 	@exit 1
 endif
 else
-	@echo "Error: XDP DirectIO SBE test requires USE_XDP=1"
+	@echo "Error: XDP DirectIO SBE InlineWS test requires USE_XDP=1"
 	@exit 1
 endif
 
-build-test-pipeline-32_binance_sbe_xdp_packetio: $(PIPELINE_XDP_DIRECTIO_SBE_BIN)
+build-test-pipeline-264_binance_sbe_xdp_packetio_inline_ws: $(PIPELINE_XDP_DIRECTIO_SBE_BIN)
 
 # ============================================================================
 # WebSocket OKX Test (WebSocketProcess with OKX WSS stream)
@@ -1218,12 +1218,12 @@ else
 endif
 
 # ============================================================================
-# BSD Socket Binance SBE Test - 1-thread SingleThreadSSL (test27)
+# BSD Socket Binance SBE Test - 1-thread SingleThreadSSL (test252)
 # Uses kernel TCP via BSD sockets with single-thread RX+TX loop + SBE binary protocol
 # ============================================================================
 
-PIPELINE_BSD_SBE_BINANCE_1T_SRC := test/pipeline/27_binance_sbe_bsdsocket_1thread.cpp
-PIPELINE_BSD_SBE_BINANCE_1T_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_bsdsocket_1thread
+PIPELINE_BSD_SBE_BINANCE_1T_SRC := test/pipeline/252_binance_sbe_bsdsocket_1thread.cpp
+PIPELINE_BSD_SBE_BINANCE_1T_BIN := $(BUILD_DIR)/test_pipeline_252_binance_sbe_bsdsocket_1thread
 
 $(PIPELINE_BSD_SBE_BINANCE_1T_BIN): $(PIPELINE_BSD_SBE_BINANCE_1T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/00_binance_spot_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling BSD Socket Binance SBE 1-thread test..."
@@ -1235,9 +1235,9 @@ else
 	@exit 1
 endif
 
-build-test-pipeline-binance_sbe_bsdsocket_1thread: $(PIPELINE_BSD_SBE_BINANCE_1T_BIN)
+build-test-pipeline-252_binance_sbe_bsdsocket_1thread: $(PIPELINE_BSD_SBE_BINANCE_1T_BIN)
 
-test-pipeline-binance-sbe-bsdsocket-1thread: $(PIPELINE_BSD_SBE_BINANCE_1T_BIN)
+test-pipeline-252-binance-sbe-bsdsocket-1thread: $(PIPELINE_BSD_SBE_BINANCE_1T_BIN)
 	@echo "🧪 Running BSD Socket Binance SBE 1-thread test..."
 ifeq ($(UNAME_S),Darwin)
 	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_SBE_BINANCE_1T_BIN) --timeout $(TIMEOUT)
@@ -1246,12 +1246,12 @@ else
 endif
 
 # ============================================================================
-# BSD Socket Binance SBE Test - 2-thread InlineSSL (test25)
+# BSD Socket Binance SBE Test - 2-thread InlineSSL (test250)
 # Uses kernel TCP via BSD sockets with SBE binary protocol
 # ============================================================================
 
-PIPELINE_BSD_SBE_BINANCE_2T_SRC := test/pipeline/25_binance_sbe_bsdsocket_2thread.cpp
-PIPELINE_BSD_SBE_BINANCE_2T_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_bsdsocket_2thread
+PIPELINE_BSD_SBE_BINANCE_2T_SRC := test/pipeline/250_binance_sbe_bsdsocket_2thread.cpp
+PIPELINE_BSD_SBE_BINANCE_2T_BIN := $(BUILD_DIR)/test_pipeline_250_binance_sbe_bsdsocket_2thread
 
 $(PIPELINE_BSD_SBE_BINANCE_2T_BIN): $(PIPELINE_BSD_SBE_BINANCE_2T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/00_binance_spot_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling BSD Socket Binance SBE 2-thread test..."
@@ -1263,9 +1263,9 @@ else
 	@exit 1
 endif
 
-build-test-pipeline-binance_sbe_bsdsocket_2thread: $(PIPELINE_BSD_SBE_BINANCE_2T_BIN)
+build-test-pipeline-250_binance_sbe_bsdsocket_2thread: $(PIPELINE_BSD_SBE_BINANCE_2T_BIN)
 
-test-pipeline-binance-sbe-bsdsocket-2thread: $(PIPELINE_BSD_SBE_BINANCE_2T_BIN)
+test-pipeline-250-binance-sbe-bsdsocket-2thread: $(PIPELINE_BSD_SBE_BINANCE_2T_BIN)
 	@echo "🧪 Running BSD Socket Binance SBE 2-thread test..."
 ifeq ($(UNAME_S),Darwin)
 	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_SBE_BINANCE_2T_BIN) --timeout $(TIMEOUT)
@@ -1274,12 +1274,12 @@ else
 endif
 
 # ============================================================================
-# BSD Socket Binance SBE Test - 3-thread DedicatedSSL (test26)
+# BSD Socket Binance SBE Test - 3-thread DedicatedSSL (test251)
 # Uses kernel TCP via BSD sockets with separate SSL thread + SBE binary protocol
 # ============================================================================
 
-PIPELINE_BSD_SBE_BINANCE_3T_SRC := test/pipeline/26_binance_sbe_bsdsocket_3thread.cpp
-PIPELINE_BSD_SBE_BINANCE_3T_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_bsdsocket_3thread
+PIPELINE_BSD_SBE_BINANCE_3T_SRC := test/pipeline/251_binance_sbe_bsdsocket_3thread.cpp
+PIPELINE_BSD_SBE_BINANCE_3T_BIN := $(BUILD_DIR)/test_pipeline_251_binance_sbe_bsdsocket_3thread
 
 $(PIPELINE_BSD_SBE_BINANCE_3T_BIN): $(PIPELINE_BSD_SBE_BINANCE_3T_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/00_binance_spot_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling BSD Socket Binance SBE 3-thread test..."
@@ -1291,9 +1291,9 @@ else
 	@exit 1
 endif
 
-build-test-pipeline-binance_sbe_bsdsocket_3thread: $(PIPELINE_BSD_SBE_BINANCE_3T_BIN)
+build-test-pipeline-251_binance_sbe_bsdsocket_3thread: $(PIPELINE_BSD_SBE_BINANCE_3T_BIN)
 
-test-pipeline-binance-sbe-bsdsocket-3thread: $(PIPELINE_BSD_SBE_BINANCE_3T_BIN)
+test-pipeline-251-binance-sbe-bsdsocket-3thread: $(PIPELINE_BSD_SBE_BINANCE_3T_BIN)
 	@echo "🧪 Running BSD Socket Binance SBE 3-thread test..."
 ifeq ($(UNAME_S),Darwin)
 	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_SBE_BINANCE_3T_BIN) --timeout $(TIMEOUT)
@@ -1302,12 +1302,12 @@ else
 endif
 
 # ============================================================================
-# BSD Socket Binance SBE Test - InlineWS (test28)
+# BSD Socket Binance SBE Test - InlineWS (test253)
 # Transport + WS in single process — no IPC rings between transport and WS
 # ============================================================================
 
-PIPELINE_BSD_SBE_BINANCE_INLINE_SRC := test/pipeline/28_binance_sbe_bsdsocket_inline_ws.cpp
-PIPELINE_BSD_SBE_BINANCE_INLINE_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_bsdsocket_inline_ws
+PIPELINE_BSD_SBE_BINANCE_INLINE_SRC := test/pipeline/253_binance_sbe_bsdsocket_inline_ws.cpp
+PIPELINE_BSD_SBE_BINANCE_INLINE_BIN := $(BUILD_DIR)/test_pipeline_253_binance_sbe_bsdsocket_inline_ws
 
 $(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN): $(PIPELINE_BSD_SBE_BINANCE_INLINE_SRC) $(PIPELINE_HEADERS) src/pipeline/11_bsd_tcp_ssl_process.hpp src/pipeline/21_ws_core.hpp src/pipeline/bsd_websocket_pipeline.hpp src/net/ip_probe.hpp src/msg/00_binance_spot_sbe.hpp $(SSL_BACKEND_SENTINEL) | $(BUILD_DIR)
 	@echo "🔨 Compiling BSD Socket Binance SBE InlineWS test..."
@@ -1319,9 +1319,9 @@ else
 	@exit 1
 endif
 
-build-test-pipeline-binance_sbe_bsdsocket_inline_ws: $(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN)
+build-test-pipeline-253_binance_sbe_bsdsocket_inline_ws: $(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN)
 
-test-pipeline-binance-sbe-bsdsocket-inline-ws: $(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN)
+test-pipeline-253-binance-sbe-bsdsocket-inline-ws: $(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN)
 	@echo "🧪 Running BSD Socket Binance SBE InlineWS test..."
 ifeq ($(UNAME_S),Darwin)
 	OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES ./$(PIPELINE_BSD_SBE_BINANCE_INLINE_BIN) --timeout $(TIMEOUT)
@@ -1334,8 +1334,8 @@ endif
 # 2 processes total: XDP Poll + InlineWS Transport
 # ============================================================================
 
-PIPELINE_XDP_SBE_INLINE_SRC := test/pipeline/29_binance_sbe_xdp_inline_ws.cpp
-PIPELINE_XDP_SBE_INLINE_BIN := $(BUILD_DIR)/test_pipeline_binance_sbe_xdp_inline_ws
+PIPELINE_XDP_SBE_INLINE_SRC := test/pipeline/261_binance_sbe_xdp_inline_ws.cpp
+PIPELINE_XDP_SBE_INLINE_BIN := $(BUILD_DIR)/test_pipeline_261_binance_sbe_xdp_inline_ws
 
 $(PIPELINE_XDP_SBE_INLINE_BIN): $(PIPELINE_XDP_SBE_INLINE_SRC) $(PIPELINE_HEADERS) src/pipeline/21_ws_core.hpp src/msg/00_binance_spot_sbe.hpp | $(BUILD_DIR)
 	@echo "🔨 Compiling XDP Binance SBE InlineWS test..."
@@ -1352,11 +1352,11 @@ else
 	@exit 1
 endif
 
-build-test-pipeline-binance_sbe_xdp_inline_ws: $(PIPELINE_XDP_SBE_INLINE_BIN)
+build-test-pipeline-261_binance_sbe_xdp_inline_ws: $(PIPELINE_XDP_SBE_INLINE_BIN)
 
-test-pipeline-binance-sbe-xdp-inline-ws: $(PIPELINE_XDP_SBE_INLINE_BIN) bpf
+test-pipeline-261-binance-sbe-xdp-inline-ws: $(PIPELINE_XDP_SBE_INLINE_BIN) bpf
 	@echo "🧪 Running XDP Binance SBE InlineWS test via script..."
-	./scripts/test_xdp.sh 29_binance_sbe_xdp_inline_ws.cpp
+	./scripts/test_xdp.sh 261_binance_sbe_xdp_inline_ws.cpp
 
 # ============================================================================
 # MktEvent Ring Reader Tool

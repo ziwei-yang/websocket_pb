@@ -1,18 +1,18 @@
-// test/pipeline/28_binance_sbe_bsdsocket_inline_ws.cpp
-// BSD Socket Binance SBE Test - InlineWS mode (transport + WS in single process)
+// test/pipeline/250_binance_sbe_bsdsocket_2thread.cpp
+// BSD Socket Binance SBE Test - 2-thread InlineSSL mode
 //
-// Uses BSDWebSocketPipeline launcher with INLINE_WS=true.
-// Transport embeds WSCore directly — no IPC rings between transport and WS,
-// no separate WS process fork. Only 1 child process.
+// Uses BSDWebSocketPipeline launcher with SBE binary protocol.
+// Parent consumes WSFrameInfo from disruptor ring and validates SBE fields.
 //
 // Architecture:
-//   - InlineWS Transport Process (1-thread: recv → decrypt → WS parse → WSFrameInfo ring)
+//   - BSD Transport Process (2-thread: RX + TX) with InlineSSL
+//   - WebSocket Process: WS handshake + frame parsing -> WSFrameInfo ring
 //   - Parent Process: consume WSFrameInfo ring, SBE decode + print_timeline
 //
 // Usage:
-//   make build-test-pipeline-binance_sbe_bsdsocket_inline_ws NIC_MTU=1500 USE_OPENSSL=1
+//   make build-test-pipeline-binance_sbe_bsdsocket_2thread NIC_MTU=1500 USE_OPENSSL=1
 //   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES BINANCE_API_KEY=<key> \
-//     ./build/test_pipeline_binance_sbe_bsdsocket_inline_ws --timeout 10000
+//     ./build/test_pipeline_250_binance_sbe_bsdsocket_2thread --timeout 10000
 //
 // Options:
 //   --timeout <ms>   Stream timeout in milliseconds (default: 10000)
@@ -24,7 +24,6 @@
 #include <csignal>
 #include <atomic>
 #include <chrono>
-#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -32,10 +31,17 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+// Capture -DENABLE_AB before including pipeline headers (macro clashes with Traits member)
+#ifdef ENABLE_AB
+static constexpr bool AB_ENABLED = true;
+#else
+static constexpr bool AB_ENABLED = false;
+#endif
+#undef ENABLE_AB
+
 #include "../../src/pipeline/bsd_websocket_pipeline.hpp"
 #include "../../src/policy/ssl.hpp"
 #include "../../src/msg/00_binance_spot_sbe.hpp"
-#include "../../src/msg/mkt_event.hpp"
 
 using namespace websocket::pipeline;
 namespace sbe = websocket::sbe;
@@ -68,17 +74,15 @@ struct BinanceUpgradeCustomizer {
     }
 };
 
-using SBEMktEventHandler = websocket::sbe::BinanceSBEHandler;
-
 // ============================================================================
-// Pipeline Traits (InlineWS — transport + WS in single process)
+// Pipeline Traits (2-thread InlineSSL)
 // ============================================================================
 
-struct BinanceSBEInlineWSTraits : DefaultBSDPipelineConfig {
+struct BinanceSBE2ThreadTraits : DefaultBSDPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
     using IOPolicy           = DefaultBlockingIO;
-    using SSLThreadingPolicy = SingleThreadSSL;
-    using MktEventHandler         = SBEMktEventHandler;
+    using SSLThreadingPolicy = InlineSSL;
+    using MktEventHandler         = NullMktEventHandler;
     using UpgradeCustomizer  = BinanceUpgradeCustomizer;
 
     static constexpr int TRANSPORT_CORE = -1;
@@ -86,12 +90,10 @@ struct BinanceSBEInlineWSTraits : DefaultBSDPipelineConfig {
 
     static constexpr const char* WSS_HOST = "stream-sbe.binance.com";
     static constexpr uint16_t WSS_PORT    = 443;
-    static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade/btcusdt@depth/btcusdt@depth20/btcusdt@bestBidAsk";
+    static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade";
 
-    static constexpr bool ENABLE_AB      = true;
+    static constexpr bool ENABLE_AB      = AB_ENABLED;
     static constexpr bool AUTO_RECONNECT = true;
-    static constexpr bool INLINE_WS      = true;   // <-- key difference
-    static constexpr bool WS_FRAME_INFO_RING = true;  // publish to ring even with MktEventHandler
 };
 
 // ============================================================================
@@ -104,7 +106,6 @@ constexpr int DEFAULT_STREAM_DURATION_MS = 10000;
 constexpr int FINAL_DRAIN_MS = 2000;
 
 int g_timeout_ms = DEFAULT_STREAM_DURATION_MS;
-bool g_merge_enabled = true;
 
 std::atomic<bool> g_shutdown{false};
 ConnStateShm* g_conn_state = nullptr;
@@ -185,15 +186,18 @@ void write_summary(const char* tag,
                    uint64_t text_frames, uint64_t binary_frames,
                    uint64_t ping_frames, uint64_t pong_frames, uint64_t close_frames,
                    uint64_t sbe_valid_events, uint64_t sbe_decode_errors,
-                   bool sequence_error,
+                   bool sequence_error, int64_t pong_deficit,
                    const std::vector<WSFrameInfo>& frame_records, uint64_t tsc_freq,
                    const char* dump_path,
-                   int64_t ws_frame_prod, int64_t ws_frame_cons_seq) {
+                   int64_t ws_frame_prod, int64_t ws_frame_cons_seq,
+                   int64_t meta_prod, int64_t meta_cons,
+                   int64_t outbox_prod, int64_t outbox_cons,
+                   int64_t pongs_prod, int64_t pongs_cons) {
     char buf[16384];
     int pos = 0;
 
     pos += snprintf(buf + pos, sizeof(buf) - pos, "\n=== Shutting down ===\n");
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n=== SBE InlineWS Test Results ===\n");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n=== SBE Test Results ===\n");
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  Duration:        %ld ms\n", duration_ms);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  Total events:    %lu (ring events incl. partial)\n", total_frames);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  Partial events:  %lu\n", partial_events);
@@ -201,6 +205,13 @@ void write_summary(const char* tag,
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  BINARY frames:   %lu\n", binary_frames);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  PING frames:     %lu\n", ping_frames);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  PONG frames:     %lu\n", pong_frames);
+    if (pong_deficit > 0) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "  PONG DEFICIT:    %ld (PINGs received but PONGs not queued - INVESTIGATE!)\n", pong_deficit);
+    } else {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "  PONG balance:    OK (all PINGs have corresponding PONGs queued)\n");
+    }
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  CLOSE frames:    %lu\n", close_frames);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  SBE valid:       %lu\n", sbe_valid_events);
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  SBE errors:      %lu\n", sbe_decode_errors);
@@ -298,12 +309,20 @@ void write_summary(const char* tag,
         pos += snprintf(buf + pos, sizeof(buf) - pos, "[FRAME-RECORDS] %s\n", dump_path);
     }
 
-    // Ring buffer status (InlineWS: only ws_frame_info ring exists)
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Ring Buffer Status (InlineWS) ---\n");
+    // Ring buffer status
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n--- Ring Buffer Status ---\n");
     bool ws_caught = ws_frame_cons_seq >= ws_frame_prod;
+    bool meta_caught = meta_cons >= meta_prod - 1;
+    bool outbox_caught = outbox_cons >= outbox_prod;
+    bool pongs_caught = pongs_cons >= pongs_prod;
     pos += snprintf(buf + pos, sizeof(buf) - pos, "  WS_FRAME_INFO producer: %ld, consumer: %ld (%s)\n",
         ws_frame_prod, ws_frame_cons_seq, ws_caught ? "ok" : "NO - FAIL");
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "  (No msg_metadata/pongs rings — InlineWS; msg_outbox available for client sends)\n");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  MSG_METADATA  producer: %ld, consumer: %ld (%s)\n",
+        meta_prod, meta_cons, meta_caught ? "ok" : "NO - FAIL");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  MSG_OUTBOX    producer: %ld, consumer: %ld (%s)\n",
+        outbox_prod, outbox_cons, outbox_caught ? "ok" : "NO - FAIL");
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "  PONGS         producer: %ld, consumer: %ld (%s)\n",
+        pongs_prod, pongs_cons, pongs_caught ? "ok" : "NO - FAIL");
     pos += snprintf(buf + pos, sizeof(buf) - pos, "====================\n");
 
     fflush(stdout);
@@ -331,20 +350,16 @@ void write_summary(const char* tag,
 // Stream Test
 // ============================================================================
 
-bool run_stream_test(BSDWebSocketPipeline<BinanceSBEInlineWSTraits>& pipeline) {
+bool run_stream_test(BSDWebSocketPipeline<BinanceSBE2ThreadTraits>& pipeline) {
     bool run_forever = (g_timeout_ms <= 0);
 
     if (run_forever) {
-        printf("\n--- SBE InlineWS Stream Test (FOREVER MODE - Ctrl+C to stop) ---\n");
+        printf("\n--- SBE Stream Test (FOREVER MODE - Ctrl+C to stop) ---\n");
     } else {
-        printf("\n--- SBE InlineWS Stream Test (%dms) ---\n", g_timeout_ms);
+        printf("\n--- SBE Stream Test (%dms) ---\n", g_timeout_ms);
     }
 
     IPCRingConsumer<WSFrameInfo> ws_frame_cons(*pipeline.ws_frame_info_region());
-    std::unique_ptr<IPCRingConsumer<websocket::msg::MktEvent>> mkt_event_cons;
-    if (pipeline.mkt_event_region()) {
-        mkt_event_cons = std::make_unique<IPCRingConsumer<websocket::msg::MktEvent>>(*pipeline.mkt_event_region());
-    }
     ConnStateShm* conn_state = pipeline.conn_state();
 
     uint64_t total_frames = 0, text_frames = 0, binary_frames = 0;
@@ -421,25 +436,6 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBEInlineWSTraits>& pipeline) {
         prev_publish_mono_ns = frame.ssl_read_end_mono_ns(tsc_freq);
         prev_latest_poll_cycle = frame.latest_poll_cycle;
 
-        if (mkt_event_cons) {
-            websocket::msg::MktEvent mkt;
-            while (mkt_event_cons->try_consume(mkt)) {
-                if (mkt.is_system_status()) {
-                    auto& st = mkt.payload.status;
-                    const char* type_str =
-                        st.status_type == 0 ? "HEARTBEAT" :
-                        st.status_type == 1 ? "DISCONNECTED" :
-                        st.status_type == 2 ? "RECONNECTED" : "UNKNOWN";
-                    struct timespec ts;
-                    clock_gettime(CLOCK_REALTIME, &ts);
-                    fprintf(stderr, "[%ld.%06ld] [STATUS] %s conn=%u %s\n",
-                            ts.tv_sec, ts.tv_nsec / 1000, type_str, st.connection_id, st.message);
-                } else {
-                    mkt.print();
-                }
-            }
-        }
-
         if (frame_records.size() < MAX_FRAME_RECORDS) {
             frame_records.push_back(frame);
         }
@@ -461,7 +457,6 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBEInlineWSTraits>& pipeline) {
                 } else {
                     sbe_decode_errors++;
                 }
-                // mkt.on_ws_frame() now runs inline in WSCore via SBEMktEventHandler
                 break;
             }
             case 0x09: ping_frames++; break;
@@ -472,7 +467,6 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBEInlineWSTraits>& pipeline) {
     };
 
     // Main streaming loop
-    // InlineWS: only 1 child process (transport), check PROC_TRANSPORT
     while (run_forever || std::chrono::steady_clock::now() < stream_end) {
         if (g_shutdown.load(std::memory_order_acquire)) {
             signal(SIGINT, SIG_IGN);
@@ -481,20 +475,15 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBEInlineWSTraits>& pipeline) {
             break;
         }
 
-        if (!conn_state->is_running(PROC_TRANSPORT)) {
-            fprintf(stderr, "[SBE] Transport process exited during streaming\n");
+        if (!conn_state->is_running(PROC_WEBSOCKET)) {
+            fprintf(stderr, "[SBE] WebSocket process exited during streaming\n");
             break;
         }
 
-        bool got_frame = false;
         WSFrameInfo frame;
         bool end_of_batch;
         while (ws_frame_cons.try_consume(frame, &end_of_batch)) {
             process_frame(frame);
-            got_frame = true;
-        }
-
-        if (got_frame) {
         }
 
         usleep(1000);
@@ -525,45 +514,43 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBEInlineWSTraits>& pipeline) {
             process_frame(frame);
         }
     }
-    if (mkt_event_cons) {
-        websocket::msg::MktEvent mkt;
-        while (mkt_event_cons->try_consume(mkt)) {
-            if (mkt.is_system_status()) {
-                auto& st = mkt.payload.status;
-                const char* type_str =
-                    st.status_type == 0 ? "HEARTBEAT" :
-                    st.status_type == 1 ? "DISCONNECTED" :
-                    st.status_type == 2 ? "RECONNECTED" : "UNKNOWN";
-                struct timespec ts;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                fprintf(stderr, "[%ld.%06ld] [STATUS] %s conn=%u %s\n",
-                        ts.tv_sec, ts.tv_nsec / 1000, type_str, st.connection_id, st.message);
-            } else {
-                mkt.print();
-            }
-        }
-    }
 
     auto actual_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time).count();
 
-    dump_frame_records(frame_records.data(), frame_records.size(), "bsd_sbe_inline");
+    dump_frame_records(frame_records.data(), frame_records.size(), "bsd_sbe_2t");
 
     char dump_path[256];
-    snprintf(dump_path, sizeof(dump_path), "/tmp/bsd_sbe_inline_frame_records_%d.bin", getpid());
+    snprintf(dump_path, sizeof(dump_path), "/tmp/bsd_sbe_2t_frame_records_%d.bin", getpid());
 
-    // Ring buffer status (InlineWS: only ws_frame_info ring)
+    // Ring buffer status
     auto* ws_fi_region = pipeline.ws_frame_info_region();
+    auto* meta_region = pipeline.msg_metadata_region(0);
+    auto* outbox_region = pipeline.msg_outbox_region();
+    auto* pongs_region = pipeline.pongs_region();
+
     int64_t ws_frame_prod = ws_fi_region->producer_published()->load(std::memory_order_acquire);
     int64_t ws_frame_cons_seq = ws_frame_cons.sequence();
+    int64_t meta_prod = meta_region->producer_published()->load(std::memory_order_acquire);
+    int64_t meta_cons = meta_region->consumer_sequence(0)->load(std::memory_order_acquire);
+    int64_t outbox_prod = outbox_region->producer_published()->load(std::memory_order_acquire);
+    int64_t outbox_cons = outbox_region->consumer_sequence(0)->load(std::memory_order_acquire);
+    int64_t pongs_prod_seq = pongs_region->producer_published()->load(std::memory_order_acquire);
+    int64_t pongs_cons_seq = pongs_region->consumer_sequence(0)->load(std::memory_order_acquire);
 
-    write_summary("bsd_sbe_inline", actual_duration,
+    int64_t pongs_queued = pongs_prod_seq + 1;
+    int64_t pong_deficit = static_cast<int64_t>(ping_frames) - pongs_queued;
+
+    write_summary("bsd_sbe_2t", actual_duration,
                   total_frames, partial_events,
                   text_frames, binary_frames, ping_frames, pong_frames, close_frames,
-                  sbe_valid_events, sbe_decode_errors, sequence_error,
+                  sbe_valid_events, sbe_decode_errors, sequence_error, pong_deficit,
                   frame_records, tsc_freq,
                   frame_records.empty() ? nullptr : dump_path,
-                  ws_frame_prod, ws_frame_cons_seq);
+                  ws_frame_prod, ws_frame_cons_seq,
+                  meta_prod, meta_cons,
+                  outbox_prod, outbox_cons,
+                  pongs_prod_seq, pongs_cons_seq);
 
     if (run_forever) return true;
 
@@ -584,9 +571,7 @@ void parse_args(int argc, char* argv[]) {
             g_timeout_ms = atoi(argv[i + 1]);
             printf("[ARGS] Timeout set to %d ms%s\n",
                    g_timeout_ms, g_timeout_ms <= 0 ? " (FOREVER MODE)" : "");
-        } else if (strcmp(argv[i], "--no-merge") == 0) {
-            g_merge_enabled = false;
-            printf("[ARGS] Merge disabled\n");
+            break;
         }
     }
 }
@@ -615,16 +600,15 @@ int main(int argc, char* argv[]) {
     bool run_forever = (g_timeout_ms <= 0);
 
     printf("==============================================\n");
-    printf("  BSD Socket Binance SBE Test (InlineWS)      \n");
+    printf("  BSD Socket Binance SBE Test (2-thread)      \n");
     printf("==============================================\n");
-    printf("  Target:     %s:%u (WSS)\n", BinanceSBEInlineWSTraits::WSS_HOST, BinanceSBEInlineWSTraits::WSS_PORT);
-    printf("  Path:       %s\n", BinanceSBEInlineWSTraits::WSS_PATH);
+    printf("  Target:     %s:%u (WSS)\n", BinanceSBE2ThreadTraits::WSS_HOST, BinanceSBE2ThreadTraits::WSS_PORT);
+    printf("  Path:       %s\n", BinanceSBE2ThreadTraits::WSS_PATH);
     printf("  SSL:        %s\n", SSLPolicyType::name());
-    printf("  Threading:  InlineWS (transport + WS in single process)\n");
-    printf("  Processes:  1 child (transport embeds WS)\n");
+    printf("  Threading:  2-thread (InlineSSL)\n");
+    printf("  Processes:  BSD Transport + WebSocket\n");
     printf("  API Key:    set\n");
     printf("  Dual A/B:   yes\n");
-    printf("  Merge:      %s\n", g_merge_enabled ? "yes" : "no");
     printf("  Reconnect:  yes\n");
     if (run_forever) {
         printf("  Timeout:    FOREVER (Ctrl+C to stop)\n");
@@ -634,7 +618,7 @@ int main(int argc, char* argv[]) {
     }
     printf("==============================================\n\n");
 
-    BSDWebSocketPipeline<BinanceSBEInlineWSTraits> pipeline;
+    BSDWebSocketPipeline<BinanceSBE2ThreadTraits> pipeline;
 
     if (!pipeline.setup()) {
         fprintf(stderr, "\nFATAL: Setup failed\n");
@@ -642,11 +626,10 @@ int main(int argc, char* argv[]) {
     }
 
     g_conn_state = pipeline.conn_state();
-    pipeline.mkt_event_handler().merge_enabled = g_merge_enabled;
 
     // Set subscription JSON
     pipeline.set_subscription_json(
-        R"({"method":"SUBSCRIBE","params":["btcusdt@trade","btcusdt@depth","btcusdt@depth20","btcusdt@bestBidAsk"],"id":1})");
+        R"({"method":"SUBSCRIBE","params":["btcusdt@trade"],"id":1})");
 
     if (!pipeline.start()) {
         fprintf(stderr, "\nFATAL: Failed to start pipeline\n");
@@ -665,9 +648,9 @@ int main(int argc, char* argv[]) {
 
     printf("\n==============================================\n");
     if (result == 0) {
-        printf("  SBE TEST PASSED (InlineWS)\n");
+        printf("  SBE TEST PASSED (2-thread)\n");
     } else {
-        printf("  SBE TEST FAILED (InlineWS)\n");
+        printf("  SBE TEST FAILED (2-thread)\n");
     }
     printf("==============================================\n");
 

@@ -3156,7 +3156,7 @@ struct WolfSSLPolicy {
 
     /**
      * Extract server record keys for direct AES-CTR decryption.
-     * WolfSSL provides direct access to key material via wolfSSL_get_keys().
+     * Uses wolfSSL_GetServerWriteKey/IV() public APIs (no build flags needed).
      * Returns true if keys were extracted (AES-GCM cipher), false otherwise.
      */
     bool extract_record_keys(websocket::crypto::TLSRecordKeys& keys) {
@@ -3168,15 +3168,10 @@ struct WolfSSLPolicy {
 
         uint8_t key_len = 0;
         if (strstr(cipher_name, "AES128") || strstr(cipher_name, "AES_128") ||
-            strstr(cipher_name, "AES-128")) {
-            key_len = 16;
-        } else if (strstr(cipher_name, "AES256") || strstr(cipher_name, "AES_256") ||
-                   strstr(cipher_name, "AES-256")) {
-            key_len = 32;
-        } else {
-            return false;  // Not AES
-        }
-
+            strstr(cipher_name, "AES-128")) key_len = 16;
+        else if (strstr(cipher_name, "AES256") || strstr(cipher_name, "AES_256") ||
+                 strstr(cipher_name, "AES-256")) key_len = 32;
+        else return false;
         if (!strstr(cipher_name, "GCM")) return false;
 
         // Determine TLS version
@@ -3186,43 +3181,24 @@ struct WolfSSLPolicy {
         keys.key_len = key_len;
         keys.is_tls13 = is_tls13;
 
-        // Use wolfSSL_get_keys() to access key material directly
-        // Requires wolfSSL built with ATOMIC_USER or OPENSSL_ALL or OPENSSL_EXTRA
-#if defined(ATOMIC_USER) || defined(OPENSSL_ALL) || defined(OPENSSL_EXTRA)
-        unsigned int suite_len = 0, key_sz = 0, iv_sz = 0;
-        unsigned char* ms = nullptr;
-        unsigned char* sr = nullptr;
-        unsigned char* cr = nullptr;
+        // Public APIs — no OPENSSL_EXTRA/ATOMIC_USER build flags needed
+        // wolfSSL_GetServerWriteKey/IV return post-handshake derived keys
+        // (HKDF-derived traffic keys for TLS 1.3, PRF-derived for TLS 1.2)
+        const unsigned char* skey = wolfSSL_GetServerWriteKey(ssl_);
+        const unsigned char* siv  = wolfSSL_GetServerWriteIV(ssl_);
+        int actual_key_sz = wolfSSL_GetKeySize(ssl_);
 
-#ifdef OPENSSL_EXTRA
-        int ret = wolfSSL_get_keys(ssl_, &ms, &suite_len, &sr, &key_sz, &cr, &iv_sz);
-#else
-        int ret = -1;  // wolfSSL_get_keys not available without OPENSSL_EXTRA
-#endif
-        if (ret != 0 || !ms) {
-            // wolfSSL_get_keys not available or failed
-            return false;
-        }
+        if (!skey || !siv) return false;
+        if (actual_key_sz != key_len) return false;
+
+        memcpy(keys.key, skey, key_len);
 
         if (is_tls13) {
-            if (key_sz >= key_len && iv_sz >= 12) {
-                memcpy(keys.key, sr, key_len);
-                memcpy(keys.iv, cr, 12);
-                return true;
-            }
-            return false;
+            memcpy(keys.iv, siv, 12);   // TLS 1.3: full 12-byte nonce base
         } else {
-            if (key_sz >= key_len && iv_sz >= 4) {
-                memcpy(keys.key, sr, key_len);
-                memcpy(keys.iv, cr, 4);  // 4-byte implicit IV for TLS 1.2 AES-GCM
-                return true;
-            }
-            return false;
+            memcpy(keys.iv, siv, 4);    // TLS 1.2 AES-GCM: 4-byte implicit IV
         }
-#else
-        (void)keys; (void)is_tls13; (void)key_len;
-        return false;
-#endif
+        return true;
     }
 
     // ========================================================================

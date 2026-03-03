@@ -1,4 +1,4 @@
-// test/pipeline/27_binance_sbe_bsdsocket_1thread.cpp
+// test/pipeline/252_binance_sbe_bsdsocket_1thread.cpp
 // BSD Socket Binance SBE Test - 1-thread SingleThreadSSL mode
 //
 // Uses BSDWebSocketPipeline launcher with SBE binary protocol.
@@ -12,7 +12,7 @@
 // Usage:
 //   make build-test-pipeline-binance_sbe_bsdsocket_1thread NIC_MTU=1500 USE_OPENSSL=1
 //   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES BINANCE_API_KEY=<key> \
-//     ./build/test_pipeline_binance_sbe_bsdsocket_1thread --timeout 10000
+//     ./build/test_pipeline_252_binance_sbe_bsdsocket_1thread --timeout 10000
 //
 // Options:
 //   --timeout <ms>   Stream timeout in milliseconds (default: 10000)
@@ -30,6 +30,14 @@
 #include <algorithm>
 #include <unistd.h>
 #include <fcntl.h>
+
+// Capture -DENABLE_AB before including pipeline headers (macro clashes with Traits member)
+#ifdef ENABLE_AB
+static constexpr bool AB_ENABLED = true;
+#else
+static constexpr bool AB_ENABLED = false;
+#endif
+#undef ENABLE_AB
 
 #include "../../src/pipeline/bsd_websocket_pipeline.hpp"
 #include "../../src/policy/ssl.hpp"
@@ -84,7 +92,7 @@ struct BinanceSBE1ThreadTraits : DefaultBSDPipelineConfig {
     static constexpr uint16_t WSS_PORT    = 443;
     static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade";
 
-    static constexpr bool ENABLE_AB      = true;
+    static constexpr bool ENABLE_AB      = AB_ENABLED;
     static constexpr bool AUTO_RECONNECT = true;
 };
 

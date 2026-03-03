@@ -1102,7 +1102,7 @@ private:
     // ========================================================================
     // Post-handshake setup: extract TLS keys + configure BIO for a connection
     // ========================================================================
-    void setup_post_handshake(size_t ci) {
+    bool setup_post_handshake(size_t ci) {
         if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
             // Extract AES-GCM keys for direct AES-CTR decryption (required)
             if (ssl_[ci].extract_record_keys(tls_keys_[ci])) {
@@ -1118,13 +1118,10 @@ private:
                        ci, tls_keys_[ci].is_tls13 ? "1.3" : "1.2", tls_keys_[ci].key_len * 8,
                        (unsigned long)tls_seq_num_[ci]);
             } else {
-                // FATAL: AES-GCM cipher required but key extraction failed
-                fprintf(stderr, "[BSD-Transport] FATAL: extract_record_keys failed (conn %zu)"
-                        " — AES-GCM cipher required. Triggering reconnect.\n", ci);
-                if constexpr (AutoReconnect) {
-                    start_reconnect(ci);
-                }
-                return;  // Do not proceed to ACTIVE
+                // Key extraction failed — caller decides whether to fallback or reconnect
+                fprintf(stderr, "[BSD-Transport] extract_record_keys failed (conn %zu)\n", ci);
+                tls_keys_valid_[ci] = false;
+                return false;
             }
 
             if constexpr (SSLThreadingPolicy::has_ssl_thread) {
@@ -1135,6 +1132,7 @@ private:
             // 2-thread/1-thread: no BIO switch needed (viewring already set from TLS_READY,
             // and AES-CTR path doesn't use SSL_read at all)
         }
+        return true;
     }
 
     // ========================================================================
@@ -1247,6 +1245,7 @@ private:
         std::atomic_thread_fence(std::memory_order_release);
 
         publish_control_event(ci, MetaEventType::TCP_DISCONNECTED);
+        tls_keys_valid_[ci] = false;
 
         // Defer ssl shutdown to reconnect_bsd() which frees the old SSL
         // object when TCP connect completes. In 2-thread mode the TX thread
@@ -1406,7 +1405,16 @@ private:
      * Switch connection ci from TLS_READY to ACTIVE (direct AES-CTR decrypt).
      */
     void switch_to_direct_decrypt(size_t ci) {
-        setup_post_handshake(ci);
+        if (!setup_post_handshake(ci)) {
+            // extract_record_keys failed — fall back to SSL_read mode.
+            // tls_keys_valid_[ci] remains false so ACTIVE loop uses SSL_read fallback.
+            reconn_[ci].reset();  // phase → ACTIVE
+            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+            fprintf(stderr, "[%ld.%06ld] [RECONNECT] extract_record_keys failed for conn %zu"
+                    " — falling back to SSL_read mode\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+            return;
+        }
         reconn_[ci].reset();  // phase → ACTIVE
         struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
         fprintf(stderr, "[%ld.%06ld] [RECONNECT] Switched to direct decrypt for conn %zu\n",
@@ -1838,6 +1846,11 @@ private:
                 // Path A: Direct AES-CTR decryption (AES-GCM guaranteed)
                 // =================================================================
                 if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
+                    if (!tls_keys_valid_[ci]) {
+                        // Fallback: use SSL_read when AES-CTR keys unavailable
+                        process_tls_ready_read(ci);
+                        continue;
+                    }
                     ssize_t raw_n = recv_buf[ci]->recv_into_next(sockfd_[ci], poll.poll_cycle,
                         poll.hw_oldest_ns, poll.hw_latest_ns, poll.hw_count, 0);
 
@@ -2134,6 +2147,11 @@ private:
                     // Path A: Direct AES-CTR decryption (AES-GCM guaranteed)
                     // =============================================================
                     if constexpr (detail::is_userspace_ssl_v<SSLPolicy>) {
+                        if (!tls_keys_valid_[ci]) {
+                            // Fallback: use SSL_read when AES-CTR keys unavailable
+                            process_tls_ready_read(ci);
+                            continue;
+                        }
                         ssize_t raw_n = recv_buf[ci]->recv_into_next(sockfd_[ci], poll_cycle,
 #ifdef __linux__
                             hw_oldest_ns, hw_latest_ns, hw_count,
@@ -2471,21 +2489,31 @@ private:
 
                 // ACTIVE: AES-CTR path (AES-GCM guaranteed)
                 {
-                    size_t live = cs.pool_write_idx - cs.chunk_pool_buf.chunks_consumed();
+                    if (!tls_keys_valid_[ci]) {
+                        // Fallback: drain encrypted chunks via SSL_read
+                        EncryptedChunk chunk;
+                        while (encrypted_rx_ring_[ci].try_pop(chunk)) {
+                            ssl_[ci].append_encrypted_view(chunk.data, chunk.len);
+                            did_work = true;
+                        }
+                        ssl_read_and_publish(ci);
+                    } else {
+                        size_t live = cs.pool_write_idx - cs.chunk_pool_buf.chunks_consumed();
 
-                    while (live < RX_POOL_SIZE) {
-                        auto& slot = (*cs.rx_pool)[cs.pool_write_idx & RX_POOL_MASK];
-                        if (!encrypted_rx_ring_[ci].try_pop(slot)) break;
+                        while (live < RX_POOL_SIZE) {
+                            auto& slot = (*cs.rx_pool)[cs.pool_write_idx & RX_POOL_MASK];
+                            if (!encrypted_rx_ring_[ci].try_pop(slot)) break;
 
-                        cs.chunk_pool_buf.push(cs.pool_write_idx);
-                        cs.pool_write_idx++;
-                        live++;
-                        did_work = true;
+                            cs.chunk_pool_buf.push(cs.pool_write_idx);
+                            cs.pool_write_idx++;
+                            live++;
+                            did_work = true;
+                        }
+
+                        // Drain TLS records via AES-CTR decryption into MSG_INBOX
+                        if (aes_ctr_decrypt_loop(ci, cs.chunk_pool_buf))
+                            did_work = true;
                     }
-
-                    // Drain TLS records via AES-CTR decryption into MSG_INBOX
-                    if (aes_ctr_decrypt_loop(ci, cs.chunk_pool_buf))
-                        did_work = true;
                 }
                 if constexpr (InlineWS) {
                     inline_ws_.ws_core.end_rx_cycle(static_cast<uint8_t>(ci));

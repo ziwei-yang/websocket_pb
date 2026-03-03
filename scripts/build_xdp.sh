@@ -364,9 +364,29 @@ map_test_source() {
             TEST_BIN="build/test_pipeline_96_websocket_binance"
             MAKE_TARGET="build-test-pipeline-96_websocket_binance"
             ;;
-        32_binance_sbe_xdp_packetio)
-            TEST_BIN="build/test_pipeline_32_binance_sbe_xdp_packetio"
-            MAKE_TARGET="build-test-pipeline-32_binance_sbe_xdp_packetio"
+        264_binance_sbe_xdp_packetio_inline_ws)
+            TEST_BIN="build/test_pipeline_264_binance_sbe_xdp_packetio_inline_ws"
+            MAKE_TARGET="build-test-pipeline-264_binance_sbe_xdp_packetio_inline_ws"
+            ;;
+        261_binance_sbe_xdp_inline_ws)
+            TEST_BIN="build/test_pipeline_261_binance_sbe_xdp_inline_ws"
+            MAKE_TARGET="build-test-pipeline-261_binance_sbe_xdp_inline_ws"
+            ;;
+        250_binance_sbe_bsdsocket_2thread)
+            TEST_BIN="build/test_pipeline_250_binance_sbe_bsdsocket_2thread"
+            MAKE_TARGET="build-test-pipeline-250_binance_sbe_bsdsocket_2thread"
+            ;;
+        251_binance_sbe_bsdsocket_3thread)
+            TEST_BIN="build/test_pipeline_251_binance_sbe_bsdsocket_3thread"
+            MAKE_TARGET="build-test-pipeline-251_binance_sbe_bsdsocket_3thread"
+            ;;
+        252_binance_sbe_bsdsocket_1thread)
+            TEST_BIN="build/test_pipeline_252_binance_sbe_bsdsocket_1thread"
+            MAKE_TARGET="build-test-pipeline-252_binance_sbe_bsdsocket_1thread"
+            ;;
+        253_binance_sbe_bsdsocket_inline_ws)
+            TEST_BIN="build/test_pipeline_253_binance_sbe_bsdsocket_inline_ws"
+            MAKE_TARGET="build-test-pipeline-253_binance_sbe_bsdsocket_inline_ws"
             ;;
         *)
             # Generic pattern: NN_name.cpp -> test_pipeline_name

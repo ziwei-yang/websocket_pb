@@ -1,18 +1,23 @@
-// test/pipeline/25_binance_sbe_bsdsocket_2thread.cpp
-// BSD Socket Binance SBE Test - 2-thread InlineSSL mode
+// test/pipeline/251_binance_sbe_bsdsocket_3thread.cpp
+// BSD Socket Binance SBE Test - 3-thread DedicatedSSL mode
 //
 // Uses BSDWebSocketPipeline launcher with SBE binary protocol.
 // Parent consumes WSFrameInfo from disruptor ring and validates SBE fields.
 //
 // Architecture:
-//   - BSD Transport Process (2-thread: RX + TX) with InlineSSL
+//   - BSD Transport Process (3-thread: RX + SSL + TX) with DedicatedSSL
 //   - WebSocket Process: WS handshake + frame parsing -> WSFrameInfo ring
 //   - Parent Process: consume WSFrameInfo ring, SBE decode + print_timeline
 //
+// Threading model:
+//   - RX thread: recv() raw bytes -> encrypted_rx_ring
+//   - SSL thread: decrypt RX via SSL_read, encrypt TX via SSL_write
+//   - TX thread: encrypted_tx_ring -> send() raw bytes
+//
 // Usage:
-//   make build-test-pipeline-binance_sbe_bsdsocket_2thread NIC_MTU=1500 USE_OPENSSL=1
+//   make build-test-pipeline-binance_sbe_bsdsocket_3thread NIC_MTU=1500 USE_OPENSSL=1
 //   OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES BINANCE_API_KEY=<key> \
-//     ./build/test_pipeline_binance_sbe_bsdsocket_2thread --timeout 10000
+//     ./build/test_pipeline_251_binance_sbe_bsdsocket_3thread --timeout 10000
 //
 // Options:
 //   --timeout <ms>   Stream timeout in milliseconds (default: 10000)
@@ -30,6 +35,14 @@
 #include <algorithm>
 #include <unistd.h>
 #include <fcntl.h>
+
+// Capture -DENABLE_AB before including pipeline headers (macro clashes with Traits member)
+#ifdef ENABLE_AB
+static constexpr bool AB_ENABLED = true;
+#else
+static constexpr bool AB_ENABLED = false;
+#endif
+#undef ENABLE_AB
 
 #include "../../src/pipeline/bsd_websocket_pipeline.hpp"
 #include "../../src/policy/ssl.hpp"
@@ -67,13 +80,13 @@ struct BinanceUpgradeCustomizer {
 };
 
 // ============================================================================
-// Pipeline Traits (2-thread InlineSSL)
+// Pipeline Traits (3-thread DedicatedSSL)
 // ============================================================================
 
-struct BinanceSBE2ThreadTraits : DefaultBSDPipelineConfig {
+struct BinanceSBE3ThreadTraits : DefaultBSDPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
     using IOPolicy           = DefaultBlockingIO;
-    using SSLThreadingPolicy = InlineSSL;
+    using SSLThreadingPolicy = DedicatedSSL;
     using MktEventHandler         = NullMktEventHandler;
     using UpgradeCustomizer  = BinanceUpgradeCustomizer;
 
@@ -84,7 +97,7 @@ struct BinanceSBE2ThreadTraits : DefaultBSDPipelineConfig {
     static constexpr uint16_t WSS_PORT    = 443;
     static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade";
 
-    static constexpr bool ENABLE_AB      = true;
+    static constexpr bool ENABLE_AB      = AB_ENABLED;
     static constexpr bool AUTO_RECONNECT = true;
 };
 
@@ -342,7 +355,7 @@ void write_summary(const char* tag,
 // Stream Test
 // ============================================================================
 
-bool run_stream_test(BSDWebSocketPipeline<BinanceSBE2ThreadTraits>& pipeline) {
+bool run_stream_test(BSDWebSocketPipeline<BinanceSBE3ThreadTraits>& pipeline) {
     bool run_forever = (g_timeout_ms <= 0);
 
     if (run_forever) {
@@ -510,10 +523,10 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBE2ThreadTraits>& pipeline) {
     auto actual_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time).count();
 
-    dump_frame_records(frame_records.data(), frame_records.size(), "bsd_sbe_2t");
+    dump_frame_records(frame_records.data(), frame_records.size(), "bsd_sbe_3t");
 
     char dump_path[256];
-    snprintf(dump_path, sizeof(dump_path), "/tmp/bsd_sbe_2t_frame_records_%d.bin", getpid());
+    snprintf(dump_path, sizeof(dump_path), "/tmp/bsd_sbe_3t_frame_records_%d.bin", getpid());
 
     // Ring buffer status
     auto* ws_fi_region = pipeline.ws_frame_info_region();
@@ -533,7 +546,7 @@ bool run_stream_test(BSDWebSocketPipeline<BinanceSBE2ThreadTraits>& pipeline) {
     int64_t pongs_queued = pongs_prod_seq + 1;
     int64_t pong_deficit = static_cast<int64_t>(ping_frames) - pongs_queued;
 
-    write_summary("bsd_sbe_2t", actual_duration,
+    write_summary("bsd_sbe_3t", actual_duration,
                   total_frames, partial_events,
                   text_frames, binary_frames, ping_frames, pong_frames, close_frames,
                   sbe_valid_events, sbe_decode_errors, sequence_error, pong_deficit,
@@ -592,12 +605,12 @@ int main(int argc, char* argv[]) {
     bool run_forever = (g_timeout_ms <= 0);
 
     printf("==============================================\n");
-    printf("  BSD Socket Binance SBE Test (2-thread)      \n");
+    printf("  BSD Socket Binance SBE Test (3-thread)      \n");
     printf("==============================================\n");
-    printf("  Target:     %s:%u (WSS)\n", BinanceSBE2ThreadTraits::WSS_HOST, BinanceSBE2ThreadTraits::WSS_PORT);
-    printf("  Path:       %s\n", BinanceSBE2ThreadTraits::WSS_PATH);
+    printf("  Target:     %s:%u (WSS)\n", BinanceSBE3ThreadTraits::WSS_HOST, BinanceSBE3ThreadTraits::WSS_PORT);
+    printf("  Path:       %s\n", BinanceSBE3ThreadTraits::WSS_PATH);
     printf("  SSL:        %s\n", SSLPolicyType::name());
-    printf("  Threading:  2-thread (InlineSSL)\n");
+    printf("  Threading:  3-thread (DedicatedSSL)\n");
     printf("  Processes:  BSD Transport + WebSocket\n");
     printf("  API Key:    set\n");
     printf("  Dual A/B:   yes\n");
@@ -610,7 +623,7 @@ int main(int argc, char* argv[]) {
     }
     printf("==============================================\n\n");
 
-    BSDWebSocketPipeline<BinanceSBE2ThreadTraits> pipeline;
+    BSDWebSocketPipeline<BinanceSBE3ThreadTraits> pipeline;
 
     if (!pipeline.setup()) {
         fprintf(stderr, "\nFATAL: Setup failed\n");
@@ -640,9 +653,9 @@ int main(int argc, char* argv[]) {
 
     printf("\n==============================================\n");
     if (result == 0) {
-        printf("  SBE TEST PASSED (2-thread)\n");
+        printf("  SBE TEST PASSED (3-thread)\n");
     } else {
-        printf("  SBE TEST FAILED (2-thread)\n");
+        printf("  SBE TEST FAILED (3-thread)\n");
     }
     printf("==============================================\n");
 

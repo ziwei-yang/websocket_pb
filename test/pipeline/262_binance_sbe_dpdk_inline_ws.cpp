@@ -1,4 +1,4 @@
-// test/pipeline/30_binance_sbe_dpdk.cpp
+// test/pipeline/262_binance_sbe_dpdk_inline_ws.cpp
 // DPDK Binance SBE Test - InlineWS mode (transport + WS in single process)
 //
 // Uses WebSocketPipeline launcher with INLINE_WS=true.
@@ -10,9 +10,9 @@
 //   - InlineWS Transport Process (core 4): recv → decrypt → WS parse → WSFrameInfo ring
 //   - Parent Process: consume WSFrameInfo + MktEvent rings, SBE decode + print_timeline
 //
-// Usage: sudo ./test_pipeline_30_binance_sbe_dpdk <interface> [--timeout <ms>]
+// Usage: sudo ./test_pipeline_262_binance_sbe_dpdk_inline_ws <interface> [--timeout <ms>]
 //
-// Build: ENABLE_RECONNECT=1 ENABLE_AB=1 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 30_binance_sbe_dpdk.cpp
+// Build: ENABLE_RECONNECT=1 ENABLE_AB=1 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 262_binance_sbe_dpdk_inline_ws.cpp
 
 #include <cstdio>
 #include <cstdlib>
@@ -489,7 +489,7 @@ int main(int argc, char* argv[]) {
 
 int main() {
     fprintf(stderr, "Error: Build with USE_DPDK=1 USE_WOLFSSL=1 ENABLE_AB=1 ENABLE_RECONNECT=1\n");
-    fprintf(stderr, "Example: ENABLE_RECONNECT=1 ENABLE_AB=1 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 30_binance_sbe_dpdk.cpp\n");
+    fprintf(stderr, "Example: ENABLE_RECONNECT=1 ENABLE_AB=1 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 262_binance_sbe_dpdk_inline_ws.cpp\n");
     return 1;
 }
 

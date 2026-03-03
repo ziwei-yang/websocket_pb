@@ -464,9 +464,12 @@ tools/
 
 test/pipeline/
 ├── 20_websocket_binance.cpp           # XDP 3-process
-├── 25_binance_sbe_bsdsocket_2thread.cpp # BSD 2-process
-├── 28_binance_sbe_bsdsocket_inline_ws.cpp # BSD InlineWS
-└── 29_binance_sbe_xdp_inline_ws.cpp   # XDP InlineWS
+├── 250_binance_sbe_bsdsocket_2thread.cpp  # BSD 2-process
+├── 253_binance_sbe_bsdsocket_inline_ws.cpp # BSD InlineWS
+├── 261_binance_sbe_xdp_inline_ws.cpp     # XDP InlineWS
+├── 262_binance_sbe_dpdk_inline_ws.cpp     # DPDK InlineWS
+├── 263_binance_sbe_dpdk_packetio_inline_ws.cpp # DPDK DirectIO InlineWS
+└── 264_binance_sbe_xdp_packetio_inline_ws.cpp  # XDP DirectIO InlineWS
 ```
 
 ## Policy Reference
