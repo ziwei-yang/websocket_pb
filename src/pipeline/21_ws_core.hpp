@@ -90,9 +90,9 @@ struct IPCTXSink {
 // DirectTXSink — for inline mode (local buffer → ssl_.write())
 // ============================================================================
 
-template<typename SSLPolicy, bool EnableAB>
+template<typename SSLPolicy, size_t MaxConn>
 struct DirectTXSink {
-    static constexpr size_t NUM_CONN = EnableAB ? 2 : 1;
+    static constexpr size_t NUM_CONN = MaxConn;
     SSLPolicy* ssl_ = nullptr;   // points to transport's ssl_[NUM_CONN] array
     uint8_t outbox_buf_[4096];
     uint8_t pong_buf_[131];      // PONG/PING frames (max 125 payload + 6 header)
@@ -111,7 +111,7 @@ struct DirectTXSink {
 // Template parameters:
 //   TXSink         — IPCTXSink or DirectTXSink
 //   WSFrameInfoProd — IPCRingProducer<WSFrameInfo> (for output to parent)
-//   EnableAB        — dual A/B connections
+//   MaxConn         — max simultaneous connections (1 = single, >1 = multi)
 //   AutoReconnect   — event-driven handshake
 //   Profiling       — compile-time profiling gates
 //   MktEventHandler      — inline callback for market data processing
@@ -121,13 +121,13 @@ struct DirectTXSink {
 
 template<typename TXSink,
          typename WSFrameInfoProd,
-         bool EnableAB, bool AutoReconnect, bool Profiling,
+         size_t MaxConn, bool AutoReconnect, bool Profiling,
          MktEventHandlerConcept MktEventHandler,
          UpgradeCustomizerConcept UpgradeCustomizer,
          bool WSFrameInfoRing = false>
 struct WSCore {
 public:
-    static constexpr size_t NUM_CONN = EnableAB ? 2 : 1;
+    static constexpr size_t NUM_CONN = MaxConn;
     static constexpr bool HasMktEventHandler = MktEventHandler::enabled;
     static constexpr bool PublishRing = !HasMktEventHandler || WSFrameInfoRing;
 
@@ -135,13 +135,12 @@ public:
     // Initialization
     // ========================================================================
 
-    bool init(MsgInbox* msg_inbox,
+    bool init(std::array<MsgInbox*, MaxConn> msg_inboxes,
               WSFrameInfoProd* ws_frame_info_prod,
               TXSink* tx_sink,
-              ConnStateShm* conn_state,
-              MsgInbox* msg_inbox_b = nullptr) {
+              ConnStateShm* conn_state) {
 
-        msg_inbox_[0] = msg_inbox;
+        for (size_t i = 0; i < MaxConn; ++i) msg_inbox_[i] = msg_inboxes[i];
         if constexpr (PublishRing) {
             ws_frame_info_prod_ = ws_frame_info_prod;
         }
@@ -150,10 +149,6 @@ public:
         }
         tx_sink_ = tx_sink;
         conn_state_ = conn_state;
-
-        if constexpr (EnableAB) {
-            msg_inbox_[1] = msg_inbox_b;
-        }
 
         for (size_t i = 0; i < NUM_CONN; i++) {
             pending_frame_[i].clear();
@@ -170,8 +165,8 @@ public:
             }
         }
 
-        printf("[WS-CORE] Initialized%s%s\n",
-               EnableAB ? " (Dual A/B)" : "",
+        printf("[WS-CORE] Initialized (MaxConn=%zu)%s\n",
+               MaxConn,
                AutoReconnect ? " (AutoReconnect)" : "");
         return true;
     }
@@ -231,7 +226,7 @@ public:
                 maybe_send_client_ping(static_cast<uint8_t>(ci));
             }
         }
-        check_dual_dead();
+        check_all_dead();
         check_upgrade_timeout();
     }
 
@@ -810,17 +805,30 @@ private:
                 uint32_t n = std::min(w.server_ping_count, WatchdogState::PING_LEARN_SAMPLES);
                 uint64_t total_delta = w.server_ping_cycles[n - 1] - w.server_ping_cycles[0];
                 uint64_t avg_delta = total_delta / (n - 1);
-                w.learned_interval_cycles = avg_delta;
 
                 uint64_t tsc_freq = conn_state_->tsc_freq_hz;
                 uint64_t avg_ms = (avg_delta * 1000ULL) / tsc_freq;
-                w.learned_interval_ms = ((avg_ms + 50) / 100) * 100;
 
-                if (w.server_ping_count <= WatchdogState::PING_LEARN_SAMPLES) {
-                    fprintf(stderr, "[WS-WATCHDOG] Server PING interval (conn %u): %lums "
-                            "(avg %lums, %u/%u samples)\n",
-                            ci, (unsigned long)w.learned_interval_ms,
-                            (unsigned long)avg_ms, n, WatchdogState::PING_LEARN_SAMPLES);
+                // Reject bogus intervals < 1s (frame parse desync can produce fake PINGs)
+                if (avg_ms < 1000) {
+                    if (w.server_ping_count <= WatchdogState::PING_LEARN_SAMPLES) {
+                        fprintf(stderr, "[WS-WATCHDOG] Ignoring bogus PING interval (conn %u): %lums "
+                                "(%u/%u samples) — too short, resetting\n",
+                                ci, (unsigned long)avg_ms, n, WatchdogState::PING_LEARN_SAMPLES);
+                    }
+                    w.server_ping_count = 0;
+                    w.learned_interval_cycles = 0;
+                    w.learned_interval_ms = 0;
+                } else {
+                    w.learned_interval_cycles = avg_delta;
+                    w.learned_interval_ms = ((avg_ms + 50) / 100) * 100;
+
+                    if (w.server_ping_count <= WatchdogState::PING_LEARN_SAMPLES) {
+                        fprintf(stderr, "[WS-WATCHDOG] Server PING interval (conn %u): %lums "
+                                "(avg %lums, %u/%u samples)\n",
+                                ci, (unsigned long)w.learned_interval_ms,
+                                (unsigned long)avg_ms, n, WatchdogState::PING_LEARN_SAMPLES);
+                    }
                 }
             }
         }
@@ -1028,7 +1036,7 @@ private:
                 info.connection_id = ci;
         info.transport_mode = transport_mode_;
         info.conn_target_ip = conn_state_ ? conn_state_->conn_target_ip[ci] : 0;
-                if constexpr (EnableAB) {
+                if constexpr (MaxConn > 1) {
                     if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
                         info.set_active_conn(true);
                 }
@@ -1083,7 +1091,7 @@ private:
             info.connection_id = ci;
         info.transport_mode = transport_mode_;
         info.conn_target_ip = conn_state_ ? conn_state_->conn_target_ip[ci] : 0;
-            if constexpr (EnableAB) {
+            if constexpr (MaxConn > 1) {
                 if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
                     info.set_active_conn(true);
             }
@@ -1133,17 +1141,6 @@ private:
         uint64_t data_gap_ms = (last_data_cycle_[ci] > 0)
             ? ((now_cycle - last_data_cycle_[ci]) * 1000ULL) / tsc_freq : 0;
 
-        uint8_t other = 1 - ci;
-        uint64_t other_data_gap_ms = 0;
-        const char* other_phase = "N/A";
-        if constexpr (EnableAB) {
-            if (last_data_cycle_[other] > 0)
-                other_data_gap_ms = ((now_cycle - last_data_cycle_[other]) * 1000ULL) / tsc_freq;
-            other_phase = (ws_phase_[other] == WsConnPhase::ACTIVE) ? "ACTIVE" :
-                          (ws_phase_[other] == WsConnPhase::DISCONNECTED) ? "DISCONNECTED" :
-                          "WS_UPGRADE_SENT";
-        }
-
         fprintf(stderr, "[%ld.%06ld] [WS-WATCHDOG] %s: conn %u dead\n"
                 "  PONG missing: last %lums ago (threshold %lums)\n"
                 "  server PING missing: last %lums ago (threshold %lums)\n"
@@ -1156,9 +1153,17 @@ private:
                 (unsigned long)(interval_learned ? (w.learned_interval_ms * 3 / 2) : 0),
                 (unsigned long)data_gap_ms);
 
-        if constexpr (EnableAB) {
-            fprintf(stderr, "  other conn %u: phase=%s, last DATA %lums ago\n",
-                    other, other_phase, (unsigned long)other_data_gap_ms);
+        if constexpr (MaxConn > 1) {
+            for (size_t other = 0; other < NUM_CONN; ++other) {
+                if (other == ci) continue;
+                uint64_t other_data_gap_ms = (last_data_cycle_[other] > 0)
+                    ? ((now_cycle - last_data_cycle_[other]) * 1000ULL) / tsc_freq : 0;
+                const char* other_phase = (ws_phase_[other] == WsConnPhase::ACTIVE) ? "ACTIVE" :
+                                          (ws_phase_[other] == WsConnPhase::DISCONNECTED) ? "DISCONNECTED" :
+                                          "WS_UPGRADE_SENT";
+                fprintf(stderr, "  other conn %zu: phase=%s, last DATA %lums ago\n",
+                        other, other_phase, (unsigned long)other_data_gap_ms);
+            }
         }
 
         if constexpr (AutoReconnect) {
@@ -1177,33 +1182,40 @@ private:
         wd_[ci] = WatchdogState{};
     }
 
-    void check_dual_dead() {
-        if constexpr (!EnableAB || !AutoReconnect) return;
-
-        if (ws_phase_[0] != WsConnPhase::ACTIVE || ws_phase_[1] != WsConnPhase::ACTIVE) return;
-        if (last_data_cycle_[0] == 0 || last_data_cycle_[1] == 0) return;
+    void check_all_dead() {
+        if constexpr (MaxConn <= 1 || !AutoReconnect) return;
 
         uint64_t now = rdtscp();
         uint64_t freq = conn_state_->tsc_freq_hz;
         uint64_t threshold_ms = conn_state_->dual_dead_threshold_ms;
         if (threshold_ms == 0 || freq == 0) return;
 
-        uint64_t gap_0 = ((now - last_data_cycle_[0]) * 1000ULL) / freq;
-        uint64_t gap_1 = ((now - last_data_cycle_[1]) * 1000ULL) / freq;
+        // All N connections must be ACTIVE with non-zero last_data_cycle_
+        for (size_t i = 0; i < NUM_CONN; ++i) {
+            if (ws_phase_[i] != WsConnPhase::ACTIVE) return;
+            if (last_data_cycle_[i] == 0) return;
+        }
 
-        if (gap_0 > threshold_ms && gap_1 > threshold_ms) {
+        // All N must exceed threshold
+        bool all_dead = true;
+        for (size_t i = 0; i < NUM_CONN; ++i) {
+            uint64_t gap = ((now - last_data_cycle_[i]) * 1000ULL) / freq;
+            if (gap <= threshold_ms) { all_dead = false; break; }
+        }
+
+        if (all_dead) {
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            fprintf(stderr, "[%ld.%06ld] [WS-DUAL-DEAD] Both connections silent "
-                    "(conn0: %lums, conn1: %lums, threshold: %lums)\n",
-                    ts.tv_sec, ts.tv_nsec / 1000,
-                    (unsigned long)gap_0, (unsigned long)gap_1,
-                    (unsigned long)threshold_ms);
+            fprintf(stderr, "[%ld.%06ld] [WS-ALL-DEAD] All %zu connections silent (threshold: %lums)\n",
+                    ts.tv_sec, ts.tv_nsec / 1000, NUM_CONN, (unsigned long)threshold_ms);
+            for (size_t i = 0; i < NUM_CONN; ++i) {
+                uint64_t gap = ((now - last_data_cycle_[i]) * 1000ULL) / freq;
+                fprintf(stderr, "  conn %zu: %lums ago\n", i, (unsigned long)gap);
+            }
 
-            trigger_watchdog_reconnect(0, now, freq);
-            trigger_watchdog_reconnect(1, now, freq);
-
-            ws_phase_[0] = WsConnPhase::DISCONNECTED;
-            ws_phase_[1] = WsConnPhase::DISCONNECTED;
+            for (size_t i = 0; i < NUM_CONN; ++i) {
+                trigger_watchdog_reconnect(static_cast<uint8_t>(i), now, freq);
+                ws_phase_[i] = WsConnPhase::DISCONNECTED;
+            }
             notify_disconnected(0);
         }
     }
@@ -1242,7 +1254,7 @@ private:
 
     void notify_disconnected(uint8_t ci) {
         if constexpr (!HasMktEventHandler) return;
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             bool all_down = true;
             for (size_t i = 0; i < NUM_CONN; i++)
                 if (ws_phase_[i] != WsConnPhase::DISCONNECTED) { all_down = false; break; }

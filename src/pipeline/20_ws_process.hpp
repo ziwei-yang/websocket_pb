@@ -444,42 +444,37 @@ template<typename MsgMetadataCons,     // IPCRingConsumer<MsgMetadata>
          typename WSFrameInfoProd,     // IPCRingProducer<WSFrameInfo>
          typename PongsProd,           // IPCRingProducer<PongFrameAligned>
          typename MsgOutboxProd,       // IPCRingProducer<MsgOutboxEvent>
-         bool EnableAB = false,
+         size_t MaxConn = 1,
          bool AutoReconnect = false,
          bool Profiling = false,
          MktEventHandlerConcept MktEventHandler = NullMktEventHandler,
          UpgradeCustomizerConcept UpgradeCustomizer = NullUpgradeCustomizer>
 struct WebSocketProcess {
 public:
-    static constexpr size_t NUM_CONN = EnableAB ? 2 : 1;
+    static constexpr size_t NUM_CONN = MaxConn;
     static constexpr bool HasMktEventHandler = MktEventHandler::enabled;
 
     // ========================================================================
     // Initialization
     // ========================================================================
 
-    bool init(MsgInbox* msg_inbox,
-              MsgMetadataCons* msg_metadata_cons,
+    bool init(std::array<MsgInbox*, MaxConn> msg_inboxes,
+              std::array<MsgMetadataCons*, MaxConn> msg_metadata_conses,
               WSFrameInfoProd* ws_frame_info_prod,
               PongsProd* pongs_prod,
               MsgOutboxProd* msg_outbox_prod,
-              ConnStateShm* conn_state,
-              MsgInbox* msg_inbox_b = nullptr,
-              MsgMetadataCons* msg_metadata_cons_b = nullptr) {
+              ConnStateShm* conn_state) {
 
-        msg_inbox_[0] = msg_inbox;
-        msg_metadata_cons_[0] = msg_metadata_cons;
+        for (size_t i = 0; i < MaxConn; ++i) {
+            msg_inbox_[i] = msg_inboxes[i];
+            msg_metadata_cons_[i] = msg_metadata_conses[i];
+        }
         if constexpr (!HasMktEventHandler) {
             ws_frame_info_prod_ = ws_frame_info_prod;
         }
         pongs_prod_ = pongs_prod;
         msg_outbox_prod_ = msg_outbox_prod;
         conn_state_ = conn_state;
-
-        if constexpr (EnableAB) {
-            msg_inbox_[1] = msg_inbox_b;
-            msg_metadata_cons_[1] = msg_metadata_cons_b;
-        }
 
         for (size_t i = 0; i < NUM_CONN; i++) {
             pending_frame_[i].clear();
@@ -499,7 +494,7 @@ public:
         }
 
         printf("[WS-PROCESS] Initialized%s%s\n",
-               EnableAB ? " (Dual A/B)" : "",
+               MaxConn > 1 ? " (Multi-conn)" : "",
                AutoReconnect ? " (AutoReconnect)" : "");
         return true;
     }
@@ -540,21 +535,23 @@ public:
         printf("[WS-PROCESS] HTTP 101 received (conn A), sending subscription\n");
         send_subscription_message(0);
 
-        if constexpr (EnableAB) {
-            // Connection B: HTTP upgrade + subscription
-            send_http_upgrade_request(1);
-            if (!recv_http_upgrade_response_blocking(1)) {
-                fprintf(stderr, "[WS-PROCESS] HTTP upgrade failed (conn B)\n");
-                return false;
+        if constexpr (MaxConn > 1) {
+            // Remaining connections: HTTP upgrade + subscription
+            for (size_t ci = 1; ci < NUM_CONN; ++ci) {
+                send_http_upgrade_request(static_cast<uint8_t>(ci));
+                if (!recv_http_upgrade_response_blocking(static_cast<uint8_t>(ci))) {
+                    fprintf(stderr, "[WS-PROCESS] HTTP upgrade failed (conn %zu)\n", ci);
+                    return false;
+                }
+                printf("[WS-PROCESS] HTTP 101 received (conn %zu), sending subscription\n", ci);
+                send_subscription_message(static_cast<uint8_t>(ci));
             }
-            printf("[WS-PROCESS] HTTP 101 received (conn B), sending subscription\n");
-            send_subscription_message(1);
         }
 
         // Signal ws_ready
         conn_state_->set_handshake_ws_ready();
         printf("[WS-PROCESS] Handshake complete%s, ws_ready signaled\n",
-               EnableAB ? " (both A/B)" : "");
+               MaxConn > 1 ? " (Multi-conn)" : "");
 
         // All connections start ACTIVE
         for (size_t i = 0; i < NUM_CONN; i++) {
@@ -570,7 +567,7 @@ public:
 
     void run() {
         printf("[WS-PROCESS] Running main loop%s%s\n",
-               EnableAB ? " (Dual A/B)" : "",
+               MaxConn > 1 ? " (Multi-conn)" : "",
                AutoReconnect ? " (AutoReconnect)" : "");
         conn_state_->set_ready(PROC_WEBSOCKET);
 
@@ -610,24 +607,26 @@ public:
             // Op 1: ping/pong (idle only)
             bool idle = (processed == 0);
 
-            if constexpr (EnableAB) {
-                // Op 2: metadata consume + commit (connection B)
-                int32_t processed_b = 0;
-                processed_b = profile_op<Profiling>([this]() -> int32_t {
-                    size_t p = msg_metadata_cons_[1]->process_manually(
-                        [this](MsgMetadata& meta, int64_t seq, bool end_of_batch) {
-                            on_event(1, meta, seq, end_of_batch);
-                            return true;
-                        }, MAX_ACCUMULATED_METADATA);
-                    if (p > 0) {
-                        msg_metadata_cons_[1]->commit_manually();
-                        if constexpr (HasMktEventHandler) mkt_event_handler_.on_batch_end(1);
-                        last_op_cycle_ = rdtscp();
-                    }
-                    return static_cast<int32_t>(p);
-                }, slot, 2);
+            if constexpr (MaxConn > 1) {
+                // Op 2: metadata consume + commit (connections 1..N-1)
+                for (size_t ci = 1; ci < NUM_CONN; ++ci) {
+                    int32_t processed_n = 0;
+                    processed_n = profile_op<Profiling>([this, ci]() -> int32_t {
+                        size_t p = msg_metadata_cons_[ci]->process_manually(
+                            [this, ci](MsgMetadata& meta, int64_t seq, bool end_of_batch) {
+                                on_event(static_cast<uint8_t>(ci), meta, seq, end_of_batch);
+                                return true;
+                            }, MAX_ACCUMULATED_METADATA);
+                        if (p > 0) {
+                            msg_metadata_cons_[ci]->commit_manually();
+                            if constexpr (HasMktEventHandler) mkt_event_handler_.on_batch_end(static_cast<uint8_t>(ci));
+                            last_op_cycle_ = rdtscp();
+                        }
+                        return static_cast<int32_t>(p);
+                    }, slot, 2);
 
-                idle = idle && (processed_b == 0);
+                    idle = idle && (processed_n == 0);
+                }
             }
 
             // Ping/pong for all connections (idle only)
@@ -645,8 +644,8 @@ public:
                         maybe_send_client_ping(static_cast<uint8_t>(ci));
                     }
                 }
-                // Fast dual-dead detection (fires at ~3s vs ~20s per-conn watchdog)
-                check_dual_dead();
+                // Fast all-dead detection (fires at ~3s vs ~20s per-conn watchdog)
+                check_all_dead();
                 check_upgrade_timeout();
                 if (count > 0) last_op_cycle_ = rdtscp();
                 return count;
@@ -751,13 +750,15 @@ private:
                     response.try_complete();
                 }
             } else {
-                // When EnableAB, drain other connection's metadata during the wait
+                // When MaxConn > 1, drain other connections' metadata during the wait
                 // to avoid ring buffer backup (initial handshake phase only)
-                if constexpr (EnableAB) {
-                    uint8_t other = ci ^ 1;
-                    MsgMetadata other_meta;
-                    while (msg_metadata_cons_[other]->try_consume(other_meta)) {
-                        // Drain but don't process (initial handshake phase)
+                if constexpr (MaxConn > 1) {
+                    for (size_t other = 0; other < NUM_CONN; ++other) {
+                        if (other == ci) continue;
+                        MsgMetadata other_meta;
+                        while (msg_metadata_cons_[other]->try_consume(other_meta)) {
+                            // Drain but don't process (initial handshake phase)
+                        }
                     }
                 }
                 __builtin_ia32_pause();
@@ -934,7 +935,7 @@ private:
         has_pending_frame_[ci] = false;
         pending_frame_[ci].clear();
 
-        // Reset dual-dead baseline: 0 means "no data yet" so check_dual_dead()
+        // Reset all-dead baseline: 0 means "no data yet" so check_all_dead()
         // won't fire until real WS data arrives on this connection
         last_data_cycle_[ci] = 0;
 
@@ -1175,7 +1176,7 @@ private:
         info.set_last_fragment(false);
         info.connection_id = ci;
         info.transport_mode = transport_mode_;
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
                 info.set_active_conn(true);
         }
@@ -1352,17 +1353,30 @@ private:
                 uint32_t n = std::min(w.server_ping_count, WatchdogState::PING_LEARN_SAMPLES);
                 uint64_t total_delta = w.server_ping_cycles[n - 1] - w.server_ping_cycles[0];
                 uint64_t avg_delta = total_delta / (n - 1);
-                w.learned_interval_cycles = avg_delta;
 
                 uint64_t tsc_freq = conn_state_->tsc_freq_hz;
                 uint64_t avg_ms = (avg_delta * 1000ULL) / tsc_freq;
-                w.learned_interval_ms = ((avg_ms + 50) / 100) * 100;
 
-                if (w.server_ping_count <= WatchdogState::PING_LEARN_SAMPLES) {
-                    fprintf(stderr, "[WS-WATCHDOG] Server PING interval (conn %u): %lums "
-                            "(avg %lums, %u/%u samples)\n",
-                            ci, (unsigned long)w.learned_interval_ms,
-                            (unsigned long)avg_ms, n, WatchdogState::PING_LEARN_SAMPLES);
+                // Reject bogus intervals < 1s (frame parse desync can produce fake PINGs)
+                if (avg_ms < 1000) {
+                    if (w.server_ping_count <= WatchdogState::PING_LEARN_SAMPLES) {
+                        fprintf(stderr, "[WS-WATCHDOG] Ignoring bogus PING interval (conn %u): %lums "
+                                "(%u/%u samples) — too short, resetting\n",
+                                ci, (unsigned long)avg_ms, n, WatchdogState::PING_LEARN_SAMPLES);
+                    }
+                    w.server_ping_count = 0;
+                    w.learned_interval_cycles = 0;
+                    w.learned_interval_ms = 0;
+                } else {
+                    w.learned_interval_cycles = avg_delta;
+                    w.learned_interval_ms = ((avg_ms + 50) / 100) * 100;
+
+                    if (w.server_ping_count <= WatchdogState::PING_LEARN_SAMPLES) {
+                        fprintf(stderr, "[WS-WATCHDOG] Server PING interval (conn %u): %lums "
+                                "(avg %lums, %u/%u samples)\n",
+                                ci, (unsigned long)w.learned_interval_ms,
+                                (unsigned long)avg_ms, n, WatchdogState::PING_LEARN_SAMPLES);
+                    }
                 }
             }
         }
@@ -1576,7 +1590,7 @@ private:
             info.set_last_fragment(is_last_fragment);
             info.connection_id = ci;
         info.transport_mode = transport_mode_;
-            if constexpr (EnableAB) {
+            if constexpr (MaxConn > 1) {
                 if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
                     info.set_active_conn(true);
             }
@@ -1625,7 +1639,7 @@ private:
             info.set_last_fragment(is_last_fragment);
             info.connection_id = ci;
         info.transport_mode = transport_mode_;
-            if constexpr (EnableAB) {
+            if constexpr (MaxConn > 1) {
                 if (ps.accumulated_metadata_count > 0 && ps.accumulated_metadata[0].is_active_conn())
                     info.set_active_conn(true);
             }
@@ -1661,18 +1675,6 @@ private:
         uint64_t data_gap_ms = (last_data_cycle_[ci] > 0)
             ? ((now_cycle - last_data_cycle_[ci]) * 1000ULL) / tsc_freq : 0;
 
-        // Cross-connection diagnostic: check the other connection's health
-        uint8_t other = 1 - ci;
-        uint64_t other_data_gap_ms = 0;
-        const char* other_phase = "N/A";
-        if constexpr (EnableAB) {
-            if (last_data_cycle_[other] > 0)
-                other_data_gap_ms = ((now_cycle - last_data_cycle_[other]) * 1000ULL) / tsc_freq;
-            other_phase = (ws_phase_[other] == WsConnPhase::ACTIVE) ? "ACTIVE" :
-                          (ws_phase_[other] == WsConnPhase::DISCONNECTED) ? "DISCONNECTED" :
-                          "WS_UPGRADE_SENT";
-        }
-
         fprintf(stderr, "[%ld.%06ld] [WS-WATCHDOG] %s: conn %u dead\n"
                 "  PONG missing: last %lums ago (threshold %lums)\n"
                 "  server PING missing: last %lums ago (threshold %lums)\n"
@@ -1685,9 +1687,18 @@ private:
                 (unsigned long)(interval_learned ? (w.learned_interval_ms * 3 / 2) : 0),
                 (unsigned long)data_gap_ms);
 
-        if constexpr (EnableAB) {
-            fprintf(stderr, "  other conn %u: phase=%s, last DATA %lums ago\n",
-                    other, other_phase, (unsigned long)other_data_gap_ms);
+        // Cross-connection diagnostic: log other connections' health
+        if constexpr (MaxConn > 1) {
+            for (size_t other = 0; other < NUM_CONN; ++other) {
+                if (other == ci) continue;
+                uint64_t other_data_gap_ms = (last_data_cycle_[other] > 0)
+                    ? ((now_cycle - last_data_cycle_[other]) * 1000ULL) / tsc_freq : 0;
+                const char* other_phase = (ws_phase_[other] == WsConnPhase::ACTIVE) ? "ACTIVE" :
+                                          (ws_phase_[other] == WsConnPhase::DISCONNECTED) ? "DISCONNECTED" :
+                                          "WS_UPGRADE_SENT";
+                fprintf(stderr, "  other conn %zu: phase=%s, last DATA %lums ago\n",
+                        other, other_phase, (unsigned long)other_data_gap_ms);
+            }
         }
 
         if constexpr (AutoReconnect) {
@@ -1707,39 +1718,42 @@ private:
         wd_[ci] = WatchdogState{};
     }
 
-    /// Fast dual-dead detection: if both connections are silent beyond threshold,
-    /// trigger reconnect for both immediately (3s vs 20s normal per-conn watchdog).
-    void check_dual_dead() {
-        if constexpr (!EnableAB || !AutoReconnect) return;
+    /// Fast all-dead detection: if all N connections are silent beyond threshold,
+    /// trigger reconnect for all immediately (3s vs 20s normal per-conn watchdog).
+    void check_all_dead() {
+        if constexpr (MaxConn <= 1 || !AutoReconnect) return;
 
-        // Both connections must be ACTIVE and have received data
-        if (ws_phase_[0] != WsConnPhase::ACTIVE || ws_phase_[1] != WsConnPhase::ACTIVE) return;
-        if (last_data_cycle_[0] == 0 || last_data_cycle_[1] == 0) return;
+        // All N connections must be ACTIVE with non-zero last_data_cycle_
+        for (size_t i = 0; i < NUM_CONN; ++i) {
+            if (ws_phase_[i] != WsConnPhase::ACTIVE) return;
+            if (last_data_cycle_[i] == 0) return;
+        }
 
         uint64_t now = rdtscp();
         uint64_t freq = conn_state_->tsc_freq_hz;
         uint64_t threshold_ms = conn_state_->dual_dead_threshold_ms;
         if (threshold_ms == 0 || freq == 0) return;  // Disabled
 
-        uint64_t gap_0 = ((now - last_data_cycle_[0]) * 1000ULL) / freq;
-        uint64_t gap_1 = ((now - last_data_cycle_[1]) * 1000ULL) / freq;
+        // All N must exceed threshold
+        bool all_dead = true;
+        for (size_t i = 0; i < NUM_CONN; ++i) {
+            uint64_t gap = ((now - last_data_cycle_[i]) * 1000ULL) / freq;
+            if (gap <= threshold_ms) { all_dead = false; break; }
+        }
 
-        if (gap_0 > threshold_ms && gap_1 > threshold_ms) {
+        if (all_dead) {
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            fprintf(stderr, "[%ld.%06ld] [WS-DUAL-DEAD] Both connections silent "
-                    "(conn0: %lums, conn1: %lums, threshold: %lums)\n",
-                    ts.tv_sec, ts.tv_nsec / 1000,
-                    (unsigned long)gap_0, (unsigned long)gap_1,
-                    (unsigned long)threshold_ms);
+            fprintf(stderr, "[%ld.%06ld] [WS-ALL-DEAD] All %zu connections silent (threshold: %lums)\n",
+                    ts.tv_sec, ts.tv_nsec / 1000, NUM_CONN, (unsigned long)threshold_ms);
+            for (size_t i = 0; i < NUM_CONN; ++i) {
+                uint64_t gap = ((now - last_data_cycle_[i]) * 1000ULL) / freq;
+                fprintf(stderr, "  conn %zu: %lums ago\n", i, (unsigned long)gap);
+            }
 
-            trigger_watchdog_reconnect(0, now, freq);
-            trigger_watchdog_reconnect(1, now, freq);
-
-            // Immediately mark DISCONNECTED to prevent repeated firing
-            // while waiting for TCP_DISCONNECTED from Transport process.
-            // Stale data will be correctly drained by on_event().
-            ws_phase_[0] = WsConnPhase::DISCONNECTED;
-            ws_phase_[1] = WsConnPhase::DISCONNECTED;
+            for (size_t i = 0; i < NUM_CONN; ++i) {
+                trigger_watchdog_reconnect(static_cast<uint8_t>(i), now, freq);
+                ws_phase_[i] = WsConnPhase::DISCONNECTED;
+            }
             notify_disconnected(0);
         }
     }
@@ -1777,7 +1791,7 @@ private:
 
     void notify_disconnected(uint8_t ci) {
         if constexpr (!HasMktEventHandler) return;
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             bool all_down = true;
             for (size_t i = 0; i < NUM_CONN; i++)
                 if (ws_phase_[i] != WsConnPhase::DISCONNECTED) { all_down = false; break; }

@@ -51,6 +51,8 @@ namespace EventFlags {
     inline constexpr uint16_t SNAPSHOT      = 1 << 0;
     inline constexpr uint16_t CONTINUATION  = 1 << 1;  // not first in multi-event batch
     inline constexpr uint16_t LAST_IN_BATCH = 1 << 2;  // last in multi-event batch
+    inline constexpr uint16_t CONN_ID_SHIFT = 8;
+    inline constexpr uint16_t CONN_ID_MASK  = 0xFF00;
 }
 
 namespace DeltaFlags {
@@ -208,6 +210,11 @@ struct alignas(512) MktEvent {
     bool is_continuation()  const { return flags & EventFlags::CONTINUATION; }
     bool is_last_in_batch() const { return flags & EventFlags::LAST_IN_BATCH; }
 
+    uint8_t connection_id() const { return static_cast<uint8_t>(flags >> 8); }
+    void set_connection_id(uint8_t ci) {
+        flags = (flags & 0x00FF) | (static_cast<uint16_t>(ci) << 8);
+    }
+
     // ========================================================================
     // Snapshot accessors — return {pointer, count} for bids/asks
     // Bids: levels[0..count-1], Asks: levels[count..count+count2-1]
@@ -239,7 +246,7 @@ struct alignas(512) MktEvent {
     // Σ = total latency: NIC/BPF arrival to event publish
     // ========================================================================
 
-    void print(int padding = 93) const {
+    void print(int padding = 95) const {
         if (is_system_status()) {
             const char* st_name =
                 payload.status.status_type == 0 ? "HEARTBEAT" :

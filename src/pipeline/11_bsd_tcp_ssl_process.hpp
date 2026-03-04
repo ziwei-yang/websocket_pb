@@ -351,7 +351,7 @@ struct EncryptedChunk {
     uint32_t hw_timestamp_count;
     // TCP segment delta (from TCP_INFO/TCP_CONNECTION_INFO)
     uint32_t tcp_seg_delta;
-    // Connection index (for EnableAB dual connections)
+    // Connection index (for multi-connection mode)
     uint8_t connection_id = 0;
 };
 
@@ -610,7 +610,7 @@ struct BSDReconnectCtx {
  * @tparam MsgOutboxCons Consumer for MSG_OUTBOX ring
  * @tparam MsgMetadataProd Producer for MSG_METADATA ring
  * @tparam PongsCons Consumer for PONGS ring
- * @tparam EnableAB Enable dual A/B connections (default: false)
+ * @tparam MaxConn Maximum number of connections (default: 1)
  * @tparam AutoReconnect Enable automatic reconnection (default: false)
  */
 template<
@@ -620,7 +620,7 @@ template<
     typename MsgOutboxCons,
     typename MsgMetadataProd,
     typename PongsCons,
-    bool EnableAB = false,
+    size_t MaxConn = 1,
     bool AutoReconnect = false,
     typename WSProcessor = void
 >
@@ -663,7 +663,7 @@ class BSDSocketTransportProcess {
     );
 
     // Number of connections
-    static constexpr size_t NUM_CONN = EnableAB ? 2 : 1;
+    static constexpr size_t NUM_CONN = MaxConn;
 
     // Ring buffer configuration
     static constexpr size_t RING_SIZE = 64;  // Must be power of 2
@@ -699,28 +699,24 @@ public:
      * When AutoReconnect=false: blocking TCP connect + SSL handshake (original path).
      * When AutoReconnect=true: non-blocking connect, state machine drives handshake.
      *
-     * Optional _b params for EnableAB dual connections.
+     * Per-connection arrays for multi-connection mode.
      */
     bool init(const char* host, uint16_t port,
               MsgOutboxCons* msg_outbox_cons,
-              MsgMetadataProd* msg_metadata_prod,
+              std::array<MsgMetadataProd*, MaxConn> msg_metadata_prods,
               PongsCons* pongs_cons,
-              MsgInbox* msg_inbox,
-              ConnStateShm* conn_state,
-              MsgInbox* msg_inbox_b = nullptr,
-              MsgMetadataProd* msg_metadata_prod_b = nullptr) {
+              std::array<MsgInbox*, MaxConn> msg_inboxes,
+              ConnStateShm* conn_state) {
 
         msg_outbox_cons_ = msg_outbox_cons;
-        msg_metadata_prod_[0] = msg_metadata_prod;
         pongs_cons_ = pongs_cons;
-        msg_inbox_[0] = msg_inbox;
         conn_state_ = conn_state;
         host_ = host;
         port_ = port;
 
-        if constexpr (EnableAB) {
-            msg_inbox_[1] = msg_inbox_b;
-            msg_metadata_prod_[1] = msg_metadata_prod_b;
+        for (size_t i = 0; i < MaxConn; i++) {
+            msg_inbox_[i] = msg_inboxes[i];
+            msg_metadata_prod_[i] = msg_metadata_prods[i];
         }
 
         if constexpr (AutoReconnect) {
@@ -1108,10 +1104,9 @@ private:
             if (ssl_[ci].extract_record_keys(tls_keys_[ci])) {
                 websocket::crypto::expand_keys(tls_keys_[ci]);
                 tls_parser_[ci] = websocket::crypto::TLSRecordParser{};
-                // server_record_count_ is reset to 0 at handshake completion, then
-                // incremented for each post-handshake record consumed by SSL_read
-                // during TLS_READY. For TLS 1.3, this is the correct starting
-                // sequence number (nonce = IV XOR seq_num).
+                // WolfSSL: wolfSSL_GetPeerSequenceNumber() returns the authoritative
+                // count of ALL TLS records (including NewSessionTickets consumed
+                // internally). For TLS 1.3, this is the correct starting seq_num.
                 tls_seq_num_[ci] = ssl_[ci].get_server_record_count();
                 tls_keys_valid_[ci] = true;
                 fprintf(stderr, "[BSD-Transport] Direct AES-CTR decryption enabled (conn %zu, TLS %s, %zu-bit key, seq=%lu)\n",
@@ -1256,19 +1251,25 @@ private:
         // Pick a different IP from the startup pool (same logic as XDP transport)
         if (conn_state_ && conn_state_->exchange_ip_count > 1) {
             uint32_t current_ip = conn_state_->conn_target_ip[ci];
-            uint32_t other_ip = 0;
-            if constexpr (EnableAB) {
-                other_ip = conn_state_->conn_target_ip[1 - ci];
+            // Collect IPs used by other connections to avoid duplicates
+            uint32_t other_ips[NUM_CONN > 1 ? NUM_CONN - 1 : 1];
+            size_t other_count = 0;
+            if constexpr (MaxConn > 1) {
+                for (size_t oi = 0; oi < NUM_CONN; oi++) {
+                    if (oi != ci) other_ips[other_count++] = conn_state_->conn_target_ip[oi];
+                }
             }
             uint32_t new_ip = current_ip;
             uint8_t count = conn_state_->exchange_ip_count;
             for (uint8_t i = 0; i < count; i++) {
                 uint8_t idx = (reconn_[ci].attempts + i) % count;
                 uint32_t candidate = conn_state_->exchange_ips[idx];
-                if (candidate != current_ip && candidate != other_ip) {
-                    new_ip = candidate;
-                    break;
+                if (candidate == current_ip) continue;
+                bool used = false;
+                for (size_t oi = 0; oi < other_count; oi++) {
+                    if (candidate == other_ips[oi]) { used = true; break; }
                 }
+                if (!used) { new_ip = candidate; break; }
             }
             if (new_ip != current_ip) {
                 conn_state_->conn_target_ip[ci] = new_ip;
@@ -1741,7 +1742,7 @@ private:
                     if (inner_ct != 0x17) {
                         parser.state = websocket::crypto::TLSRecordState::NEED_TAG;
                         parser.tag_consumed = 0;
-                        seq_num++;
+                        // seq_num incremented by NEED_TAG after consuming auth tag
                         continue;
                     }
                 }
@@ -1918,7 +1919,7 @@ private:
     /**
      * TX Thread (2-thread model): MSG_OUTBOX + PONGS → SSL_write + send
      *
-     * Routes by connection_id when EnableAB is true.
+     * Routes by connection_id when MaxConn > 1.
      */
     void tx_thread_inline_ssl() {
         while (running_.load(std::memory_order_acquire)) {
@@ -1937,7 +1938,7 @@ private:
                     (void)end_of_batch;
 
                     if (event.data_len > 0) {
-                        size_t ci = EnableAB ? event.connection_id : 0;
+                        size_t ci = (MaxConn > 1) ? event.connection_id : 0;
 
                         // Skip if connection is not sendable
                         if constexpr (AutoReconnect) {
@@ -1997,7 +1998,7 @@ private:
                     (void)end_of_batch;
 
                     if (pong.data_len > 0) {
-                        size_t ci = EnableAB ? pong.connection_id : 0;
+                        size_t ci = (MaxConn > 1) ? pong.connection_id : 0;
 
                         // Skip if connection is not sendable
                         if constexpr (AutoReconnect) {
@@ -2096,13 +2097,17 @@ private:
             // Active connection appears first in pfds[] for priority processing
             int nfds = 0;
             uint8_t conn_order[NUM_CONN];
-            conn_order[0] = 0;
-            if constexpr (EnableAB) {
+            // Fill with 0..NUM_CONN-1 then move the active connection to front
+            for (size_t i = 0; i < NUM_CONN; i++) conn_order[i] = static_cast<uint8_t>(i);
+            if constexpr (MaxConn > 1) {
                 if (active_conn_ptr_) {
                     uint8_t a = *active_conn_ptr_;
-                    if (a < NUM_CONN) conn_order[0] = a;
+                    if (a < NUM_CONN && a != 0) {
+                        // Swap active to front
+                        conn_order[0] = a;
+                        conn_order[a] = 0;
+                    }
                 }
-                conn_order[1] = 1 - conn_order[0];
             }
 
             for (size_t i = 0; i < NUM_CONN; i++) {
@@ -2225,7 +2230,7 @@ private:
                         (void)end_of_batch;
 
                         if (event.data_len > 0) {
-                            size_t ci = EnableAB ? event.connection_id : 0;
+                            size_t ci = (MaxConn > 1) ? event.connection_id : 0;
 
                             if constexpr (AutoReconnect) {
                                 if (reconn_[ci].phase != BSDConnPhase::ACTIVE &&
@@ -2289,7 +2294,7 @@ private:
                         (void)end_of_batch;
 
                         if (pong.data_len > 0) {
-                            size_t ci = EnableAB ? pong.connection_id : 0;
+                            size_t ci = (MaxConn > 1) ? pong.connection_id : 0;
 
                             if constexpr (AutoReconnect) {
                                 if (reconn_[ci].phase != BSDConnPhase::ACTIVE &&
@@ -2528,7 +2533,7 @@ private:
                     (void)end_of_batch;
 
                     if (event.data_len > 0) {
-                        size_t ci = EnableAB ? event.connection_id : 0;
+                        size_t ci = (MaxConn > 1) ? event.connection_id : 0;
 
                         if constexpr (AutoReconnect) {
                             if (reconn_[ci].phase != BSDConnPhase::ACTIVE &&
@@ -2583,7 +2588,7 @@ private:
                     (void)end_of_batch;
 
                     if (pong.data_len > 0) {
-                        size_t ci = EnableAB ? pong.connection_id : 0;
+                        size_t ci = (MaxConn > 1) ? pong.connection_id : 0;
 
                         if constexpr (AutoReconnect) {
                             if (reconn_[ci].phase != BSDConnPhase::ACTIVE &&
@@ -2941,7 +2946,7 @@ private:
 
     struct InlineWSState {
         WSProcessor ws_core;
-        DirectTXSink<SSLPolicy, EnableAB> tx_sink;
+        DirectTXSink<SSLPolicy, MaxConn> tx_sink;
     };
     struct EmptyState {};
     [[no_unique_address]] std::conditional_t<InlineWS, InlineWSState, EmptyState> inline_ws_{};
@@ -2954,17 +2959,11 @@ public:
     template<typename WSFrameInfoProd>
     void init_inline(WSFrameInfoProd* ws_frame_info_prod,
                      ConnStateShm* conn_state,
-                     MsgInbox* msg_inbox_a,
-                     MsgInbox* msg_inbox_b = nullptr) {
+                     std::array<MsgInbox*, MaxConn> msg_inboxes) {
         static_assert(InlineWS, "init_inline() only valid when WSProcessor != void");
         inline_ws_.tx_sink.ssl_ = ssl_;
-        if constexpr (EnableAB) {
-            inline_ws_.ws_core.init(msg_inbox_a, ws_frame_info_prod,
-                                    &inline_ws_.tx_sink, conn_state, msg_inbox_b);
-        } else {
-            inline_ws_.ws_core.init(msg_inbox_a, ws_frame_info_prod,
-                                    &inline_ws_.tx_sink, conn_state);
-        }
+        inline_ws_.ws_core.init(msg_inboxes, ws_frame_info_prod,
+                                &inline_ws_.tx_sink, conn_state);
         inline_ws_.ws_core.set_transport_mode(static_cast<uint8_t>(TransportMode::BSD_1THREAD));
     }
 
@@ -3048,27 +3047,27 @@ private:
 
 // 2-thread blocking with platform-default event policy
 template<typename SSLPolicy, typename MsgOutboxCons, typename MsgMetadataProd, typename PongsCons,
-         bool EnableAB = false, bool AutoReconnect = false>
+         size_t MaxConn = 1, bool AutoReconnect = false>
 using BSDSocketTransport2Thread = BSDSocketTransportProcess<
     SSLPolicy, DefaultBlockingIO, InlineSSL,
     MsgOutboxCons, MsgMetadataProd, PongsCons,
-    EnableAB, AutoReconnect>;
+    MaxConn, AutoReconnect>;
 
 // 3-thread blocking with platform-default event policy
 template<typename SSLPolicy, typename MsgOutboxCons, typename MsgMetadataProd, typename PongsCons,
-         bool EnableAB = false, bool AutoReconnect = false>
+         size_t MaxConn = 1, bool AutoReconnect = false>
 using BSDSocketTransport3Thread = BSDSocketTransportProcess<
     SSLPolicy, DefaultBlockingIO, DedicatedSSL,
     MsgOutboxCons, MsgMetadataProd, PongsCons,
-    EnableAB, AutoReconnect>;
+    MaxConn, AutoReconnect>;
 
 // 1-thread blocking with platform-default event policy (single-thread RX+TX, no spinlocks)
 template<typename SSLPolicy, typename MsgOutboxCons, typename MsgMetadataProd, typename PongsCons,
-         bool EnableAB = false, bool AutoReconnect = false>
+         size_t MaxConn = 1, bool AutoReconnect = false>
 using BSDSocketTransport1Thread = BSDSocketTransportProcess<
     SSLPolicy, DefaultBlockingIO, SingleThreadSSL,
     MsgOutboxCons, MsgMetadataProd, PongsCons,
-    EnableAB, AutoReconnect>;
+    MaxConn, AutoReconnect>;
 
 #ifdef __linux__
 // 1-thread io_uring (Linux only, NoSSL or kTLS only)

@@ -32,6 +32,13 @@
 #include "pipeline_config.hpp"
 #include "../xdp/packet_frame_descriptor.hpp"
 
+// Compile-time maximum connection count (pass -DMAX_CONN=N, default 1)
+#ifndef MAX_CONN
+#define MAX_CONN 1
+#endif
+static constexpr size_t PIPELINE_MAX_CONN = MAX_CONN;
+#undef MAX_CONN  // Prevent macro collision with Traits::MAX_CONN member names
+
 namespace websocket::pipeline {
 
 // ============================================================================
@@ -348,6 +355,8 @@ struct alignas(64) WSFrameInfo {
                         const uint8_t* payload_data = nullptr) const {
         uint64_t ref = ws_frame_publish_cycle;
         if (ref == 0) return;
+        static uint64_t s_prev_publish_mono_ns = 0;
+        static uint64_t s_prev_latest_poll_cycle = 0;
         double to_us = 1e6 / static_cast<double>(tsc_freq_hz);
         auto before_pub = [&](uint64_t cycle) -> double {
             return (cycle > 0 && ref > cycle) ? static_cast<double>(ref - cycle) * to_us : 0.0;
@@ -375,27 +384,31 @@ struct alignas(64) WSFrameInfo {
         bool use_latest_ref = is_chunk_mode || nic_packet_ct > 1;
         uint64_t bpf_ref_ns = (use_latest_ref && latest_bpf_entry_ns > 0)
                                ? latest_bpf_entry_ns : first_bpf_entry_ns;
+        // Label for the NIC-timestamp column: "bpf" for XDP, "nic" for DPDK
+        const char* nic_label = (transport_mode == static_cast<uint8_t>(TransportMode::XDP) ||
+                                 transport_mode == static_cast<uint8_t>(TransportMode::XDP_DISRUPTOR))
+                                ? "bpf" : "nic";
         if (bpf_ref_ns > 0 && publish_time_ts > 0) {
             double bpf_us = static_cast<double>(publish_time_ts - bpf_ref_ns) / 1000.0;
 
-            bool is_new_packet = (prev_latest_poll_cycle == 0 ||
-                                  latest_poll_cycle != prev_latest_poll_cycle);
-            if (is_new_packet && prev_publish_mono_ns > 0) {
+            bool is_new_packet = (s_prev_latest_poll_cycle == 0 ||
+                                  latest_poll_cycle != s_prev_latest_poll_cycle);
+            if (is_new_packet && s_prev_publish_mono_ns > 0) {
                 double interval_us =
-                    static_cast<double>(static_cast<int64_t>(bpf_ref_ns - prev_publish_mono_ns)) / 1000.0;
+                    static_cast<double>(static_cast<int64_t>(bpf_ref_ns - s_prev_publish_mono_ns)) / 1000.0;
                 char iv[16], bv[16];
                 fmt(bv, bpf_us);
                 if (interval_us >= 0) {
                     fmt(iv, interval_us);
-                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "%7s| bpf %6s ", iv, bv);
+                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "%7s| %s %6s ", iv, nic_label, bv);
                 } else {
                     fmt(iv, -interval_us);
-                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "\033[31m%7s\033[0m| bpf %6s ", iv, bv);
+                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "\033[31m%7s\033[0m| %s %6s ", iv, nic_label, bv);
                 }
             } else {
                 char bv[16];
                 fmt(bv, bpf_us);
-                std::snprintf(bpf_prefix, sizeof(bpf_prefix), "       | bpf %6s ", bv);
+                std::snprintf(bpf_prefix, sizeof(bpf_prefix), "       | %s %6s ", nic_label, bv);
             }
         } else if (first_poll_cycle > 0 && publish_time_ts > 0 && tsc_freq_hz > 0) {
             // No BPF timestamps (BSD socket mode) — reconstruct poll mono ns from TSC
@@ -406,11 +419,11 @@ struct alignas(64) WSFrameInfo {
             uint64_t poll_mono_ns = publish_time_ts -
                 static_cast<uint64_t>(static_cast<double>(ws_frame_publish_cycle - poll_ref_cycle) * ns_per_cycle);
 
-            bool is_new_packet = (prev_latest_poll_cycle == 0 ||
-                                  latest_poll_cycle != prev_latest_poll_cycle);
-            if (is_new_packet && prev_publish_mono_ns > 0) {
+            bool is_new_packet = (s_prev_latest_poll_cycle == 0 ||
+                                  latest_poll_cycle != s_prev_latest_poll_cycle);
+            if (is_new_packet && s_prev_publish_mono_ns > 0) {
                 double interval_us =
-                    static_cast<double>(static_cast<int64_t>(poll_mono_ns - prev_publish_mono_ns)) / 1000.0;
+                    static_cast<double>(static_cast<int64_t>(poll_mono_ns - s_prev_publish_mono_ns)) / 1000.0;
                 char iv[16];
                 if (interval_us >= 0) {
                     fmt(iv, interval_us);
@@ -531,14 +544,35 @@ struct alignas(64) WSFrameInfo {
             std::snprintf(frag_suffix, sizeof(frag_suffix), " Fg");
         }
         bool is_mkt = ((mkt_event_type != 0 || mkt_event_count != 0 || exchange_event_time_us != 0) && !is_discard_early() && !is_merged());
-        if (connection_id == 0) {
+        // Connection ID prefix character: 0-9, a-f
+        char conn_prefix[4];
+        conn_prefix[0] = (connection_id < 10) ? ('0' + connection_id) : ('a' + connection_id - 10);
+        conn_prefix[1] = ' ';
+        conn_prefix[2] = '\0';
+        if (is_active_conn()) {
+            // Active connection: no background, blue text for market data
             line_color = is_mkt ? "\033[34m" : "";
             line_reset = is_mkt ? "\033[0m" : "";
         } else {
-            line_color = is_mkt ? "\033[34;47m" : "\033[47m";
+            // Non-active connections: distinct background per connection_id
+            // 0=white, 1=yellow, 2=light yellow, 3=light cyan, 4=green, 5=light green, 6=cyan
+            static constexpr const char* bg_colors[] = {
+                "\033[47m", "\033[43m", "\033[103m", "\033[106m",
+                "\033[42m", "\033[102m", "\033[46m"
+            };
+            const char* bg = bg_colors[connection_id < 7 ? connection_id : connection_id % 7];
+            // Build color: market data gets blue text + background, others just background
+            static thread_local char color_buf[32];
+            if (is_mkt) {
+                std::snprintf(color_buf, sizeof(color_buf), "\033[34m%s", bg);
+                line_color = color_buf;
+            } else {
+                line_color = bg;
+            }
             line_reset = "\033[0m";
         }
         const char* ssl_prefix = is_active_conn() ? "*ssl" : " ssl";
+        const char* winner_mark = (!is_discard_early() && !is_merged()) ? " <-" : "";
         bool is_bsd_mode = (first_bpf_entry_ns == 0 && first_poll_cycle > 0);
         if (is_bsd_mode) {
             // NIC timestamp column: show nic-to-publish latency when available
@@ -552,27 +586,29 @@ struct alignas(64) WSFrameInfo {
                 fmt(tot, nic_us);
             }
             fprintf(stderr,
-                    "%s%s%s"
+                    "%s%s%s%s"
                     "| socket %5u %10s "
                     "|%s %u %s %4s~%6s "
                     "| WS %3u %6s "
-                    "|%s%s%2s %-2s @%6s%s |%s%s%s%s%s\n",
-                    line_color, bpf_prefix, nic_col,
+                    "|%s%s%2s %-2s @%6s%s |%s%s%s%s%s%s\n",
+                    conn_prefix, line_color, bpf_prefix, nic_col,
                     nic_packet_ct, t[1],
                     ssl_prefix, ssl_read_ct, sz, t[2], t[3],
-                    ssl_read_batch_num, t[4], discard_mark, frag_ul_on, mkt_cnt, mkt_typ, tot, frag_ul_off, exch_diff, seq_suffix, frag_suffix, dbg_suffix, line_reset);
+                    ssl_read_batch_num, t[4], discard_mark, frag_ul_on, mkt_cnt, mkt_typ, tot, frag_ul_off, exch_diff, seq_suffix, frag_suffix, dbg_suffix, line_reset, winner_mark);
         } else {
             fprintf(stderr,
-                    "%s%s"
+                    "%s%s%s"
                     "| %u pkt %5u %4s~%6s "
                     "|%s %u %s %4s~%6s "
                     "| WS %3u %6s "
-                    "|%s%s%2s %-2s @%6s%s |%s%s%s%s%s\n",
-                    line_color, bpf_prefix,
+                    "|%s%s%2s %-2s @%6s%s |%s%s%s%s%s%s\n",
+                    conn_prefix, line_color, bpf_prefix,
                     nic_packet_ct, last_pkt_mem_idx, t[0], t[1],
                     ssl_prefix, ssl_read_ct, sz, t[2], t[3],
-                    ssl_read_batch_num, t[4], discard_mark, frag_ul_on, mkt_cnt, mkt_typ, tot, frag_ul_off, exch_diff, seq_suffix, frag_suffix, dbg_suffix, line_reset);
+                    ssl_read_batch_num, t[4], discard_mark, frag_ul_on, mkt_cnt, mkt_typ, tot, frag_ul_off, exch_diff, seq_suffix, frag_suffix, dbg_suffix, line_reset, winner_mark);
         }
+        s_prev_publish_mono_ns = ssl_read_end_mono_ns(tsc_freq_hz);
+        s_prev_latest_poll_cycle = latest_poll_cycle;
     }
 };
 static_assert(sizeof(WSFrameInfo) == 256, "WSFrameInfo must be 256 bytes");
@@ -707,9 +743,9 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
     // WS → Transport: ws_handshake_done[ci]   (switch to direct decrypt)
     // ========================================================================
     alignas(CACHE_LINE_SIZE) struct {
-        std::atomic<bool> reconnect_request[2];   // WS → Transport: "please reconnect ci"
-        std::atomic<bool> ws_handshake_done[2];   // WS → Transport: "switch to direct decrypt"
-        uint8_t _pad[60];
+        std::atomic<bool> reconnect_request[PIPELINE_MAX_CONN];   // WS → Transport: "please reconnect ci"
+        std::atomic<bool> ws_handshake_done[PIPELINE_MAX_CONN];   // WS → Transport: "switch to direct decrypt"
+        uint8_t _pad[64 - 2 * PIPELINE_MAX_CONN * sizeof(std::atomic<bool>)];
     } conn_reconnect;
 
     // ========================================================================
@@ -743,8 +779,11 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
     uint8_t  _pad_exchange[7];
 
     // Per-connection target IP (set by parent, read by Transport)
-    // Network byte order. conn_target_ip[0] = conn A, conn_target_ip[1] = conn B
-    uint32_t conn_target_ip[2];
+    // Network byte order. conn_target_ip[i] = connection i
+    uint32_t conn_target_ip[PIPELINE_MAX_CONN];
+
+    // Actual connection count (MIN(MAX_CONN, dns_ip_count)), set by parent
+    uint8_t actual_conn_count;
 
     // Probe interface name (non-XDP interface used for DNS/probing by Transport on reconnect)
     char probe_interface[64];
@@ -979,10 +1018,10 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         std::memset(disconnect.detail, 0, sizeof(disconnect.detail));
 
         // Per-connection reconnect signaling
-        conn_reconnect.reconnect_request[0].store(false, std::memory_order_relaxed);
-        conn_reconnect.reconnect_request[1].store(false, std::memory_order_relaxed);
-        conn_reconnect.ws_handshake_done[0].store(false, std::memory_order_relaxed);
-        conn_reconnect.ws_handshake_done[1].store(false, std::memory_order_relaxed);
+        for (size_t i = 0; i < PIPELINE_MAX_CONN; ++i) {
+            conn_reconnect.reconnect_request[i].store(false, std::memory_order_relaxed);
+            conn_reconnect.ws_handshake_done[i].store(false, std::memory_order_relaxed);
+        }
 
         // A/B connection priority
         conn_priority.active_connection.store(0xFF, std::memory_order_relaxed);
@@ -1003,8 +1042,8 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
         exchange_ip_count = 0;
 
         // IP probe fields
-        conn_target_ip[0] = 0;
-        conn_target_ip[1] = 0;
+        for (size_t i = 0; i < PIPELINE_MAX_CONN; ++i) conn_target_ip[i] = 0;
+        actual_conn_count = 1;
         std::memset(probe_interface, 0, sizeof(probe_interface));
         dual_dead_threshold_ms = 0;
 

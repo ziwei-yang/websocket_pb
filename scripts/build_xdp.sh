@@ -38,7 +38,7 @@ set -e
 INTERFACE="enp108s0"
 RELOAD_DRIVER=false
 SKIP_CLOCK_SYNC=false
-ENABLE_AB_FLAG=false
+MAX_CONN_VALUE=""
 ENABLE_RECONNECT_FLAG=false
 TEST_SOURCE=""
 
@@ -101,7 +101,7 @@ Usage: $0 [OPTIONS] <test_source>
 
 Options:
   -i, --interface IFACE   Network interface (default: enp108s0)
-  --enable-ab             Enable dual A/B connection mode (-DENABLE_AB)
+  --max-conn N            Max simultaneous connections (default: 1, -DMAX_CONN=N)
   --enable-reconnect      Enable auto-reconnect mode (-DENABLE_RECONNECT)
   --reload                Reload NIC driver before setup
   --skip-clock-sync       Skip NIC clock synchronization
@@ -109,7 +109,7 @@ Options:
 
 Examples:
   $0 20_websocket_binance.cpp
-  $0 --enable-ab 20_websocket_binance.cpp
+  $0 --max-conn 3 20_websocket_binance.cpp
   $0 -i enp108s0 00_xdp_poll.cpp
 
 After running this script, you can run the test manually:
@@ -136,9 +136,9 @@ parse_args() {
                 INTERFACE="$2"
                 shift 2
                 ;;
-            --enable-ab)
-                ENABLE_AB_FLAG=true
-                shift
+            --max-conn)
+                MAX_CONN_VALUE="$2"
+                shift 2
                 ;;
             --enable-reconnect)
                 ENABLE_RECONNECT_FLAG=true
@@ -428,11 +428,14 @@ build_test() {
     log_info "Compiling BPF program..."
     make bpf USE_XDP=1 XDP_INTERFACE="$INTERFACE" || die "Failed to build BPF program"
 
-    # Dual A/B connection mode (via --enable-ab flag or ENABLE_AB env var)
-    local AB_FLAGS=""
-    if [[ "$ENABLE_AB_FLAG" == "true" ]] || [[ -n "$ENABLE_AB" ]]; then
-        AB_FLAGS="ENABLE_AB=1"
-        log_info "Dual A/B connection mode enabled (ENABLE_AB=1)"
+    # Multi-connection mode (via --max-conn flag or MAX_CONN env var)
+    local CONN_FLAGS=""
+    if [[ -n "$MAX_CONN_VALUE" ]]; then
+        CONN_FLAGS="MAX_CONN=$MAX_CONN_VALUE"
+        log_info "Multi-connection mode enabled (MAX_CONN=$MAX_CONN_VALUE)"
+    elif [[ -n "$MAX_CONN" ]]; then
+        CONN_FLAGS="MAX_CONN=$MAX_CONN"
+        log_info "Multi-connection mode enabled (MAX_CONN=$MAX_CONN)"
     fi
 
     # Auto-reconnect mode (via --enable-reconnect flag or ENABLE_RECONNECT env var)
@@ -442,11 +445,11 @@ build_test() {
         log_info "Auto-reconnect mode enabled (ENABLE_RECONNECT=1)"
     fi
 
-    # Remove existing binary to force rebuild (make doesn't track flag changes like ENABLE_AB)
+    # Remove existing binary to force rebuild (make doesn't track flag changes like MAX_CONN)
     rm -f "$TEST_BIN"
 
     # Build test binary (as normal user, no sudo)
-    make "$MAKE_TARGET" USE_XDP=1 XDP_INTERFACE="$INTERFACE" $SSL_FLAGS $AB_FLAGS $RECONNECT_FLAGS || die "Failed to build test: $MAKE_TARGET"
+    make "$MAKE_TARGET" USE_XDP=1 XDP_INTERFACE="$INTERFACE" $SSL_FLAGS $CONN_FLAGS $RECONNECT_FLAGS || die "Failed to build test: $MAKE_TARGET"
 
     log_ok "Test binary built: $TEST_BIN"
 }

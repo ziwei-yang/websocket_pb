@@ -40,15 +40,14 @@
 // ============================================================================
 // Compile-time toggles (from -D flags)
 // Must be captured and #undef'd BEFORE including websocket_pipeline.hpp
-// to prevent macro collision with Traits member names (e.g., Traits::ENABLE_AB)
+// to prevent macro collision with Traits member names (e.g., Traits::MAX_CONN)
 // ============================================================================
 
-#ifdef ENABLE_AB
-static constexpr bool AB_ENABLED = true;
+#ifdef MAX_CONN
+static constexpr size_t CONN_COUNT = MAX_CONN;
 #else
-static constexpr bool AB_ENABLED = false;
+static constexpr size_t CONN_COUNT = 1;
 #endif
-#undef ENABLE_AB
 
 #ifdef ENABLE_RECONNECT
 static constexpr bool RECONNECT_ENABLED = true;
@@ -84,7 +83,7 @@ struct OKXTraits : DefaultPipelineConfig {
     static constexpr int TRANSPORT_CORE  = 4;
     static constexpr int WEBSOCKET_CORE  = 6;
 
-    static constexpr bool ENABLE_AB      = AB_ENABLED;
+    static constexpr size_t MAX_CONN     = CONN_COUNT;
     static constexpr bool AUTO_RECONNECT = RECONNECT_ENABLED;
     static constexpr bool PROFILING      = true;
 
@@ -415,7 +414,7 @@ int main(int argc, char* argv[]) {
     // ========================================================================
 
     bool run_forever = (g_timeout_ms <= 0);
-    constexpr size_t NUM_CONN = AB_ENABLED ? 2 : 1;
+    constexpr size_t NUM_CONN = CONN_COUNT;
 
     if (run_forever) {
         printf("\n--- WSS Stream Test (FOREVER MODE - Ctrl+C to stop) ---\n");

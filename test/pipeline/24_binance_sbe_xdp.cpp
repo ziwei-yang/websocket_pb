@@ -37,12 +37,11 @@
 // Must be captured and #undef'd BEFORE including websocket_pipeline.hpp
 // ============================================================================
 
-#ifdef ENABLE_AB
-static constexpr bool AB_ENABLED = true;
+#ifdef MAX_CONN
+static constexpr size_t CONN_COUNT = MAX_CONN;
 #else
-static constexpr bool AB_ENABLED = false;
+static constexpr size_t CONN_COUNT = 1;
 #endif
-#undef ENABLE_AB
 
 #ifdef ENABLE_RECONNECT
 static constexpr bool RECONNECT_ENABLED = true;
@@ -95,7 +94,7 @@ struct BinanceSBETraits : DefaultPipelineConfig {
     static constexpr int TRANSPORT_CORE  = 4;
     static constexpr int WEBSOCKET_CORE  = 6;
 
-    static constexpr bool ENABLE_AB      = AB_ENABLED;
+    static constexpr size_t MAX_CONN     = CONN_COUNT;
     static constexpr bool AUTO_RECONNECT = RECONNECT_ENABLED;
     static constexpr bool PROFILING      = true;
 
@@ -215,7 +214,7 @@ int main(int argc, char* argv[]) {
     printf("  Path:       %s\n", BinanceSBETraits::WSS_PATH);
     printf("  SSL:        %s\n", SSLPolicyType::name());
     printf("  API Key:    %s\n", (api_key && api_key[0]) ? "set" : "NOT SET");
-    printf("  Dual A/B:   %s\n", AB_ENABLED ? "yes" : "no");
+    printf("  Connections: %zu\n", CONN_COUNT);
     printf("  Reconnect:  %s\n", RECONNECT_ENABLED ? "yes" : "no");
     if (run_forever) {
         printf("  Timeout:    FOREVER (Ctrl+C to stop)\n");
@@ -255,7 +254,7 @@ int main(int argc, char* argv[]) {
     // Main loop — consume WSFrameInfo from disruptor ring in parent process
     // ========================================================================
 
-    constexpr size_t NUM_CONN = AB_ENABLED ? 2 : 1;
+    constexpr size_t NUM_CONN = CONN_COUNT;
 
     // Create consumer for WS_FRAME_INFO ring
     IPCRingConsumer<WSFrameInfo> ws_frame_cons(*pipeline.ws_frame_info_region());

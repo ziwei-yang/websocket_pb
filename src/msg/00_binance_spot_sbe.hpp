@@ -21,6 +21,7 @@
 #include <string_view>
 
 #include "stream_decoder.hpp"
+#include "../pipeline/pipeline_data.hpp"  // PIPELINE_MAX_CONN
 
 // ============================================================================
 // Part 1: Zero-copy SBE wire decoders
@@ -556,7 +557,7 @@ struct BinanceSBEHandler {
     websocket::pipeline::WSFrameInfo pending_trades_info_{};
 
     // Per-connection streaming SBE parse state
-    SBEParseState sbe_state_[2]{};
+    SBEParseState sbe_state_[PIPELINE_MAX_CONN]{};
 
     // ── Streaming SBE parser — single code path for fragments + complete frames ──
     //
@@ -805,6 +806,23 @@ private:
                     return;
                 }
             }
+            // First-entry lower-bound stale check.  Catches both:
+            // (a) fragmented messages (state.sequence==0, last entry unreadable)
+            // (b) full messages where last_trade_id_ is partial (winning conn
+            //     mid-fragment, only first N entries flushed — state.sequence
+            //     barely exceeds the partial eff_tid but first_tid does not)
+            if (state.group_count > 0 &&
+                state.bytes_consumed + state.group_block_len <= len) {
+                int64_t first_tid = read_i64(payload + state.bytes_consumed);
+                int64_t eff_tid = has_pending_trades_
+                    ? std::max(last_trade_id_, pending_trades_max_id_)
+                    : last_trade_id_;
+                if (first_tid > 0 && first_tid <= eff_tid) {
+                    info.set_discard_early(true);
+                    state.phase = SBEParseState::DONE;
+                    return;
+                }
+            }
         }
 
         // Parse trade entries
@@ -815,6 +833,32 @@ private:
             const uint8_t* body = payload + HEADER_SIZE;
             int64_t transact_ns = read_i64(body + 8) * 1000;  // transact_time_us at body+8
             int64_t event_ts_ns = state.event_time_us * 1000;
+
+            // Cross-connection: flush pending trades from a different connection
+            // before adding entries from this connection, preventing mixed batches
+            if (merge_enabled && has_pending_trades_ && pending_trades_ci_ != ci) {
+                flush_pending_trades(false);
+            }
+
+            // Stale re-check after cross-conn flush and on fragment resumption.
+            // Catches: (a) header-only fragments where no entry was readable,
+            // (b) resumed fragments where last_trade_id_ advanced between calls,
+            // (c) messages that passed HEADER_PARSED stale check before cross-conn flush
+            if (state.group_published < state.group_count) {
+                uint32_t next_offset = state.bytes_consumed +
+                    static_cast<uint32_t>(state.group_published) * state.group_block_len;
+                if (next_offset + state.group_block_len <= len) {
+                    int64_t next_tid = read_i64(payload + next_offset);
+                    int64_t eff_tid = has_pending_trades_
+                        ? std::max(last_trade_id_, pending_trades_max_id_)
+                        : last_trade_id_;
+                    if (next_tid > 0 && next_tid <= eff_tid) {
+                        state.phase = SBEParseState::DONE;
+                        info.set_discard_early(true);
+                        return;
+                    }
+                }
+            }
 
             // Non-merge local batch (stack-local, no member state needed)
             websocket::msg::TradeEntry nm_batch[websocket::msg::MAX_TRADES];
@@ -831,7 +875,7 @@ private:
                 if (merge_enabled) {
                     pending_trades_event_ts_ns_ = event_ts_ns;
                     if (state.sequence > 0)
-                        pending_trades_max_id_ = state.sequence;
+                        pending_trades_max_id_ = std::max(pending_trades_max_id_, state.sequence);
                     else
                         pending_trades_max_id_ = std::max(pending_trades_max_id_, trade_id);
 
@@ -1114,7 +1158,7 @@ public:
             (*ws_frame_info_prod_)[pending_trades_ring_seq_].set_merged(false);
         }
         if (clear_merged) pending_trades_ring_seq_ = -1;
-        last_trade_id_ = pending_trades_max_id_;
+        last_trade_id_ = std::max(last_trade_id_, pending_trades_max_id_);
         record_win(pending_trades_ci_);
         current_info_ = &pending_trades_info_;
         publish_event([&](websocket::msg::MktEvent& ev) {
@@ -1140,12 +1184,12 @@ public:
     }
 
     void on_disconnected(uint8_t ci) {
-        if (ci < 2) sbe_state_[ci].reset();
+        if (ci < PIPELINE_MAX_CONN) sbe_state_[ci].reset();
         publish_status(websocket::msg::SystemStatusType::DISCONNECTED, ci);
     }
 
     void on_reconnected(uint8_t ci) {
-        if (ci < 2) sbe_state_[ci].reset();
+        if (ci < PIPELINE_MAX_CONN) sbe_state_[ci].reset();
         publish_status(websocket::msg::SystemStatusType::RECONNECTED, ci);
     }
 
@@ -1216,6 +1260,7 @@ public:
                 e.nic_ts_ns = real_ns - (mono_ns - mono_arrival);
         }
         build(e);
+        e.set_connection_id(active_ci_);
         mkt_event_prod->publish(slot);
     }
 

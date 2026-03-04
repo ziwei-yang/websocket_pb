@@ -20,6 +20,7 @@
 #include "pipeline/pipeline_data.hpp"
 #include "msg/mkt_event.hpp"
 #include "msg/orderbook.hpp"
+#include "msg/market_conf.hpp"
 
 using namespace websocket::msg;
 using namespace websocket::pipeline;
@@ -63,6 +64,9 @@ struct ViewerState {
     size_t     trade_write = 0;
     size_t     trade_count = 0;
     int64_t    trade_seq = 0;
+    int64_t    bbo_seq = 0;        // last BBO src_seq (book_update_id)
+    int64_t    ob_seq = 0;         // last OB/depth src_seq (book_update_id / last_update_id)
+    uint64_t   dup_count = 0;      // non-monotonic event count
 
     uint64_t   total_events = 0;
     uint64_t   snap_count = 0, delta_count = 0, bbo_count = 0, trade_msg_count = 0;
@@ -135,6 +139,7 @@ struct ViewerState {
     uint8_t  last_status_conn = 0;
     int64_t  last_status_ts_ns = 0;      // recv_ts of last status event
     char     last_status_msg[64] = "";
+    uint8_t  last_mkt_conn = 0;          // connection_id from last market data event
 };
 
 // ============================================================================
@@ -167,11 +172,11 @@ static int get_term_cols() {
 }
 
 // ============================================================================
-// Price formatting (Binance SBE: exponent = -8)
+// Price formatting (normalized exponent from market_conf.hpp)
 // ============================================================================
 
-static constexpr int8_t PRICE_EXP = -8;
-static constexpr int8_t QTY_EXP   = -8;
+static constexpr int8_t PRICE_EXP = websocket::market::BinanceUSDM::price_exp;
+static constexpr int8_t QTY_EXP   = websocket::market::BinanceUSDM::qty_exp;
 
 static constexpr double pow10_table[] = {
     1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0
@@ -276,6 +281,7 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
     s.last_recv_ts_ns = evt.recv_ts_ns;
     s.last_event_ts_ns = evt.event_ts_ns;
     s.last_nic_ts_ns = evt.nic_ts_ns;
+    s.last_mkt_conn = evt.connection_id();
 
     // Advance event-count segments (rolling 60s)
     if (s.evt_seg_start_ns == 0)
@@ -333,12 +339,28 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
     }
 
     if (evt.is_book_snapshot() || evt.is_bbo_array() || evt.is_book_delta()) {
+        int64_t& type_seq = evt.is_bbo_array() ? s.bbo_seq : s.ob_seq;
+        if (evt.src_seq > 0 && evt.src_seq <= type_seq) {
+            s.dup_count++;
+            if (evt.is_book_snapshot()) s.snap_count++;
+            else if (evt.is_bbo_array()) s.bbo_count++;
+            else s.delta_count++;
+            return;
+        }
+        type_seq = std::max(type_seq, evt.src_seq);
         s.ob.apply(evt);
         if (evt.is_book_snapshot()) s.snap_count++;
         else if (evt.is_bbo_array()) s.bbo_count++;
         else s.delta_count++;
         sample_depth(s, evt.recv_ts_ns);
     } else if (evt.is_trade_array()) {
+        if (evt.src_seq > 0 && evt.src_seq <= s.trade_seq) {
+            s.dup_count++;
+            s.trade_msg_count++;
+            return;
+        }
+        s.trade_seq = std::max(s.trade_seq, evt.src_seq);
+
         // Advance volume segments based on recv_ts
         if (s.vol_seg_start_ns == 0)
             s.vol_seg_start_ns = evt.recv_ts_ns;
@@ -367,7 +389,6 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
             s.trade_write++;
             if (s.trade_count < ViewerState::TRADE_BUF) s.trade_count++;
         }
-        s.trade_seq = evt.src_seq;
         s.trade_msg_count++;
     }
 }
@@ -399,8 +420,8 @@ static void add_log_line(ViewerState& s, const MktEvent& evt) {
     }
 
     snprintf(line, 160,
-             " %-14ld %s %-8s r=%-19ld e=%ld",
-             evt.src_seq, type_str, counts,
+             " c%u %-14ld %s %-8s r=%-19ld e=%ld",
+             evt.connection_id(), evt.src_seq, type_str, counts,
              evt.recv_ts_ns, evt.event_ts_ns);
 
     s.log_write++;
@@ -656,9 +677,13 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
         int used = 1 + static_cast<int>(std::strlen(s.exchange)) + 1 + static_cast<int>(std::strlen(s.symbol));
         pos = fb_puts(fb, pos, RST);
 
-        // Connection badge with server latency: background-colored " connA:+1.5ms "
+        // Connection badge with server latency: background-colored " conn0:+1.5ms "
         if (s.last_status_type != 0xFF) {
-            const char* conn_name = s.last_status_conn == 0 ? "connA" : "connB";
+            char conn_name[8];
+            if (s.last_status_type == 0xFF)
+                snprintf(conn_name, sizeof(conn_name), "conn*");
+            else
+                snprintf(conn_name, sizeof(conn_name), "conn%u", s.last_mkt_conn);
             // Base color: RED for Disconn(1), GREEN for Heartbt(0)/Reconn(2)/Failovr(3)
             const char* bg_color = (s.last_status_type == 1) ? BG_RED : BG_GREEN;
             char badge[48];
@@ -678,6 +703,16 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
             pos = fb_put(fb, pos, badge, badge_len);
             pos = fb_puts(fb, pos, RST);
             used += 1 + badge_len;
+        }
+
+        if (s.dup_count > 0) {
+            char dup[32];
+            int dup_len = snprintf(dup, sizeof(dup), " dup: %lu ", s.dup_count);
+            pos = fb_puts(fb, pos, " ");
+            pos = fb_puts(fb, pos, "\033[97m\033[41m");  // bright white on red bg
+            pos = fb_put(fb, pos, dup, dup_len);
+            pos = fb_puts(fb, pos, RST);
+            used += 1 + dup_len;
         }
 
         // Update frequency (rolling 60s)
@@ -901,6 +936,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
                 // Sell strength bar (grows right) + volume
                 pos = render_strength_bar(fb, pos, RED, 'S', sell_strength, 32, strength_scale);
                 n = snprintf(tmp, sizeof(tmp), "%6.3f", sell_vol);
+                if (n > 6) n = 6;
                 pos = fb_puts(fb, pos, RED);
                 pos = fb_put(fb, pos, tmp, n);
                 pos = fb_puts(fb, pos, RST);
@@ -908,6 +944,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
                 // Buy strength bar (grows right) + volume
                 pos = render_strength_bar(fb, pos, GREEN, 'B', buy_strength, 32, strength_scale);
                 n = snprintf(tmp, sizeof(tmp), "%6.3f", buy_vol);
+                if (n > 6) n = 6;
                 pos = fb_puts(fb, pos, GREEN);
                 pos = fb_put(fb, pos, tmp, n);
                 pos = fb_puts(fb, pos, RST);
@@ -937,6 +974,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
                 // Title row — fills label(5)+pipe(1)+bar area
                 n = snprintf(tmp, sizeof(tmp), "INTERVALS (%u)", interval_total);
                 int title_width = hist_bar_width + 6;
+                if (n > title_width) n = title_width;
                 pos = fb_puts(fb, pos, BOLD);
                 pos = fb_put(fb, pos, tmp, n);
                 pos = fb_puts(fb, pos, RST);
@@ -957,6 +995,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
                     if (cnt > 0 && interval_total > 0) {
                         float pct = 100.0f * cnt / interval_total;
                         pct_len = snprintf(tmp, sizeof(tmp), "%.1f%%", pct);
+                        if (pct_len > hist_bar_width) pct_len = hist_bar_width;
                         pos = fb_puts(fb, pos, DIM);
                         pos = fb_put(fb, pos, tmp, pct_len);
                         pos = fb_puts(fb, pos, RST);
@@ -982,6 +1021,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
         fb[pos++] = ' ';
         pos = render_strength_bar(fb, pos, RED, 'S', sell_strength, narrow_bar_w, strength_scale);
         n = snprintf(tmp, sizeof(tmp), "%6.3f", sell_vol);
+        if (n > 6) n = 6;
         pos = fb_puts(fb, pos, RED);
         pos = fb_put(fb, pos, tmp, n);
         pos = fb_puts(fb, pos, RST);
@@ -990,6 +1030,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
         fb[pos++] = ' ';
         pos = render_strength_bar(fb, pos, GREEN, 'B', buy_strength, narrow_bar_w, strength_scale);
         n = snprintf(tmp, sizeof(tmp), "%6.3f", buy_vol);
+        if (n > 6) n = 6;
         pos = fb_puts(fb, pos, GREEN);
         pos = fb_put(fb, pos, tmp, n);
         pos = fb_puts(fb, pos, RST);

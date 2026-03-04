@@ -12,7 +12,7 @@
 //
 // Usage: sudo ./test_pipeline_262_binance_sbe_dpdk_inline_ws <interface> [--timeout <ms>]
 //
-// Build: ENABLE_RECONNECT=1 ENABLE_AB=1 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 262_binance_sbe_dpdk_inline_ws.cpp
+// Build: ENABLE_RECONNECT=1 MAX_CONN=2 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 262_binance_sbe_dpdk_inline_ws.cpp
 
 #include <cstdio>
 #include <cstdlib>
@@ -39,12 +39,11 @@
 // Must be captured and #undef'd BEFORE including websocket_pipeline.hpp
 // ============================================================================
 
-#ifdef ENABLE_AB
-static constexpr bool AB_ENABLED = true;
+#ifdef MAX_CONN
+static constexpr size_t CONN_COUNT = MAX_CONN;
 #else
-static constexpr bool AB_ENABLED = false;
+static constexpr size_t CONN_COUNT = 1;
 #endif
-#undef ENABLE_AB
 
 // ENABLE_RECONNECT is required for InlineWS — always force true
 #ifdef ENABLE_RECONNECT
@@ -101,7 +100,7 @@ struct BinanceSBETraits : DefaultPipelineConfig {
     static constexpr int TRANSPORT_CORE  = 4;
     static constexpr int WEBSOCKET_CORE  = 4;  // unused in InlineWS, same as transport
 
-    static constexpr bool ENABLE_AB      = AB_ENABLED;
+    static constexpr size_t MAX_CONN     = CONN_COUNT;
     static constexpr bool AUTO_RECONNECT = true;   // required for InlineWS
     static constexpr bool PROFILING      = true;
     static constexpr bool INLINE_WS      = true;   // key toggle
@@ -226,7 +225,7 @@ int main(int argc, char* argv[]) {
     printf("  Mode:       InlineWS (transport + WS in single process)\n");
     printf("  Processes:  2 (DPDK Poll + Transport+WS)\n");
     printf("  API Key:    %s\n", (api_key && api_key[0]) ? "set" : "NOT SET");
-    printf("  Dual A/B:   %s\n", AB_ENABLED ? "yes" : "no");
+    printf("  Connections: %zu\n", CONN_COUNT);
     printf("  Reconnect:  yes (required)\n");
     if (run_forever) {
         printf("  Timeout:    FOREVER (Ctrl+C to stop)\n");
@@ -266,7 +265,7 @@ int main(int argc, char* argv[]) {
     // Main loop — consume WSFrameInfo + MktEvent from disruptor rings
     // ========================================================================
 
-    constexpr size_t NUM_CONN = AB_ENABLED ? 2 : 1;
+    constexpr size_t NUM_CONN = CONN_COUNT;
 
     // Create consumer for WS_FRAME_INFO ring
     IPCRingConsumer<WSFrameInfo> ws_frame_cons(*pipeline.ws_frame_info_region());
@@ -488,8 +487,8 @@ int main(int argc, char* argv[]) {
 #else  // !USE_DPDK
 
 int main() {
-    fprintf(stderr, "Error: Build with USE_DPDK=1 USE_WOLFSSL=1 ENABLE_AB=1 ENABLE_RECONNECT=1\n");
-    fprintf(stderr, "Example: ENABLE_RECONNECT=1 ENABLE_AB=1 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 262_binance_sbe_dpdk_inline_ws.cpp\n");
+    fprintf(stderr, "Error: Build with USE_DPDK=1 USE_WOLFSSL=1 MAX_CONN=2 ENABLE_RECONNECT=1\n");
+    fprintf(stderr, "Example: ENABLE_RECONNECT=1 MAX_CONN=2 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 262_binance_sbe_dpdk_inline_ws.cpp\n");
     return 1;
 }
 

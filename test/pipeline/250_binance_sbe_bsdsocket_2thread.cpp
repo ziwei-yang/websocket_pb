@@ -31,13 +31,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-// Capture -DENABLE_AB before including pipeline headers (macro clashes with Traits member)
-#ifdef ENABLE_AB
-static constexpr bool AB_ENABLED = true;
+// Capture -DMAX_CONN before including pipeline headers (macro clashes with Traits member)
+#ifdef MAX_CONN
+static constexpr size_t CONN_COUNT = MAX_CONN;
 #else
-static constexpr bool AB_ENABLED = false;
+static constexpr size_t CONN_COUNT = 1;
 #endif
-#undef ENABLE_AB
 
 #include "../../src/pipeline/bsd_websocket_pipeline.hpp"
 #include "../../src/policy/ssl.hpp"
@@ -92,7 +91,7 @@ struct BinanceSBE2ThreadTraits : DefaultBSDPipelineConfig {
     static constexpr uint16_t WSS_PORT    = 443;
     static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade";
 
-    static constexpr bool ENABLE_AB      = AB_ENABLED;
+    static constexpr size_t MAX_CONN     = CONN_COUNT;
     static constexpr bool AUTO_RECONNECT = true;
 };
 
@@ -608,7 +607,7 @@ int main(int argc, char* argv[]) {
     printf("  Threading:  2-thread (InlineSSL)\n");
     printf("  Processes:  BSD Transport + WebSocket\n");
     printf("  API Key:    set\n");
-    printf("  Dual A/B:   yes\n");
+    printf("  Connections: %zu\n", CONN_COUNT);
     printf("  Reconnect:  yes\n");
     if (run_forever) {
         printf("  Timeout:    FOREVER (Ctrl+C to stop)\n");

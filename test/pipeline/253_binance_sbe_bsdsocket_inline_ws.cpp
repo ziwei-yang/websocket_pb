@@ -32,13 +32,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-// Capture -DENABLE_AB before including pipeline headers (macro clashes with Traits member)
-#ifdef ENABLE_AB
-static constexpr bool AB_ENABLED = true;
+// Capture -DMAX_CONN before including pipeline headers (macro clashes with Traits member)
+#ifdef MAX_CONN
+static constexpr size_t CONN_COUNT = MAX_CONN;
 #else
-static constexpr bool AB_ENABLED = false;
+static constexpr size_t CONN_COUNT = 1;
 #endif
-#undef ENABLE_AB
 
 #include "../../src/pipeline/bsd_websocket_pipeline.hpp"
 #include "../../src/policy/ssl.hpp"
@@ -96,7 +95,7 @@ struct BinanceSBEInlineWSTraits : DefaultBSDPipelineConfig {
     static constexpr uint16_t WSS_PORT    = 443;
     static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade/btcusdt@depth/btcusdt@depth20/btcusdt@bestBidAsk";
 
-    static constexpr bool ENABLE_AB      = AB_ENABLED;
+    static constexpr size_t MAX_CONN     = CONN_COUNT;
     static constexpr bool AUTO_RECONNECT = true;
     static constexpr bool INLINE_WS      = true;   // <-- key difference
     static constexpr bool WS_FRAME_INFO_RING = true;  // publish to ring even with MktEventHandler
@@ -631,7 +630,7 @@ int main(int argc, char* argv[]) {
     printf("  Threading:  InlineWS (transport + WS in single process)\n");
     printf("  Processes:  1 child (transport embeds WS)\n");
     printf("  API Key:    set\n");
-    printf("  Dual A/B:   yes\n");
+    printf("  Connections: %zu\n", CONN_COUNT);
     printf("  Merge:      %s\n", g_merge_enabled ? "yes" : "no");
     printf("  Reconnect:  yes\n");
     if (run_forever) {

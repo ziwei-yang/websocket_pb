@@ -14,7 +14,7 @@
 #
 # Options:
 #   -i, --interface IFACE   Network interface (default: enp108s0)
-#   --enable-ab             Enable dual A/B connection mode (-DENABLE_AB)
+#   --max-conn N            Max simultaneous connections (default: 1, -DMAX_CONN=N)
 #   --enable-reconnect      Enable auto-reconnect mode (-DENABLE_RECONNECT)
 #   --hugepages N           Number of 2MB hugepages to allocate (default: 512)
 #   --skip-bind             Skip vfio-pci bind (assume already bound)
@@ -38,7 +38,7 @@ set -e
 
 INTERFACE="enp108s0"
 HUGEPAGES=512
-ENABLE_AB_FLAG=false
+MAX_CONN_VALUE=""
 ENABLE_RECONNECT_FLAG=false
 SKIP_BIND=false
 TEST_SOURCE=""
@@ -91,7 +91,7 @@ Usage: $0 [OPTIONS] <test_source>
 
 Options:
   -i, --interface IFACE   Network interface (default: enp108s0)
-  --enable-ab             Enable dual A/B connection mode (-DENABLE_AB)
+  --max-conn N            Max simultaneous connections (default: 1, -DMAX_CONN=N)
   --enable-reconnect      Enable auto-reconnect mode (-DENABLE_RECONNECT)
   --hugepages N           Number of 2MB hugepages to allocate (default: 512)
   --skip-bind             Skip vfio-pci bind (assume already bound)
@@ -126,9 +126,9 @@ parse_args() {
                 INTERFACE="$2"
                 shift 2
                 ;;
-            --enable-ab)
-                ENABLE_AB_FLAG=true
-                shift
+            --max-conn)
+                MAX_CONN_VALUE="$2"
+                shift 2
                 ;;
             --enable-reconnect)
                 ENABLE_RECONNECT_FLAG=true
@@ -315,11 +315,14 @@ build_test() {
     fi
     # Some DPDK tests (04, 05) don't need SSL — SSL_FLAGS may be empty
 
-    # Dual A/B connection mode
-    local AB_FLAGS=""
-    if [[ "$ENABLE_AB_FLAG" == "true" ]] || [[ -n "$ENABLE_AB" ]]; then
-        AB_FLAGS="ENABLE_AB=1"
-        log_info "Dual A/B connection mode enabled (ENABLE_AB=1)"
+    # Multi-connection mode
+    local CONN_FLAGS=""
+    if [[ -n "$MAX_CONN_VALUE" ]]; then
+        CONN_FLAGS="MAX_CONN=$MAX_CONN_VALUE"
+        log_info "Multi-connection mode enabled (MAX_CONN=$MAX_CONN_VALUE)"
+    elif [[ -n "$MAX_CONN" ]]; then
+        CONN_FLAGS="MAX_CONN=$MAX_CONN"
+        log_info "Multi-connection mode enabled (MAX_CONN=$MAX_CONN)"
     fi
 
     # Auto-reconnect mode
@@ -333,7 +336,7 @@ build_test() {
     rm -f "$TEST_BIN"
 
     # Build test binary (as normal user, no sudo)
-    make "$MAKE_TARGET" USE_DPDK=1 DPDK_INTERFACE="$INTERFACE" $SSL_FLAGS $AB_FLAGS $RECONNECT_FLAGS || die "Failed to build test: $MAKE_TARGET"
+    make "$MAKE_TARGET" USE_DPDK=1 DPDK_INTERFACE="$INTERFACE" $SSL_FLAGS $CONN_FLAGS $RECONNECT_FLAGS || die "Failed to build test: $MAKE_TARGET"
 
     log_ok "Test binary built: $TEST_BIN"
 }

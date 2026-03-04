@@ -656,7 +656,7 @@ struct IpSelector {
     /// Reset rotation to start from fastest again.
     void reset_rotation() { rotation_index = 0; }
 
-    // ── Dual Connection Mode ──
+    // ── Dual Connection Mode (legacy) ──
 
     /// Initial assignment: a = fastest, b = second fastest.
     /// Returns false if fewer than 2 preferred IPs.
@@ -668,15 +668,37 @@ struct IpSelector {
         return true;
     }
 
-    /// Choose reconnect IP for one connection, avoiding other_ip if possible.
-    const ProbeEntry* next_for_reconnect(uint32_t other_ip_net) {
-        if (preferred.empty()) return nullptr;
-        // Find lowest-latency IP that differs from other connection
-        for (const auto& e : preferred) {
-            if (e.ipv4_net() != other_ip_net) return &e;
+    // ── Multi Connection Mode ──
+
+    /// Assign up to n distinct IPs from preferred pool, sorted by latency.
+    /// Returns actual count assigned (may be < n if fewer IPs available).
+    size_t assign_multi(size_t n, std::vector<const ProbeEntry*>& out) const {
+        out.clear();
+        size_t count = std::min(n, preferred.size());
+        for (size_t i = 0; i < count; ++i) {
+            out.push_back(&preferred[i]);
         }
-        // All IPs are the same (single IP from DNS) — use rotation
+        return count;
+    }
+
+    /// Choose reconnect IP for one connection, avoiding all other connections' IPs.
+    /// other_ips: array of IPs to avoid (network byte order), other_count: number of IPs.
+    const ProbeEntry* next_for_reconnect(const uint32_t* other_ips, size_t other_count) {
+        if (preferred.empty()) return nullptr;
+        for (const auto& e : preferred) {
+            bool conflict = false;
+            for (size_t i = 0; i < other_count; ++i) {
+                if (e.ipv4_net() == other_ips[i]) { conflict = true; break; }
+            }
+            if (!conflict) return &e;
+        }
+        // All IPs conflict — use rotation
         return next();
+    }
+
+    /// Legacy single-IP avoidance wrapper.
+    const ProbeEntry* next_for_reconnect(uint32_t other_ip_net) {
+        return next_for_reconnect(&other_ip_net, 1);
     }
 };
 

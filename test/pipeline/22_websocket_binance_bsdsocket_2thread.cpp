@@ -28,6 +28,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+// Hardcoded 2-connection mode — set macro before pipeline headers size ConnStateShm arrays
+#ifndef MAX_CONN
+#define MAX_CONN 2
+#endif
+
 #include "../../src/pipeline/bsd_websocket_pipeline.hpp"
 #include "../../src/policy/ssl.hpp"
 
@@ -64,7 +69,7 @@ struct BinanceBSD2ThreadTraits : DefaultBSDPipelineConfig {
     static constexpr uint16_t WSS_PORT = 443;
     static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade";
 
-    static constexpr bool ENABLE_AB        = true;
+    static constexpr size_t MAX_CONN       = 2;
     static constexpr bool AUTO_RECONNECT   = true;
 };
 

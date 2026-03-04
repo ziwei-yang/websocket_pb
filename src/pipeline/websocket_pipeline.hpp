@@ -89,7 +89,7 @@ concept PipelineTraitsConcept = requires {
     { T::WSS_PATH }  -> std::convertible_to<const char*>;
 
     // ── Feature toggles ──
-    { T::ENABLE_AB }        -> std::convertible_to<bool>;
+    { T::MAX_CONN }         -> std::convertible_to<size_t>;
     { T::AUTO_RECONNECT }   -> std::convertible_to<bool>;
     { T::PROFILING }        -> std::convertible_to<bool>;
     { T::TRICKLE_ENABLED }  -> std::convertible_to<bool>;
@@ -113,7 +113,7 @@ struct DefaultPipelineConfig {
     using UpgradeCustomizer = NullUpgradeCustomizer;
 
     // ── Feature toggles ──
-    static constexpr bool ENABLE_AB        = false;
+    static constexpr size_t MAX_CONN       = 1;
     static constexpr bool AUTO_RECONNECT   = false;
     static constexpr bool PROFILING        = false;
     static constexpr bool TRICKLE_ENABLED  = true;
@@ -429,7 +429,7 @@ public:
         return true;
     }
 
-    template<bool EnableAB, bool NeedWSFrameInfoRing, bool IsInlineWS = false, bool IsDirectIO = false>
+    template<size_t MaxConn, bool NeedWSFrameInfoRing, bool IsInlineWS = false, bool IsDirectIO = false>
     bool create_all_rings() {
         mkdir("/dev/shm/hft", 0755);
         std::string full_dir = "/dev/shm/hft/" + ipc_ring_dir_;
@@ -452,10 +452,10 @@ public:
 
         // Transport <-> WebSocket IPC rings (skip in InlineWS mode — no WS process)
         if constexpr (!IsInlineWS) {
-            if (!create_ring("msg_metadata_a", MSG_METADATA_SIZE * sizeof(MsgMetadata),
-                             sizeof(MsgMetadata), 1)) return false;
-            if constexpr (EnableAB) {
-                if (!create_ring("msg_metadata_b", MSG_METADATA_SIZE * sizeof(MsgMetadata),
+            for (size_t i = 0; i < MaxConn; ++i) {
+                char name[64];
+                std::snprintf(name, sizeof(name), "msg_metadata_%zu", i);
+                if (!create_ring(name, MSG_METADATA_SIZE * sizeof(MsgMetadata),
                                  sizeof(MsgMetadata), 1)) return false;
             }
             if (!create_ring("pongs", PONGS_SIZE * sizeof(PongFrameAligned),
@@ -475,11 +475,16 @@ public:
     void cleanup() {
         if (ipc_ring_dir_.empty()) return;
         std::string base = "/dev/shm/hft/" + ipc_ring_dir_;
-        const char* ring_names[] = {
-            "raw_inbox", "raw_outbox",
-            "msg_outbox", "msg_metadata_a", "msg_metadata_b", "pongs", "ws_frame_info"
+        const char* fixed_names[] = {
+            "raw_inbox", "raw_outbox", "msg_outbox", "pongs", "ws_frame_info"
         };
-        for (const char* name : ring_names) {
+        for (const char* name : fixed_names) {
+            unlink((base + "/" + name + ".hdr").c_str());
+            unlink((base + "/" + name + ".dat").c_str());
+        }
+        for (size_t i = 0; i < PIPELINE_MAX_CONN; ++i) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "msg_metadata_%zu", i);
             unlink((base + "/" + name + ".hdr").c_str());
             unlink((base + "/" + name + ".dat").c_str());
         }
@@ -619,11 +624,11 @@ template<PipelineTraitsConcept Traits>
 class WebSocketPipeline {
 public:
     // ── Derived constants ──
-    static constexpr bool EnableAB       = Traits::ENABLE_AB;
+    static constexpr size_t MaxConn      = Traits::MAX_CONN;
     static constexpr bool AutoReconnect  = Traits::AUTO_RECONNECT;
     static constexpr bool Prof           = Traits::PROFILING;
     static constexpr bool InlineWS       = Traits::INLINE_WS;
-    static constexpr size_t NUM_CONN     = EnableAB ? 2 : 1;
+    static constexpr size_t NUM_CONN     = MaxConn;
     static constexpr bool HasMktEventHandler  = Traits::MktEventHandler::enabled;
     static constexpr bool WSFrameInfoRing = Traits::WS_FRAME_INFO_RING;
     static constexpr bool NeedWSFrameInfoRing = !HasMktEventHandler || WSFrameInfoRing;
@@ -663,22 +668,22 @@ public:
         SSLPolicyType,
         IPCRingProducer<MsgMetadata>,
         IPCRingConsumer<PongFrameAligned>,
-        EnableAB, AutoReconnect, Prof>;
+        MaxConn, AutoReconnect, Prof>;
 
     using WebSocketType = WebSocketProcess<
         IPCRingConsumer<MsgMetadata>,
         IPCRingProducer<WSFrameInfo>,
         IPCRingProducer<PongFrameAligned>,
         IPCRingProducer<MsgOutboxEvent>,
-        EnableAB, AutoReconnect, Prof,
+        MaxConn, AutoReconnect, Prof,
         MktEventHandlerType,
         UpgradeCustomizerType>;
 
     // --- Inline mode types (InlineWS) ---
     using InlineWSCoreType = WSCore<
-        DirectTXSink<SSLPolicyType, EnableAB>,
+        DirectTXSink<SSLPolicyType, MaxConn>,
         IPCRingProducer<WSFrameInfo>,
-        EnableAB, AutoReconnect, Prof,
+        MaxConn, AutoReconnect, Prof,
         MktEventHandlerType,
         UpgradeCustomizerType,
         WSFrameInfoRing>;
@@ -687,7 +692,7 @@ public:
         SSLPolicyType,
         NullRingAdapter,
         NullRingAdapter,
-        EnableAB, AutoReconnect, Prof,
+        MaxConn, AutoReconnect, Prof,
         InlineWSCoreType>;
 
     // --- Direct IO mode types (no poll process, PacketIO handles NIC) ---
@@ -704,7 +709,7 @@ public:
         SSLPolicyType,
         NullRingAdapter,
         NullRingAdapter,
-        EnableAB, AutoReconnect, Prof,
+        MaxConn, AutoReconnect, Prof,
         InlineWSCoreType,
         DirectIOPacketIOType>;
 
@@ -767,23 +772,22 @@ public:
             }
 
             // Assign per-connection IPs
-            if constexpr (EnableAB) {
-                const websocket::net::ProbeEntry* ip_a = nullptr;
-                const websocket::net::ProbeEntry* ip_b = nullptr;
-                if (selector.assign_dual(ip_a, ip_b)) {
-                    conn_target_ip_[0] = ip_a->ipv4_net();
-                    conn_target_ip_[1] = ip_b->ipv4_net();
-                } else {
-                    // Single IP available — both connections use it
-                    conn_target_ip_[0] = conn_target_ip_[1] = ip_a->ipv4_net();
+            if constexpr (MaxConn > 1) {
+                std::vector<const websocket::net::ProbeEntry*> assigned_ips;
+                size_t assigned = selector.assign_multi(MaxConn, assigned_ips);
+                actual_conn_count_ = static_cast<uint8_t>(assigned);
+                for (size_t i = 0; i < MaxConn; ++i) {
+                    conn_target_ip_[i] = (i < assigned) ? assigned_ips[i]->ipv4_net()
+                                                         : assigned_ips[0]->ipv4_net();
                 }
-                printf("Target: conn0=%s (%ldus), conn1=%s (%ldus)\n",
-                       ip_a->ip_str, ip_a->rtt_us,
-                       ip_b ? ip_b->ip_str : ip_a->ip_str,
-                       ip_b ? ip_b->rtt_us : ip_a->rtt_us);
+                printf("Target: %zu connections assigned\n", assigned);
+                for (size_t i = 0; i < assigned; ++i) {
+                    printf("  conn%zu=%s (%ldus)\n", i, assigned_ips[i]->ip_str, assigned_ips[i]->rtt_us);
+                }
             } else {
                 const auto* ip = selector.fastest();
-                conn_target_ip_[0] = conn_target_ip_[1] = ip->ipv4_net();
+                conn_target_ip_[0] = ip->ipv4_net();
+                actual_conn_count_ = 1;
                 printf("Target: %s (%ldus)\n", ip->ip_str, ip->rtt_us);
             }
             wss_target_ip_ = probe_result_.entries[0].ip_str;
@@ -829,7 +833,7 @@ public:
                gateway_mac_[3], gateway_mac_[4], gateway_mac_[5]);
 
         // Create IPC rings (InlineWS skips transport↔WS rings, DirectIO skips raw rings)
-        if (!ipc_manager_.template create_all_rings<EnableAB, NeedWSFrameInfoRing, InlineWS, DirectIO>()) {
+        if (!ipc_manager_.template create_all_rings<MaxConn, NeedWSFrameInfoRing, InlineWS, DirectIO>()) {
             fprintf(stderr, "FAIL: Cannot create IPC rings\n");
             return false;
         }
@@ -908,8 +912,9 @@ public:
         conn_state_->tsc_freq_hz = static_cast<uint64_t>(tsc_freq_ghz_ * 1e9);
 
         // IP probe target IPs and interface
-        conn_state_->conn_target_ip[0] = conn_target_ip_[0];
-        conn_state_->conn_target_ip[1] = conn_target_ip_[1];
+        for (size_t i = 0; i < NUM_CONN; ++i)
+            conn_state_->conn_target_ip[i] = conn_target_ip_[i];
+        conn_state_->actual_conn_count = actual_conn_count_;
         strncpy(conn_state_->probe_interface, probe_iface_.c_str(),
                 sizeof(conn_state_->probe_interface) - 1);
 
@@ -923,7 +928,7 @@ public:
             }
             conn_state_->exchange_ip_count = count;
         }
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             conn_state_->dual_dead_threshold_ms = Traits::DUAL_DEAD_THRESHOLD_MS;
         }
 
@@ -940,7 +945,7 @@ public:
         }
 
         // Create standalone MktEvent ring (for external consumers like mkt_event_reader)
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             if (!IPCRingManager::open_or_create_standalone_ring("mkt_event.Binance.BTC-USDT",
                     MKT_EVENT_RING_SIZE * sizeof(websocket::msg::MktEvent),
                     sizeof(websocket::msg::MktEvent), 8)) {
@@ -958,16 +963,17 @@ public:
             // MSG_OUTBOX always opened (parent may send custom WS frames)
             msg_outbox_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_outbox"));
             if constexpr (!InlineWS) {
-                msg_metadata_region_[0] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_a"));
-                if constexpr (EnableAB) {
-                    msg_metadata_region_[1] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("msg_metadata_b"));
+                for (size_t i = 0; i < NUM_CONN; ++i) {
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "msg_metadata_%zu", i);
+                    msg_metadata_region_[i] = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name(name));
                 }
                 pongs_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("pongs"));
             }
             if constexpr (NeedWSFrameInfoRing) {
                 ws_frame_info_region_ = new disruptor::ipc::shared_region(ipc_manager_.get_ring_name("ws_frame_info"));
             }
-            if constexpr (EnableAB) {
+            if constexpr (MaxConn > 1) {
                 mkt_event_region_ = new disruptor::ipc::shared_region("mkt_event.Binance.BTC-USDT");
             }
         } catch (const std::exception& e) {
@@ -1255,51 +1261,48 @@ private:
 
         IPCRingConsumer<PacketFrameDescriptor> raw_inbox_cons(*raw_inbox_region_);
         IPCRingProducer<PacketFrameDescriptor> raw_outbox_prod(*raw_outbox_region_);
-        IPCRingProducer<MsgMetadata> msg_metadata_prod_a(*msg_metadata_region_[0]);
         IPCRingConsumer<PongFrameAligned> pongs_cons(*pongs_region_);
         IPCRingConsumer<MsgOutboxEvent> msg_outbox_cons(*msg_outbox_region_);
+
+        // All metadata producers at function scope (avoids dangling pointer risk)
+        std::array<std::unique_ptr<IPCRingProducer<MsgMetadata>>, NUM_CONN> msg_metadata_prods;
+        std::array<IPCRingProducer<MsgMetadata>*, NUM_CONN> msg_metadata_prod_ptrs{};
+        for (size_t i = 0; i < NUM_CONN; ++i) {
+            msg_metadata_prods[i] = std::make_unique<IPCRingProducer<MsgMetadata>>(
+                *msg_metadata_region_[i]);
+            msg_metadata_prod_ptrs[i] = msg_metadata_prods[i].get();
+        }
+
+        std::array<MsgInbox*, NUM_CONN> inboxes{};
+        for (size_t i = 0; i < NUM_CONN; ++i) inboxes[i] = msg_inbox_[i];
 
         char url[512];
         snprintf(url, sizeof(url), "wss://%s:%u%s",
                  Traits::WSS_HOST, Traits::WSS_PORT, Traits::WSS_PATH);
 
-        if constexpr (EnableAB) {
-            IPCRingProducer<MsgMetadata> msg_metadata_prod_b(*msg_metadata_region_[1]);
-            TransportType transport(url, umem_area_, FRAME_SIZE,
-                &raw_inbox_cons, &raw_outbox_prod,
-                msg_inbox_[0], &msg_metadata_prod_a, &pongs_cons,
-                conn_state_, &msg_outbox_cons,
-                msg_inbox_[1], &msg_metadata_prod_b);
-            if constexpr (Prof) transport.set_profiling_data(&profiling_->transport);
-            if (!transport.init()) { conn_state_->shutdown_all(); return; }
-            transport.run();
-            transport.cleanup();
-        } else {
-            TransportType transport(url, umem_area_, FRAME_SIZE,
-                &raw_inbox_cons, &raw_outbox_prod,
-                msg_inbox_[0], &msg_metadata_prod_a, &pongs_cons,
-                conn_state_, &msg_outbox_cons);
-            if constexpr (Prof) transport.set_profiling_data(&profiling_->transport);
-            if (!transport.init()) { conn_state_->shutdown_all(); return; }
-            transport.run();
-            transport.cleanup();
-        }
+        TransportType transport(url, umem_area_, FRAME_SIZE,
+            &raw_inbox_cons, &raw_outbox_prod,
+            inboxes, msg_metadata_prod_ptrs, &pongs_cons,
+            conn_state_, &msg_outbox_cons);
+        if constexpr (Prof) transport.set_profiling_data(&profiling_->transport);
+        if (!transport.init()) { conn_state_->shutdown_all(); return; }
+        transport.run();
+        transport.cleanup();
     }
 
     void run_websocket_process() {
         pipeline_helpers::pin_to_cpu(Traits::WEBSOCKET_CORE);
 
-        IPCRingConsumer<MsgMetadata> msg_metadata_cons_a(*msg_metadata_region_[0]);
         IPCRingProducer<MsgOutboxEvent> msg_outbox_prod(*msg_outbox_region_);
         IPCRingProducer<PongFrameAligned> pongs_prod(*pongs_region_);
 
-        // Conn B metadata consumer must outlive ws_process.run() — declared here
-        // so it stays alive for the entire function scope (not scoped inside
-        // the if-constexpr block which would create a dangling pointer).
-        std::unique_ptr<IPCRingConsumer<MsgMetadata>> msg_metadata_cons_b_holder;
-        if constexpr (EnableAB) {
-            msg_metadata_cons_b_holder = std::make_unique<IPCRingConsumer<MsgMetadata>>(
-                *msg_metadata_region_[1]);
+        // All metadata consumers at function scope (avoids dangling pointer risk)
+        std::array<std::unique_ptr<IPCRingConsumer<MsgMetadata>>, NUM_CONN> msg_metadata_cons;
+        std::array<IPCRingConsumer<MsgMetadata>*, NUM_CONN> msg_metadata_cons_ptrs{};
+        for (size_t i = 0; i < NUM_CONN; ++i) {
+            msg_metadata_cons[i] = std::make_unique<IPCRingConsumer<MsgMetadata>>(
+                *msg_metadata_region_[i]);
+            msg_metadata_cons_ptrs[i] = msg_metadata_cons[i].get();
         }
 
         // WSFrameInfo producer — created when ring is needed
@@ -1307,7 +1310,7 @@ private:
 
         // MktEvent producer — must outlive ws_process.run(), declared at function scope
         std::unique_ptr<IPCRingProducer<websocket::msg::MktEvent>> mkt_event_prod_holder;
-        if constexpr (HasMktEventHandler && EnableAB) {
+        if constexpr (HasMktEventHandler && MaxConn > 1) {
             if (mkt_event_region_) {
                 mkt_event_prod_holder = std::make_unique<IPCRingProducer<websocket::msg::MktEvent>>(
                     *mkt_event_region_);
@@ -1318,7 +1321,7 @@ private:
         ws_process.mkt_event_handler() = mkt_event_handler_;
 
         // Wire MktEvent producer, conn_state, and ws_frame_info_prod to handler
-        if constexpr (HasMktEventHandler && EnableAB) {
+        if constexpr (HasMktEventHandler && MaxConn > 1) {
             ws_process.mkt_event_handler().mkt_event_prod = mkt_event_prod_holder.get();
             ws_process.mkt_event_handler().conn_state = conn_state_;
         }
@@ -1328,13 +1331,10 @@ private:
 
         if constexpr (Prof) ws_process.set_profiling_data(&profiling_->ws_process);
 
-        if constexpr (EnableAB) {
-            bool ok = ws_process.init(msg_inbox_[0], &msg_metadata_cons_a,
-                ws_frame_info_prod_holder.get(), &pongs_prod, &msg_outbox_prod,
-                conn_state_, msg_inbox_[1], msg_metadata_cons_b_holder.get());
-            if (!ok) { conn_state_->shutdown_all(); return; }
-        } else {
-            bool ok = ws_process.init(msg_inbox_[0], &msg_metadata_cons_a,
+        {
+            std::array<MsgInbox*, NUM_CONN> inboxes{};
+            for (size_t i = 0; i < NUM_CONN; ++i) inboxes[i] = msg_inbox_[i];
+            bool ok = ws_process.init(inboxes, msg_metadata_cons_ptrs,
                 ws_frame_info_prod_holder.get(), &pongs_prod, &msg_outbox_prod,
                 conn_state_);
             if (!ok) { conn_state_->shutdown_all(); return; }
@@ -1365,7 +1365,7 @@ private:
 
         // MktEvent producer — transport → standalone ring (for external consumers)
         std::unique_ptr<IPCRingProducer<websocket::msg::MktEvent>> mkt_event_prod_holder;
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             if (mkt_event_region_) {
                 mkt_event_prod_holder = std::make_unique<IPCRingProducer<websocket::msg::MktEvent>>(
                     *mkt_event_region_);
@@ -1374,15 +1374,20 @@ private:
 
         // InlineTransportType: MsgMetadataProd=NullRingAdapter, LowPrioCons=NullRingAdapter
         // MsgOutboxCons is real (parent sends), WSProcessor=InlineWSCoreType
+        std::array<MsgInbox*, MaxConn> inboxes{};
+        std::array<NullRingAdapter*, MaxConn> null_prods{};
+        for (size_t i = 0; i < MaxConn; ++i) {
+            inboxes[i] = msg_inbox_[i];
+            null_prods[i] = nullptr;
+        }
         InlineTransportType transport(url, umem_area_, FRAME_SIZE,
             &raw_inbox_cons, &raw_outbox_prod,
-            msg_inbox_[0], nullptr, nullptr,
-            conn_state_, &msg_outbox_cons,
-            EnableAB ? msg_inbox_[1] : nullptr, nullptr);
+            inboxes, null_prods, nullptr,
+            conn_state_, &msg_outbox_cons);
         transport.inline_mkt_event_handler() = mkt_event_handler_;
 
         // Wire MktEvent producer and ConnStateShm to mkt_event_handler
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             transport.inline_mkt_event_handler().mkt_event_prod = mkt_event_prod_holder.get();
             transport.inline_mkt_event_handler().conn_state = conn_state_;
         }
@@ -1391,16 +1396,10 @@ private:
         if (!transport.init()) { conn_state_->shutdown_all(); return; }
 
         // Wire WSCore to msg_inbox, ws_frame_info_prod, DirectTXSink
-        if constexpr (EnableAB) {
-            transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_,
-                                  msg_inbox_[0], msg_inbox_[1]);
-        } else {
-            transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_,
-                                  msg_inbox_[0]);
-        }
+        transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_, inboxes);
 
         // Wire active connection pointer for priority ordering
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             transport.set_active_conn_ptr(&transport.inline_mkt_event_handler().active_ci_);
         }
 
@@ -1429,7 +1428,7 @@ private:
 
         // MktEvent producer — transport → standalone ring (for external consumers)
         std::unique_ptr<IPCRingProducer<websocket::msg::MktEvent>> mkt_event_prod_holder;
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             if (mkt_event_region_) {
                 mkt_event_prod_holder = std::make_unique<IPCRingProducer<websocket::msg::MktEvent>>(
                     *mkt_event_region_);
@@ -1437,15 +1436,20 @@ private:
         }
 
         // DirectIOTransportType: PacketIO handles NIC, no raw rings needed
+        std::array<MsgInbox*, MaxConn> inboxes{};
+        std::array<NullRingAdapter*, MaxConn> null_prods{};
+        for (size_t i = 0; i < MaxConn; ++i) {
+            inboxes[i] = msg_inbox_[i];
+            null_prods[i] = nullptr;
+        }
         DirectIOTransportType transport(url, nullptr, 0,
             nullptr, nullptr,  // no raw inbox/outbox
-            msg_inbox_[0], nullptr, nullptr,
-            conn_state_, &msg_outbox_cons,
-            EnableAB ? msg_inbox_[1] : nullptr, nullptr);
+            inboxes, null_prods, nullptr,
+            conn_state_, &msg_outbox_cons);
         transport.inline_mkt_event_handler() = mkt_event_handler_;
 
         // Wire MktEvent producer and ConnStateShm to mkt_event_handler
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             transport.inline_mkt_event_handler().mkt_event_prod = mkt_event_prod_holder.get();
             transport.inline_mkt_event_handler().conn_state = conn_state_;
         }
@@ -1454,16 +1458,10 @@ private:
         if (!transport.init()) { conn_state_->shutdown_all(); return; }
 
         // Wire WSCore to msg_inbox, ws_frame_info_prod, DirectTXSink
-        if constexpr (EnableAB) {
-            transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_,
-                                  msg_inbox_[0], msg_inbox_[1]);
-        } else {
-            transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_,
-                                  msg_inbox_[0]);
-        }
+        transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_, inboxes);
 
         // Wire active connection pointer for priority ordering
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             transport.set_active_conn_ptr(&transport.inline_mkt_event_handler().active_ci_);
         }
 
@@ -1500,6 +1498,7 @@ private:
     std::string probe_iface_;
     double tsc_freq_ghz_ = 0.0;
     uint32_t conn_target_ip_[NUM_CONN]{};
+    uint8_t actual_conn_count_ = 1;
     websocket::net::ProbeResult probe_result_;
 
     IPCRingManager ipc_manager_;

@@ -31,6 +31,7 @@
 // C++20, policy-based design, single-thread HFT focus
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
@@ -155,7 +156,7 @@ struct ReconnectCtx {
 template<typename SSLPolicy,
          typename MsgMetadataProd,
          typename LowPrioCons,
-         bool EnableAB = false,
+         size_t MaxConn = 1,
          bool AutoReconnect = false,
          bool Profiling = false,
          typename WSProcessor = void,
@@ -176,9 +177,9 @@ public:
     using RawOutboxProd = IPCRingProducer<websocket::xdp::PacketFrameDescriptor>;
     using MsgOutboxCons = IPCRingConsumer<MsgOutboxEvent>;
 
-    // Transport type: PacketTransportAB when EnableAB, single PacketTransport otherwise
-    using TransportType = std::conditional_t<EnableAB,
-        websocket::transport::PacketTransportAB<PacketIO>,
+    // Transport type: PacketTransportMulti when MaxConn > 1, single PacketTransport otherwise
+    using TransportType = std::conditional_t<(MaxConn > 1),
+        websocket::transport::PacketTransportMulti<PacketIO, MaxConn>,
         websocket::transport::PacketTransport<PacketIO>>;
 
     // ========================================================================
@@ -190,13 +191,11 @@ public:
                      uint32_t frame_size,
                      RawInboxCons* raw_inbox_cons,
                      RawOutboxProd* raw_outbox_prod,
-                     MsgInbox* msg_inbox,
-                     MsgMetadataProd* msg_metadata_prod,
+                     std::array<MsgInbox*, MaxConn> msg_inboxes,
+                     std::array<MsgMetadataProd*, MaxConn> msg_metadata_prods,
                      LowPrioCons* low_prio_cons,
                      ConnStateShm* conn_state,
-                     MsgOutboxCons* msg_outbox_cons = nullptr,
-                     MsgInbox* msg_inbox_b = nullptr,
-                     MsgMetadataProd* msg_metadata_prod_b = nullptr)
+                     MsgOutboxCons* msg_outbox_cons = nullptr)
         : url_(url)
         , umem_area_(umem_area)
         , frame_size_(frame_size)
@@ -206,11 +205,9 @@ public:
         , conn_state_(conn_state)
         , msg_outbox_cons_(msg_outbox_cons) {
 
-        msg_inbox_[0] = msg_inbox;
-        msg_metadata_prod_[0] = msg_metadata_prod;
-        if constexpr (EnableAB) {
-            msg_inbox_[1] = msg_inbox_b;
-            msg_metadata_prod_[1] = msg_metadata_prod_b;
+        for (size_t i = 0; i < MaxConn; ++i) {
+            msg_inbox_[i] = msg_inboxes[i];
+            msg_metadata_prod_[i] = msg_metadata_prods[i];
         }
 
         parsed_url_ = parse_url(url);
@@ -226,7 +223,7 @@ public:
 
     bool init() {
         printf("[TRANSPORT] Initializing Transport Process%s%s\n",
-               EnableAB ? " (Dual A/B)" : "",
+               (MaxConn > 1) ? " (Multi-conn)" : "",
                AutoReconnect ? " (AutoReconnect)" : "");
         printf("[TRANSPORT] URL: %s\n", url_);
 
@@ -264,7 +261,7 @@ public:
             // Configure BPF/software filter with exchange IPs and port
             // (In non-DirectIO mode, the poll process handles this)
             auto& pio_transport = [&]() -> auto& {
-                if constexpr (EnableAB) return transport_.a;
+                if constexpr (MaxConn > 1) return transport_.conn[0];
                 else return transport_;
             }();
 
@@ -314,15 +311,13 @@ public:
         if constexpr (AutoReconnect) {
             // Non-blocking startup: initiate TCP connect for all connections
             // State machine in run() handles TCP→TLS→TLS_READY→ACTIVE
-            if constexpr (EnableAB) {
+            if constexpr (MaxConn > 1) {
                 // Use per-connection target IPs from parent probe
-                transport_.start_connect_ip(0, ntohl(conn_state_->conn_target_ip[0]), parsed_url_.port);
-                reconn_[0].phase = ConnPhase::TCP_CONNECTING;
-                reconn_[0].phase_start_cycle = rdtsc();
-
-                transport_.start_connect_ip(1, ntohl(conn_state_->conn_target_ip[1]), parsed_url_.port);
-                reconn_[1].phase = ConnPhase::TCP_CONNECTING;
-                reconn_[1].phase_start_cycle = rdtsc();
+                for (size_t ci = 0; ci < MaxConn; ++ci) {
+                    transport_.start_connect_ip(ci, ntohl(conn_state_->conn_target_ip[ci]), parsed_url_.port);
+                    reconn_[ci].phase = ConnPhase::TCP_CONNECTING;
+                    reconn_[ci].phase_start_cycle = rdtsc();
+                }
             } else {
                 transport_.initiate_connect_ip(ntohl(conn_state_->conn_target_ip[0]), parsed_url_.port);
                 reconn_[0].phase = ConnPhase::TCP_CONNECTING;
@@ -330,39 +325,25 @@ public:
             }
         } else {
             // Non-reconnect: blocking TCP + TLS handshake (original path)
-            if constexpr (EnableAB) {
-                transport_.start_connect_ip(0, ntohl(conn_state_->conn_target_ip[0]), parsed_url_.port);
-                // Blocking wait for TCP
-                while (!transport_.handshake_complete(0)) {
-                    transport_.poll();
-                    usleep(100);
-                }
-                transport_.set_connected(0);
+            if constexpr (MaxConn > 1) {
+                for (size_t ci = 0; ci < MaxConn; ++ci) {
+                    transport_.start_connect_ip(ci, ntohl(conn_state_->conn_target_ip[ci]), parsed_url_.port);
+                    // Blocking wait for TCP
+                    while (!transport_.handshake_complete(ci)) {
+                        transport_.poll();
+                        usleep(100);
+                    }
+                    transport_.set_connected(ci);
 
-                if (ssl_[0].init() != 0) return false;
-                if (ssl_[0].handshake_userspace_transport(&transport_.a, parsed_url_.host.c_str()) != 0) return false;
-                websocket::crypto::TLSRecordKeys tls_keys_a;
-                if (ssl_[0].extract_record_keys(tls_keys_a)) {
-                    transport_.a.set_tls_record_keys(tls_keys_a);
+                    if (ssl_[ci].init() != 0) return false;
+                    if (ssl_[ci].handshake_userspace_transport(&transport_.conn[ci], parsed_url_.host.c_str()) != 0) return false;
+                    websocket::crypto::TLSRecordKeys tls_keys;
+                    if (ssl_[ci].extract_record_keys(tls_keys)) {
+                        transport_.conn[ci].set_tls_record_keys(tls_keys);
+                    }
+                    transport_.conn[ci].reset_hw_timestamps();
+                    transport_.conn[ci].reset_recv_stats();
                 }
-                transport_.a.reset_hw_timestamps();
-                transport_.a.reset_recv_stats();
-
-                transport_.start_connect_ip(1, ntohl(conn_state_->conn_target_ip[1]), parsed_url_.port);
-                while (!transport_.handshake_complete(1)) {
-                    transport_.poll();
-                    usleep(100);
-                }
-                transport_.set_connected(1);
-
-                if (ssl_[1].init() != 0) return false;
-                if (ssl_[1].handshake_userspace_transport(&transport_.b, parsed_url_.host.c_str()) != 0) return false;
-                websocket::crypto::TLSRecordKeys tls_keys_b;
-                if (ssl_[1].extract_record_keys(tls_keys_b)) {
-                    transport_.b.set_tls_record_keys(tls_keys_b);
-                }
-                transport_.b.reset_hw_timestamps();
-                transport_.b.reset_recv_stats();
             } else {
                 transport_.initiate_connect_ip(ntohl(conn_state_->conn_target_ip[0]), parsed_url_.port);
                 // Blocking wait for TCP
@@ -392,7 +373,7 @@ public:
 
     void run() {
         printf("[TRANSPORT] Phase 4: Message Streaming%s%s\n",
-               EnableAB ? " (Dual A/B)" : "",
+               (MaxConn > 1) ? " (Multi-conn)" : "",
                AutoReconnect ? " (AutoReconnect)" : "");
 
         running_ = true;
@@ -409,7 +390,7 @@ public:
                 slot = profiling_data_->next_slot();
             }
 
-            if constexpr (EnableAB) {
+            if constexpr (MaxConn > 1) {
                 // ── Dual A/B: Demuxed poll ──
                 // Op 0: Demuxed poll (processes RX for BOTH A and B)
                 profile_op<Profiling>([this]{ return static_cast<int32_t>(transport_.poll()); }, slot, 0);
@@ -427,12 +408,16 @@ public:
             // ── Per-connection state machine dispatch (active connection first) ──
             uint8_t conn_order[NUM_CONN];
             conn_order[0] = 0;
-            if constexpr (EnableAB) {
+            if constexpr (MaxConn > 1) {
                 if (active_conn_ptr_) {
                     uint8_t a = *active_conn_ptr_;
                     if (a < NUM_CONN) conn_order[0] = a;
                 }
-                conn_order[1] = 1 - conn_order[0];
+                // Fill remaining slots with all other connections
+                uint8_t pos = 1;
+                for (uint8_t c = 0; c < NUM_CONN; ++c) {
+                    if (c != conn_order[0]) conn_order[pos++] = c;
+                }
             }
 
             // Prefetch both connections' recv buffer UMEM head frames early.
@@ -440,11 +425,8 @@ public:
             // potentially evicting the head frame data from L2/L3 cache.
             // Issuing prefetches here gives ~1-5us (outbox + ci=0 processing)
             // for the DRAM fetch (~100-200ns) to complete before ssl_read_by_chunk.
-            if constexpr (EnableAB) {
-                get_transport(0).prefetch_recv_head();
-                get_transport(1).prefetch_recv_head();
-            } else {
-                get_transport(0).prefetch_recv_head();
+            for (size_t c = 0; c < NUM_CONN; ++c) {
+                get_transport(c).prefetch_recv_head();
             }
 
             for (uint8_t i = 0; i < NUM_CONN; i++) {
@@ -453,14 +435,19 @@ public:
                     // Check WS-initiated reconnect request
                     if (conn_state_->get_reconnect_request(ci)) {
                         conn_state_->clear_reconnect_request(ci);
-                        if constexpr (EnableAB) {
-                            uint8_t other = 1 - ci;
+                        if constexpr (MaxConn > 1) {
                             struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
                             fprintf(stderr, "[%ld.%06ld] [RECONNECT] WS-watchdog triggered conn %u "
-                                    "(phase=%u, other conn %u phase=%u)\n",
+                                    "(phase=%u)",
                                     _ts.tv_sec, _ts.tv_nsec / 1000, ci,
-                                    static_cast<unsigned>(reconn_[ci].phase), other,
-                                    static_cast<unsigned>(reconn_[other].phase));
+                                    static_cast<unsigned>(reconn_[ci].phase));
+                            for (size_t oc = 0; oc < MaxConn; ++oc) {
+                                if (oc != ci) {
+                                    fprintf(stderr, ", conn %zu phase=%u",
+                                            oc, static_cast<unsigned>(reconn_[oc].phase));
+                                }
+                            }
+                            fprintf(stderr, "\n");
                         }
                         start_reconnect(ci);
                     }
@@ -641,11 +628,11 @@ public:
 
 private:
     // ========================================================================
-    // Transport accessor helper (works for both EnableAB and single)
+    // Transport accessor helper (works for both multi-conn and single)
     // ========================================================================
 
     auto& get_transport(uint8_t ci) {
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             return transport_.transport(ci);
         } else {
             (void)ci;
@@ -702,25 +689,36 @@ private:
         // Pick a different IP from the startup pool (all IPs are already in BPF filter)
         if (conn_state_->exchange_ip_count > 1) {
             uint32_t current_ip = conn_state_->conn_target_ip[ci];
-            uint32_t other_ip = 0;
-            if constexpr (EnableAB) {
-                other_ip = conn_state_->conn_target_ip[1 - ci];
+            // Collect all other connections' IPs to avoid duplicates
+            uint32_t other_ips[MaxConn > 1 ? MaxConn - 1 : 1]{};
+            size_t other_count = 0;
+            if constexpr (MaxConn > 1) {
+                for (size_t oc = 0; oc < MaxConn; ++oc) {
+                    if (oc != ci) {
+                        other_ips[other_count++] = conn_state_->conn_target_ip[oc];
+                    }
+                }
             }
 
-            // Round-robin through the pool, skip current and other connection's IP
+            // Round-robin through the pool, skip current and other connections' IPs
             uint32_t new_ip = current_ip;
             uint8_t count = conn_state_->exchange_ip_count;
             for (uint8_t i = 0; i < count; i++) {
                 uint8_t idx = (reconn_[ci].attempts + i) % count;
                 uint32_t candidate = conn_state_->exchange_ips[idx];
-                if (candidate != current_ip && candidate != other_ip) {
+                if (candidate == current_ip) continue;
+                bool used_by_other = false;
+                for (size_t oi = 0; oi < other_count; ++oi) {
+                    if (candidate == other_ips[oi]) { used_by_other = true; break; }
+                }
+                if (!used_by_other) {
                     new_ip = candidate;
                     break;
                 }
             }
 
             if (new_ip != current_ip) {
-                if constexpr (EnableAB) {
+                if constexpr (MaxConn > 1) {
                     transport_.set_remote_ip(ci, ntohl(new_ip));
                 } else {
                     transport_.set_remote_ip(ntohl(new_ip));
@@ -738,7 +736,7 @@ private:
 
         // Reset and reconnect TCP (uses updated remote IP)
         int rc;
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             rc = transport_.start_reconnect(ci);
         } else {
             transport_.reset_for_reconnect();
@@ -847,9 +845,17 @@ private:
         websocket::crypto::TLSRecordKeys tls_keys;
         if (ssl_[ci].extract_record_keys(tls_keys)) {
             conn.set_tls_record_keys(tls_keys);
-            struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
-            fprintf(stderr, "[%ld.%06ld] [RECONNECT] Direct AES-CTR decrypt enabled for conn %u\n",
-                    _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+            if (tls_keys.is_tls13) {
+                uint64_t seq = ssl_[ci].get_server_record_count();
+                conn.set_tls_seq_num(seq);
+                struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                fprintf(stderr, "[%ld.%06ld] [RECONNECT] Direct AES-CTR: conn %u seq_num=%lu\n",
+                        _ts.tv_sec, _ts.tv_nsec / 1000, ci, seq);
+            } else {
+                struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                fprintf(stderr, "[%ld.%06ld] [RECONNECT] Direct AES-CTR decrypt enabled for conn %u (TLS 1.2)\n",
+                        _ts.tv_sec, _ts.tv_nsec / 1000, ci);
+            }
         }
 
         // Stop trickle thread (if applicable)
@@ -867,7 +873,7 @@ private:
     void start_reconnect_from_tcp(uint8_t ci) {
         ssl_[ci].shutdown();
         int rc;
-        if constexpr (EnableAB) {
+        if constexpr (MaxConn > 1) {
             rc = transport_.start_reconnect(ci);
         } else {
             transport_.reset_for_reconnect();
@@ -991,13 +997,11 @@ private:
             last_valid_ssl_end_cycle_ = timing.recv_end_cycle;
 
             timing.hw_timestamp_count = conn.get_recv_packet_count();
-            if (timing.hw_timestamp_count > 0) {
-                timing.hw_timestamp_oldest_ns = conn.get_recv_oldest_timestamp();
-                timing.hw_timestamp_latest_ns = conn.get_recv_latest_timestamp();
-            } else {
-                timing.hw_timestamp_oldest_ns = 0;
-                timing.hw_timestamp_latest_ns = 0;
-            }
+            // Always read timestamps unconditionally — partially-consumed frames
+            // (offset > 0) report valid timestamps but don't increment packet_count.
+            // Gating on packet_count > 0 would discard those valid timestamps.
+            timing.hw_timestamp_oldest_ns = conn.get_recv_oldest_timestamp();
+            timing.hw_timestamp_latest_ns = conn.get_recv_latest_timestamp();
             timing.bpf_entry_oldest_ns = conn.get_recv_oldest_bpf_entry_ns();
             timing.bpf_entry_latest_ns = conn.get_recv_latest_bpf_entry_ns();
             timing.poll_cycle_oldest = conn.get_recv_oldest_poll_cycle();
@@ -1056,13 +1060,9 @@ private:
             last_valid_ssl_end_cycle_ = timing.recv_end_cycle;
 
             timing.hw_timestamp_count = conn.get_recv_packet_count();
-            if (timing.hw_timestamp_count > 0) {
-                timing.hw_timestamp_oldest_ns = conn.get_recv_oldest_timestamp();
-                timing.hw_timestamp_latest_ns = conn.get_recv_latest_timestamp();
-            } else {
-                timing.hw_timestamp_oldest_ns = 0;
-                timing.hw_timestamp_latest_ns = 0;
-            }
+            // Always read timestamps unconditionally — see process_ssl_read_for_conn() comment
+            timing.hw_timestamp_oldest_ns = conn.get_recv_oldest_timestamp();
+            timing.hw_timestamp_latest_ns = conn.get_recv_latest_timestamp();
             timing.bpf_entry_oldest_ns = conn.get_recv_oldest_bpf_entry_ns();
             timing.bpf_entry_latest_ns = conn.get_recv_latest_bpf_entry_ns();
             timing.poll_cycle_oldest = conn.get_recv_oldest_poll_cycle();
@@ -1090,7 +1090,7 @@ private:
             [&](PongFrameAligned& pong, int64_t /*seq*/, bool /*eob*/) -> bool {
                 if (pong.data_len == 0) return true;  // skip empty, commit
 
-                uint8_t ci = EnableAB ? pong.connection_id : 0;
+                uint8_t ci = (MaxConn > 1) ? pong.connection_id : 0;
 
                 if constexpr (AutoReconnect) {
                     if (reconn_[ci].phase != ConnPhase::ACTIVE &&
@@ -1133,7 +1133,7 @@ private:
             [&](MsgOutboxEvent& evt, int64_t /*seq*/, bool /*eob*/) -> bool {
                 if (evt.data_len == 0) return true;  // skip empty, commit
 
-                uint8_t ci = EnableAB ? evt.connection_id : 0;
+                uint8_t ci = (MaxConn > 1) ? evt.connection_id : 0;
 
                 if constexpr (AutoReconnect) {
                     if (reconn_[ci].phase != ConnPhase::ACTIVE &&
@@ -1192,7 +1192,7 @@ private:
     RawOutboxProd* raw_outbox_prod_ = nullptr;
 
     // IPC interfaces
-    static constexpr size_t NUM_CONN = EnableAB ? 2 : 1;
+    static constexpr size_t NUM_CONN = MaxConn;
     MsgInbox* msg_inbox_[NUM_CONN]{};
     MsgMetadataProd* msg_metadata_prod_[NUM_CONN]{};
     LowPrioCons* low_prio_cons_ = nullptr;
@@ -1238,7 +1238,7 @@ private:
 
     struct InlineWSState {
         WSProcessor ws_core;
-        DirectTXSink<SSLPolicy, EnableAB> tx_sink;
+        DirectTXSink<SSLPolicy, MaxConn> tx_sink;
     };
     struct EmptyState {};
     [[no_unique_address]] std::conditional_t<InlineWS, InlineWSState, EmptyState> inline_ws_{};
@@ -1251,17 +1251,11 @@ public:
     template<typename WSFrameInfoProd>
     void init_inline(WSFrameInfoProd* ws_frame_info_prod,
                      ConnStateShm* conn_state,
-                     MsgInbox* msg_inbox_a,
-                     MsgInbox* msg_inbox_b = nullptr) {
+                     std::array<MsgInbox*, MaxConn> msg_inboxes) {
         static_assert(InlineWS, "init_inline() only valid when WSProcessor != void");
         inline_ws_.tx_sink.ssl_ = ssl_;
-        if constexpr (EnableAB) {
-            inline_ws_.ws_core.init(msg_inbox_a, ws_frame_info_prod,
-                                    &inline_ws_.tx_sink, conn_state, msg_inbox_b);
-        } else {
-            inline_ws_.ws_core.init(msg_inbox_a, ws_frame_info_prod,
-                                    &inline_ws_.tx_sink, conn_state);
-        }
+        inline_ws_.ws_core.init(msg_inboxes, ws_frame_info_prod,
+                                &inline_ws_.tx_sink, conn_state);
 #ifdef USE_DPDK
         inline_ws_.ws_core.set_transport_mode(static_cast<uint8_t>(TransportMode::DPDK_DISRUPTOR));
 #else

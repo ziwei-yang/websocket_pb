@@ -11,7 +11,7 @@
 //
 // Usage: sudo ./test_pipeline_263_binance_sbe_dpdk_packetio_inline_ws <interface> [--timeout <ms>]
 //
-// Build: ENABLE_RECONNECT=1 ENABLE_AB=1 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 263_binance_sbe_dpdk_packetio_inline_ws.cpp
+// Build: ENABLE_RECONNECT=1 MAX_CONN=2 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 263_binance_sbe_dpdk_packetio_inline_ws.cpp
 
 #include <cstdio>
 #include <cstdlib>
@@ -38,12 +38,11 @@
 // Must be captured and #undef'd BEFORE including websocket_pipeline.hpp
 // ============================================================================
 
-#ifdef ENABLE_AB
-static constexpr bool AB_ENABLED = true;
+#ifdef MAX_CONN
+static constexpr size_t CONN_COUNT = MAX_CONN;
 #else
-static constexpr bool AB_ENABLED = false;
+static constexpr size_t CONN_COUNT = 1;
 #endif
-#undef ENABLE_AB
 
 // ENABLE_RECONNECT is required for InlineWS — always force true
 #ifdef ENABLE_RECONNECT
@@ -101,7 +100,7 @@ struct BinanceSBETraits : DefaultPipelineConfig {
     static constexpr int TRANSPORT_CORE  = 4;
     static constexpr int WEBSOCKET_CORE  = 4;   // unused (InlineWS)
 
-    static constexpr bool ENABLE_AB      = AB_ENABLED;
+    static constexpr size_t MAX_CONN     = CONN_COUNT;
     static constexpr bool AUTO_RECONNECT = true;   // required for InlineWS
     static constexpr bool PROFILING      = true;
     static constexpr bool INLINE_WS      = true;   // key toggle
@@ -225,7 +224,7 @@ int main(int argc, char* argv[]) {
     printf("  Mode:       DirectIO + InlineWS (single child process)\n");
     printf("  Processes:  1 child (Transport+NIC+WS)\n");
     printf("  API Key:    %s\n", (api_key && api_key[0]) ? "set" : "NOT SET");
-    printf("  Dual A/B:   %s\n", AB_ENABLED ? "yes" : "no");
+    printf("  Connections: %zu\n", CONN_COUNT);
     printf("  Reconnect:  yes (required)\n");
     if (run_forever) {
         printf("  Timeout:    FOREVER (Ctrl+C to stop)\n");
@@ -265,7 +264,7 @@ int main(int argc, char* argv[]) {
     // Main loop — consume WSFrameInfo + MktEvent from disruptor rings
     // ========================================================================
 
-    constexpr size_t NUM_CONN = AB_ENABLED ? 2 : 1;
+    constexpr size_t NUM_CONN = CONN_COUNT;
 
     // Create consumer for WS_FRAME_INFO ring
     IPCRingConsumer<WSFrameInfo> ws_frame_cons(*pipeline.ws_frame_info_region());
@@ -282,6 +281,13 @@ int main(int argc, char* argv[]) {
     uint64_t text_frames = 0;
     uint64_t binary_frames = 0;
     uint64_t sbe_decode_errors = 0;
+
+    // MktEvent monotonic sequence check (per-type to avoid BBO/OB false positives)
+    int64_t mkt_trade_seq = 0;
+    int64_t mkt_bbo_seq = 0;
+    int64_t mkt_ob_seq = 0;  // depth snapshot + delta
+    uint64_t mkt_dup_count = 0;
+    uint64_t mkt_event_count = 0;
 
     printf("\n--- SBE DirectIO Stream Test (%s) ---\n",
            run_forever ? "FOREVER MODE - Ctrl+C to stop" :
@@ -345,6 +351,21 @@ int main(int argc, char* argv[]) {
                         fprintf(stderr, "[%ld.%06ld] [STATUS] %s conn=%u %s\n",
                                 ts.tv_sec, ts.tv_nsec / 1000, type_str, st.connection_id, st.message);
                     } else {
+                        mkt_event_count++;
+                        // Per-type monotonic sequence check
+                        if (mkt.src_seq > 0) {
+                            int64_t* seq_p = mkt.is_trade_array() ? &mkt_trade_seq
+                                           : mkt.is_bbo_array()   ? &mkt_bbo_seq
+                                                                   : &mkt_ob_seq;
+                            if (mkt.src_seq <= *seq_p) {
+                                mkt_dup_count++;
+                                fprintf(stderr, "\033[91m[DUP] %s seq %ld <= %ld (dup #%lu)\033[0m\n",
+                                        mkt.is_trade_array() ? "TRADE" :
+                                        mkt.is_bbo_array()   ? "BBO" : "BOOK",
+                                        mkt.src_seq, *seq_p, mkt_dup_count);
+                            }
+                            *seq_p = std::max(*seq_p, mkt.src_seq);
+                        }
                         mkt.print();
                     }
                 }
@@ -404,6 +425,14 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "[%ld.%06ld] [STATUS] %s conn=%u %s\n",
                         ts.tv_sec, ts.tv_nsec / 1000, type_str, st.connection_id, st.message);
             } else {
+                mkt_event_count++;
+                if (mkt.src_seq > 0) {
+                    int64_t* seq_p = mkt.is_trade_array() ? &mkt_trade_seq
+                                   : mkt.is_bbo_array()   ? &mkt_bbo_seq
+                                                           : &mkt_ob_seq;
+                    if (mkt.src_seq <= *seq_p) mkt_dup_count++;
+                    *seq_p = std::max(*seq_p, mkt.src_seq);
+                }
                 mkt.print();
             }
         }
@@ -442,6 +471,9 @@ int main(int argc, char* argv[]) {
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Binary (SBE):    %lu\n", binary_frames);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Text (JSON):     %lu\n", text_frames);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  SBE errors:      %lu\n", sbe_decode_errors);
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  MktEvents:       %lu\n", mkt_event_count);
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  MktEvent dups:   %lu%s\n", mkt_dup_count,
+           mkt_dup_count > 0 ? " *** DUPLICATES DETECTED ***" : " (clean)");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "\n--- Ring Buffer Status (DirectIO) ---\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  WS_FRAME_INFO producer: %ld, consumer: %ld (%s)\n",
            ws_frame_prod, ws_frame_cons_seq, (ws_frame_cons_seq >= ws_frame_prod) ? "ok" : "BEHIND");
@@ -483,8 +515,8 @@ int main(int argc, char* argv[]) {
 #else  // !USE_DPDK
 
 int main() {
-    fprintf(stderr, "Error: Build with USE_DPDK=1 USE_WOLFSSL=1 ENABLE_AB=1 ENABLE_RECONNECT=1\n");
-    fprintf(stderr, "Example: ENABLE_RECONNECT=1 ENABLE_AB=1 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 263_binance_sbe_dpdk_packetio_inline_ws.cpp\n");
+    fprintf(stderr, "Error: Build with USE_DPDK=1 USE_WOLFSSL=1 MAX_CONN=2 ENABLE_RECONNECT=1\n");
+    fprintf(stderr, "Example: ENABLE_RECONNECT=1 MAX_CONN=2 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 263_binance_sbe_dpdk_packetio_inline_ws.cpp\n");
     return 1;
 }
 

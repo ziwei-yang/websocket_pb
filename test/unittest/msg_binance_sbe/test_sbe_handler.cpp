@@ -1530,6 +1530,483 @@ void test_cross_type_flush_trades_then_depth() {
 }
 
 // ============================================================================
+// Test 35: Fragment stale trade — first entry dedup (core bug repro)
+// ============================================================================
+
+void test_fragment_stale_trade_first_entry_dedup() {
+    TestHarness h;
+
+    // Feed 100 fresh trades (ids 1000-1099) → sets last_trade_id_ = 1099
+    TradeSet ts_fresh(1000, 100);
+    h.feed_frame(0, ts_fresh.build(1000000));
+    h.idle();
+    assert(h.handler.last_trade_id_ == 1099);
+
+    // Build identical stale message (ids 1000-1099), ~2500+ bytes
+    TradeSet ts_stale(1000, 100);
+    auto b = ts_stale.build(2000000, 2000001);
+    // 8 (SBE header) + 18 (root block) + 6 (group header) + 100*25 = 2532 bytes
+    assert(b.size() >= 2500);
+
+    // Feed as fragment: only first 1400 bytes — enters TRADES_HEADER
+    // since len < entries_end, state.sequence stays 0 (can't read last entry)
+    SBEParseState state{};
+    WSFrameInfo info{};
+    info.clear();
+    h.handler.on_ws_data(state, 1, b.data(), 1400, info);
+
+    // The fallback check should fire: first_tid=1000 <= 1099 → discard
+    assert(info.is_discard_early() == true);
+    assert(info.mkt_event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY));
+    assert(info.exchange_event_time_us == 2000000);
+}
+
+// ============================================================================
+// Test 36: Fragment fresh trade — not falsely discarded
+// ============================================================================
+
+void test_fragment_fresh_trade_not_falsely_discarded() {
+    TestHarness h;
+
+    // Feed 5 fresh trades (ids 100-104) → sets last_trade_id_ = 104
+    TradeSet ts1(100, 5);
+    h.feed_frame(0, ts1.build(1000000));
+    h.idle();
+    assert(h.handler.last_trade_id_ == 104);
+
+    // Build NEW trades (ids 200-299), ~2500+ bytes
+    TradeSet ts_new(200, 100);
+    auto b = ts_new.build(2000000, 2000001);
+    assert(b.size() >= 2500);
+
+    // Feed as fragment: only first 1400 bytes
+    SBEParseState state{};
+    WSFrameInfo info{};
+    info.clear();
+    h.handler.on_ws_data(state, 1, b.data(), 1400, info);
+
+    // first_tid=200 > 104 → should NOT discard
+    assert(info.is_discard_early() == false);
+    assert(info.mkt_event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY));
+
+    // Feed full data → trades should parse
+    info.clear();
+    h.handler.on_ws_data(state, 1, b.data(), static_cast<uint32_t>(b.size()), info);
+
+    assert(state.phase == SBEParseState::TRADES_ENTRIES ||
+           state.phase == SBEParseState::DONE);
+    // Not discarded
+    assert(info.is_discard_early() == false);
+}
+
+// ============================================================================
+// Test 37: Fragment stale trade — multi-connection dedup
+// ============================================================================
+
+void test_fragment_stale_trade_multi_conn() {
+    TestHarness h;
+
+    // Feed 50 fresh trades (ids 500-549) from conn 0
+    TradeSet ts(500, 50);
+    h.feed_frame(0, ts.build(1000000));
+    h.idle();
+    assert(h.handler.last_trade_id_ == 549);
+
+    auto events_before = h.published();
+
+    // Feed identical message from conn 1 as fragment (partial)
+    auto b = ts.build(1000000, 1000001);
+    SBEParseState state1{};
+    WSFrameInfo info1{};
+    info1.clear();
+    h.handler.on_ws_data(state1, 1, b.data(), 1400, info1);
+    assert(info1.is_discard_early() == true);
+
+    // Feed identical message from conn 2 as full frame via feed_frame
+    h.feed_frame(2, ts.build(1000000));
+    h.idle();
+
+    auto events_after = h.published();
+    // The full-frame feed from conn 2 should also be discarded (existing stale check)
+    // No new trade events should appear beyond what conn 0 published
+    assert(events_after.size() == events_before.size());
+}
+
+// ============================================================================
+// Test 38: Fragment stale trade — merge mode with pending buffer
+// ============================================================================
+
+void test_fragment_stale_trade_merge_mode() {
+    TestHarness h;
+    // merge is enabled by default in TestHarness
+
+    // Feed 50 trades from conn 0 (enters pending buffer, NOT flushed yet)
+    TradeSet ts(500, 50);
+    h.feed_frame(0, ts.build(1000000));
+    // DO NOT idle() — trades stay in pending buffer
+    assert(h.handler.has_pending_trades_ == true);
+    assert(h.handler.pending_trades_max_id_ == 549);
+
+    // Feed same trades from conn 1 as fragment
+    auto b = ts.build(1000000, 1000001);
+    SBEParseState state1{};
+    WSFrameInfo info1{};
+    info1.clear();
+    h.handler.on_ws_data(state1, 1, b.data(), 1400, info1);
+
+    // eff_tid = max(last_trade_id_=0, pending_trades_max_id_=549) = 549
+    // first_tid = 500 <= 549 → discard
+    assert(info1.is_discard_early() == true);
+
+    // Now flush
+    h.idle();
+
+    // Published events should contain only conn 0's trades
+    auto events = h.published();
+    assert(!events.empty());
+    for (auto& ev : events) {
+        if (ev.is_trade_array()) {
+            for (uint8_t i = 0; i < ev.count; i++)
+                assert(ev.payload.trades.entries[i].trade_id >= 500 &&
+                       ev.payload.trades.entries[i].trade_id <= 549);
+        }
+    }
+}
+
+// ============================================================================
+// Test 39: Full message stale — first_tid catches race with partial eff_tid
+//
+// Scenario: conn A processes a 56-trade fragment, inner-flushes set
+// last_trade_id_ to a PARTIAL max (e.g., entry 43's id). Conn B then
+// receives the FULL message — state.sequence (last entry) barely exceeds
+// eff_tid, but first_tid is well below it. The first-entry check catches
+// this even when state.sequence > 0.
+// ============================================================================
+
+void test_full_message_stale_via_first_entry() {
+    TestHarness h;
+
+    // Build a 56-trade message: ids 1000-1055
+    TradeSet ts(1000, 56);
+    auto b = ts.build(1000000, 1000001);
+    // 8 + 18 + 6 + 56*25 = 1432 bytes total
+
+    // Simulate conn 0 processing only 44 entries (partial fragment)
+    // This means 4 inner flushes (11 each), last_trade_id_ = max of 44th entry
+    // Feed as fragment: give enough bytes for header + 44 entries
+    uint32_t partial_len = 8 + 18 + 6 + 44 * 25;  // 1132 bytes
+    assert(partial_len < b.size());
+
+    SBEParseState state0{};
+    WSFrameInfo info0{};
+    info0.clear();
+    h.handler.on_ws_data(state0, 0, b.data(), partial_len, info0);
+
+    // state0.sequence should be 0 (can't read last of 56 entries in 44-entry fragment)
+    // Inner flushes occur at entry 11 (flush 0-10), 22 (flush 11-21), 33 (flush 22-32)
+    // pending_trades_max_id_ updated BEFORE flush, so:
+    //   flush at entry 11: last_trade_id_ = 1011
+    //   flush at entry 22: last_trade_id_ = 1022
+    //   flush at entry 33: last_trade_id_ = 1033
+    // Entries 33-43 remain in pending buffer (unflushed, count=11)
+    assert(h.handler.last_trade_id_ == 1033);
+    assert(h.handler.pending_trades_max_id_ == 1043);
+    assert(state0.group_published == 44);
+
+    // Now conn 1 gets the FULL message
+    // state.sequence = 1055 (last entry)
+    // eff_tid = max(last_trade_id_=1033, pending_trades_max_id_=1043) = 1043
+    // Without first_tid check: 1055 > 1043 → passes stale check → DUP!
+    // With first_tid check: first_tid=1000 <= 1043 → DISCARD ✓
+    SBEParseState state1{};
+    WSFrameInfo info1{};
+    info1.clear();
+    h.handler.on_ws_data(state1, 1, b.data(), static_cast<uint32_t>(b.size()), info1);
+
+    assert(info1.is_discard_early() == true);
+    assert(info1.mkt_event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY));
+}
+
+// ============================================================================
+// Test 40: Cross-connection merge flush prevents mixed batches
+// ============================================================================
+
+void test_cross_conn_merge_flush_before_mix() {
+    TestHarness h;
+    h.handler.merge_enabled = true;
+
+    // Conn 0 feeds 10 trades (ids 100-109)
+    TradeSet ts0(100, 10);
+    auto b0 = ts0.build(1000000, 1000001);
+    h.feed_frame(0, b0);
+    // Pending buffer now has 10 entries from conn 0, not yet flushed
+
+    // Conn 1 feeds 10 trades (ids 200-209) — different connection
+    TradeSet ts1(200, 10);
+    auto b1 = ts1.build(1000000, 1000001);
+    h.feed_frame(1, b1);
+    // Cross-conn flush should have flushed conn 0's pending before adding conn 1's
+
+    // Flush remaining
+    h.idle();
+
+    auto events = h.published();
+
+    // Should have 2 separate TRADE_ARRAY events (not mixed)
+    int trade_count = 0;
+    int64_t prev_seq = 0;
+    for (auto& ev : events) {
+        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
+            assert(ev.src_seq > prev_seq);
+            prev_seq = ev.src_seq;
+            trade_count++;
+        }
+    }
+    assert(trade_count == 2);
+
+    // First event should be conn 0's trades (src_seq = 109)
+    // Second event should be conn 1's trades (src_seq = 209)
+    bool found_109 = false, found_209 = false;
+    for (auto& ev : events) {
+        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
+            if (ev.src_seq == 109) found_109 = true;
+            if (ev.src_seq == 209) found_209 = true;
+        }
+    }
+    assert(found_109);
+    assert(found_209);
+}
+
+// ============================================================================
+// Test 41: Fragment interleave — stale resumption discarded (merge mode)
+// ============================================================================
+
+void test_fragment_interleave_stale_resumption() {
+    TestHarness h;
+    h.handler.merge_enabled = true;
+
+    // Conn 0: large fragmented trade message (ids 1000-1104, 105 entries)
+    TradeSet ts0(1000, 105);
+    auto b0 = ts0.build(1000000, 1000001);
+    // Fragment 1: enough bytes for header + 56 entries
+    // header=8, block=18, group_header=6, 56*25=1400  →  1432 bytes
+    uint32_t frag1_len = 8 + 18 + 6 + 56 * 25;
+    assert(frag1_len < b0.size());
+
+    SBEParseState state0{};
+    WSFrameInfo info0{};
+    info0.clear();
+    h.handler.on_ws_data(state0, 0, b0.data(), frag1_len, info0);
+    // state0 is mid-fragment: group_published=56 (or less due to inner flushes)
+    assert(state0.group_published > 0);
+    assert(state0.group_published < 105);
+
+    // Simulate batch boundary — flushes partial trades from conn 0
+    h.idle();
+
+    // Record last_trade_id_ after conn 0's partial flush
+    int64_t ltid_after_conn0 = h.handler.last_trade_id_;
+    assert(ltid_after_conn0 > 0);
+
+    // Conn 1: different, NEWER trade message (ids 1200-1249, 50 entries)
+    TradeSet ts1(1200, 50);
+    auto b1 = ts1.build(1000000, 1000001);
+    h.feed_frame(1, b1);
+    h.idle();
+
+    // last_trade_id_ should now be 1249 (conn 1's max)
+    assert(h.handler.last_trade_id_ == 1249);
+
+    // Conn 0: fragment 2 — feed remaining data
+    WSFrameInfo info0b{};
+    info0b.clear();
+    h.handler.on_ws_data(state0, 0, b0.data(), static_cast<uint32_t>(b0.size()), info0b);
+
+    // Fragment resumption stale check: next_tid (1056) <= last_trade_id_ (1249) → discard
+    assert(info0b.is_discard_early() == true);
+
+    // Verify all published src_seqs are monotonic
+    auto events = h.published();
+    int64_t prev_seq = 0;
+    for (auto& ev : events) {
+        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
+            assert(ev.src_seq > prev_seq);
+            prev_seq = ev.src_seq;
+        }
+    }
+}
+
+// ============================================================================
+// Test 42: Fragment interleave — stale resumption discarded (non-merge mode)
+// ============================================================================
+
+void test_fragment_interleave_non_merge() {
+    TestHarness h;
+    h.handler.merge_enabled = false;
+
+    // Conn 0: large fragmented trade message (ids 1000-1104, 105 entries)
+    TradeSet ts0(1000, 105);
+    auto b0 = ts0.build(1000000, 1000001);
+    uint32_t frag1_len = 8 + 18 + 6 + 56 * 25;  // header + 56 entries
+
+    SBEParseState state0{};
+    WSFrameInfo info0{};
+    info0.clear();
+    h.handler.on_ws_data(state0, 0, b0.data(), frag1_len, info0);
+    // Non-merge publishes immediately — 56 entries published in batches of MAX_TRADES
+    assert(state0.group_published == 56);
+
+    // Conn 1: newer trades (ids 1200-1249)
+    TradeSet ts1(1200, 50);
+    auto b1 = ts1.build(1000000, 1000001);
+    h.feed_frame(1, b1);
+
+    // last_trade_id_ should now be 1249
+    assert(h.handler.last_trade_id_ == 1249);
+
+    // Conn 0: fragment 2 — remaining entries (ids 1056-1104)
+    WSFrameInfo info0b{};
+    info0b.clear();
+    h.handler.on_ws_data(state0, 0, b0.data(), static_cast<uint32_t>(b0.size()), info0b);
+
+    // Fragment resumption stale check: next_tid (1056) <= 1249 → discard
+    assert(info0b.is_discard_early() == true);
+
+    // Verify monotonic src_seq across all published events
+    auto events = h.published();
+    int64_t prev_seq = 0;
+    for (auto& ev : events) {
+        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
+            assert(ev.src_seq > prev_seq);
+            prev_seq = ev.src_seq;
+        }
+    }
+}
+
+// ============================================================================
+// Test 43: Cross-connection pending attribution is correct
+// ============================================================================
+
+void test_cross_conn_pending_ci_attribution() {
+    TestHarness h;
+    h.handler.merge_enabled = true;
+
+    // Conn 0 feeds 5 trades (ids 100-104)
+    TradeSet ts0(100, 5);
+    auto b0 = ts0.build(1000000, 1000001);
+    h.feed_frame(0, b0);
+    // Pending buffer has 5 entries from conn 0
+
+    assert(h.handler.has_pending_trades_ == true);
+    assert(h.handler.pending_trades_ci_ == 0);
+
+    // Conn 2 feeds 5 trades (ids 200-204) — different connection
+    TradeSet ts2(200, 5);
+    auto b2 = ts2.build(1000000, 1000001);
+    h.feed_frame(2, b2);
+
+    // After cross-conn flush: conn 0's trades published, then conn 2's pending
+    // pending_trades_ci_ should now be 2
+    assert(h.handler.pending_trades_ci_ == 2);
+
+    // Flush remaining
+    h.idle();
+
+    auto events = h.published();
+    int trade_count = 0;
+    for (auto& ev : events) {
+        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY))
+            trade_count++;
+    }
+    // Two separate batches
+    assert(trade_count == 2);
+}
+
+// ============================================================================
+// Test 44: Header-only fragment (zero entries parsed) — stale on resumption
+// ============================================================================
+
+void test_header_only_fragment_stale_on_resume() {
+    TestHarness h;
+    h.handler.merge_enabled = true;
+
+    // Build a single-trade message (id 5000)
+    TradeSet ts(5000, 1);
+    auto b = ts.build(1000000, 1000001);
+    // SBE: header=8, root_block=18, group_header=6, 1*25=25 → total 57 bytes
+
+    // Fragment 1: only give enough for header + group header (no entries)
+    // 8 (SBE header) + 18 (root block) + 6 (group header) = 32 bytes
+    uint32_t hdr_only_len = 32;
+    assert(hdr_only_len < b.size());
+
+    SBEParseState state0{};
+    WSFrameInfo info0{};
+    info0.clear();
+    h.handler.on_ws_data(state0, 0, b.data(), hdr_only_len, info0);
+    // Header parsed, group header parsed, but no entry data available
+    // state.sequence = 0 (can't read last entry)
+    // state.phase should be TRADES_ENTRIES (entered entry loop but broke immediately)
+    assert(state0.group_count == 1);
+    assert(state0.group_published == 0);
+    assert(info0.is_discard_early() == false);  // stale checks couldn't read any tid
+
+    // Advance last_trade_id_ via conn 1 with newer trades
+    TradeSet ts1(6000, 10);
+    auto b1 = ts1.build(1000000, 1000001);
+    h.feed_frame(1, b1);
+    h.idle();
+    assert(h.handler.last_trade_id_ == 6009);
+
+    // Fragment 2: conn 0 resumes with full data
+    WSFrameInfo info0b{};
+    info0b.clear();
+    h.handler.on_ws_data(state0, 0, b.data(), static_cast<uint32_t>(b.size()), info0b);
+
+    // Stale re-check: next_tid (5000) <= last_trade_id_ (6009) → DISCARD
+    assert(info0b.is_discard_early() == true);
+
+    // Verify no non-monotonic published events
+    auto events = h.published();
+    int64_t prev_seq = 0;
+    for (auto& ev : events) {
+        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
+            assert(ev.src_seq > prev_seq);
+            prev_seq = ev.src_seq;
+        }
+    }
+}
+
+// ============================================================================
+// Test 45: pending_trades_max_id_ monotonic (never decreases)
+// ============================================================================
+
+void test_pending_max_id_monotonic() {
+    TestHarness h;
+    h.handler.merge_enabled = true;
+
+    // Conn 0: newer trades (ids 500-509)
+    TradeSet ts0(500, 10);
+    auto b0 = ts0.build(1000000, 1000001);
+    h.feed_frame(0, b0);
+    // pending_trades_max_id_ = 509
+    assert(h.handler.pending_trades_max_id_ >= 509);
+
+    // Conn 0: older trades from same connection (ids 100-109, same batch)
+    // These should be caught by stale check (first_tid 100 <= eff_tid 509)
+    TradeSet ts1(100, 10);
+    auto b1 = ts1.build(1000000, 1000001);
+    h.feed_frame(0, b1);
+
+    // pending_trades_max_id_ should NOT decrease
+    assert(h.handler.pending_trades_max_id_ >= 509);
+
+    h.idle();
+    // last_trade_id_ should be at least 509
+    assert(h.handler.last_trade_id_ >= 509);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -1644,6 +2121,41 @@ int main() {
     cleanup_ring_files();
 
     RUN_TEST(test_cross_type_flush_trades_then_depth);
+    cleanup_ring_files();
+
+    std::printf("\n--- Fragment trade dedup ---\n");
+    RUN_TEST(test_fragment_stale_trade_first_entry_dedup);
+    cleanup_ring_files();
+
+    RUN_TEST(test_fragment_fresh_trade_not_falsely_discarded);
+    cleanup_ring_files();
+
+    RUN_TEST(test_fragment_stale_trade_multi_conn);
+    cleanup_ring_files();
+
+    RUN_TEST(test_fragment_stale_trade_merge_mode);
+    cleanup_ring_files();
+
+    RUN_TEST(test_full_message_stale_via_first_entry);
+    cleanup_ring_files();
+
+    std::printf("\n--- Cross-connection monotonic ordering ---\n");
+    RUN_TEST(test_cross_conn_merge_flush_before_mix);
+    cleanup_ring_files();
+
+    RUN_TEST(test_fragment_interleave_stale_resumption);
+    cleanup_ring_files();
+
+    RUN_TEST(test_fragment_interleave_non_merge);
+    cleanup_ring_files();
+
+    RUN_TEST(test_cross_conn_pending_ci_attribution);
+    cleanup_ring_files();
+
+    RUN_TEST(test_header_only_fragment_stale_on_resume);
+    cleanup_ring_files();
+
+    RUN_TEST(test_pending_max_id_monotonic);
     cleanup_ring_files();
 
     std::printf("\n=== %d/%d tests passed ===\n", tests_passed, tests_total);

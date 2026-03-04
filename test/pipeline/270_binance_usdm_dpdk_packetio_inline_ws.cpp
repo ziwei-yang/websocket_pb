@@ -1,19 +1,21 @@
-// test/pipeline/261_binance_sbe_xdp_inline_ws.cpp
-// XDP Binance SBE Test - InlineWS mode (transport + WS in single process)
+// test/pipeline/270_binance_usdm_dpdk_packetio_inline_ws.cpp
+// DPDK Direct PacketIO Binance USD-M Futures JSON Test - Single child process (no poll process)
 //
-// Uses WebSocketPipeline launcher with INLINE_WS=true.
-// Transport embeds WSCore directly — no IPC rings between transport and WS,
-// no separate WS process fork. 2 processes total (XDP Poll + Transport+WS).
+// Uses WebSocketPipeline launcher with INLINE_WS=true and PacketIOType=DPDKPacketIO.
+// Transport handles NIC I/O (DPDK PMD) + TCP + SSL + WS parse directly — no IPC
+// ring hop between a poll process and transport. 1 child process total.
 //
 // Architecture:
-//   - XDP Poll Process (core 2): AF_XDP → RAW_INBOX ring
-//   - InlineWS Transport Process (core 4): recv → decrypt → WS parse → WSFrameInfo ring
-//   - Parent Process: consume WSFrameInfo ring, SBE decode + print_timeline
+//   - DirectIO Transport Process (core 4): DPDK PMD → recv → decrypt → WS parse → WSFrameInfo ring
+//   - Parent Process: consume WSFrameInfo + MktEvent rings, yyjson decode + print_timeline
 //
-// Usage: ./test_pipeline_261_binance_sbe_xdp_inline_ws <interface> <bpf_path> [--timeout <ms>]
-// (Called by scripts/build_xdp.sh 261_binance_sbe_xdp_inline_ws.cpp)
+// Streams: btcusdt@aggTrade/btcusdt@depth20/btcusdt@depth@100ms/btcusdt@depth@250ms
+// Public endpoint — no API key required.
 //
-// Build: make build-test-pipeline-binance_sbe_xdp_inline_ws XDP_INTERFACE=enp108s0 USE_WOLFSSL=1 MAX_CONN=2 ENABLE_RECONNECT=1
+// Usage: sudo ./test_pipeline_270_binance_usdm_dpdk_packetio_inline_ws <interface> [--timeout <ms>]
+//
+// Build: ENABLE_RECONNECT=1 MAX_CONN=2 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 270_binance_usdm_dpdk_packetio_inline_ws.cpp
+// Link: requires yyjson.o
 
 #include <cstdio>
 #include <cstdlib>
@@ -30,7 +32,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#ifdef USE_XDP
+#ifdef USE_DPDK
 
 #define DEBUG 0
 #define DEBUG_IPC 0
@@ -56,12 +58,11 @@ static constexpr bool RECONNECT_ENABLED = true;  // InlineWS requires AUTO_RECON
 
 #include "../../src/pipeline/websocket_pipeline.hpp"
 #include "../../src/policy/ssl.hpp"
-#include "../../src/msg/00_binance_spot_sbe.hpp"
+#include "../../src/msg/02_binance_usdm_yyjson.hpp"
 #include "../../src/msg/mkt_event.hpp"
 
 using namespace websocket::pipeline;
 using namespace websocket::ssl;
-namespace sbe = websocket::sbe;
 
 // Select SSL policy based on compile-time flags
 #if defined(USE_OPENSSL)
@@ -73,33 +74,18 @@ using SSLPolicyType = WolfSSLPolicy;
 #endif
 
 // ============================================================================
-// BinanceUpgradeCustomizer — adds X-MBX-APIKEY header from env var
+// PipelineTraits for Binance USD-M Futures JSON (DPDK DirectIO — no poll process)
 // ============================================================================
 
-struct BinanceUpgradeCustomizer {
-    static void customize(const ConnStateShm*,
-        std::vector<std::pair<std::string, std::string>>& headers) {
-        const char* key = getenv("BINANCE_API_KEY");
-        if (key && key[0]) {
-            headers.emplace_back("X-MBX-APIKEY", key);
-        }
-    }
-};
-
-using SBEMktEventHandler = websocket::sbe::BinanceSBEHandler;
-
-// ============================================================================
-// PipelineTraits for Binance SBE (InlineWS)
-// ============================================================================
-
-struct BinanceSBEInlineWSTraits : DefaultPipelineConfig {
+struct BinanceUSDMTraits : DefaultPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
-    using MktEventHandler         = SBEMktEventHandler;
-    using UpgradeCustomizer  = BinanceUpgradeCustomizer;
+    using MktEventHandler    = websocket::json::BinanceUSDMYyjsonParser;
+    using UpgradeCustomizer  = NullUpgradeCustomizer;
+    using PacketIOType       = DPDKPacketIO;  // Direct NIC I/O (no poll process)
 
-    static constexpr int XDP_POLL_CORE   = 2;
+    static constexpr int XDP_POLL_CORE   = 2;   // unused (no poll process)
     static constexpr int TRANSPORT_CORE  = 4;
-    static constexpr int WEBSOCKET_CORE  = 4;  // unused in InlineWS, same as transport
+    static constexpr int WEBSOCKET_CORE  = 4;   // unused (InlineWS)
 
     static constexpr size_t MAX_CONN     = CONN_COUNT;
     static constexpr bool AUTO_RECONNECT = true;   // required for InlineWS
@@ -107,12 +93,12 @@ struct BinanceSBEInlineWSTraits : DefaultPipelineConfig {
     static constexpr bool INLINE_WS      = true;   // key toggle
     static constexpr bool WS_FRAME_INFO_RING = true;  // publish to ring even with MktEventHandler
 
-    static constexpr const char* WSS_HOST = "stream-sbe.binance.com";
+    static constexpr const char* WSS_HOST = "fstream.binance.com";
     static constexpr uint16_t WSS_PORT    = 443;
-    static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade/btcusdt@depth/btcusdt@depth20/btcusdt@bestBidAsk";
+    static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@aggTrade/btcusdt@depth20/btcusdt@depth@100ms/btcusdt@depth@250ms";
 };
 
-static_assert(PipelineTraitsConcept<BinanceSBEInlineWSTraits>);
+static_assert(PipelineTraitsConcept<BinanceUSDMTraits>);
 
 // ============================================================================
 // Configuration
@@ -120,7 +106,7 @@ static_assert(PipelineTraitsConcept<BinanceSBEInlineWSTraits>);
 
 namespace {
 
-constexpr int DEFAULT_STREAM_DURATION_MS = 10000;
+constexpr int DEFAULT_STREAM_DURATION_MS = 10000;   // Stream for 10 seconds
 int g_timeout_ms = DEFAULT_STREAM_DURATION_MS;
 
 std::atomic<bool> g_shutdown{false};
@@ -147,6 +133,7 @@ void parse_args(int argc, char* argv[]) {
     }
 }
 
+// Write message to stdout, fall back to /dev/tty if pipe is broken
 void write_tty(const char* msg, int len) {
     ssize_t wr = write(STDOUT_FILENO, msg, len);
     if (wr <= 0) {
@@ -155,13 +142,14 @@ void write_tty(const char* msg, int len) {
     }
 }
 
+// Periodic profiling save thread (every 10 minutes)
 constexpr int PROFILING_SAVE_INTERVAL_S = 600;
 
 template<typename Pipeline>
 void profiling_save_thread(Pipeline& pipeline) {
     int elapsed = 0;
     while (!g_shutdown.load(std::memory_order_acquire)) {
-        usleep(1000000);
+        usleep(1000000);  // 1s granularity
         if (g_shutdown.load(std::memory_order_acquire)) break;
         if (++elapsed >= PROFILING_SAVE_INTERVAL_S) {
             elapsed = 0;
@@ -182,26 +170,21 @@ void profiling_save_thread(Pipeline& pipeline) {
 // ============================================================================
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <interface> <bpf_path> [--timeout <ms>]\n", argv[0]);
-        fprintf(stderr, "\nBinance SBE binary protocol test (InlineWS mode).\n");
-        fprintf(stderr, "Requires BINANCE_API_KEY env var with Ed25519 API key.\n");
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <interface> [--timeout <ms>]\n", argv[0]);
+        fprintf(stderr, "\nBinance USD-M Futures JSON test (DPDK DirectIO mode).\n");
+        fprintf(stderr, "Public streams — no API key required.\n");
         return 1;
     }
 
     const char* interface = argv[1];
-    const char* bpf_path = argv[2];
 
     parse_args(argc, argv);
 
-    const char* api_key = getenv("BINANCE_API_KEY");
-    if (!api_key || !api_key[0]) {
-        fprintf(stderr, "WARNING: BINANCE_API_KEY not set. SBE stream may reject connection.\n");
-    }
-
-    if (geteuid() == 0) {
-        fprintf(stderr, "ERROR: Do NOT run as root! Use build_xdp.sh which sets capabilities.\n");
-        return 1;
+    if (geteuid() != 0) {
+        fprintf(stderr, "WARN: Not running as root. DPDK may fail without capabilities.\n");
+        fprintf(stderr, "      Fix: sudo setcap 'cap_ipc_lock,cap_net_admin,cap_net_raw,cap_sys_nice,cap_sys_rawio+ep' %s\n", argv[0]);
+        fprintf(stderr, "      Or:  sudo %s %s ...\n", argv[0], argv[1]);
     }
 
     signal(SIGPIPE, SIG_IGN);
@@ -212,15 +195,16 @@ int main(int argc, char* argv[]) {
     bool run_forever = (g_timeout_ms <= 0);
 
     printf("==============================================\n");
-    printf("  Binance SBE Test (XDP InlineWS)             \n");
+    printf("  USDM JSON Test (DPDK DirectIO)              \n");
     printf("==============================================\n");
     printf("  Interface:  %s\n", interface);
-    printf("  Target:     %s:%u (WSS)\n", BinanceSBEInlineWSTraits::WSS_HOST, BinanceSBEInlineWSTraits::WSS_PORT);
-    printf("  Path:       %s\n", BinanceSBEInlineWSTraits::WSS_PATH);
+    printf("  I/O:        DPDK PMD (Direct — no poll process)\n");
+    printf("  Target:     %s:%u (WSS)\n", BinanceUSDMTraits::WSS_HOST, BinanceUSDMTraits::WSS_PORT);
+    printf("  Path:       %s\n", BinanceUSDMTraits::WSS_PATH);
     printf("  SSL:        %s\n", SSLPolicyType::name());
-    printf("  Mode:       InlineWS (transport + WS in single process)\n");
-    printf("  Processes:  2 (XDP Poll + Transport+WS)\n");
-    printf("  API Key:    %s\n", (api_key && api_key[0]) ? "set" : "NOT SET");
+    printf("  Mode:       DirectIO + InlineWS (single child process)\n");
+    printf("  Processes:  1 child (Transport+NIC+WS)\n");
+    printf("  Streams:    btcusdt@aggTrade, depth20, depth@100ms, depth@250ms\n");
     printf("  Connections: %zu\n", CONN_COUNT);
     printf("  Reconnect:  yes (required)\n");
     if (run_forever) {
@@ -230,17 +214,15 @@ int main(int argc, char* argv[]) {
     }
     printf("==============================================\n\n");
 
-    WebSocketPipeline<BinanceSBEInlineWSTraits> pipeline;
+    // Setup pipeline
+    WebSocketPipeline<BinanceUSDMTraits> pipeline;
 
-    if (!pipeline.setup(interface, bpf_path)) {
+    if (!pipeline.setup(interface, "/dev/null")) {
         fprintf(stderr, "\nFATAL: Setup failed\n");
         return 1;
     }
 
     g_conn_state = pipeline.conn_state();
-
-    pipeline.set_subscription_json(
-        R"({"method":"SUBSCRIBE","params":["btcusdt@trade","btcusdt@depth","btcusdt@depth20","btcusdt@bestBidAsk"],"id":1})");
 
     if (!pipeline.start()) {
         fprintf(stderr, "\nFATAL: Failed to start pipeline\n");
@@ -248,17 +230,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    usleep(500000);  // 500ms stabilization
+    // Give processes time to stabilize
+    usleep(500000);  // 500ms
 
+    // Start periodic profiling save thread
     std::thread prof_thread(profiling_save_thread<decltype(pipeline)>,
                             std::ref(pipeline));
 
     // ========================================================================
-    // Main loop — consume WSFrameInfo from disruptor ring in parent process
+    // Main loop — consume WSFrameInfo + MktEvent from disruptor rings
     // ========================================================================
 
     constexpr size_t NUM_CONN = CONN_COUNT;
 
+    // Create consumer for WS_FRAME_INFO ring
     IPCRingConsumer<WSFrameInfo> ws_frame_cons(*pipeline.ws_frame_info_region());
     std::unique_ptr<IPCRingConsumer<websocket::msg::MktEvent>> mkt_event_cons;
     if (pipeline.mkt_event_region()) {
@@ -270,11 +255,16 @@ int main(int argc, char* argv[]) {
     uint64_t prev_latest_poll_cycle[NUM_CONN] = {};
 
     uint64_t total_frames = 0, prev_total = 0;
-    uint64_t text_frames = 0;
-    uint64_t binary_frames = 0;
-    uint64_t sbe_decode_errors = 0;
+    uint64_t json_frames = 0;
 
-    printf("\n--- SBE InlineWS Stream Test (%s) ---\n",
+    // MktEvent monotonic sequence check (per-type to avoid BBO/OB false positives)
+    int64_t mkt_trade_seq = 0;
+    int64_t mkt_bbo_seq = 0;
+    int64_t mkt_ob_seq = 0;  // depth snapshot + delta
+    uint64_t mkt_dup_count = 0;
+    uint64_t mkt_event_count = 0;
+
+    printf("\n--- USDM JSON DirectIO Stream Test (%s) ---\n",
            run_forever ? "FOREVER MODE - Ctrl+C to stop" :
            (std::to_string(g_timeout_ms) + "ms").c_str());
 
@@ -285,13 +275,13 @@ int main(int argc, char* argv[]) {
         if (g_shutdown.load(std::memory_order_acquire)) {
             signal(SIGINT, SIG_IGN);
             signal(SIGQUIT, SIG_IGN);
-            printf("[SBE] Shutdown signal received\n");
+            printf("[USDM] Shutdown signal received\n");
             break;
         }
 
-        // InlineWS: check PROC_TRANSPORT (no separate WS process)
+        // DirectIO InlineWS: check PROC_TRANSPORT (no separate WS or poll process)
         if (!pipeline.conn_state()->is_running(PROC_TRANSPORT)) {
-            fprintf(stderr, "[SBE] Transport process exited during streaming\n");
+            fprintf(stderr, "[USDM] Transport process exited during streaming\n");
             break;
         }
 
@@ -302,19 +292,8 @@ int main(int argc, char* argv[]) {
             uint8_t ci = frame.connection_id;
             const uint8_t* payload = pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset);
 
-            int64_t event_time_ms = 0;
-            if (frame.opcode == 0x02 && frame.payload_len >= sbe::HEADER_SIZE + 8) {
-                binary_frames++;
-                sbe::SBEHeader hdr;
-                if (sbe::decode_header(payload, frame.payload_len, hdr)) {
-                    int64_t event_time_us = sbe::read_i64(payload + sbe::HEADER_SIZE);
-                    event_time_ms = event_time_us / 1000;
-                    // mkt.on_ws_frame() now runs inline in WSCore via SBEMktEventHandler
-                } else {
-                    sbe_decode_errors++;
-                }
-            } else if (frame.opcode == 0x01) {
-                text_frames++;
+            if (frame.opcode == 0x01) {
+                json_frames++;
             }
 
             frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci],
@@ -336,6 +315,21 @@ int main(int argc, char* argv[]) {
                         fprintf(stderr, "[%ld.%06ld] [STATUS] %s conn=%u %s\n",
                                 ts.tv_sec, ts.tv_nsec / 1000, type_str, st.connection_id, st.message);
                     } else {
+                        mkt_event_count++;
+                        // Per-type monotonic sequence check
+                        if (mkt.src_seq > 0) {
+                            int64_t* seq_p = mkt.is_trade_array() ? &mkt_trade_seq
+                                           : mkt.is_bbo_array()   ? &mkt_bbo_seq
+                                                                   : &mkt_ob_seq;
+                            if (mkt.src_seq <= *seq_p) {
+                                mkt_dup_count++;
+                                fprintf(stderr, "\033[91m[DUP] %s seq %ld <= %ld (dup #%lu)\033[0m\n",
+                                        mkt.is_trade_array() ? "TRADE" :
+                                        mkt.is_bbo_array()   ? "BBO" : "BOOK",
+                                        mkt.src_seq, *seq_p, mkt_dup_count);
+                            }
+                            *seq_p = std::max(*seq_p, mkt.src_seq);
+                        }
                         mkt.print();
                     }
                 }
@@ -346,14 +340,12 @@ int main(int argc, char* argv[]) {
         prev_total = total_frames;
     }
 
-    // Drain remaining
+    // Drain remaining frames after loop exit
     {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            uint8_t ci = frame.connection_id;
-            if (frame.opcode == 0x02) binary_frames++;
-            else if (frame.opcode == 0x01) text_frames++;
+            if (frame.opcode == 0x01) json_frames++;
         }
     }
 
@@ -367,6 +359,7 @@ int main(int argc, char* argv[]) {
     g_shutdown.store(true, std::memory_order_release);
     pipeline.conn_state()->shutdown_all();
 
+    // Stop periodic profiling thread
     if (prof_thread.joinable()) prof_thread.join();
 
     usleep(200000);  // 200ms for processes to quiesce
@@ -376,8 +369,7 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            if (frame.opcode == 0x02) binary_frames++;
-            else if (frame.opcode == 0x01) text_frames++;
+            if (frame.opcode == 0x01) json_frames++;
         }
     }
     if (mkt_event_cons) {
@@ -394,12 +386,20 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "[%ld.%06ld] [STATUS] %s conn=%u %s\n",
                         ts.tv_sec, ts.tv_nsec / 1000, type_str, st.connection_id, st.message);
             } else {
+                mkt_event_count++;
+                if (mkt.src_seq > 0) {
+                    int64_t* seq_p = mkt.is_trade_array() ? &mkt_trade_seq
+                                   : mkt.is_bbo_array()   ? &mkt_bbo_seq
+                                                           : &mkt_ob_seq;
+                    if (mkt.src_seq <= *seq_p) mkt_dup_count++;
+                    *seq_p = std::max(*seq_p, mkt.src_seq);
+                }
                 mkt.print();
             }
         }
     }
 
-    // Save profiling data
+    // Save profiling data before shutdown
     fflush(stdout);
     int saved_stdout = dup(STDOUT_FILENO);
     int tty_fd = open("/dev/tty", O_WRONLY);
@@ -413,7 +413,7 @@ int main(int argc, char* argv[]) {
         close(saved_stdout);
     }
 
-    // Ring buffer status (InlineWS: only ws_frame_info and msg_outbox rings)
+    // Ring buffer status
     auto* ws_fi_region = pipeline.ws_frame_info_region();
     int64_t ws_frame_prod = ws_fi_region->producer_published()->load(std::memory_order_acquire);
     int64_t ws_frame_cons_seq = ws_frame_cons.sequence();
@@ -422,24 +422,26 @@ int main(int argc, char* argv[]) {
     int64_t outbox_prod = outbox_region->producer_published()->load(std::memory_order_acquire);
     int64_t outbox_cons = outbox_region->consumer_sequence(0)->load(std::memory_order_acquire);
 
+    // Build summary in stack buffer
     char summary[4096];
     int pos = 0;
     pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== Shutting down ===\n");
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== SBE InlineWS Test Results ===\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== USDM JSON DirectIO Test Results (DPDK) ===\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Duration:        %ld ms\n", actual_duration);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Total frames:    %lu\n", total_frames);
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  Binary (SBE):    %lu\n", binary_frames);
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  Text (JSON):     %lu\n", text_frames);
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  SBE errors:      %lu\n", sbe_decode_errors);
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n--- Ring Buffer Status (InlineWS) ---\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  JSON frames:     %lu\n", json_frames);
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  MktEvents:       %lu\n", mkt_event_count);
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  MktEvent dups:   %lu%s\n", mkt_dup_count,
+           mkt_dup_count > 0 ? " *** DUPLICATES DETECTED ***" : " (clean)");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n--- Ring Buffer Status (DirectIO) ---\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  WS_FRAME_INFO producer: %ld, consumer: %ld (%s)\n",
            ws_frame_prod, ws_frame_cons_seq, (ws_frame_cons_seq >= ws_frame_prod) ? "ok" : "BEHIND");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  MSG_OUTBOX    producer: %ld, consumer: %ld (%s)\n",
            outbox_prod, outbox_cons, (outbox_cons >= outbox_prod) ? "ok" : "BEHIND");
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  (No msg_metadata/pongs rings — InlineWS)\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  (No raw_inbox/raw_outbox/metadata/pongs rings — DirectIO + InlineWS)\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "====================\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "\n==============================================\n");
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  SBE INLINE_WS TEST COMPLETE\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  USDM JSON DIRECT_IO TEST COMPLETE (DPDK)\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "==============================================\n");
 
     fflush(stdout);
@@ -453,9 +455,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Also save to /tmp for persistence
     {
         char path[256];
-        snprintf(path, sizeof(path), "/tmp/sbe_inline_ws_summary_%d.txt", getpid());
+        snprintf(path, sizeof(path), "/tmp/usdm_dpdk_directio_summary_%d.txt", getpid());
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
             (void)write(fd, summary, pos);
@@ -468,12 +471,12 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 
-#else  // !USE_XDP
+#else  // !USE_DPDK
 
 int main() {
-    fprintf(stderr, "Error: Build with USE_XDP=1 USE_WOLFSSL=1 MAX_CONN=2 ENABLE_RECONNECT=1\n");
-    fprintf(stderr, "Example: make build-test-pipeline-binance_sbe_xdp_inline_ws XDP_INTERFACE=enp108s0 USE_WOLFSSL=1 MAX_CONN=2 ENABLE_RECONNECT=1\n");
+    fprintf(stderr, "Error: Build with USE_DPDK=1 USE_WOLFSSL=1 MAX_CONN=2 ENABLE_RECONNECT=1\n");
+    fprintf(stderr, "Example: ENABLE_RECONNECT=1 MAX_CONN=2 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 270_binance_usdm_dpdk_packetio_inline_ws.cpp\n");
     return 1;
 }
 
-#endif  // USE_XDP
+#endif  // USE_DPDK

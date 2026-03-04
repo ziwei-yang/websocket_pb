@@ -1698,12 +1698,9 @@ struct PacketTransport {
                     // If inner content type is not application data (0x17),
                     // this might be a KeyUpdate or alert
                     if (inner_ct != 0x17) {
-                        // Signal non-app-data but still advance past it
                         tls_parser_.state = TLSRecordState::NEED_TAG;
                         tls_parser_.tag_consumed = 0;
-                        tls_seq_num_++;
-                        // Don't call callback for non-app-data
-                        // But we need to consume the tag
+                        // seq_num incremented by NEED_TAG after consuming auth tag
                         continue;
                     }
                 }

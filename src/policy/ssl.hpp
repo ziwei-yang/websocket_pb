@@ -2744,7 +2744,12 @@ struct WolfSSLPolicy {
         }
     }
 
-    uint64_t get_server_record_count() const { return server_record_count_; }
+    uint64_t get_server_record_count() const {
+        if (!ssl_) return 0;
+        word64 seq = 0;
+        wolfSSL_GetPeerSequenceNumber(ssl_, &seq);
+        return static_cast<uint64_t>(seq);
+    }
 
     /**
      * Perform TLS handshake
@@ -2804,9 +2809,6 @@ struct WolfSSLPolicy {
         fprintf(stderr, "[TLS] Handshake SUCCESS (BSD socket)\n");
         fprintf(stderr, "[TLS]   Version: %s\n", tls_version ? tls_version : "unknown");
         fprintf(stderr, "[TLS]   Cipher:  %s\n", cipher_name ? cipher_name : "unknown");
-
-        // Reset server record counter — only count post-handshake records
-        server_record_count_ = 0;
     }
 
     /**
@@ -2884,8 +2886,6 @@ struct WolfSSLPolicy {
 
                 // Stop trickle thread, switch to inline trickle
                 transport->stop_rx_trickle_thread();
-                // Reset server record counter — only count post-handshake records
-                server_record_count_ = 0;
                 return 0;
             }
 
@@ -2996,7 +2996,6 @@ struct WolfSSLPolicy {
             fprintf(stderr, "[TLS] Handshake SUCCESS (non-blocking)\n");
             fprintf(stderr, "[TLS]   Version: %s\n", tls_version ? tls_version : "unknown");
             fprintf(stderr, "[TLS]   Cipher:  %s\n", cipher_name ? cipher_name : "unknown");
-            server_record_count_ = 0;
             return HandshakeResult::SUCCESS;
         }
 
@@ -3042,7 +3041,6 @@ struct WolfSSLPolicy {
         }
         // wolfSSL_new() inherits client mode from ctx_ (wolfSSLv23_client_method)
         // so wolfSSL_set_connect_state() is not needed
-        server_record_count_ = 0;
         return 0;
     }
 
@@ -3054,7 +3052,6 @@ struct WolfSSLPolicy {
         if (!ssl_) return HandshakeResult::ERROR;
         int ret = wolfSSL_connect(ssl_);
         if (ret == SSL_SUCCESS) {
-            server_record_count_ = 0;
             return HandshakeResult::SUCCESS;
         }
         int err = wolfSSL_get_error(ssl_, ret);
@@ -3076,8 +3073,7 @@ struct WolfSSLPolicy {
         int n = wolfSSL_read(ssl_, buf, len);
 
         if (n > 0) {
-            server_record_count_++;  // Track records for seq_num
-            return n;  // Success
+            return n;  // Success — seq_num tracked by wolfSSL_GetPeerSequenceNumber()
         } else if (n == 0) {
             return 0;  // Connection closed
         } else {
@@ -3443,9 +3439,6 @@ public:
     WOLFSSL_CTX* ctx_;
     WOLFSSL* ssl_;
     std::string hostname_;  // SNI hostname
-
-    // Server record counter (post-handshake, for TLS 1.3 seq_num tracking)
-    uint64_t server_record_count_ = 0;
 
 private:
     // Zero-copy RX state (ring buffer)
