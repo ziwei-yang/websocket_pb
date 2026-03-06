@@ -673,9 +673,9 @@ test-sbe-handler: $(TEST_SBE_HANDLER_BIN)
 	./$(TEST_SBE_HANDLER_BIN)
 
 # Build USDM JSON parser tests
-$(TEST_USDM_JSON_BIN): $(TEST_USDM_JSON_SRC) src/msg/01_binance_usdm_json.hpp src/msg/02_binance_usdm_yyjson.hpp src/msg/03_binance_usdm_simdjson.hpp src/msg/market_conf.hpp $(BUILD_DIR)/yyjson.o $(BUILD_DIR)/simdjson.o | $(BUILD_DIR)
+$(TEST_USDM_JSON_BIN): $(TEST_USDM_JSON_SRC) src/msg/01_binance_usdm_json.hpp src/msg/03_binance_usdm_simdjson.hpp src/msg/market_conf.hpp $(BUILD_DIR)/simdjson.o | $(BUILD_DIR)
 	@echo "🔨 Compiling USDM JSON parser unit tests..."
-	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/yyjson.o $(BUILD_DIR)/simdjson.o
+	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/simdjson.o
 	@echo "✅ Test build complete: $@"
 
 # Run USDM JSON parser tests
@@ -683,19 +683,15 @@ test-usdm-json-parser: $(TEST_USDM_JSON_BIN)
 	@echo "🧪 Running USDM JSON parser unit tests..."
 	./$(TEST_USDM_JSON_BIN)
 
-# Build yyjson vendor object (C11)
-$(BUILD_DIR)/yyjson.o: src/vendor/yyjson.c src/vendor/yyjson.h | $(BUILD_DIR)
-	$(CC) -std=c11 -O3 -march=native -c -o $@ $<
-
 # Build simdjson vendor object (C++17)
 $(BUILD_DIR)/simdjson.o: src/vendor/simdjson.cpp src/vendor/simdjson.h | $(BUILD_DIR)
 	$(CXX) -std=c++17 -O3 -march=native -c -o $@ $<
 
-# Build USDM JSON benchmark (custom vs yyjson vs simdjson)
-$(TEST_USDM_JSON_BENCH_BIN): $(TEST_USDM_JSON_BENCH_SRC) $(BUILD_DIR)/yyjson.o $(BUILD_DIR)/simdjson.o \
-		src/msg/01_binance_usdm_json.hpp src/msg/02_binance_usdm_yyjson.hpp src/msg/03_binance_usdm_simdjson.hpp | $(BUILD_DIR)
+# Build USDM JSON benchmark (custom vs simdjson)
+$(TEST_USDM_JSON_BENCH_BIN): $(TEST_USDM_JSON_BENCH_SRC) $(BUILD_DIR)/simdjson.o \
+		src/msg/01_binance_usdm_json.hpp src/msg/03_binance_usdm_simdjson.hpp | $(BUILD_DIR)
 	@echo "🔨 Compiling USDM JSON parse benchmark..."
-	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/yyjson.o $(BUILD_DIR)/simdjson.o
+	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/simdjson.o
 	@echo "✅ Benchmark build complete: $@"
 
 # Run USDM JSON parse benchmark
@@ -1232,11 +1228,11 @@ build-test-pipeline-264_binance_sbe_xdp_packetio_inline_ws: $(PIPELINE_XDP_DIREC
 PIPELINE_DPDK_DIRECTIO_USDM_SRC := test/pipeline/270_binance_usdm_dpdk_packetio_inline_ws.cpp
 PIPELINE_DPDK_DIRECTIO_USDM_BIN := $(BUILD_DIR)/test_pipeline_270_binance_usdm_dpdk_packetio_inline_ws
 
-$(PIPELINE_DPDK_DIRECTIO_USDM_BIN): $(PIPELINE_DPDK_DIRECTIO_USDM_SRC) $(PIPELINE_HEADERS) src/msg/03_binance_usdm_simdjson.hpp $(BUILD_DIR)/yyjson.o $(BUILD_DIR)/simdjson.o | $(BUILD_DIR)
+$(PIPELINE_DPDK_DIRECTIO_USDM_BIN): $(PIPELINE_DPDK_DIRECTIO_USDM_SRC) $(PIPELINE_HEADERS) src/msg/03_binance_usdm_simdjson.hpp $(BUILD_DIR)/simdjson.o | $(BUILD_DIR)
 	@echo "Compiling DPDK DirectIO Binance USDM JSON InlineWS test..."
 ifdef USE_DPDK
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
-	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/yyjson.o $(BUILD_DIR)/simdjson.o $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/simdjson.o $(LDFLAGS)
 	@echo "DPDK DirectIO USDM JSON InlineWS test build complete: $@"
 else
 	@echo "Error: DPDK DirectIO USDM test requires USE_WOLFSSL=1 or USE_OPENSSL=1"

@@ -1,5 +1,5 @@
 // test/unittest/test_usdm_json_bench.cpp
-// Benchmark: custom vs essential-only vs essential+remaining vs yyjson vs simdjson
+// Benchmark: custom vs essential-only vs essential+remaining vs simdjson
 // Pure parsing benchmark — no IPC rings, no pipeline_data.hpp
 //
 // Build:  make bench-usdm-json-parser NIC_MTU=1500
@@ -14,7 +14,6 @@
 
 // Part 1 only — no pipeline_data.hpp needed
 #include "msg/01_binance_usdm_json.hpp"
-#include "msg/02_binance_usdm_yyjson.hpp"
 #include "msg/03_binance_usdm_simdjson.hpp"
 
 #include "core/timing.hpp"
@@ -313,92 +312,6 @@ static std::vector<uint64_t> bench_ess_rem_depth_diff(const uint8_t* json, uint3
 }
 
 // ============================================================================
-// yyjson benchmarks
-// ============================================================================
-
-using namespace websocket::json::yy;
-
-static std::vector<uint64_t> bench_yyjson_agg_trade(const uint8_t* json, uint32_t len) {
-    std::vector<uint64_t> cycles(BENCH_ITERS);
-
-    for (int i = 0; i < WARMUP_ITERS; i++) {
-        auto res = yy_parse_combined(json, len);
-        auto tf = yy_parse_agg_trade(res.data);
-        sink(tf.event_time_ms); sink(tf.agg_trade_id); sink(tf.price_mantissa);
-        sink(tf.qty_mantissa); sink(tf.trade_time_ms); sink(tf.buyer_is_maker);
-    }
-
-    for (int i = 0; i < BENCH_ITERS; i++) {
-        uint64_t t0 = rdtscp();
-        auto res = yy_parse_combined(json, len);
-        auto tf = yy_parse_agg_trade(res.data);
-        sink(tf.event_time_ms); sink(tf.agg_trade_id); sink(tf.price_mantissa);
-        sink(tf.qty_mantissa); sink(tf.trade_time_ms); sink(tf.buyer_is_maker);
-        uint64_t t1 = rdtscp();
-        cycles[i] = t1 - t0;
-    }
-    return cycles;
-}
-
-static std::vector<uint64_t> bench_yyjson_depth_partial(const uint8_t* json, uint32_t len) {
-    std::vector<uint64_t> cycles(BENCH_ITERS);
-    BookLevel bids[20], asks[20];
-
-    for (int i = 0; i < WARMUP_ITERS; i++) {
-        auto res = yy_parse_combined(json, len);
-        auto df = yy_parse_depth(res.data);
-        sink(df.event_time_ms); sink(df.txn_time_ms); sink(df.last_update_id);
-        uint8_t bc = yy_parse_book_levels(df.bids_val, bids, 20);
-        uint8_t ac = yy_parse_book_levels(df.asks_val, asks, 20);
-        for (uint8_t j = 0; j < bc; j++) { sink(bids[j].price); sink(bids[j].qty); }
-        for (uint8_t j = 0; j < ac; j++) { sink(asks[j].price); sink(asks[j].qty); }
-    }
-
-    for (int i = 0; i < BENCH_ITERS; i++) {
-        uint64_t t0 = rdtscp();
-        auto res = yy_parse_combined(json, len);
-        auto df = yy_parse_depth(res.data);
-        sink(df.event_time_ms); sink(df.txn_time_ms); sink(df.last_update_id);
-        uint8_t bc = yy_parse_book_levels(df.bids_val, bids, 20);
-        uint8_t ac = yy_parse_book_levels(df.asks_val, asks, 20);
-        for (uint8_t j = 0; j < bc; j++) { sink(bids[j].price); sink(bids[j].qty); }
-        for (uint8_t j = 0; j < ac; j++) { sink(asks[j].price); sink(asks[j].qty); }
-        uint64_t t1 = rdtscp();
-        cycles[i] = t1 - t0;
-    }
-    return cycles;
-}
-
-static std::vector<uint64_t> bench_yyjson_depth_diff(const uint8_t* json, uint32_t len) {
-    std::vector<uint64_t> cycles(BENCH_ITERS);
-    DeltaEntry bid_deltas[32], ask_deltas[32];
-
-    for (int i = 0; i < WARMUP_ITERS; i++) {
-        auto res = yy_parse_combined(json, len);
-        auto df = yy_parse_depth(res.data);
-        sink(df.event_time_ms); sink(df.txn_time_ms); sink(df.last_update_id);
-        uint8_t bc = yy_parse_delta_levels(df.bids_val, bid_deltas, 32, false);
-        uint8_t ac = yy_parse_delta_levels(df.asks_val, ask_deltas, 32, true);
-        for (uint8_t j = 0; j < bc; j++) { sink(bid_deltas[j].price); sink(bid_deltas[j].qty); }
-        for (uint8_t j = 0; j < ac; j++) { sink(ask_deltas[j].price); sink(ask_deltas[j].qty); }
-    }
-
-    for (int i = 0; i < BENCH_ITERS; i++) {
-        uint64_t t0 = rdtscp();
-        auto res = yy_parse_combined(json, len);
-        auto df = yy_parse_depth(res.data);
-        sink(df.event_time_ms); sink(df.txn_time_ms); sink(df.last_update_id);
-        uint8_t bc = yy_parse_delta_levels(df.bids_val, bid_deltas, 32, false);
-        uint8_t ac = yy_parse_delta_levels(df.asks_val, ask_deltas, 32, true);
-        for (uint8_t j = 0; j < bc; j++) { sink(bid_deltas[j].price); sink(bid_deltas[j].qty); }
-        for (uint8_t j = 0; j < ac; j++) { sink(ask_deltas[j].price); sink(ask_deltas[j].qty); }
-        uint64_t t1 = rdtscp();
-        cycles[i] = t1 - t0;
-    }
-    return cycles;
-}
-
-// ============================================================================
 // simdjson benchmarks
 // ============================================================================
 
@@ -549,26 +462,22 @@ int main() {
         auto custom_cycles    = bench_custom_agg_trade(json, len);
         auto essential_cycles = bench_essential_agg_trade(json, len);
         auto ess_rem_cycles   = bench_ess_rem_agg_trade(json, len);
-        auto yyjson_cycles    = bench_yyjson_agg_trade(json, len);
         auto simdjson_cycles  = bench_simdjson_agg_trade(json, len);
 
         auto cs = compute_stats(custom_cycles, tsc_freq);
         auto es = compute_stats(essential_cycles, tsc_freq);
         auto er = compute_stats(ess_rem_cycles, tsc_freq);
-        auto ys = compute_stats(yyjson_cycles, tsc_freq);
         auto ss = compute_stats(simdjson_cycles, tsc_freq);
 
         std::printf("aggTrade:\n");
         print_stats("custom:", cs);
         print_stats("essential:", es);
         print_stats("ess+rem:", er);
-        print_stats("yyjson:", ys);
         print_stats("simdjson:", ss);
         if (cs.median_ns > 0) {
             std::printf("  stale saving: %.0f%% (essential vs custom)\n",
                         100.0 * (1.0 - (double)es.median_ns / (double)cs.median_ns));
-            std::printf("  yyjson/custom: %.1fx  simdjson/custom: %.1fx\n\n",
-                        (double)ys.median_ns / (double)cs.median_ns,
+            std::printf("  simdjson/custom: %.1fx\n\n",
                         (double)ss.median_ns / (double)cs.median_ns);
         }
     }
@@ -581,26 +490,22 @@ int main() {
         auto custom_cycles    = bench_custom_depth_partial(json, len);
         auto essential_cycles = bench_essential_depth_partial(json, len);
         auto ess_rem_cycles   = bench_ess_rem_depth_partial(json, len);
-        auto yyjson_cycles    = bench_yyjson_depth_partial(json, len);
         auto simdjson_cycles  = bench_simdjson_depth_partial(json, len);
 
         auto cs = compute_stats(custom_cycles, tsc_freq);
         auto es = compute_stats(essential_cycles, tsc_freq);
         auto er = compute_stats(ess_rem_cycles, tsc_freq);
-        auto ys = compute_stats(yyjson_cycles, tsc_freq);
         auto ss = compute_stats(simdjson_cycles, tsc_freq);
 
         std::printf("depthUpdate (partial, 5+5 levels):\n");
         print_stats("custom:", cs);
         print_stats("essential:", es);
         print_stats("ess+rem:", er);
-        print_stats("yyjson:", ys);
         print_stats("simdjson:", ss);
         if (cs.median_ns > 0) {
             std::printf("  stale saving: %.0f%% (essential vs custom)\n",
                         100.0 * (1.0 - (double)es.median_ns / (double)cs.median_ns));
-            std::printf("  yyjson/custom: %.1fx  simdjson/custom: %.1fx\n\n",
-                        (double)ys.median_ns / (double)cs.median_ns,
+            std::printf("  simdjson/custom: %.1fx\n\n",
                         (double)ss.median_ns / (double)cs.median_ns);
         }
     }
@@ -613,26 +518,22 @@ int main() {
         auto custom_cycles    = bench_custom_depth_diff(json, len);
         auto essential_cycles = bench_essential_depth_diff(json, len);
         auto ess_rem_cycles   = bench_ess_rem_depth_diff(json, len);
-        auto yyjson_cycles    = bench_yyjson_depth_diff(json, len);
         auto simdjson_cycles  = bench_simdjson_depth_diff(json, len);
 
         auto cs = compute_stats(custom_cycles, tsc_freq);
         auto es = compute_stats(essential_cycles, tsc_freq);
         auto er = compute_stats(ess_rem_cycles, tsc_freq);
-        auto ys = compute_stats(yyjson_cycles, tsc_freq);
         auto ss = compute_stats(simdjson_cycles, tsc_freq);
 
         std::printf("depthUpdate (diff, 1+1 levels):\n");
         print_stats("custom:", cs);
         print_stats("essential:", es);
         print_stats("ess+rem:", er);
-        print_stats("yyjson:", ys);
         print_stats("simdjson:", ss);
         if (cs.median_ns > 0) {
             std::printf("  stale saving: %.0f%% (essential vs custom)\n",
                         100.0 * (1.0 - (double)es.median_ns / (double)cs.median_ns));
-            std::printf("  yyjson/custom: %.1fx  simdjson/custom: %.1fx\n\n",
-                        (double)ys.median_ns / (double)cs.median_ns,
+            std::printf("  simdjson/custom: %.1fx\n\n",
                         (double)ss.median_ns / (double)cs.median_ns);
         }
     }

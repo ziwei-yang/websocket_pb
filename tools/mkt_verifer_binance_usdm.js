@@ -466,6 +466,7 @@ function parseDepthRemaining(payload, startPos) {
     p = toValue(payload, p);
     if (p === -1) return r;
     r.bidsArrayPos = p;
+    r.valid = true;       // bids array found is sufficient for streaming
     p = skipValue(payload, p);
     if (p === -1) return r;
     while (p < payload.length && (payload[p] === ',' || payload[p] === ' ')) p++;

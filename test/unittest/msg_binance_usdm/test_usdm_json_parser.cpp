@@ -1,5 +1,5 @@
 // test/unittest/test_usdm_json_parser.cpp
-// Unit tests for Binance USD-M JSON handlers (custom, yyjson, simdjson)
+// Unit tests for Binance USD-M JSON handlers (custom, simdjson)
 // Creates real IPC ring files in /dev/shm/hft/test_usdm_json/ to test publish path.
 
 #include <cassert>
@@ -19,7 +19,6 @@
 // pipeline_data.hpp must come first (defines PIPELINE_DATA_HPP_INCLUDED)
 #include "pipeline/pipeline_data.hpp"
 #include "msg/01_binance_usdm_json.hpp"
-#include "msg/02_binance_usdm_yyjson.hpp"
 #include "msg/03_binance_usdm_simdjson.hpp"
 
 using namespace websocket::json;
@@ -262,6 +261,27 @@ struct TestHarness {
             *handler.pending_ring_seq_slot_ = seq;
             handler.pending_ring_seq_slot_ = nullptr;
         }
+    }
+
+    // Feed truncated payload and return WSFrameInfo (for inspecting mkt_event_count)
+    WSFrameInfo feed_fragment_info(uint8_t ci, const char* json, uint32_t truncated_len) {
+        WSFrameInfo info{};
+        info.clear();
+        info.connection_id = ci;
+        auto& st = state_for(ci);
+        handler.on_ws_data(st, ci,
+                           (const uint8_t*)json, truncated_len, info);
+        // Do NOT reset state — continuation frame
+
+        int64_t seq = ws_prod->try_claim();
+        assert(seq >= 0);
+        (*ws_prod)[seq] = info;
+        ws_prod->publish(seq);
+        if (handler.pending_ring_seq_slot_) {
+            *handler.pending_ring_seq_slot_ = seq;
+            handler.pending_ring_seq_slot_ = nullptr;
+        }
+        return info;
     }
 
     // Feed full payload with accumulated length — resets state (simulates final frame)
@@ -523,99 +543,6 @@ void test_decode_essential_truncated() {
             (const uint8_t*)depth, cut);
         (void)e;
     }
-}
-
-// ============================================================================
-// yyjson Primitive Tests
-// ============================================================================
-
-void test_yy_decimal_cstr_to_int64() {
-    using websocket::json::yy::decimal_cstr_to_int64;
-    assert(decimal_cstr_to_int64(nullptr) == 0);
-    assert(decimal_cstr_to_int64("0") == 0);
-    assert(decimal_cstr_to_int64("0.001") == 1);
-    assert(decimal_cstr_to_int64("7403.89") == 740389);
-    assert(decimal_cstr_to_int64("-42.5") == -425);
-}
-
-void test_yy_parse_combined() {
-    auto res = websocket::json::yy::yy_parse_combined(
-        (const uint8_t*)AGG_TRADE_JSON,
-        static_cast<uint32_t>(strlen(AGG_TRADE_JSON)));
-    assert(res.type == UsdmStreamType::AGG_TRADE);
-    assert(res.data != nullptr);
-
-    auto res2 = websocket::json::yy::yy_parse_combined(
-        (const uint8_t*)DEPTH_PARTIAL_JSON,
-        static_cast<uint32_t>(strlen(DEPTH_PARTIAL_JSON)));
-    assert(res2.type == UsdmStreamType::DEPTH_PARTIAL);
-    assert(res2.data != nullptr);
-
-    auto res3 = websocket::json::yy::yy_parse_combined(
-        (const uint8_t*)DEPTH_DIFF_JSON,
-        static_cast<uint32_t>(strlen(DEPTH_DIFF_JSON)));
-    assert(res3.type == UsdmStreamType::DEPTH_DIFF);
-    assert(res3.data != nullptr);
-}
-
-void test_yy_parse_agg_trade() {
-    auto res = websocket::json::yy::yy_parse_combined(
-        (const uint8_t*)AGG_TRADE_JSON,
-        static_cast<uint32_t>(strlen(AGG_TRADE_JSON)));
-    auto tf = websocket::json::yy::yy_parse_agg_trade(res.data);
-    assert(tf.valid);
-    assert(tf.event_time_ms == 123456789);
-    assert(tf.agg_trade_id == 5933014);
-    assert(tf.price_mantissa == 1);       // "0.001" -> 1
-    assert(tf.qty_mantissa == 100);       // "100" -> 100
-    assert(tf.trade_time_ms == 123456785);
-    assert(tf.buyer_is_maker == true);
-}
-
-void test_yy_parse_depth_partial() {
-    auto res = websocket::json::yy::yy_parse_combined(
-        (const uint8_t*)DEPTH_PARTIAL_JSON,
-        static_cast<uint32_t>(strlen(DEPTH_PARTIAL_JSON)));
-    auto df = websocket::json::yy::yy_parse_depth(res.data);
-    assert(df.valid);
-    assert(df.event_time_ms == 1571889248277LL);
-    assert(df.txn_time_ms == 1571889248276LL);
-    assert(df.last_update_id == 390497878);
-
-    BookLevel bids[20], asks[20];
-    uint8_t bc = websocket::json::yy::yy_parse_book_levels(df.bids_val, bids, 20);
-    uint8_t ac = websocket::json::yy::yy_parse_book_levels(df.asks_val, asks, 20);
-    assert(bc == 5);
-    assert(ac == 5);
-    assert(bids[0].price == 740389);  // "7403.89"
-    assert(bids[0].qty == 2);         // "0.002"
-    assert(asks[0].price == 740596);  // "7405.96"
-    assert(asks[0].qty == 3340);      // "3.340"
-}
-
-void test_yy_parse_depth_diff() {
-    auto res = websocket::json::yy::yy_parse_combined(
-        (const uint8_t*)DEPTH_DIFF_JSON,
-        static_cast<uint32_t>(strlen(DEPTH_DIFF_JSON)));
-    auto df = websocket::json::yy::yy_parse_depth(res.data);
-    assert(df.valid);
-    assert(df.event_time_ms == 123456789);
-    assert(df.txn_time_ms == 123456788);
-    assert(df.last_update_id == 160);
-
-    DeltaEntry bid_deltas[32], ask_deltas[32];
-    uint8_t bc = websocket::json::yy::yy_parse_delta_levels(df.bids_val, bid_deltas, 32, false);
-    uint8_t ac = websocket::json::yy::yy_parse_delta_levels(df.asks_val, ask_deltas, 32, true);
-    assert(bc == 1);
-    assert(ac == 1);
-    assert(bid_deltas[0].price == 24);   // "0.0024"
-    assert(bid_deltas[0].qty == 10);
-    assert(bid_deltas[0].action == static_cast<uint8_t>(DeltaAction::UPDATE));
-    assert(bid_deltas[0].is_bid());
-    assert(ask_deltas[0].price == 26);   // "0.0026"
-    assert(ask_deltas[0].qty == 100);
-    assert(ask_deltas[0].action == static_cast<uint8_t>(DeltaAction::UPDATE));
-    assert(ask_deltas[0].is_ask());
 }
 
 // ============================================================================
@@ -1294,11 +1221,9 @@ void test_pending_max_id_monotonic() {
 
 void test_equiv_agg_trade() {
     auto run = [](auto& h) { h.feed_frame(0, AGG_TRADE_JSON); h.idle(); return h.published(); };
-    std::vector<MktEvent> ec, ey, es;
+    std::vector<MktEvent> ec, es;
     { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
-    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
     { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
-    assert_events_match(ec, ey, "custom vs yyjson: agg_trade");
     assert_events_match(ec, es, "custom vs simdjson: agg_trade");
 }
 
@@ -1312,11 +1237,9 @@ void test_equiv_agg_trade_merge() {
         h.feed_frame(0, buf1); h.feed_frame(0, buf2); h.feed_frame(0, buf3);
         h.idle(); return h.published();
     };
-    std::vector<MktEvent> ec, ey, es;
+    std::vector<MktEvent> ec, es;
     { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
-    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
     { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
-    assert_events_match(ec, ey, "custom vs yyjson: agg_trade_merge");
     assert_events_match(ec, es, "custom vs simdjson: agg_trade_merge");
 }
 
@@ -1325,41 +1248,33 @@ void test_equiv_agg_trade_no_merge() {
         h.handler.merge_enabled = false;
         h.feed_frame(0, AGG_TRADE_JSON); return h.published();
     };
-    std::vector<MktEvent> ec, ey, es;
+    std::vector<MktEvent> ec, es;
     { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
-    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
     { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
-    assert_events_match(ec, ey, "custom vs yyjson: agg_trade_no_merge");
     assert_events_match(ec, es, "custom vs simdjson: agg_trade_no_merge");
 }
 
 void test_equiv_depth_snapshot() {
     auto run = [](auto& h) { h.feed_frame(0, DEPTH_PARTIAL_JSON); return h.published(); };
-    std::vector<MktEvent> ec, ey, es;
+    std::vector<MktEvent> ec, es;
     { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
-    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
     { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
-    assert_events_match(ec, ey, "custom vs yyjson: depth_snapshot");
     assert_events_match(ec, es, "custom vs simdjson: depth_snapshot");
 }
 
 void test_equiv_depth_snapshot_large() {
     auto run = [](auto& h) { h.feed_frame(0, DEPTH_PARTIAL_LARGE_JSON); return h.published(); };
-    std::vector<MktEvent> ec, ey, es;
+    std::vector<MktEvent> ec, es;
     { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
-    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
     { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
-    assert_events_match(ec, ey, "custom vs yyjson: depth_snapshot_large");
     assert_events_match(ec, es, "custom vs simdjson: depth_snapshot_large");
 }
 
 void test_equiv_depth_diff() {
     auto run = [](auto& h) { h.feed_frame(0, DEPTH_DIFF_JSON); return h.published(); };
-    std::vector<MktEvent> ec, ey, es;
+    std::vector<MktEvent> ec, es;
     { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
-    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
     { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
-    assert_events_match(ec, ey, "custom vs yyjson: depth_diff");
     assert_events_match(ec, es, "custom vs simdjson: depth_diff");
 }
 
@@ -1369,11 +1284,9 @@ void test_equiv_depth_diff_delete() {
         h.feed_frame(0, DEPTH_DIFF_DELETE_JSON);
         return h.published();
     };
-    std::vector<MktEvent> ec, ey, es;
+    std::vector<MktEvent> ec, es;
     { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
-    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
     { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
-    assert_events_match(ec, ey, "custom vs yyjson: depth_diff_delete");
     assert_events_match(ec, es, "custom vs simdjson: depth_diff_delete");
 }
 
@@ -1387,11 +1300,9 @@ void test_equiv_cross_type_flush() {
         h.feed_frame(0, DEPTH_PARTIAL_JSON);
         return h.published();
     };
-    std::vector<MktEvent> ec, ey, es;
+    std::vector<MktEvent> ec, es;
     { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
-    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
     { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
-    assert_events_match(ec, ey, "custom vs yyjson: cross_type_flush");
     assert_events_match(ec, es, "custom vs simdjson: cross_type_flush");
 }
 
@@ -1869,11 +1780,9 @@ void test_stream_equivalence_agg_trade() {
         h.idle();
         return h.published();
     };
-    std::vector<MktEvent> ec, ey, es;
+    std::vector<MktEvent> ec, es;
     { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
-    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
     { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
-    assert_events_match(ec, ey, "stream custom vs yyjson: agg_trade");
     assert_events_match(ec, es, "stream custom vs simdjson: agg_trade");
 }
 
@@ -1886,11 +1795,9 @@ void test_stream_equivalence_depth_snapshot() {
         h.feed_final_fragment(0, json.c_str());
         return h.published();
     };
-    std::vector<MktEvent> ec, ey, es;
+    std::vector<MktEvent> ec, es;
     { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
-    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
     { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
-    assert_events_match(ec, ey, "stream custom vs yyjson: depth_snapshot");
     assert_events_match(ec, es, "stream custom vs simdjson: depth_snapshot");
 }
 
@@ -1902,12 +1809,77 @@ void test_stream_equivalence_depth_diff() {
         h.feed_final_fragment(0, DEPTH_DIFF_JSON);
         return h.published();
     };
-    std::vector<MktEvent> ec, ey, es;
+    std::vector<MktEvent> ec, es;
     { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
-    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
     { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
-    assert_events_match(ec, ey, "stream custom vs yyjson: depth_diff");
     assert_events_match(ec, es, "stream custom vs simdjson: depth_diff");
+}
+
+// ============================================================================
+// parse_depth_remaining truncated bids fix — regression tests
+// ============================================================================
+
+void test_parse_depth_remaining_truncated_bids() {
+    // Build a large depth (130 bids + 5 asks) — bids array exceeds ~1400 bytes
+    auto json = build_large_depth_json(true, 1600000000000LL, 500100, 130, 5);
+    auto len = static_cast<uint32_t>(json.size());
+
+    auto e = BinanceUSDMJsonDecoder::decode_essential(
+        (const uint8_t*)json.c_str(), len);
+    assert(e.valid);
+
+    // Find where bids array starts so we can truncate inside it
+    auto bids_marker = json.find("\"b\":[");
+    assert(bids_marker != std::string::npos);
+    // Truncate ~80 chars into the bids array (past the "[" but well before "],"a":")
+    uint32_t trunc_end_offset = static_cast<uint32_t>(bids_marker + 80);
+    assert(trunc_end_offset < len);
+
+    const uint8_t* trunc_end = (const uint8_t*)json.c_str() + trunc_end_offset;
+    auto r = parse_depth_remaining(e.resume_pos, trunc_end);
+
+    // The fix: valid=true even when bids array can't be fully skipped
+    assert(r.valid == true);
+    assert(r.bids_array != nullptr);
+    assert(*r.bids_array == '[');
+    // asks_array not found (truncated before "a":) — that's fine for streaming
+    assert(r.asks_array == nullptr);
+}
+
+template<typename H>
+void test_stream_depth_first_fragment_has_event_count() {
+    TestHarness<H> h;
+
+    // Build large depth (130 bids + 5 asks)
+    auto json = build_large_depth_json(false, 1600000000010LL, 800000, 130, 5);
+
+    // Truncate ~80 chars into the bids array
+    auto bids_marker = json.find("\"b\":[");
+    assert(bids_marker != std::string::npos);
+    uint32_t trunc = static_cast<uint32_t>(bids_marker + 80);
+
+    // Feed first fragment
+    auto info = h.feed_fragment_info(0, json.c_str(), trunc);
+    auto& st = h.state_for(0);
+
+    // Must have entered BIDS_PARSING (not stuck at HEADER_PARSED)
+    assert(st.phase == JsonParseState::BIDS_PARSING);
+    assert(st.bids_count > 0);
+
+    // The bug: mkt_event_count was 0 before the fix
+    assert(info.mkt_event_count > 0);
+
+    // Feed full payload — final result should be correct
+    h.feed_final_fragment(0, json.c_str());
+
+    auto events = h.published();
+    // Large diff (130+5=135) produces multiple flush events
+    uint16_t total = 0;
+    for (auto& e : events) {
+        assert(e.is_book_delta());
+        total += e.count;
+    }
+    assert(total == 135);
 }
 
 // ============================================================================
@@ -1928,13 +1900,6 @@ int main() {
     RUN_TEST(test_parse_combined_stream_truncated);
     RUN_TEST(test_skip_value_truncated);
 
-    std::printf("\n--- yyjson primitives ---\n");
-    RUN_TEST(test_yy_decimal_cstr_to_int64);
-    RUN_TEST(test_yy_parse_combined);
-    RUN_TEST(test_yy_parse_agg_trade);
-    RUN_TEST(test_yy_parse_depth_partial);
-    RUN_TEST(test_yy_parse_depth_diff);
-
     std::printf("\n--- decode_essential ---\n");
     RUN_TEST(test_decode_essential_agg_trade);
     RUN_TEST(test_decode_essential_depth_partial);
@@ -1948,6 +1913,7 @@ int main() {
     RUN_TEST(test_parse_agg_trade_remaining_truncated_m);
     RUN_TEST(test_parse_depth_remaining);
     RUN_TEST(test_parse_depth_remaining_diff);
+    RUN_TEST(test_parse_depth_remaining_truncated_bids);
 
     std::printf("\n--- simdjson parsers ---\n");
     RUN_TEST(test_simd_parse_agg_trade);
@@ -1996,12 +1962,12 @@ int main() {
         RUN_TEST_T((test_stream_depth_diff_many_bids_regression<H>));
         RUN_TEST_T((test_stream_depth_diff_exactly_38_bids<H>));
         RUN_TEST_T((test_stream_depth_diff_all_bids_no_asks<H>));
+        RUN_TEST_T((test_stream_depth_first_fragment_has_event_count<H>));
         RUN_TEST_T((test_stream_depth_dedup_no_rerun<H>));
         RUN_TEST_T((test_stream_done_state_prevents_double_publish<H>));
         RUN_TEST_T((test_stream_state_reset_between_messages<H>));
     };
 
-    run_handler_tests.template operator()<BinanceUSDMYyjsonParser>("BinanceUSDMYyjsonParser");
     run_handler_tests.template operator()<BinanceUSDMJsonParser>("BinanceUSDMJsonParser");
     run_handler_tests.template operator()<BinanceUSDMSimdjsonParser>("BinanceUSDMSimdjsonParser");
 

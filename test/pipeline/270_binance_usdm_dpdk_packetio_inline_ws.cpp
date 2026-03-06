@@ -7,7 +7,7 @@
 //
 // Architecture:
 //   - DirectIO Transport Process (core 4): DPDK PMD → recv → decrypt → WS parse → WSFrameInfo ring
-//   - Parent Process: consume WSFrameInfo + MktEvent rings, yyjson decode + print_timeline
+//   - Parent Process: consume WSFrameInfo + MktEvent rings, simdjson decode + print_timeline
 //
 // Streams: btcusdt@aggTrade/btcusdt@depth20/btcusdt@depth@100ms/btcusdt@depth@250ms
 // Public endpoint — no API key required.
@@ -15,7 +15,7 @@
 // Usage: sudo ./test_pipeline_270_binance_usdm_dpdk_packetio_inline_ws <interface> [--timeout <ms>]
 //
 // Build: ENABLE_RECONNECT=1 MAX_CONN=2 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 270_binance_usdm_dpdk_packetio_inline_ws.cpp
-// Link: requires yyjson.o
+// Link: requires simdjson.o
 
 #include <cstdio>
 #include <cstdlib>

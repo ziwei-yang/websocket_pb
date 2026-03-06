@@ -354,13 +354,13 @@ inline DepthRemaining parse_depth_remaining(const uint8_t* p, const uint8_t* end
     if (p >= end || *p != '"') return r;
     p = to_value(p, end);
     r.bids_array = p;
+    r.valid = true;       // bids array found is sufficient for streaming
     p = skip_value(p, end);
     while (p < end && (*p == ',' || *p == ' ')) ++p;
-    // Field 9: "a" (asks array) — locate
+    // Field 9: "a" (asks array) — locate (best-effort; streaming finds it later)
     if (p >= end || *p != '"') return r;
     p = to_value(p, end);
     r.asks_array = p;
-    r.valid = true;
     return r;
 }
 

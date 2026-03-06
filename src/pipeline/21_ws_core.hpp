@@ -620,6 +620,9 @@ private:
             if ((pending_frame_[ci].opcode == 0x01 || pending_frame_[ci].opcode == 0x02) && info.payload_len >= 64) {
                 const uint8_t* payload = msg_inbox_[ci]->data_at(info.msg_inbox_offset);
                 WSFrameInfo frag_info{};
+                frag_info.first_byte_ts = info.first_byte_ts;
+                frag_info.latest_bpf_entry_ns = info.latest_bpf_entry_ns;
+                frag_info.first_bpf_entry_ns = info.first_bpf_entry_ns;
                 mkt_event_handler_.on_ws_data(mkt_event_handler_.sbe_state_[ci],
                                               ci, payload, info.payload_len, frag_info);
                 info.mkt_event_type = frag_info.mkt_event_type;
