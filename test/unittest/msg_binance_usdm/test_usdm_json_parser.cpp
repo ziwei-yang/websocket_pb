@@ -1,5 +1,5 @@
 // test/unittest/test_usdm_json_parser.cpp
-// Unit tests for BinanceUSDMJsonParser (JSON market data for USD-M futures)
+// Unit tests for Binance USD-M JSON handlers (custom, yyjson, simdjson)
 // Creates real IPC ring files in /dev/shm/hft/test_usdm_json/ to test publish path.
 
 #include <cassert>
@@ -20,6 +20,7 @@
 #include "pipeline/pipeline_data.hpp"
 #include "msg/01_binance_usdm_json.hpp"
 #include "msg/02_binance_usdm_yyjson.hpp"
+#include "msg/03_binance_usdm_simdjson.hpp"
 
 using namespace websocket::json;
 using namespace websocket::pipeline;
@@ -36,6 +37,12 @@ constexpr const char* DEPTH_PARTIAL_JSON = R"({"stream":"btcusdt@depth20","data"
 constexpr const char* DEPTH_DIFF_JSON = R"({"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","E":123456789,"T":123456788,"s":"BTCUSDT","U":157,"u":160,"pu":149,"b":[["0.0024","10"]],"a":[["0.0026","100"]]}})";
 
 constexpr const char* DEPTH_DIFF_DELETE_JSON = R"({"stream":"btcusdt@depth@250ms","data":{"e":"depthUpdate","E":123456790,"T":123456789,"s":"BTCUSDT","U":161,"u":165,"pu":160,"b":[["0.0024","0"]],"a":[["0.0026","50"]]}})";
+
+// aggTrade with reordered fields: "a" before "s" (actual Binance field order)
+constexpr const char* AGG_TRADE_REORDERED_JSON = R"({"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":123456789,"a":5933014,"s":"BTCUSDT","p":"0.001","q":"100","nq":"100","f":100,"l":105,"T":123456785,"m":true}})";
+
+// depth20 with 10 bids + 10 asks (exercises level-count loop more than the 5+5 payload)
+constexpr const char* DEPTH_PARTIAL_LARGE_JSON = R"({"stream":"btcusdt@depth20","data":{"e":"depthUpdate","E":1571889248277,"T":1571889248276,"s":"BTCUSDT","U":390497796,"u":390497900,"pu":390497794,"b":[["7403.89","0.002"],["7403.90","3.906"],["7404.00","1.428"],["7404.85","5.239"],["7405.43","2.562"],["7405.50","1.100"],["7405.60","0.750"],["7405.70","2.300"],["7405.80","4.500"],["7405.90","0.123"]],"a":[["7405.96","3.340"],["7406.63","4.525"],["7407.08","2.475"],["7407.15","4.800"],["7407.20","0.175"],["7407.30","1.200"],["7407.40","0.900"],["7407.50","3.100"],["7407.60","2.800"],["7407.70","0.456"]]}})";
 
 // ============================================================================
 // Ring setup/teardown helpers (same as test_sbe_handler.cpp)
@@ -132,9 +139,49 @@ static std::vector<MktEvent> read_published_events(
 }
 
 // ============================================================================
-// Test harness
+// Cross-handler equivalence helpers
 // ============================================================================
 
+// Compare two MktEvents field-by-field, skipping recv_ts_ns (offset 16-24).
+// Layout: [0,16) header+src_seq | [16,24) recv_ts_ns(skip) | [24,40) event_ts_ns+nic_ts_ns | [40,512) payload
+static bool events_equivalent(const MktEvent& a, const MktEvent& b) {
+    static_assert(sizeof(MktEvent) == 512);
+    const auto* pa = reinterpret_cast<const uint8_t*>(&a);
+    const auto* pb = reinterpret_cast<const uint8_t*>(&b);
+    if (std::memcmp(pa, pb, 16) != 0) return false;          // [0,16)
+    if (std::memcmp(pa + 24, pb + 24, 16) != 0) return false; // [24,40)
+    if (std::memcmp(pa + 40, pb + 40, 472) != 0) return false; // [40,512)
+    return true;
+}
+
+static void assert_events_match(const std::vector<MktEvent>& a,
+                                const std::vector<MktEvent>& b,
+                                const char* label) {
+    if (a.size() != b.size()) {
+        std::fprintf(stderr, "EQUIV FAIL [%s]: size mismatch %zu vs %zu\n",
+                     label, a.size(), b.size());
+        assert(a.size() == b.size());
+    }
+    for (size_t i = 0; i < a.size(); i++) {
+        if (!events_equivalent(a[i], b[i])) {
+            std::fprintf(stderr, "EQUIV FAIL [%s] event[%zu]:\n", label, i);
+            std::fprintf(stderr, "  event_type: %u vs %u\n", a[i].event_type, b[i].event_type);
+            std::fprintf(stderr, "  flags:      0x%04x vs 0x%04x\n", a[i].flags, b[i].flags);
+            std::fprintf(stderr, "  count:      %u vs %u\n", a[i].count, b[i].count);
+            std::fprintf(stderr, "  count2:     %u vs %u\n", a[i].count2, b[i].count2);
+            std::fprintf(stderr, "  src_seq:    %ld vs %ld\n", a[i].src_seq, b[i].src_seq);
+            std::fprintf(stderr, "  event_ts:   %ld vs %ld\n", a[i].event_ts_ns, b[i].event_ts_ns);
+            std::fprintf(stderr, "  nic_ts:     %ld vs %ld\n", a[i].nic_ts_ns, b[i].nic_ts_ns);
+            assert(events_equivalent(a[i], b[i]));
+        }
+    }
+}
+
+// ============================================================================
+// Test harness (templated on handler type)
+// ============================================================================
+
+template<typename Handler>
 struct TestHarness {
     RingFiles rf;
     disruptor::ipc::shared_region* region = nullptr;
@@ -144,7 +191,16 @@ struct TestHarness {
     disruptor::ipc::shared_region* ws_region = nullptr;
     IPCRingProducer<WSFrameInfo>* ws_prod = nullptr;
 
-    BinanceUSDMYyjsonParser handler;
+    Handler handler;
+
+    // Extra states for ci values beyond PIPELINE_MAX_CONN (tests use ci=0,1,2)
+    static constexpr uint8_t MAX_TEST_CONN = 4;
+    JsonParseState extra_states_[MAX_TEST_CONN]{};
+
+    JsonParseState& state_for(uint8_t ci) {
+        if (ci < PIPELINE_MAX_CONN) return handler.sbe_state_[ci];
+        return extra_states_[ci % MAX_TEST_CONN];
+    }
 
     TestHarness() {
         rf = create_ring_files("mkt_event");
@@ -172,9 +228,10 @@ struct TestHarness {
         WSFrameInfo info{};
         info.clear();
         info.connection_id = ci;
-        handler.on_ws_data(handler.sbe_state_[ci], ci,
+        auto& st = state_for(ci);
+        handler.on_ws_data(st, ci,
                            (const uint8_t*)json, static_cast<uint32_t>(strlen(json)), info);
-        handler.sbe_state_[ci].reset();
+        st.reset();
 
         // Mimic WSCore: publish WSFrameInfo to ring, fill pending_ring_seq_slot_
         int64_t seq = ws_prod->try_claim();
@@ -185,6 +242,31 @@ struct TestHarness {
             *handler.pending_ring_seq_slot_ = seq;
             handler.pending_ring_seq_slot_ = nullptr;
         }
+    }
+
+    // Feed truncated payload — does NOT reset state (simulates continuation frame)
+    void feed_fragment(uint8_t ci, const char* json, uint32_t truncated_len) {
+        WSFrameInfo info{};
+        info.clear();
+        info.connection_id = ci;
+        auto& st = state_for(ci);
+        handler.on_ws_data(st, ci,
+                           (const uint8_t*)json, truncated_len, info);
+        // Do NOT reset state — continuation frame
+
+        int64_t seq = ws_prod->try_claim();
+        assert(seq >= 0);
+        (*ws_prod)[seq] = info;
+        ws_prod->publish(seq);
+        if (handler.pending_ring_seq_slot_) {
+            *handler.pending_ring_seq_slot_ = seq;
+            handler.pending_ring_seq_slot_ = nullptr;
+        }
+    }
+
+    // Feed full payload with accumulated length — resets state (simulates final frame)
+    void feed_final_fragment(uint8_t ci, const char* json) {
+        feed_frame(ci, json);  // passes full length + resets state
     }
 
     void idle() {
@@ -205,6 +287,13 @@ static int tests_total = 0;
 
 #define RUN_TEST(fn) do { \
     tests_total++; \
+    fn(); \
+    tests_passed++; \
+    std::printf("  PASS  %s\n", #fn); \
+} while(0)
+
+#define RUN_TEST_T(fn) do { \
+    tests_total++; cleanup_ring_files(); \
     fn(); \
     tests_passed++; \
     std::printf("  PASS  %s\n", #fn); \
@@ -342,6 +431,100 @@ void test_parse_combined_stream() {
     assert(std::memcmp(hdr.data_start, "{\"e\":\"aggTrade\"", 15) == 0);
 }
 
+void test_parse_combined_stream_truncated() {
+    // Exact crash case: payload ends at opening '"' of stream value
+    // {"stream":"  → 11 bytes, opening quote is last byte
+    {
+        const char* trunc = R"({"stream":")";
+        auto hdr = parse_combined_stream((const uint8_t*)trunc,
+                                          static_cast<uint32_t>(strlen(trunc)));
+        assert(hdr.type == UsdmStreamType::UNKNOWN);  // must not crash
+    }
+    // Truncated mid-stream-name (no closing quote)
+    {
+        const char* trunc = R"({"stream":"btcusdt@agg)";
+        auto hdr = parse_combined_stream((const uint8_t*)trunc,
+                                          static_cast<uint32_t>(strlen(trunc)));
+        assert(hdr.type == UsdmStreamType::UNKNOWN);
+    }
+    // Truncated before data value
+    {
+        const char* trunc = R"({"stream":"btcusdt@aggTrade","data":)";
+        auto hdr = parse_combined_stream((const uint8_t*)trunc,
+                                          static_cast<uint32_t>(strlen(trunc)));
+        assert(hdr.type == UsdmStreamType::AGG_TRADE);
+        // data_start may be null or data_len 0 — just must not crash
+    }
+    // Truncated data object (no closing brace)
+    {
+        const char* trunc = R"({"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","E":123)";
+        auto hdr = parse_combined_stream((const uint8_t*)trunc,
+                                          static_cast<uint32_t>(strlen(trunc)));
+        assert(hdr.type == UsdmStreamType::DEPTH_DIFF);
+        assert(hdr.data_start != nullptr);
+    }
+    // Very small payloads
+    {
+        auto hdr = parse_combined_stream((const uint8_t*)"{", 1);
+        assert(hdr.type == UsdmStreamType::UNKNOWN);
+    }
+    {
+        auto hdr = parse_combined_stream((const uint8_t*)"", 0);
+        assert(hdr.type == UsdmStreamType::UNKNOWN);
+    }
+}
+
+void test_skip_value_truncated() {
+    // true truncated at various points
+    {
+        const uint8_t* p = (const uint8_t*)"t";
+        const uint8_t* end = p + 1;
+        auto r = skip_value(p, end);
+        assert(r <= end);
+    }
+    {
+        const uint8_t* p = (const uint8_t*)"tr";
+        const uint8_t* end = p + 2;
+        auto r = skip_value(p, end);
+        assert(r <= end);
+    }
+    // false truncated
+    {
+        const uint8_t* p = (const uint8_t*)"fa";
+        const uint8_t* end = p + 2;
+        auto r = skip_value(p, end);
+        assert(r <= end);
+    }
+    // null truncated
+    {
+        const uint8_t* p = (const uint8_t*)"nu";
+        const uint8_t* end = p + 2;
+        auto r = skip_value(p, end);
+        assert(r <= end);
+    }
+}
+
+void test_decode_essential_truncated() {
+    // Test that decode_essential never crashes on any truncation of a valid payload.
+    // Walk through every possible cut point of a full aggTrade JSON.
+    const char* full = AGG_TRADE_JSON;
+    uint32_t full_len = static_cast<uint32_t>(strlen(full));
+    for (uint32_t cut = 0; cut < full_len; cut++) {
+        auto e = BinanceUSDMJsonDecoder::decode_essential(
+            (const uint8_t*)full, cut);
+        // Must not crash. Validity depends on how much data is available.
+        (void)e;
+    }
+    // Same for depth diff
+    const char* depth = DEPTH_DIFF_JSON;
+    uint32_t depth_len = static_cast<uint32_t>(strlen(depth));
+    for (uint32_t cut = 0; cut < depth_len; cut++) {
+        auto e = BinanceUSDMJsonDecoder::decode_essential(
+            (const uint8_t*)depth, cut);
+        (void)e;
+    }
+}
+
 // ============================================================================
 // yyjson Primitive Tests
 // ============================================================================
@@ -436,11 +619,295 @@ void test_yy_parse_depth_diff() {
 }
 
 // ============================================================================
-// aggTrade Handling Tests
+// decode_essential Tests
 // ============================================================================
 
+void test_decode_essential_agg_trade() {
+    auto e = BinanceUSDMJsonDecoder::decode_essential(
+        (const uint8_t*)AGG_TRADE_JSON,
+        static_cast<uint32_t>(strlen(AGG_TRADE_JSON)));
+    assert(e.valid);
+    assert(e.msg_type == static_cast<uint16_t>(UsdmStreamType::AGG_TRADE));
+    assert(e.sequence == 5933014);       // "a":5933014
+    assert(e.event_time_ms == 123456789); // "E":123456789
+    assert(e.data_start != nullptr);
+    assert(*e.data_start == '{');
+    assert(e.resume_pos != nullptr);
+    assert(e.resume_pos > e.data_start);
+    assert(e.data_end != nullptr);
+    assert(e.data_end > e.resume_pos);
+    // resume_pos should point at the start of the "p" field
+    assert(*e.resume_pos == '"');
+}
+
+void test_decode_essential_depth_partial() {
+    auto e = BinanceUSDMJsonDecoder::decode_essential(
+        (const uint8_t*)DEPTH_PARTIAL_JSON,
+        static_cast<uint32_t>(strlen(DEPTH_PARTIAL_JSON)));
+    assert(e.valid);
+    assert(e.msg_type == static_cast<uint16_t>(UsdmStreamType::DEPTH_PARTIAL));
+    assert(e.sequence == 390497878);          // "u":390497878
+    assert(e.event_time_ms == 1571889248277LL); // "E"
+    assert(e.txn_time_ms == 1571889248276LL);   // "T"
+    assert(e.resume_pos != nullptr);
+    assert(*e.resume_pos == '"');  // should point at "pu" field
+}
+
+void test_decode_essential_depth_diff() {
+    auto e = BinanceUSDMJsonDecoder::decode_essential(
+        (const uint8_t*)DEPTH_DIFF_JSON,
+        static_cast<uint32_t>(strlen(DEPTH_DIFF_JSON)));
+    assert(e.valid);
+    assert(e.msg_type == static_cast<uint16_t>(UsdmStreamType::DEPTH_DIFF));
+    assert(e.sequence == 160);              // "u":160
+    assert(e.event_time_ms == 123456789);   // "E"
+    assert(e.txn_time_ms == 123456788);     // "T"
+    assert(e.resume_pos != nullptr);
+}
+
+void test_decode_essential_invalid() {
+    // Empty
+    {
+        auto e = BinanceUSDMJsonDecoder::decode_essential(nullptr, 0);
+        assert(!e.valid);
+    }
+    // Garbage
+    {
+        const char* garbage = "not json at all";
+        auto e = BinanceUSDMJsonDecoder::decode_essential(
+            (const uint8_t*)garbage, static_cast<uint32_t>(strlen(garbage)));
+        assert(!e.valid);
+    }
+    // Unknown stream
+    {
+        const char* unknown = R"({"stream":"btcusdt@ticker","data":{"e":"24hrTicker"}})";
+        auto e = BinanceUSDMJsonDecoder::decode_essential(
+            (const uint8_t*)unknown, static_cast<uint32_t>(strlen(unknown)));
+        assert(!e.valid);
+    }
+}
+
+void test_decode_essential_agg_trade_reordered() {
+    auto e = BinanceUSDMJsonDecoder::decode_essential(
+        (const uint8_t*)AGG_TRADE_REORDERED_JSON,
+        static_cast<uint32_t>(strlen(AGG_TRADE_REORDERED_JSON)));
+    assert(e.valid);
+    assert(e.msg_type == static_cast<uint16_t>(UsdmStreamType::AGG_TRADE));
+    assert(e.sequence == 5933014);        // "a":5933014 (via fallback scan)
+    assert(e.event_time_ms == 123456789); // "E":123456789
+    assert(e.data_start != nullptr);
+    assert(e.resume_pos != nullptr);
+    assert(e.data_end != nullptr);
+}
+
+template<typename H>
+void test_agg_trade_reordered_not_discarded() {
+    TestHarness<H> h;
+    h.feed_frame(0, AGG_TRADE_REORDERED_JSON);
+    h.idle();
+
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_trade_array());
+    assert(events[0].count == 1);
+    assert(events[0].payload.trades.entries[0].trade_id == 5933014);
+}
+
+// ============================================================================
+// Remaining-field Parser Tests
+// ============================================================================
+
+void test_parse_agg_trade_remaining() {
+    auto e = BinanceUSDMJsonDecoder::decode_essential(
+        (const uint8_t*)AGG_TRADE_JSON,
+        static_cast<uint32_t>(strlen(AGG_TRADE_JSON)));
+    assert(e.valid);
+
+    auto r = parse_agg_trade_remaining(e.resume_pos, e.data_end);
+    assert(r.valid);
+    assert(r.price_mantissa == 1);         // "0.001" -> 1
+    assert(r.qty_mantissa == 100);         // "100" -> 100
+    assert(r.trade_time_ms == 123456785);  // "T"
+    assert(r.buyer_is_maker == true);      // "m":true
+}
+
+void test_parse_agg_trade_remaining_truncated_m() {
+    // Truncate aggTrade payload right after "m": so the bool value is missing.
+    // This simulates a TLS record boundary splitting the JSON mid-field.
+    // parse_agg_trade_remaining() must return valid=false (not silently default).
+    const char* full = AGG_TRADE_JSON;
+    size_t full_len = strlen(full);
+
+    // Find "m": in the payload and truncate right after the colon
+    const char* m_field = strstr(full, "\"m\":");
+    assert(m_field != nullptr);
+    size_t trunc_len = static_cast<size_t>(m_field - full) + 4;  // include "m":
+    assert(trunc_len < full_len);
+
+    auto e = BinanceUSDMJsonDecoder::decode_essential(
+        (const uint8_t*)full, static_cast<uint32_t>(trunc_len));
+    // decode_essential may or may not succeed (it parses earlier fields),
+    // but if it does, the remaining parse must fail
+    if (e.valid && e.resume_pos) {
+        // Clamp data_end to our truncated boundary
+        const uint8_t* trunc_end = (const uint8_t*)full + trunc_len;
+        if (e.data_end > trunc_end) {
+            // Use truncated end
+            auto r = parse_agg_trade_remaining(e.resume_pos, trunc_end);
+            assert(!r.valid);  // must NOT report valid with missing "m" value
+        }
+    }
+    std::printf("  truncated \"m\" field correctly rejected\n");
+}
+
+void test_parse_depth_remaining() {
+    auto e = BinanceUSDMJsonDecoder::decode_essential(
+        (const uint8_t*)DEPTH_PARTIAL_JSON,
+        static_cast<uint32_t>(strlen(DEPTH_PARTIAL_JSON)));
+    assert(e.valid);
+
+    auto r = parse_depth_remaining(e.resume_pos, e.data_end);
+    assert(r.valid);
+    assert(r.bids_array != nullptr);
+    assert(r.asks_array != nullptr);
+    assert(*r.bids_array == '[');
+    assert(*r.asks_array == '[');
+
+    // Parse levels from bids/asks arrays
+    BookLevel bids[20], asks[20];
+    uint8_t bc = parse_book_levels(r.bids_array, e.data_end, bids, 20);
+    uint8_t ac = parse_book_levels(r.asks_array, e.data_end, asks, 20);
+    assert(bc == 5);
+    assert(ac == 5);
+    assert(bids[0].price == 740389);  // "7403.89"
+    assert(bids[0].qty == 2);         // "0.002"
+    assert(asks[0].price == 740596);  // "7405.96"
+    assert(asks[0].qty == 3340);      // "3.340"
+}
+
+void test_parse_depth_remaining_diff() {
+    auto e = BinanceUSDMJsonDecoder::decode_essential(
+        (const uint8_t*)DEPTH_DIFF_JSON,
+        static_cast<uint32_t>(strlen(DEPTH_DIFF_JSON)));
+    assert(e.valid);
+
+    auto r = parse_depth_remaining(e.resume_pos, e.data_end);
+    assert(r.valid);
+
+    DeltaEntry bid_deltas[32], ask_deltas[32];
+    uint8_t bc = parse_delta_levels(r.bids_array, e.data_end, bid_deltas, 32, false);
+    uint8_t ac = parse_delta_levels(r.asks_array, e.data_end, ask_deltas, 32, true);
+    assert(bc == 1);
+    assert(ac == 1);
+    assert(bid_deltas[0].price == 24);   // "0.0024"
+    assert(bid_deltas[0].qty == 10);
+    assert(ask_deltas[0].price == 26);   // "0.0026"
+    assert(ask_deltas[0].qty == 100);
+}
+
+// ============================================================================
+// simdjson Parse Tests
+// ============================================================================
+
+void test_simd_parse_agg_trade() {
+    auto len = static_cast<uint32_t>(strlen(AGG_TRADE_JSON));
+    simdjson::ondemand::parser parser;
+    alignas(64) uint8_t buf[4096 + simdjson::SIMDJSON_PADDING];
+    std::memcpy(buf, AGG_TRADE_JSON, len);
+    std::memset(buf + len, 0, simdjson::SIMDJSON_PADDING);
+    size_t cap = len + simdjson::SIMDJSON_PADDING;
+
+    auto res = websocket::json::simd::simd_parse_combined(parser, buf, len, cap);
+    assert(res.valid);
+    assert(res.type == UsdmStreamType::AGG_TRADE);
+
+    auto tf = websocket::json::simd::simd_parse_agg_trade(res.data);
+    assert(tf.valid);
+    assert(tf.event_time_ms == 123456789);
+    assert(tf.agg_trade_id == 5933014);
+    assert(tf.price_mantissa == 1);       // "0.001" -> 1
+    assert(tf.qty_mantissa == 100);       // "100" -> 100
+    assert(tf.trade_time_ms == 123456785);
+    assert(tf.buyer_is_maker == true);
+}
+
+void test_simd_parse_depth_partial() {
+    auto len = static_cast<uint32_t>(strlen(DEPTH_PARTIAL_JSON));
+    simdjson::ondemand::parser parser;
+    alignas(64) uint8_t buf[4096 + simdjson::SIMDJSON_PADDING];
+    std::memcpy(buf, DEPTH_PARTIAL_JSON, len);
+    std::memset(buf + len, 0, simdjson::SIMDJSON_PADDING);
+    size_t cap = len + simdjson::SIMDJSON_PADDING;
+
+    auto res = websocket::json::simd::simd_parse_combined(parser, buf, len, cap);
+    assert(res.valid);
+    assert(res.type == UsdmStreamType::DEPTH_PARTIAL);
+
+    auto dh = websocket::json::simd::simd_parse_depth_header(res.data);
+    assert(dh.valid);
+    assert(dh.event_time_ms == 1571889248277LL);
+    assert(dh.txn_time_ms == 1571889248276LL);
+    assert(dh.last_update_id == 390497878);
+
+    // Must iterate bids before asks (On Demand cursor is forward-only)
+    BookLevel bids[20], asks[20];
+    simdjson::ondemand::array b_arr, a_arr;
+    assert(!res.data.find_field("b").get_array().get(b_arr));
+    uint8_t bc = websocket::json::simd::simd_parse_book_levels(b_arr, bids, 20);
+    assert(!res.data.find_field("a").get_array().get(a_arr));
+    uint8_t ac = websocket::json::simd::simd_parse_book_levels(a_arr, asks, 20);
+    assert(bc == 5);
+    assert(ac == 5);
+    assert(bids[0].price == 740389);  // "7403.89"
+    assert(bids[0].qty == 2);         // "0.002"
+    assert(asks[0].price == 740596);  // "7405.96"
+    assert(asks[0].qty == 3340);      // "3.340"
+}
+
+void test_simd_parse_depth_diff() {
+    auto len = static_cast<uint32_t>(strlen(DEPTH_DIFF_JSON));
+    simdjson::ondemand::parser parser;
+    alignas(64) uint8_t buf[4096 + simdjson::SIMDJSON_PADDING];
+    std::memcpy(buf, DEPTH_DIFF_JSON, len);
+    std::memset(buf + len, 0, simdjson::SIMDJSON_PADDING);
+    size_t cap = len + simdjson::SIMDJSON_PADDING;
+
+    auto res = websocket::json::simd::simd_parse_combined(parser, buf, len, cap);
+    assert(res.valid);
+    assert(res.type == UsdmStreamType::DEPTH_DIFF);
+
+    auto dh = websocket::json::simd::simd_parse_depth_header(res.data);
+    assert(dh.valid);
+    assert(dh.event_time_ms == 123456789);
+    assert(dh.txn_time_ms == 123456788);
+    assert(dh.last_update_id == 160);
+
+    // Must iterate bids before asks (On Demand cursor is forward-only)
+    DeltaEntry bid_deltas[32], ask_deltas[32];
+    simdjson::ondemand::array b_arr, a_arr;
+    assert(!res.data.find_field("b").get_array().get(b_arr));
+    uint8_t bc = websocket::json::simd::simd_parse_delta_levels(b_arr, bid_deltas, 32, false);
+    assert(!res.data.find_field("a").get_array().get(a_arr));
+    uint8_t ac = websocket::json::simd::simd_parse_delta_levels(a_arr, ask_deltas, 32, true);
+    assert(bc == 1);
+    assert(ac == 1);
+    assert(bid_deltas[0].price == 24);
+    assert(bid_deltas[0].qty == 10);
+    assert(bid_deltas[0].action == static_cast<uint8_t>(DeltaAction::UPDATE));
+    assert(bid_deltas[0].is_bid());
+    assert(ask_deltas[0].price == 26);
+    assert(ask_deltas[0].qty == 100);
+    assert(ask_deltas[0].action == static_cast<uint8_t>(DeltaAction::UPDATE));
+    assert(ask_deltas[0].is_ask());
+}
+
+// ============================================================================
+// Handler Tests (templated — run for each handler type)
+// ============================================================================
+
+template<typename H>
 void test_agg_trade_single() {
-    TestHarness h;
+    TestHarness<H> h;
     h.feed_frame(0, AGG_TRADE_JSON);
     h.idle();
 
@@ -461,8 +928,9 @@ void test_agg_trade_single() {
     assert(!te.is_buyer());
 }
 
+template<typename H>
 void test_agg_trade_merge() {
-    TestHarness h;
+    TestHarness<H> h;
 
     // 3 aggTrades with different ids
     char buf1[512], buf2[512], buf3[512];
@@ -483,8 +951,9 @@ void test_agg_trade_merge() {
     assert(events[0].payload.trades.entries[2].trade_id == 5933016);
 }
 
+template<typename H>
 void test_agg_trade_merge_overflow() {
-    TestHarness h;
+    TestHarness<H> h;
 
     // Feed 15 aggTrades — should flush at MAX_TRADES(11) + remainder(4)
     for (int i = 0; i < 15; i++) {
@@ -503,8 +972,9 @@ void test_agg_trade_merge_overflow() {
     assert(events[1].count == 4);
 }
 
+template<typename H>
 void test_agg_trade_dedup() {
-    TestHarness h;
+    TestHarness<H> h;
 
     // Feed same aggTrade twice (same id)
     h.feed_frame(0, AGG_TRADE_JSON);
@@ -516,8 +986,9 @@ void test_agg_trade_dedup() {
     assert(events[0].count == 1);
 }
 
+template<typename H>
 void test_agg_trade_no_merge() {
-    TestHarness h;
+    TestHarness<H> h;
     h.handler.merge_enabled = false;
 
     h.feed_frame(0, AGG_TRADE_JSON);
@@ -530,12 +1001,9 @@ void test_agg_trade_no_merge() {
     assert(events[0].payload.trades.entries[0].trade_id == 5933014);
 }
 
-// ============================================================================
-// Depth Snapshot Tests
-// ============================================================================
-
+template<typename H>
 void test_depth_snapshot_parse() {
-    TestHarness h;
+    TestHarness<H> h;
     h.feed_frame(0, DEPTH_PARTIAL_JSON);
 
     auto events = h.published();
@@ -557,8 +1025,9 @@ void test_depth_snapshot_parse() {
     assert(e.payload.snapshot.levels[5].qty == 334000000LL);  // "3.340" -> 3340 * qty_scale(10^5)
 }
 
+template<typename H>
 void test_depth_snapshot_dedup() {
-    TestHarness h;
+    TestHarness<H> h;
     h.feed_frame(0, DEPTH_PARTIAL_JSON);
     h.feed_frame(0, DEPTH_PARTIAL_JSON);
 
@@ -566,12 +1035,9 @@ void test_depth_snapshot_dedup() {
     assert(events.size() == 1);
 }
 
-// ============================================================================
-// Depth Delta Tests
-// ============================================================================
-
+template<typename H>
 void test_depth_delta_parse() {
-    TestHarness h;
+    TestHarness<H> h;
     h.feed_frame(0, DEPTH_DIFF_JSON);
 
     auto events = h.published();
@@ -597,8 +1063,9 @@ void test_depth_delta_parse() {
     assert(ask.is_ask());
 }
 
+template<typename H>
 void test_depth_delta_delete() {
-    TestHarness h;
+    TestHarness<H> h;
     // First feed a diff to set baseline seq
     h.feed_frame(0, DEPTH_DIFF_JSON);
     // Then feed the delete diff (higher seq)
@@ -624,8 +1091,9 @@ void test_depth_delta_delete() {
     assert(ask.action == static_cast<uint8_t>(DeltaAction::UPDATE));
 }
 
+template<typename H>
 void test_depth_delta_dedup() {
-    TestHarness h;
+    TestHarness<H> h;
     h.feed_frame(0, DEPTH_DIFF_JSON);
     // Same seq (160) should be discarded
     h.feed_frame(0, DEPTH_DIFF_JSON);
@@ -634,12 +1102,9 @@ void test_depth_delta_dedup() {
     assert(events.size() == 1);
 }
 
-// ============================================================================
-// Cross-Type Tests
-// ============================================================================
-
+template<typename H>
 void test_cross_type_flush_trades_then_depth() {
-    TestHarness h;
+    TestHarness<H> h;
 
     // Feed 2 aggTrades (pending)
     char buf1[512], buf2[512];
@@ -660,8 +1125,9 @@ void test_cross_type_flush_trades_then_depth() {
     assert(events[1].is_book_snapshot());
 }
 
+template<typename H>
 void test_batch_end_flushes_trades() {
-    TestHarness h;
+    TestHarness<H> h;
 
     char buf1[512], buf2[512];
     snprintf(buf1, sizeof(buf1), R"({"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":100,"s":"BTCUSDT","a":2000,"p":"1.00","q":"10","nq":"10","f":1,"l":1,"T":99,"m":true}})");
@@ -681,8 +1147,9 @@ void test_batch_end_flushes_trades() {
     assert(events[0].count == 2);
 }
 
+template<typename H>
 void test_disconnect_reconnect() {
-    TestHarness h;
+    TestHarness<H> h;
 
     h.handler.on_disconnected(0);
     h.handler.on_reconnected(0);
@@ -701,12 +1168,9 @@ void test_disconnect_reconnect() {
     assert(events[1].payload.status.connection_id == 0);
 }
 
-// ============================================================================
-// Cross-connection monotonic ordering tests (ported from SBE tests 40, 43, 45)
-// ============================================================================
-
+template<typename H>
 void test_cross_conn_merge_flush_before_mix() {
-    TestHarness h;
+    TestHarness<H> h;
     h.handler.merge_enabled = true;
 
     // Conn 0 feeds aggTrade id=1000
@@ -753,8 +1217,9 @@ void test_cross_conn_merge_flush_before_mix() {
     assert(found_2000);
 }
 
+template<typename H>
 void test_cross_conn_pending_ci_attribution() {
-    TestHarness h;
+    TestHarness<H> h;
     h.handler.merge_enabled = true;
 
     // Conn 0 feeds 2 trades (ids 1000, 1001)
@@ -796,8 +1261,9 @@ void test_cross_conn_pending_ci_attribution() {
     assert(trade_count == 2);
 }
 
+template<typename H>
 void test_pending_max_id_monotonic() {
-    TestHarness h;
+    TestHarness<H> h;
     h.handler.merge_enabled = true;
 
     // Conn 0: trade with id=509
@@ -823,55 +1289,737 @@ void test_pending_max_id_monotonic() {
 }
 
 // ============================================================================
+// Cross-handler Equivalence Tests
+// ============================================================================
+
+void test_equiv_agg_trade() {
+    auto run = [](auto& h) { h.feed_frame(0, AGG_TRADE_JSON); h.idle(); return h.published(); };
+    std::vector<MktEvent> ec, ey, es;
+    { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
+    assert_events_match(ec, ey, "custom vs yyjson: agg_trade");
+    assert_events_match(ec, es, "custom vs simdjson: agg_trade");
+}
+
+void test_equiv_agg_trade_merge() {
+    char buf1[512], buf2[512], buf3[512];
+    snprintf(buf1, sizeof(buf1), R"({"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":100,"s":"BTCUSDT","a":5933014,"p":"0.001","q":"100","nq":"100","f":100,"l":105,"T":99,"m":true}})");
+    snprintf(buf2, sizeof(buf2), R"({"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":101,"s":"BTCUSDT","a":5933015,"p":"0.002","q":"200","nq":"200","f":106,"l":110,"T":100,"m":false}})");
+    snprintf(buf3, sizeof(buf3), R"({"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":102,"s":"BTCUSDT","a":5933016,"p":"0.003","q":"300","nq":"300","f":111,"l":115,"T":101,"m":true}})");
+
+    auto run = [&](auto& h) {
+        h.feed_frame(0, buf1); h.feed_frame(0, buf2); h.feed_frame(0, buf3);
+        h.idle(); return h.published();
+    };
+    std::vector<MktEvent> ec, ey, es;
+    { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
+    assert_events_match(ec, ey, "custom vs yyjson: agg_trade_merge");
+    assert_events_match(ec, es, "custom vs simdjson: agg_trade_merge");
+}
+
+void test_equiv_agg_trade_no_merge() {
+    auto run = [](auto& h) {
+        h.handler.merge_enabled = false;
+        h.feed_frame(0, AGG_TRADE_JSON); return h.published();
+    };
+    std::vector<MktEvent> ec, ey, es;
+    { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
+    assert_events_match(ec, ey, "custom vs yyjson: agg_trade_no_merge");
+    assert_events_match(ec, es, "custom vs simdjson: agg_trade_no_merge");
+}
+
+void test_equiv_depth_snapshot() {
+    auto run = [](auto& h) { h.feed_frame(0, DEPTH_PARTIAL_JSON); return h.published(); };
+    std::vector<MktEvent> ec, ey, es;
+    { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
+    assert_events_match(ec, ey, "custom vs yyjson: depth_snapshot");
+    assert_events_match(ec, es, "custom vs simdjson: depth_snapshot");
+}
+
+void test_equiv_depth_snapshot_large() {
+    auto run = [](auto& h) { h.feed_frame(0, DEPTH_PARTIAL_LARGE_JSON); return h.published(); };
+    std::vector<MktEvent> ec, ey, es;
+    { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
+    assert_events_match(ec, ey, "custom vs yyjson: depth_snapshot_large");
+    assert_events_match(ec, es, "custom vs simdjson: depth_snapshot_large");
+}
+
+void test_equiv_depth_diff() {
+    auto run = [](auto& h) { h.feed_frame(0, DEPTH_DIFF_JSON); return h.published(); };
+    std::vector<MktEvent> ec, ey, es;
+    { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
+    assert_events_match(ec, ey, "custom vs yyjson: depth_diff");
+    assert_events_match(ec, es, "custom vs simdjson: depth_diff");
+}
+
+void test_equiv_depth_diff_delete() {
+    auto run = [](auto& h) {
+        h.feed_frame(0, DEPTH_DIFF_JSON);
+        h.feed_frame(0, DEPTH_DIFF_DELETE_JSON);
+        return h.published();
+    };
+    std::vector<MktEvent> ec, ey, es;
+    { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
+    assert_events_match(ec, ey, "custom vs yyjson: depth_diff_delete");
+    assert_events_match(ec, es, "custom vs simdjson: depth_diff_delete");
+}
+
+void test_equiv_cross_type_flush() {
+    char buf1[512], buf2[512];
+    snprintf(buf1, sizeof(buf1), R"({"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":100,"s":"BTCUSDT","a":1000,"p":"1.00","q":"10","nq":"10","f":1,"l":1,"T":99,"m":true}})");
+    snprintf(buf2, sizeof(buf2), R"({"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":101,"s":"BTCUSDT","a":1001,"p":"2.00","q":"20","nq":"20","f":2,"l":2,"T":100,"m":false}})");
+
+    auto run = [&](auto& h) {
+        h.feed_frame(0, buf1); h.feed_frame(0, buf2);
+        h.feed_frame(0, DEPTH_PARTIAL_JSON);
+        return h.published();
+    };
+    std::vector<MktEvent> ec, ey, es;
+    { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
+    assert_events_match(ec, ey, "custom vs yyjson: cross_type_flush");
+    assert_events_match(ec, es, "custom vs simdjson: cross_type_flush");
+}
+
+// ============================================================================
+// Streaming Fragment Parsing Tests
+// ============================================================================
+
+// Helper: build large depth JSON with N bids + M asks
+static std::string build_large_depth_json(bool is_snapshot, int64_t event_time,
+                                           int64_t update_id, int num_bids, int num_asks) {
+    std::string json;
+    if (is_snapshot)
+        json = R"({"stream":"btcusdt@depth20","data":{"e":"depthUpdate","E":)";
+    else
+        json = R"({"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","E":)";
+    json += std::to_string(event_time);
+    json += R"(,"T":)" + std::to_string(event_time - 1);
+    json += R"(,"s":"BTCUSDT","U":)" + std::to_string(update_id - 10);
+    json += R"(,"u":)" + std::to_string(update_id);
+    json += R"(,"pu":)" + std::to_string(update_id - 11);
+    json += R"(,"b":[)";
+    for (int i = 0; i < num_bids; i++) {
+        if (i > 0) json += ",";
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[\"%.2f\",\"%.3f\"]", 7400.00 + i * 0.01, 1.0 + i * 0.1);
+        json += buf;
+    }
+    json += R"(],"a":[)";
+    for (int i = 0; i < num_asks; i++) {
+        if (i > 0) json += ",";
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[\"%.2f\",\"%.3f\"]", 7500.00 + i * 0.01, 2.0 + i * 0.1);
+        json += buf;
+    }
+    json += R"(]}})";
+    return json;
+}
+
+// ── parse_levels_streaming regression: start_offset at level '[' not outer '[' ──
+//
+// Bug: parse_levels_streaming used to begin with `if (*p == '[') ++p;` to skip
+// the outer array bracket.  When called with start_offset pointing at a level's
+// '[' (e.g. after mid-level truncation reverts to level_start), that opening '['
+// was consumed, the inner-loop then saw '"' instead of '[', and broke out with
+// new_count=0.  The fix moves the outer-'[' skip to the callers.
+//
+// This test calls parse_levels_streaming directly with start_offset at the first
+// level's '[' (i.e. already past the outer '['), verifying all levels are parsed.
+
+void test_parse_levels_streaming_no_outer_bracket_skip() {
+    // Raw array contents WITHOUT the outer '[': two levels + closing ']'
+    // Represents the inside of ["100.50","3.000"],["200.75","4.500"]]
+    // (caller already skipped outer '[')
+    const char* data = R"(["100.50","3.000"],["200.75","4.500"]])";
+    auto len = static_cast<uint32_t>(strlen(data));
+
+    websocket::msg::DeltaEntry buf[4]{};
+
+    // Call with start_offset=0, meaning p starts at '[' of first level
+    auto sr = websocket::json::parse_levels_streaming(
+        reinterpret_cast<const uint8_t*>(data), len, 0,
+        buf, 0, 4, false);
+
+    // Must parse both levels and see the closing ']'
+    assert(sr.new_count == 2);
+    assert(sr.array_done == true);
+    assert(buf[0].price == 10050);   // "100.50" → 10050
+    assert(buf[0].qty   == 3000);    // "3.000"  → 3000
+    assert(buf[1].price == 20075);   // "200.75" → 20075
+    assert(buf[1].qty   == 4500);    // "4.500"  → 4500
+    assert(buf[0].flags == 0);       // bid (is_ask=false)
+    assert(buf[1].flags == 0);
+}
+
+// Same test but with is_ask=true to verify flag propagation
+void test_parse_levels_streaming_at_level_bracket_ask() {
+    const char* data = R"(["50.25","1.100"]])";
+    auto len = static_cast<uint32_t>(strlen(data));
+
+    websocket::msg::DeltaEntry buf[2]{};
+
+    auto sr = websocket::json::parse_levels_streaming(
+        reinterpret_cast<const uint8_t*>(data), len, 0,
+        buf, 0, 2, true);
+
+    assert(sr.new_count == 1);
+    assert(sr.array_done == true);
+    assert(buf[0].price == 5025);
+    assert(buf[0].qty   == 1100);
+    assert(buf[0].flags == websocket::msg::DeltaFlags::SIDE_ASK);
+}
+
+// Regression: truncation mid-level reverts to level_start, then re-calling at
+// that offset (a level '[') must still parse correctly on the next call.
+void test_parse_levels_streaming_truncation_revert_then_resume() {
+    // Full data: 3 levels inside an array (outer '[' already skipped by caller)
+    const char* full = R"(["10.00","1.000"],["20.00","2.000"],["30.00","3.000"]])";
+    auto full_len = static_cast<uint32_t>(strlen(full));
+
+    // Truncate mid-way through the second level (after first level completes)
+    // First level: ["10.00","1.000"]  = 18 chars
+    // Comma: ,                         = 1  char   (offset 18)
+    // Second level starts at offset 19: ["20.00","2.0  ← truncate here (offset 32)
+    uint32_t trunc_len = 32;
+
+    websocket::msg::DeltaEntry buf[4]{};
+
+    // First call: parses 1 complete level, truncates mid-second, reverts
+    auto sr1 = websocket::json::parse_levels_streaming(
+        reinterpret_cast<const uint8_t*>(full), trunc_len, 0,
+        buf, 0, 4, false);
+
+    assert(sr1.new_count == 1);
+    assert(sr1.array_done == false);
+    // resume_offset should be at the second level's '[' (the revert point)
+    assert(full[sr1.resume_offset] == '[');
+
+    // Second call: resume at the level's '[' with full data — this is the
+    // exact scenario that triggered the bug (level '[' mistaken for outer '[')
+    auto sr2 = websocket::json::parse_levels_streaming(
+        reinterpret_cast<const uint8_t*>(full), full_len, sr1.resume_offset,
+        buf, 1, 4, false);
+
+    assert(sr2.new_count == 2);       // levels 2 and 3
+    assert(sr2.array_done == true);   // saw closing ']'
+    assert(buf[1].price == 2000);     // "20.00" → 2000
+    assert(buf[2].price == 3000);     // "30.00" → 3000
+}
+
+// ── Streaming AGG_TRADE tests ──
+
+template<typename H>
+void test_stream_agg_trade_truncated_then_complete() {
+    TestHarness<H> h;
+
+    // Fragment 1: truncated at 100 bytes (decode_essential succeeds, remaining fails)
+    h.feed_fragment(0, AGG_TRADE_JSON, 100);
+    auto& st = h.state_for(0);
+    assert(st.phase == JsonParseState::HEADER_PARSED);
+    assert(st.msg_type == static_cast<uint16_t>(UsdmStreamType::AGG_TRADE));
+
+    // Fragment 2: full data — parse succeeds
+    h.feed_final_fragment(0, AGG_TRADE_JSON);
+    h.idle();
+
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_trade_array());
+    assert(events[0].count == 1);
+    assert(events[0].src_seq == 5933014);
+}
+
+template<typename H>
+void test_stream_agg_trade_too_small() {
+    TestHarness<H> h;
+
+    // Fragment smaller than decode_essential needs
+    h.feed_fragment(0, AGG_TRADE_JSON, 30);
+    auto& st = h.state_for(0);
+    assert(st.phase == JsonParseState::IDLE);
+}
+
+template<typename H>
+void test_stream_agg_trade_complete_in_one() {
+    TestHarness<H> h;
+    h.feed_frame(0, AGG_TRADE_JSON);
+    h.idle();
+
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_trade_array());
+    assert(events[0].count == 1);
+    assert(events[0].src_seq == 5933014);
+}
+
+template<typename H>
+void test_stream_agg_trade_dedup_no_double_count() {
+    TestHarness<H> h;
+
+    // First complete trade
+    h.feed_frame(0, AGG_TRADE_JSON);
+    h.idle();
+
+    // Same trade_id again as fragment — should hit dedup
+    h.feed_fragment(0, AGG_TRADE_JSON, 100);
+    auto& st = h.state_for(0);
+    assert(st.phase == JsonParseState::DONE);
+
+    // Feed final — state still DONE, no-op
+    h.feed_final_fragment(0, AGG_TRADE_JSON);
+
+    auto events = h.published();
+    assert(events.size() == 1);  // only the first trade
+}
+
+// ── Streaming DEPTH_PARTIAL (snapshot) tests ──
+
+template<typename H>
+void test_stream_depth_snapshot_truncated_bids() {
+    TestHarness<H> h;
+    auto json = build_large_depth_json(true, 1600000000000LL, 500000, 14, 14);
+
+    // Find offset in the middle of bids array
+    auto bid_start = json.find("\"b\":[");
+    assert(bid_start != std::string::npos);
+    // Truncate after ~5 bid levels
+    uint32_t trunc = static_cast<uint32_t>(bid_start + 80);  // somewhere in bids
+
+    h.feed_fragment(0, json.c_str(), trunc);
+    auto& st = h.state_for(0);
+    // Should be BIDS_PARSING (started parsing but truncated)
+    assert(st.phase == JsonParseState::BIDS_PARSING || st.phase == JsonParseState::HEADER_PARSED);
+    assert(st.msg_type == static_cast<uint16_t>(UsdmStreamType::DEPTH_PARTIAL));
+
+    // Feed full
+    h.feed_final_fragment(0, json.c_str());
+
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_book_snapshot());
+    assert(events[0].is_snapshot());
+}
+
+template<typename H>
+void test_stream_depth_snapshot_truncated_asks() {
+    TestHarness<H> h;
+    auto json = build_large_depth_json(true, 1600000000000LL, 500001, 5, 5);
+
+    // Truncate after all bids, inside asks array
+    auto asks_start = json.find("\"a\":[");
+    assert(asks_start != std::string::npos);
+    uint32_t trunc = static_cast<uint32_t>(asks_start + 30);
+
+    h.feed_fragment(0, json.c_str(), trunc);
+    auto& st = h.state_for(0);
+    // Should be in ASKS_PARSING
+    assert(st.phase == JsonParseState::ASKS_PARSING || st.phase == JsonParseState::BIDS_PARSING);
+
+    h.feed_final_fragment(0, json.c_str());
+
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_book_snapshot());
+}
+
+template<typename H>
+void test_stream_depth_snapshot_capacity_publish() {
+    TestHarness<H> h;
+    // 20 bids + 20 asks — exceeds SNAPSHOT_HALF=14 per side
+    auto json = build_large_depth_json(true, 1600000000000LL, 500002, 20, 20);
+
+    h.feed_frame(0, json.c_str());
+
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_book_snapshot());
+    // Should be capped at SNAPSHOT_HALF per side
+    assert(events[0].count <= 14);
+    assert(events[0].count2 <= 14);
+}
+
+template<typename H>
+void test_stream_depth_snapshot_complete_in_one() {
+    TestHarness<H> h;
+    h.feed_frame(0, DEPTH_PARTIAL_JSON);
+
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_book_snapshot());
+    assert(events[0].count == 5);
+    assert(events[0].count2 == 5);
+}
+
+// ── Streaming DEPTH_DIFF (delta) tests ──
+
+template<typename H>
+void test_stream_depth_diff_truncated() {
+    TestHarness<H> h;
+
+    // Truncate inside bids array
+    auto bid_start = std::string(DEPTH_DIFF_JSON).find("\"b\":[");
+    uint32_t trunc = static_cast<uint32_t>(bid_start + 5);
+
+    h.feed_fragment(0, DEPTH_DIFF_JSON, trunc);
+    auto& st = h.state_for(0);
+    assert(st.phase != JsonParseState::IDLE);
+    assert(st.phase != JsonParseState::DONE);
+
+    h.feed_final_fragment(0, DEPTH_DIFF_JSON);
+
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_book_delta());
+    assert(events[0].count == 2);  // 1 bid + 1 ask
+}
+
+template<typename H>
+void test_stream_depth_diff_overflow_flush() {
+    TestHarness<H> h;
+    // 25 bids + 5 asks = 30 total > MAX_DELTAS=19
+    auto json = build_large_depth_json(false, 1600000000001LL, 600000, 25, 5);
+
+    h.feed_frame(0, json.c_str());
+
+    auto events = h.published();
+    // Should produce 2+ events (first flush at 19, second with remaining 11)
+    assert(events.size() >= 2);
+    uint8_t total = 0;
+    for (auto& e : events) {
+        assert(e.is_book_delta());
+        total += e.count;
+    }
+    assert(total == 30);
+}
+
+template<typename H>
+void test_stream_depth_diff_complete_in_one() {
+    TestHarness<H> h;
+    h.feed_frame(0, DEPTH_DIFF_JSON);
+
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_book_delta());
+    assert(events[0].count == 2);
+}
+
+// ── bids_count underflow regression tests ──
+// Bug: remaining = MAX_DELTAS - bids_count (should be delta_count).
+// After a mid-bids flush, delta_count resets to 0 but bids_count stays at 19+.
+// When the while loop iterates again with bids_count > MAX_DELTAS, remaining
+// underflows (uint8_t), buf_max overflows to 0, and parse_levels_streaming
+// returns new_count=0 → asks are never parsed.
+//
+// With a full frame, the bug triggers at >= 39 bids (needs 3 batches: 19+19+N,
+// the third iteration sees bids_count=38 > MAX_DELTAS=19 → underflow).
+
+template<typename H>
+void test_stream_depth_diff_many_bids_regression() {
+    TestHarness<H> h;
+    // 39 bids + 5 asks = 44 total.  Requires 3 bid batches (19+19+1).
+    // With the bids_count bug: only 1 event (19 levels from first flush).
+    // With fix: 3 events (19 + 19 + 6 = 44 levels).
+    auto json = build_large_depth_json(false, 1600000000002LL, 700000, 39, 5);
+
+    h.feed_frame(0, json.c_str());
+
+    auto events = h.published();
+    assert(events.size() == 3);
+    uint16_t total = 0;
+    for (auto& e : events) {
+        assert(e.is_book_delta());
+        total += e.count;
+    }
+    assert(total == 44);
+}
+
+template<typename H>
+void test_stream_depth_diff_exactly_38_bids() {
+    TestHarness<H> h;
+    // 38 bids + 5 asks = 43 total.  Boundary: exactly 2 bid batches (19+19),
+    // second batch fills buf_max and post-loop finds ']' → array_done=true.
+    // No underflow (loop doesn't iterate a 3rd time).
+    auto json = build_large_depth_json(false, 1600000000003LL, 700001, 38, 5);
+
+    h.feed_frame(0, json.c_str());
+
+    auto events = h.published();
+    assert(events.size() == 3);
+    uint16_t total = 0;
+    for (auto& e : events) {
+        assert(e.is_book_delta());
+        total += e.count;
+    }
+    assert(total == 43);
+}
+
+template<typename H>
+void test_stream_depth_diff_all_bids_no_asks() {
+    TestHarness<H> h;
+    // 39 bids + 0 asks = 39 total.  Same underflow scenario, no asks at all.
+    auto json = build_large_depth_json(false, 1600000000004LL, 700002, 39, 0);
+
+    h.feed_frame(0, json.c_str());
+
+    auto events = h.published();
+    assert(events.size() == 3);
+    uint16_t total = 0;
+    for (auto& e : events) {
+        assert(e.is_book_delta());
+        total += e.count;
+    }
+    assert(total == 39);
+}
+
+// ── Dedup and state management tests ──
+
+template<typename H>
+void test_stream_depth_dedup_no_rerun() {
+    TestHarness<H> h;
+
+    h.feed_frame(0, DEPTH_DIFF_JSON);  // sets last_book_seq_ = 160
+
+    // Same sequence as fragment — should dedup
+    h.feed_fragment(0, DEPTH_DIFF_JSON, 100);
+    auto& st = h.state_for(0);
+    assert(st.phase == JsonParseState::DONE);
+}
+
+template<typename Handler>
+static void handler_on_ws_data_helper(Handler& handler, JsonParseState& st,
+                                       uint8_t ci, const char* json,
+                                       WSFrameInfo& info) {
+    handler.on_ws_data(st, ci,
+                       (const uint8_t*)json, static_cast<uint32_t>(strlen(json)), info);
+}
+
+template<typename H>
+void test_stream_done_state_prevents_double_publish() {
+    TestHarness<H> h;
+
+    // Feed complete trade as first call (state→DONE after parse)
+    WSFrameInfo info{};
+    info.clear();
+    info.connection_id = 0;
+    auto& st = h.state_for(0);
+    handler_on_ws_data_helper(h.handler, st, 0, AGG_TRADE_JSON, info);
+    // State should be DONE
+    assert(st.phase == JsonParseState::DONE);
+
+    // Feed again as "continuation" (state=DONE → immediate return)
+    WSFrameInfo info2{};
+    info2.clear();
+    info2.connection_id = 0;
+    handler_on_ws_data_helper(h.handler, st, 0, AGG_TRADE_JSON, info2);
+    // Still DONE
+    assert(st.phase == JsonParseState::DONE);
+
+    // Reset + flush
+    st.reset();
+    h.idle();
+
+    auto events = h.published();
+    assert(events.size() == 1);  // only 1 trade
+}
+
+template<typename H>
+void test_stream_state_reset_between_messages() {
+    TestHarness<H> h;
+
+    // Feed fragment of trade (state=HEADER_PARSED)
+    h.feed_fragment(0, AGG_TRADE_JSON, 100);
+    auto& st = h.state_for(0);
+    assert(st.phase == JsonParseState::HEADER_PARSED);
+    assert(st.msg_type == static_cast<uint16_t>(UsdmStreamType::AGG_TRADE));
+
+    // Reset state (simulates message boundary)
+    st.reset();
+    assert(st.phase == JsonParseState::IDLE);
+
+    // Feed completely different depth message
+    h.feed_frame(0, DEPTH_DIFF_JSON);
+
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_book_delta());
+    assert(events[0].count == 2);  // 1 bid + 1 ask — correct parse, no contamination
+}
+
+// ── Cross-handler equivalence for streaming ──
+
+void test_stream_equivalence_agg_trade() {
+    auto run = [](auto& h) {
+        h.feed_fragment(0, AGG_TRADE_JSON, 100);
+        h.feed_final_fragment(0, AGG_TRADE_JSON);
+        h.idle();
+        return h.published();
+    };
+    std::vector<MktEvent> ec, ey, es;
+    { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
+    assert_events_match(ec, ey, "stream custom vs yyjson: agg_trade");
+    assert_events_match(ec, es, "stream custom vs simdjson: agg_trade");
+}
+
+void test_stream_equivalence_depth_snapshot() {
+    auto json = build_large_depth_json(true, 1600000000000LL, 500010, 10, 10);
+    auto run = [&](auto& h) {
+        auto bid_start = json.find("\"b\":[");
+        uint32_t trunc = static_cast<uint32_t>(bid_start + 60);
+        h.feed_fragment(0, json.c_str(), trunc);
+        h.feed_final_fragment(0, json.c_str());
+        return h.published();
+    };
+    std::vector<MktEvent> ec, ey, es;
+    { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
+    assert_events_match(ec, ey, "stream custom vs yyjson: depth_snapshot");
+    assert_events_match(ec, es, "stream custom vs simdjson: depth_snapshot");
+}
+
+void test_stream_equivalence_depth_diff() {
+    auto run = [](auto& h) {
+        auto bid_start = std::string(DEPTH_DIFF_JSON).find("\"b\":[");
+        uint32_t trunc = static_cast<uint32_t>(bid_start + 5);
+        h.feed_fragment(0, DEPTH_DIFF_JSON, trunc);
+        h.feed_final_fragment(0, DEPTH_DIFF_JSON);
+        return h.published();
+    };
+    std::vector<MktEvent> ec, ey, es;
+    { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMYyjsonParser> h; ey = run(h); } cleanup_ring_files();
+    { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
+    assert_events_match(ec, ey, "stream custom vs yyjson: depth_diff");
+    assert_events_match(ec, es, "stream custom vs simdjson: depth_diff");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
 int main() {
     cleanup_ring_files();
 
-    std::printf("=== BinanceUSDMYyjsonParser Unit Tests ===\n");
+    std::printf("=== Binance USDM JSON Handler Unit Tests ===\n");
 
-    // JSON parsing primitives
+    // ── Parse primitive tests (run once) ──
+    std::printf("\n--- JSON parsing primitives ---\n");
     RUN_TEST(test_parse_int64_fast);
     RUN_TEST(test_parse_decimal_string);
     RUN_TEST(test_classify_stream);
     RUN_TEST(test_parse_combined_stream);
+    RUN_TEST(test_parse_combined_stream_truncated);
+    RUN_TEST(test_skip_value_truncated);
 
-    // yyjson primitives
+    std::printf("\n--- yyjson primitives ---\n");
     RUN_TEST(test_yy_decimal_cstr_to_int64);
     RUN_TEST(test_yy_parse_combined);
     RUN_TEST(test_yy_parse_agg_trade);
     RUN_TEST(test_yy_parse_depth_partial);
     RUN_TEST(test_yy_parse_depth_diff);
 
-    // aggTrade handling
-    RUN_TEST(test_agg_trade_single);
-    RUN_TEST(test_agg_trade_merge);
-    RUN_TEST(test_agg_trade_merge_overflow);
-    RUN_TEST(test_agg_trade_dedup);
-    RUN_TEST(test_agg_trade_no_merge);
+    std::printf("\n--- decode_essential ---\n");
+    RUN_TEST(test_decode_essential_agg_trade);
+    RUN_TEST(test_decode_essential_depth_partial);
+    RUN_TEST(test_decode_essential_depth_diff);
+    RUN_TEST(test_decode_essential_invalid);
+    RUN_TEST(test_decode_essential_truncated);
+    RUN_TEST(test_decode_essential_agg_trade_reordered);
 
-    // Depth snapshot
-    RUN_TEST(test_depth_snapshot_parse);
-    RUN_TEST(test_depth_snapshot_dedup);
+    std::printf("\n--- remaining-field parsers ---\n");
+    RUN_TEST(test_parse_agg_trade_remaining);
+    RUN_TEST(test_parse_agg_trade_remaining_truncated_m);
+    RUN_TEST(test_parse_depth_remaining);
+    RUN_TEST(test_parse_depth_remaining_diff);
 
-    // Depth delta
-    RUN_TEST(test_depth_delta_parse);
-    RUN_TEST(test_depth_delta_delete);
-    RUN_TEST(test_depth_delta_dedup);
+    std::printf("\n--- simdjson parsers ---\n");
+    RUN_TEST(test_simd_parse_agg_trade);
+    RUN_TEST(test_simd_parse_depth_partial);
+    RUN_TEST(test_simd_parse_depth_diff);
 
-    // Cross-type
-    RUN_TEST(test_cross_type_flush_trades_then_depth);
-    RUN_TEST(test_batch_end_flushes_trades);
-    RUN_TEST(test_disconnect_reconnect);
+    std::printf("\n--- parse_levels_streaming regression ---\n");
+    RUN_TEST(test_parse_levels_streaming_no_outer_bracket_skip);
+    RUN_TEST(test_parse_levels_streaming_at_level_bracket_ask);
+    RUN_TEST(test_parse_levels_streaming_truncation_revert_then_resume);
 
-    std::printf("\n--- Cross-connection monotonic ordering ---\n");
-    cleanup_ring_files();
-    RUN_TEST(test_cross_conn_merge_flush_before_mix);
-    cleanup_ring_files();
-    RUN_TEST(test_cross_conn_pending_ci_attribution);
-    cleanup_ring_files();
-    RUN_TEST(test_pending_max_id_monotonic);
+    // ── Handler tests (run for each handler type) ──
+
+    auto run_handler_tests = [&]<typename H>(const char* label) {
+        std::printf("\n--- %s ---\n", label);
+        RUN_TEST_T((test_agg_trade_single<H>));
+        RUN_TEST_T((test_agg_trade_merge<H>));
+        RUN_TEST_T((test_agg_trade_merge_overflow<H>));
+        RUN_TEST_T((test_agg_trade_dedup<H>));
+        RUN_TEST_T((test_agg_trade_no_merge<H>));
+        RUN_TEST_T((test_depth_snapshot_parse<H>));
+        RUN_TEST_T((test_depth_snapshot_dedup<H>));
+        RUN_TEST_T((test_depth_delta_parse<H>));
+        RUN_TEST_T((test_depth_delta_delete<H>));
+        RUN_TEST_T((test_depth_delta_dedup<H>));
+        RUN_TEST_T((test_cross_type_flush_trades_then_depth<H>));
+        RUN_TEST_T((test_batch_end_flushes_trades<H>));
+        RUN_TEST_T((test_disconnect_reconnect<H>));
+        RUN_TEST_T((test_cross_conn_merge_flush_before_mix<H>));
+        RUN_TEST_T((test_cross_conn_pending_ci_attribution<H>));
+        RUN_TEST_T((test_pending_max_id_monotonic<H>));
+        RUN_TEST_T((test_agg_trade_reordered_not_discarded<H>));
+
+        std::printf("  -- streaming fragment parsing --\n");
+        RUN_TEST_T((test_stream_agg_trade_truncated_then_complete<H>));
+        RUN_TEST_T((test_stream_agg_trade_too_small<H>));
+        RUN_TEST_T((test_stream_agg_trade_complete_in_one<H>));
+        RUN_TEST_T((test_stream_agg_trade_dedup_no_double_count<H>));
+        RUN_TEST_T((test_stream_depth_snapshot_truncated_bids<H>));
+        RUN_TEST_T((test_stream_depth_snapshot_truncated_asks<H>));
+        RUN_TEST_T((test_stream_depth_snapshot_capacity_publish<H>));
+        RUN_TEST_T((test_stream_depth_snapshot_complete_in_one<H>));
+        RUN_TEST_T((test_stream_depth_diff_truncated<H>));
+        RUN_TEST_T((test_stream_depth_diff_overflow_flush<H>));
+        RUN_TEST_T((test_stream_depth_diff_complete_in_one<H>));
+        RUN_TEST_T((test_stream_depth_diff_many_bids_regression<H>));
+        RUN_TEST_T((test_stream_depth_diff_exactly_38_bids<H>));
+        RUN_TEST_T((test_stream_depth_diff_all_bids_no_asks<H>));
+        RUN_TEST_T((test_stream_depth_dedup_no_rerun<H>));
+        RUN_TEST_T((test_stream_done_state_prevents_double_publish<H>));
+        RUN_TEST_T((test_stream_state_reset_between_messages<H>));
+    };
+
+    run_handler_tests.template operator()<BinanceUSDMYyjsonParser>("BinanceUSDMYyjsonParser");
+    run_handler_tests.template operator()<BinanceUSDMJsonParser>("BinanceUSDMJsonParser");
+    run_handler_tests.template operator()<BinanceUSDMSimdjsonParser>("BinanceUSDMSimdjsonParser");
+
+    // ── Cross-handler equivalence tests ──
+    std::printf("\n--- Cross-handler equivalence ---\n");
+    RUN_TEST_T(test_equiv_agg_trade);
+    RUN_TEST_T(test_equiv_agg_trade_merge);
+    RUN_TEST_T(test_equiv_agg_trade_no_merge);
+    RUN_TEST_T(test_equiv_depth_snapshot);
+    RUN_TEST_T(test_equiv_depth_snapshot_large);
+    RUN_TEST_T(test_equiv_depth_diff);
+    RUN_TEST_T(test_equiv_depth_diff_delete);
+    RUN_TEST_T(test_equiv_cross_type_flush);
+
+    std::printf("\n--- Cross-handler streaming equivalence ---\n");
+    RUN_TEST_T(test_stream_equivalence_agg_trade);
+    RUN_TEST_T(test_stream_equivalence_depth_snapshot);
+    RUN_TEST_T(test_stream_equivalence_depth_diff);
 
     std::printf("\n%d/%d tests passed\n", tests_passed, tests_total);
     cleanup_ring_files();

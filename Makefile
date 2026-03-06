@@ -286,6 +286,7 @@ TEST_SBE_HANDLER_SRC := $(TEST_DIR)/msg_binance_sbe/test_sbe_handler.cpp
 TEST_USDM_JSON_SRC := $(TEST_DIR)/msg_binance_usdm/test_usdm_json_parser.cpp
 TEST_USDM_JSON_BENCH_SRC := $(TEST_DIR)/msg_binance_usdm/test_usdm_json_bench.cpp
 TEST_ORDERBOOK_SRC := $(TEST_DIR)/test_orderbook.cpp
+TEST_MKT_VIEWER_DEDUP_SRC := $(TEST_DIR)/test_mkt_viewer_dedup.cpp
 
 # Integration test source files
 TEST_BINANCE_SRC := $(INTEGRATION_DIR)/binance.cpp
@@ -326,6 +327,7 @@ TEST_SBE_HANDLER_BIN := $(BUILD_DIR)/test_sbe_handler
 TEST_USDM_JSON_BIN := $(BUILD_DIR)/test_usdm_json_parser
 TEST_USDM_JSON_BENCH_BIN := $(BUILD_DIR)/test_usdm_json_bench
 TEST_ORDERBOOK_BIN := $(BUILD_DIR)/test_orderbook
+TEST_MKT_VIEWER_DEDUP_BIN := $(BUILD_DIR)/test_mkt_viewer_dedup
 TEST_AES_CTR_SEQ_SRC := $(TEST_DIR)/test_aes_ctr_seq.cpp
 TEST_AES_CTR_SEQ_BIN := $(BUILD_DIR)/test_aes_ctr_seq
 TEST_TLS13_INNER_CT_SRC := $(TEST_DIR)/test_tls13_inner_ct.cpp
@@ -335,7 +337,7 @@ TEST_WOLFSSL_SEQ_BIN := $(BUILD_DIR)/test_wolfssl_seq_num
 TEST_LAST_BYTE_TS_SRC := $(TEST_DIR)/test_last_byte_ts.cpp
 TEST_LAST_BYTE_TS_BIN := $(BUILD_DIR)/test_last_byte_ts
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-aes-ctr-seq test-tls13-inner-ct test-wolfssl-seq-num test-last-byte-ts test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-usdm-json-parser test-orderbook test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread build-test-pipeline-252_binance_sbe_bsdsocket_1thread test-pipeline-252-binance-sbe-bsdsocket-1thread build-test-pipeline-250_binance_sbe_bsdsocket_2thread test-pipeline-250-binance-sbe-bsdsocket-2thread build-test-pipeline-251_binance_sbe_bsdsocket_3thread test-pipeline-251-binance-sbe-bsdsocket-3thread build-test-pipeline-253_binance_sbe_bsdsocket_inline_ws test-pipeline-253-binance-sbe-bsdsocket-inline-ws build-test-pipeline-261_binance_sbe_xdp_inline_ws test-pipeline-261-binance-sbe-xdp-inline-ws build-test-pipeline-262_binance_sbe_dpdk_inline_ws build-test-pipeline-263_binance_sbe_dpdk_packetio_inline_ws build-test-pipeline-264_binance_sbe_xdp_packetio_inline_ws bench-usdm-json-parser
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-aes-ctr-seq test-tls13-inner-ct test-wolfssl-seq-num test-last-byte-ts test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-usdm-json-parser test-orderbook test-mkt-viewer-dedup test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread build-test-pipeline-252_binance_sbe_bsdsocket_1thread test-pipeline-252-binance-sbe-bsdsocket-1thread build-test-pipeline-250_binance_sbe_bsdsocket_2thread test-pipeline-250-binance-sbe-bsdsocket-2thread build-test-pipeline-251_binance_sbe_bsdsocket_3thread test-pipeline-251-binance-sbe-bsdsocket-3thread build-test-pipeline-253_binance_sbe_bsdsocket_inline_ws test-pipeline-253-binance-sbe-bsdsocket-inline-ws build-test-pipeline-261_binance_sbe_xdp_inline_ws test-pipeline-261-binance-sbe-xdp-inline-ws build-test-pipeline-262_binance_sbe_dpdk_inline_ws build-test-pipeline-263_binance_sbe_dpdk_packetio_inline_ws build-test-pipeline-264_binance_sbe_xdp_packetio_inline_ws bench-usdm-json-parser
 
 all: $(EXAMPLE_BIN)
 
@@ -671,9 +673,9 @@ test-sbe-handler: $(TEST_SBE_HANDLER_BIN)
 	./$(TEST_SBE_HANDLER_BIN)
 
 # Build USDM JSON parser tests
-$(TEST_USDM_JSON_BIN): $(TEST_USDM_JSON_SRC) src/msg/01_binance_usdm_json.hpp src/msg/02_binance_usdm_yyjson.hpp src/msg/market_conf.hpp $(BUILD_DIR)/yyjson.o | $(BUILD_DIR)
+$(TEST_USDM_JSON_BIN): $(TEST_USDM_JSON_SRC) src/msg/01_binance_usdm_json.hpp src/msg/02_binance_usdm_yyjson.hpp src/msg/03_binance_usdm_simdjson.hpp src/msg/market_conf.hpp $(BUILD_DIR)/yyjson.o $(BUILD_DIR)/simdjson.o | $(BUILD_DIR)
 	@echo "🔨 Compiling USDM JSON parser unit tests..."
-	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/yyjson.o
+	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/yyjson.o $(BUILD_DIR)/simdjson.o
 	@echo "✅ Test build complete: $@"
 
 # Run USDM JSON parser tests
@@ -685,10 +687,15 @@ test-usdm-json-parser: $(TEST_USDM_JSON_BIN)
 $(BUILD_DIR)/yyjson.o: src/vendor/yyjson.c src/vendor/yyjson.h | $(BUILD_DIR)
 	$(CC) -std=c11 -O3 -march=native -c -o $@ $<
 
-# Build USDM JSON benchmark (custom vs yyjson)
-$(TEST_USDM_JSON_BENCH_BIN): $(TEST_USDM_JSON_BENCH_SRC) $(BUILD_DIR)/yyjson.o src/msg/01_binance_usdm_json.hpp src/msg/02_binance_usdm_yyjson.hpp | $(BUILD_DIR)
+# Build simdjson vendor object (C++17)
+$(BUILD_DIR)/simdjson.o: src/vendor/simdjson.cpp src/vendor/simdjson.h | $(BUILD_DIR)
+	$(CXX) -std=c++17 -O3 -march=native -c -o $@ $<
+
+# Build USDM JSON benchmark (custom vs yyjson vs simdjson)
+$(TEST_USDM_JSON_BENCH_BIN): $(TEST_USDM_JSON_BENCH_SRC) $(BUILD_DIR)/yyjson.o $(BUILD_DIR)/simdjson.o \
+		src/msg/01_binance_usdm_json.hpp src/msg/02_binance_usdm_yyjson.hpp src/msg/03_binance_usdm_simdjson.hpp | $(BUILD_DIR)
 	@echo "🔨 Compiling USDM JSON parse benchmark..."
-	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/yyjson.o
+	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/yyjson.o $(BUILD_DIR)/simdjson.o
 	@echo "✅ Benchmark build complete: $@"
 
 # Run USDM JSON parse benchmark
@@ -706,6 +713,17 @@ $(TEST_ORDERBOOK_BIN): $(TEST_ORDERBOOK_SRC) | $(BUILD_DIR)
 test-orderbook: $(TEST_ORDERBOOK_BIN)
 	@echo "🧪 Running OrderBook unit tests..."
 	./$(TEST_ORDERBOOK_BIN)
+
+# Build mkt_viewer dedup tests
+$(TEST_MKT_VIEWER_DEDUP_BIN): $(TEST_MKT_VIEWER_DEDUP_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling mkt_viewer dedup unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run mkt_viewer dedup tests
+test-mkt-viewer-dedup: $(TEST_MKT_VIEWER_DEDUP_BIN)
+	@echo "🧪 Running mkt_viewer dedup unit tests..."
+	./$(TEST_MKT_VIEWER_DEDUP_BIN)
 
 # ============================================================================
 # Pipeline Integration Tests (Multi-Process AF_XDP WebSocket)
@@ -1208,17 +1226,17 @@ endif
 build-test-pipeline-264_binance_sbe_xdp_packetio_inline_ws: $(PIPELINE_XDP_DIRECTIO_SBE_BIN)
 
 # ============================================================================
-# DPDK DirectIO Binance USDM JSON InlineWS Test (DPDKPacketIO, yyjson parser)
+# DPDK DirectIO Binance USDM JSON InlineWS Test (DPDKPacketIO, simdjson parser)
 # ============================================================================
 
 PIPELINE_DPDK_DIRECTIO_USDM_SRC := test/pipeline/270_binance_usdm_dpdk_packetio_inline_ws.cpp
 PIPELINE_DPDK_DIRECTIO_USDM_BIN := $(BUILD_DIR)/test_pipeline_270_binance_usdm_dpdk_packetio_inline_ws
 
-$(PIPELINE_DPDK_DIRECTIO_USDM_BIN): $(PIPELINE_DPDK_DIRECTIO_USDM_SRC) $(PIPELINE_HEADERS) src/msg/02_binance_usdm_yyjson.hpp $(BUILD_DIR)/yyjson.o | $(BUILD_DIR)
+$(PIPELINE_DPDK_DIRECTIO_USDM_BIN): $(PIPELINE_DPDK_DIRECTIO_USDM_SRC) $(PIPELINE_HEADERS) src/msg/03_binance_usdm_simdjson.hpp $(BUILD_DIR)/yyjson.o $(BUILD_DIR)/simdjson.o | $(BUILD_DIR)
 	@echo "Compiling DPDK DirectIO Binance USDM JSON InlineWS test..."
 ifdef USE_DPDK
 ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
-	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/yyjson.o $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/yyjson.o $(BUILD_DIR)/simdjson.o $(LDFLAGS)
 	@echo "DPDK DirectIO USDM JSON InlineWS test build complete: $@"
 else
 	@echo "Error: DPDK DirectIO USDM test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
@@ -1489,6 +1507,21 @@ $(MKT_VIEWER_BIN): $(MKT_VIEWER_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
 	@echo "✅ MktEvent viewer build complete: $@"
 
 build-mkt-viewer: $(MKT_VIEWER_BIN)
+
+# ============================================================================
+# MktEvent Sampling Tool
+# Captures WSFrameInfo + raw payloads + MktEvents for offline verification
+# ============================================================================
+
+MKT_SAMPLING_SRC := tools/mkt_sampling.cpp
+MKT_SAMPLING_BIN := $(BUILD_DIR)/mkt_sampling
+
+$(MKT_SAMPLING_BIN): $(MKT_SAMPLING_SRC) $(PIPELINE_HEADERS) | $(BUILD_DIR)
+	@echo "🔨 Compiling MktEvent sampler..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ MktEvent sampler build complete: $@"
+
+build-mkt-sampling: $(MKT_SAMPLING_BIN)
 
 # ============================================================================
 # Unified XDP+TCP+SSL+WS Pipeline Test (Single-Process)
@@ -1833,7 +1866,7 @@ test-simulator: $(SIMULATOR_BIN)
 # Unified Test Target - Run All Unit Tests
 # ============================================================================
 
-test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-aes-ctr-seq test-tls13-inner-ct test-wolfssl-seq-num test-last-byte-ts test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-usdm-json-parser test-orderbook
+test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-aes-ctr-seq test-tls13-inner-ct test-wolfssl-seq-num test-last-byte-ts test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-usdm-json-parser test-orderbook test-mkt-viewer-dedup
 	@echo ""
 	@echo "╔════════════════════════════════════════════════════════════════════╗"
 	@echo "║                    ALL UNIT TESTS COMPLETED                        ║"

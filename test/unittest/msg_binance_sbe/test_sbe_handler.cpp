@@ -2007,6 +2007,85 @@ void test_pending_max_id_monotonic() {
 }
 
 // ============================================================================
+// Test 46: Fragment depth superseded by other connection
+// ============================================================================
+
+void test_fragment_depth_superseded_by_other_conn() {
+    TestHarness h;
+
+    // Build large depth snapshot: seq=1000, 40 bids + 40 asks
+    // ~8 + 18 + 4 + 40*16 + 4 + 40*16 + 8 = 1322 bytes
+    auto b = build_large_depth_snapshot(1000000, 1000, 40, 40);
+
+    // Fragment: first 700 bytes from conn 0
+    SBEParseState state0{};
+    WSFrameInfo info0{};
+    info0.clear();
+    h.handler.on_ws_data(state0, 0, b.data(), 700, info0);
+    // Should be mid-stream (BIDS_ENTRIES or similar)
+    assert(state0.phase != SBEParseState::IDLE);
+    assert(state0.phase != SBEParseState::DONE);
+    assert(h.handler.last_book_seq_ == 1000);  // claimed on acceptance
+
+    auto events_after_frag = h.published();
+
+    // Complete depth diff from conn 1: seq=2000 (supersedes)
+    int64_t bp[] = {49000}, bq[] = {100};
+    int64_t ap[] = {51000}, aq[] = {200};
+    auto b2 = build_depth_diff_msg(2000000, 1999, 2000, -8, -8,
+                                    1, bp, bq, 1, ap, aq, "BTCUSDT");
+    h.feed_frame(1, b2);
+    h.idle();
+    assert(h.handler.last_book_seq_ == 2000);  // superseded
+
+    auto events_after_supersede = h.published();
+
+    // Resume conn 0 fragment with full payload
+    WSFrameInfo info0_resume{};
+    info0_resume.clear();
+    h.handler.on_ws_data(state0, 0, b.data(), static_cast<uint32_t>(b.size()), info0_resume);
+
+    // Fix: should detect seq=1000 < last_book_seq_=2000, set discard_early, stop
+    assert(info0_resume.is_discard_early() == true);
+
+    auto events_after_resume = h.published();
+    // No new depth events from the stale conn 0 resume
+    size_t new_events = events_after_resume.size() - events_after_supersede.size();
+    assert(new_events == 0);
+}
+
+// ============================================================================
+// Test 47: Fragment depth deduped DONE propagates discard
+// ============================================================================
+
+void test_fragment_depth_deduped_done_propagates_discard() {
+    TestHarness h;
+
+    // Establish watermark with depth diff seq=505
+    int64_t bp[] = {50000}, bq[] = {1000};
+    int64_t ap[] = {50100}, aq[] = {1500};
+    auto b = build_depth_diff_msg(1000000, 500, 505, -8, -8,
+                                   1, bp, bq, 1, ap, aq, "BTCUSDT");
+    h.feed_frame(0, b);
+    h.idle();
+    assert(h.handler.last_book_seq_ == 505);
+
+    // Same seq=505 as full frame from conn 1 → initial dedup → DONE
+    SBEParseState state1{};
+    WSFrameInfo info1{};
+    info1.clear();
+    h.handler.on_ws_data(state1, 1, b.data(), static_cast<uint32_t>(b.size()), info1);
+    assert(state1.phase == SBEParseState::DONE);
+    assert(info1.is_discard_early() == true);
+
+    // Simulate next TLS record hitting non-IDLE DONE path
+    WSFrameInfo info1b{};
+    info1b.clear();
+    h.handler.on_ws_data(state1, 1, b.data(), static_cast<uint32_t>(b.size()), info1b);
+    assert(info1b.is_discard_early() == true);  // deduped flag propagates
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -2156,6 +2235,13 @@ int main() {
     cleanup_ring_files();
 
     RUN_TEST(test_pending_max_id_monotonic);
+    cleanup_ring_files();
+
+    std::printf("\n--- Streaming depth dedup ---\n");
+    RUN_TEST(test_fragment_depth_superseded_by_other_conn);
+    cleanup_ring_files();
+
+    RUN_TEST(test_fragment_depth_deduped_done_propagates_discard);
     cleanup_ring_files();
 
     std::printf("\n=== %d/%d tests passed ===\n", tests_passed, tests_total);

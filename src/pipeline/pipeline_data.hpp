@@ -468,19 +468,34 @@ struct alignas(64) WSFrameInfo {
         } else if (opcode == 0x0A) {
             std::snprintf(mkt_typ, sizeof(mkt_typ), "Po");
         }
-        // Debug suffix for untyped frames: dump opcode, flags, and first payload bytes
-        char dbg_suffix[80] = "";
+        // Debug suffix for untyped frames: ASCII for TEXT, hex for others
+        char dbg_suffix[128] = "";
         if (mkt_typ[0] == '\0') {
             int dp = 0;
-            dp += std::snprintf(dbg_suffix + dp, sizeof(dbg_suffix) - dp,
-                                " [op=%02x fl=%02x et=%u", opcode, flags, mkt_event_type);
-            if (payload_data != nullptr && payload_len > 0) {
-                dp += std::snprintf(dbg_suffix + dp, sizeof(dbg_suffix) - dp, " d=");
-                uint32_t show = payload_len < 16 ? payload_len : 16;
-                for (uint32_t i = 0; i < show && dp < (int)sizeof(dbg_suffix) - 3; ++i)
-                    dp += std::snprintf(dbg_suffix + dp, sizeof(dbg_suffix) - dp, "%02x", payload_data[i]);
+            if (opcode == 0x01 && payload_data != nullptr && payload_len > 0) {
+                // TEXT frame: show ASCII (first ~40 chars)
+                dp += std::snprintf(dbg_suffix + dp, sizeof(dbg_suffix) - dp, " [");
+                uint32_t show = payload_len < 40 ? payload_len : 40;
+                for (uint32_t i = 0; i < show && dp < (int)sizeof(dbg_suffix) - 4; ++i) {
+                    char c = static_cast<char>(payload_data[i]);
+                    dbg_suffix[dp++] = (c >= 0x20 && c < 0x7f) ? c : '.';
+                }
+                if (payload_len > 40)
+                    dp += std::snprintf(dbg_suffix + dp, sizeof(dbg_suffix) - dp, "...");
+                dbg_suffix[dp++] = ']';
+                dbg_suffix[dp] = '\0';
+            } else {
+                // Non-text: hex dump with metadata
+                dp += std::snprintf(dbg_suffix + dp, sizeof(dbg_suffix) - dp,
+                                    " [op=%02x fl=%02x et=%u", opcode, flags, mkt_event_type);
+                if (payload_data != nullptr && payload_len > 0) {
+                    dp += std::snprintf(dbg_suffix + dp, sizeof(dbg_suffix) - dp, " d=");
+                    uint32_t show = payload_len < 16 ? payload_len : 16;
+                    for (uint32_t i = 0; i < show && dp < (int)sizeof(dbg_suffix) - 3; ++i)
+                        dp += std::snprintf(dbg_suffix + dp, sizeof(dbg_suffix) - dp, "%02x", payload_data[i]);
+                }
+                dp += std::snprintf(dbg_suffix + dp, sizeof(dbg_suffix) - dp, "]");
             }
-            dp += std::snprintf(dbg_suffix + dp, sizeof(dbg_suffix) - dp, "]");
         }
         // 'X' prefix for discard_early frames (stale sequence skipped)
         const char* discard_mark = is_discard_early() ? "X" : is_merged() ? "M" : " ";
@@ -572,7 +587,7 @@ struct alignas(64) WSFrameInfo {
             line_reset = "\033[0m";
         }
         const char* ssl_prefix = is_active_conn() ? "*ssl" : " ssl";
-        const char* winner_mark = (!is_discard_early() && !is_merged()) ? " <-" : "";
+        const char* winner_mark = (is_mkt && (!is_fragmented() || is_last_fragment())) ? " <-" : "";
         bool is_bsd_mode = (first_bpf_entry_ns == 0 && first_poll_cycle > 0);
         if (is_bsd_mode) {
             // NIC timestamp column: show nic-to-publish latency when available

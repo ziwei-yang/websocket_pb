@@ -28,6 +28,7 @@
 #include <string_view>
 #include <vector>
 #include <algorithm>
+#include <unordered_set>
 #include <thread>
 #include <unistd.h>
 #include <fcntl.h>
@@ -58,7 +59,7 @@ static constexpr bool RECONNECT_ENABLED = true;  // InlineWS requires AUTO_RECON
 
 #include "../../src/pipeline/websocket_pipeline.hpp"
 #include "../../src/policy/ssl.hpp"
-#include "../../src/msg/02_binance_usdm_yyjson.hpp"
+#include "../../src/msg/03_binance_usdm_simdjson.hpp"
 #include "../../src/msg/mkt_event.hpp"
 
 using namespace websocket::pipeline;
@@ -79,7 +80,7 @@ using SSLPolicyType = WolfSSLPolicy;
 
 struct BinanceUSDMTraits : DefaultPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
-    using MktEventHandler    = websocket::json::BinanceUSDMYyjsonParser;
+    using MktEventHandler    = websocket::json::BinanceUSDMSimdjsonParser;
     using UpgradeCustomizer  = NullUpgradeCustomizer;
     using PacketIOType       = DPDKPacketIO;  // Direct NIC I/O (no poll process)
 
@@ -261,8 +262,15 @@ int main(int argc, char* argv[]) {
     int64_t mkt_trade_seq = 0;
     int64_t mkt_bbo_seq = 0;
     int64_t mkt_ob_seq = 0;  // depth snapshot + delta
+    std::unordered_set<uint64_t> ob_seen_deltas;  // content-based dedup for multi-flush BOOK events
     uint64_t mkt_dup_count = 0;
     uint64_t mkt_event_count = 0;
+    uint64_t discard_early_count = 0;
+
+    // Helper: content key for delta dedup (price<<1 | side)
+    auto delta_key = [](const websocket::msg::DeltaEntry& de) -> uint64_t {
+        return (static_cast<uint64_t>(de.price) << 1) | (de.flags & websocket::msg::DeltaFlags::SIDE_ASK);
+    };
 
     printf("\n--- USDM JSON DirectIO Stream Test (%s) ---\n",
            run_forever ? "FOREVER MODE - Ctrl+C to stop" :
@@ -294,6 +302,7 @@ int main(int argc, char* argv[]) {
 
             if (frame.opcode == 0x01) {
                 json_frames++;
+                if (frame.is_discard_early()) discard_early_count++;
             }
 
             frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci],
@@ -318,17 +327,43 @@ int main(int argc, char* argv[]) {
                         mkt_event_count++;
                         // Per-type monotonic sequence check
                         if (mkt.src_seq > 0) {
-                            int64_t* seq_p = mkt.is_trade_array() ? &mkt_trade_seq
-                                           : mkt.is_bbo_array()   ? &mkt_bbo_seq
-                                                                   : &mkt_ob_seq;
-                            if (mkt.src_seq <= *seq_p) {
-                                mkt_dup_count++;
-                                fprintf(stderr, "\033[91m[DUP] %s seq %ld <= %ld (dup #%lu)\033[0m\n",
-                                        mkt.is_trade_array() ? "TRADE" :
-                                        mkt.is_bbo_array()   ? "BBO" : "BOOK",
-                                        mkt.src_seq, *seq_p, mkt_dup_count);
+                            if (mkt.is_book_delta() || mkt.is_book_snapshot()) {
+                                if (mkt.src_seq > mkt_ob_seq) {
+                                    // New sequence — accept, reset buffer
+                                    ob_seen_deltas.clear();
+                                    for (uint8_t i = 0; i < mkt.count; i++)
+                                        ob_seen_deltas.insert(delta_key(mkt.payload.deltas.entries[i]));
+                                    mkt_ob_seq = mkt.src_seq;
+                                } else if (mkt.src_seq == mkt_ob_seq) {
+                                    // Same seq — check content overlap (multi-flush vs real dup)
+                                    uint8_t overlap = 0;
+                                    for (uint8_t i = 0; i < mkt.count; i++) {
+                                        auto k = delta_key(mkt.payload.deltas.entries[i]);
+                                        if (ob_seen_deltas.count(k)) overlap++;
+                                        else ob_seen_deltas.insert(k);
+                                    }
+                                    if (overlap > 0) {
+                                        mkt_dup_count++;
+                                        fprintf(stderr, "\033[91m[DUP] BOOK seq %ld (dup #%lu, %u/%u overlap)\033[0m\n",
+                                                mkt.src_seq, mkt_dup_count, overlap, mkt.count);
+                                    }
+                                } else {
+                                    // Old sequence
+                                    mkt_dup_count++;
+                                    fprintf(stderr, "\033[91m[DUP] BOOK seq %ld < %ld (dup #%lu)\033[0m\n",
+                                            mkt.src_seq, mkt_ob_seq, mkt_dup_count);
+                                }
+                            } else {
+                                // TRADE / BBO — keep simple seq check
+                                int64_t* seq_p = mkt.is_trade_array() ? &mkt_trade_seq : &mkt_bbo_seq;
+                                if (mkt.src_seq <= *seq_p) {
+                                    mkt_dup_count++;
+                                    fprintf(stderr, "\033[91m[DUP] %s seq %ld <= %ld (dup #%lu)\033[0m\n",
+                                            mkt.is_trade_array() ? "TRADE" : "BBO",
+                                            mkt.src_seq, *seq_p, mkt_dup_count);
+                                }
+                                *seq_p = std::max(*seq_p, mkt.src_seq);
                             }
-                            *seq_p = std::max(*seq_p, mkt.src_seq);
                         }
                         mkt.print();
                     }
@@ -345,7 +380,10 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            if (frame.opcode == 0x01) json_frames++;
+            if (frame.opcode == 0x01) {
+                json_frames++;
+                if (frame.is_discard_early()) discard_early_count++;
+            }
         }
     }
 
@@ -369,7 +407,10 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            if (frame.opcode == 0x01) json_frames++;
+            if (frame.opcode == 0x01) {
+                json_frames++;
+                if (frame.is_discard_early()) discard_early_count++;
+            }
         }
     }
     if (mkt_event_cons) {
@@ -388,11 +429,28 @@ int main(int argc, char* argv[]) {
             } else {
                 mkt_event_count++;
                 if (mkt.src_seq > 0) {
-                    int64_t* seq_p = mkt.is_trade_array() ? &mkt_trade_seq
-                                   : mkt.is_bbo_array()   ? &mkt_bbo_seq
-                                                           : &mkt_ob_seq;
-                    if (mkt.src_seq <= *seq_p) mkt_dup_count++;
-                    *seq_p = std::max(*seq_p, mkt.src_seq);
+                    if (mkt.is_book_delta() || mkt.is_book_snapshot()) {
+                        if (mkt.src_seq > mkt_ob_seq) {
+                            ob_seen_deltas.clear();
+                            for (uint8_t i = 0; i < mkt.count; i++)
+                                ob_seen_deltas.insert(delta_key(mkt.payload.deltas.entries[i]));
+                            mkt_ob_seq = mkt.src_seq;
+                        } else if (mkt.src_seq == mkt_ob_seq) {
+                            uint8_t overlap = 0;
+                            for (uint8_t i = 0; i < mkt.count; i++) {
+                                auto k = delta_key(mkt.payload.deltas.entries[i]);
+                                if (ob_seen_deltas.count(k)) overlap++;
+                                else ob_seen_deltas.insert(k);
+                            }
+                            if (overlap > 0) mkt_dup_count++;
+                        } else {
+                            mkt_dup_count++;
+                        }
+                    } else {
+                        int64_t* seq_p = mkt.is_trade_array() ? &mkt_trade_seq : &mkt_bbo_seq;
+                        if (mkt.src_seq <= *seq_p) mkt_dup_count++;
+                        *seq_p = std::max(*seq_p, mkt.src_seq);
+                    }
                 }
                 mkt.print();
             }
@@ -433,6 +491,9 @@ int main(int argc, char* argv[]) {
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  MktEvents:       %lu\n", mkt_event_count);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  MktEvent dups:   %lu%s\n", mkt_dup_count,
            mkt_dup_count > 0 ? " *** DUPLICATES DETECTED ***" : " (clean)");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  Discard early:   %lu (%.1f%% of JSON)\n",
+           discard_early_count,
+           json_frames > 0 ? 100.0 * discard_early_count / json_frames : 0.0);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "\n--- Ring Buffer Status (DirectIO) ---\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  WS_FRAME_INFO producer: %ld, consumer: %ld (%s)\n",
            ws_frame_prod, ws_frame_cons_seq, (ws_frame_cons_seq >= ws_frame_prod) ? "ok" : "BEHIND");

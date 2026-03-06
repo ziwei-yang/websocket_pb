@@ -14,6 +14,7 @@
 #include <ctime>
 #include <string>
 #include <algorithm>
+#include <unordered_set>
 #include <unistd.h>
 #include <sys/ioctl.h>
 
@@ -53,6 +54,10 @@ static constexpr const char* BG_RED    = "\033[41m";
 // Data structures
 // ============================================================================
 
+static uint64_t delta_content_key(const DeltaEntry& de) {
+    return (static_cast<uint64_t>(de.price) << 1) | (de.flags & DeltaFlags::SIDE_ASK);
+}
+
 static constexpr int MAX_LATENCY_SAMPLES = 65536;
 
 struct ViewerState {
@@ -66,6 +71,7 @@ struct ViewerState {
     int64_t    trade_seq = 0;
     int64_t    bbo_seq = 0;        // last BBO src_seq (book_update_id)
     int64_t    ob_seq = 0;         // last OB/depth src_seq (book_update_id / last_update_id)
+    std::unordered_set<uint64_t> ob_seen_deltas;  // content keys for current ob_seq batch
     uint64_t   dup_count = 0;      // non-monotonic event count
 
     uint64_t   total_events = 0;
@@ -341,11 +347,39 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
     if (evt.is_book_snapshot() || evt.is_bbo_array() || evt.is_book_delta()) {
         int64_t& type_seq = evt.is_bbo_array() ? s.bbo_seq : s.ob_seq;
         if (evt.src_seq > 0 && evt.src_seq <= type_seq) {
-            s.dup_count++;
-            if (evt.is_book_snapshot()) s.snap_count++;
-            else if (evt.is_bbo_array()) s.bbo_count++;
-            else s.delta_count++;
-            return;
+            bool is_book = !evt.is_bbo_array();
+            if (is_book && evt.src_seq == type_seq) {
+                // Same seq — content-based dedup for multi-flush
+                uint8_t overlap = 0;
+                for (uint8_t i = 0; i < evt.count; i++) {
+                    if (s.ob_seen_deltas.count(delta_content_key(evt.payload.deltas.entries[i])))
+                        overlap++;
+                }
+                if (overlap == evt.count) {
+                    // All deltas already seen — true duplicate
+                    s.dup_count++;
+                    if (evt.is_book_snapshot()) s.snap_count++;
+                    else s.delta_count++;
+                    return;
+                }
+                // Has new deltas — accept as continuation
+                for (uint8_t i = 0; i < evt.count; i++)
+                    s.ob_seen_deltas.insert(delta_content_key(evt.payload.deltas.entries[i]));
+            } else {
+                // BBO dup or strictly older seq — discard
+                s.dup_count++;
+                if (evt.is_book_snapshot()) s.snap_count++;
+                else if (evt.is_bbo_array()) s.bbo_count++;
+                else s.delta_count++;
+                return;
+            }
+        } else {
+            // New sequence — track content for future dedup
+            if (!evt.is_bbo_array()) {
+                s.ob_seen_deltas.clear();
+                for (uint8_t i = 0; i < evt.count; i++)
+                    s.ob_seen_deltas.insert(delta_content_key(evt.payload.deltas.entries[i]));
+            }
         }
         type_seq = std::max(type_seq, evt.src_seq);
         s.ob.apply(evt);

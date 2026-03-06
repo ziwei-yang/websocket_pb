@@ -493,6 +493,10 @@ namespace websocket::sbe {
         uint16_t asks_count = 0;
         uint16_t asks_published = 0;
 
+        // Dedup propagation: set when initial dedup fires DONE, so subsequent
+        // TLS records hitting the non-IDLE DONE path can propagate discard_early.
+        bool deduped = false;
+
         // Cursor tracking
         uint32_t bytes_consumed = 0;   // Total bytes parsed so far from payload start
         uint16_t root_block_len = 0;   // SBE root block length
@@ -500,10 +504,12 @@ namespace websocket::sbe {
         // Depth delta accumulator (partial publish across fragments)
         uint8_t delta_count = 0;       // Entries accumulated in delta_buf
         uint8_t snapshot_bid_count = 0; // Bids accumulated (snapshot only, for bid/ask split)
+        uint8_t flush_count = 0;       // Multi-flush batch counter (for CONTINUATION flag)
         websocket::msg::DeltaEntry delta_buf[websocket::msg::MAX_BOOK_LEVELS];
 
         void reset() {
             phase = IDLE;
+            deduped = false;
             bytes_consumed = 0;
             msg_type = 0;
             sequence = 0;
@@ -518,6 +524,7 @@ namespace websocket::sbe {
             root_block_len = 0;
             delta_count = 0;
             snapshot_bid_count = 0;
+            flush_count = 0;
         }
     };
 
@@ -592,7 +599,20 @@ struct BinanceSBEHandler {
             info.mkt_event_count = state.group_count;
             if (state.bids_count > 0 || state.asks_count > 0)
                 info.mkt_event_count = state.bids_count + state.asks_count;
-            if (state.phase == SBEParseState::DONE) return;  // fully parsed, just repopulated info
+            if (state.phase == SBEParseState::DONE) {
+                if (state.deduped) info.set_discard_early(true);
+                return;  // fully parsed, just repopulated info
+            }
+
+            // Re-check dedup: another connection may have superseded while streaming
+            if (state.msg_type == DEPTH_SNAPSHOT_STREAM || state.msg_type == DEPTH_DIFF_STREAM) {
+                if (state.sequence < last_book_seq_) {
+                    state.deduped = true;
+                    state.phase = SBEParseState::DONE;
+                    info.set_discard_early(true);
+                    return;
+                }
+            }
         }
 
         // ── Phase IDLE → HEADER_PARSED ──────────────────────────────────────
@@ -659,6 +679,7 @@ struct BinanceSBEHandler {
                 && state.msg_type != BEST_BID_ASK_STREAM) {
                 if (state.sequence <= last_book_seq_) {
                     info.set_discard_early(true);
+                    state.deduped = true;
                     state.phase = SBEParseState::DONE;
                     return;
                 }
@@ -802,6 +823,7 @@ private:
                     : last_trade_id_;
                 if (state.sequence <= eff_tid) {
                     info.set_discard_early(true);
+                    state.deduped = true;
                     state.phase = SBEParseState::DONE;
                     return;
                 }
@@ -819,6 +841,7 @@ private:
                     : last_trade_id_;
                 if (first_tid > 0 && first_tid <= eff_tid) {
                     info.set_discard_early(true);
+                    state.deduped = true;
                     state.phase = SBEParseState::DONE;
                     return;
                 }
@@ -1077,7 +1100,7 @@ private:
                     if (event_type == websocket::msg::EventType::BOOK_SNAPSHOT)
                         flush_depth_snapshot(state, ci, info);
                     else
-                        flush_depth_deltas(state, ci, info, event_type, extra_flags);
+                        flush_depth_deltas(state, ci, info, event_type, extra_flags, /*is_final=*/true);
                 }
                 state.phase = SBEParseState::DONE;
             }
@@ -1087,20 +1110,26 @@ private:
     void flush_depth_deltas(SBEParseState& state, uint8_t ci,
                             [[maybe_unused]] websocket::pipeline::WSFrameInfo& info,
                             websocket::msg::EventType event_type,
-                            uint16_t extra_flags) {
+                            uint16_t extra_flags,
+                            bool is_final = false) {
         if (state.delta_count == 0) return;
         record_win(ci);
         uint8_t count = state.delta_count;
         int64_t seq = state.sequence;
+        uint8_t fc = state.flush_count;
         publish_event([&](websocket::msg::MktEvent& e) {
             e.event_type = static_cast<uint8_t>(event_type);
-            e.flags = extra_flags;
+            uint16_t f = extra_flags;
+            if (fc > 0)    f |= websocket::msg::EventFlags::CONTINUATION;
+            if (is_final)  f |= websocket::msg::EventFlags::LAST_IN_BATCH;
+            e.flags = f;
             e.src_seq = seq;
             e.event_ts_ns = state.event_time_us * 1000;
             e.count = count;
             std::memcpy(e.payload.deltas.entries, state.delta_buf,
                         count * sizeof(websocket::msg::DeltaEntry));
         });
+        state.flush_count++;
         state.delta_count = 0;
     }
 

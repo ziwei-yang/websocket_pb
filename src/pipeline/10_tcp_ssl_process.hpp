@@ -519,7 +519,13 @@ public:
                             if constexpr (InlineWS) {
                                 if (ssl_bytes > 0) {
                                     // Drain: read remaining TLS records
-                                    while (process_ssl_read_for_conn(ci, timing[ci]) > 0) {}
+                                    uint32_t _drain_n = 0;
+                                    while (process_ssl_read_for_conn(ci, timing[ci]) > 0) { _drain_n++; }
+                                    if (_drain_n > 100) {
+                                        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+                                        fprintf(stderr, "[%ld.%06ld] [DEBUG-DRAIN] conn %u drained %u extra reads\n",
+                                                _ts.tv_sec, _ts.tv_nsec / 1000, ci, _drain_n);
+                                    }
                                 }
                             }
                         }

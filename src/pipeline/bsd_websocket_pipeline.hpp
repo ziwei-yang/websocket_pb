@@ -583,13 +583,26 @@ public:
             return false;
         }
 
-        // Allocate MsgInbox per connection (shared memory for cross-process access)
+        // Allocate MsgInbox per connection (file-backed for external tool access)
+        mkdir(shm_paths::PIPELINE_DIR, 0755);
         for (size_t i = 0; i < NUM_CONN; i++) {
+            char path[128];
+            snprintf(path, sizeof(path), "%s/msg_inbox_%zu.dat", shm_paths::PIPELINE_DIR, i);
+            int fd = open(path, O_CREAT | O_RDWR, 0644);
+            if (fd < 0) {
+                fprintf(stderr, "FAIL: Cannot open MsgInbox file %s: %s\n", path, strerror(errno));
+                return false;
+            }
+            if (ftruncate(fd, sizeof(MsgInbox)) < 0) {
+                fprintf(stderr, "FAIL: Cannot ftruncate MsgInbox file %s\n", path);
+                close(fd);
+                return false;
+            }
             msg_inbox_[i] = static_cast<MsgInbox*>(
-                mmap(nullptr, sizeof(MsgInbox), PROT_READ | PROT_WRITE,
-                     MAP_SHARED | MAP_ANONYMOUS, -1, 0));
+                mmap(nullptr, sizeof(MsgInbox), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+            close(fd);
             if (msg_inbox_[i] == MAP_FAILED) {
-                fprintf(stderr, "FAIL: Cannot allocate MsgInbox[%zu]\n", i);
+                fprintf(stderr, "FAIL: Cannot mmap MsgInbox[%zu]\n", i);
                 return false;
             }
             msg_inbox_[i]->init();
@@ -773,6 +786,9 @@ public:
             if (msg_inbox_[i] && msg_inbox_[i] != MAP_FAILED) {
                 munmap(msg_inbox_[i], sizeof(MsgInbox)); msg_inbox_[i] = nullptr;
             }
+            char path[128];
+            snprintf(path, sizeof(path), "%s/msg_inbox_%zu.dat", shm_paths::PIPELINE_DIR, i);
+            unlink(path);
         }
     }
 

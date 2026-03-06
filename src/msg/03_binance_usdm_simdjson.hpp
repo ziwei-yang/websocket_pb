@@ -1,167 +1,159 @@
-// msg/02_binance_usdm_yyjson.hpp
-// Binance USD-M Futures JSON market data: yyjson DOM parser + handler
+// msg/03_binance_usdm_simdjson.hpp
+// Binance USD-M Futures: simdjson On Demand parse functions (Part 1 only)
 //
-// websocket::json::yy — yyjson-backed parsers for Binance futures streams.
+// websocket::json::simd — simdjson On Demand parsers for Binance futures streams.
 //   Reuses types and classify_stream() from 01_binance_usdm_json.hpp.
-//   Uses yyjson 0.12.0 DOM API for field extraction.
-//
-//   BinanceUSDMYyjsonParser — Handler struct for pipeline integration
+//   Uses simdjson 4.x On Demand (streaming cursor, no DOM tree).
 #pragma once
 
-#include "msg/01_binance_usdm_json.hpp"  // reuse types + classify_stream()
+#include "msg/01_binance_usdm_json.hpp"   // reuse types, classify_stream
 #include "msg/market_conf.hpp"
+#include "vendor/simdjson.h"
 
-extern "C" {
-#include "vendor/yyjson.h"
-}
+namespace websocket::json::simd {
 
-// ============================================================================
-// Part 1: yyjson Parse Functions
-// ============================================================================
-
-namespace websocket::json::yy {
-
-// Decimal C-string → int64 mantissa (e.g., "7403.89" → 740389)
-inline int64_t decimal_cstr_to_int64(const char* s) {
-    if (!s) return 0;
+// Decimal string_view -> int64 mantissa ("7403.89" -> 740389)
+inline int64_t decimal_sv_to_int64(std::string_view sv) {
     bool neg = false;
-    if (*s == '-') { neg = true; ++s; }
+    const char* s = sv.data();
+    const char* end = s + sv.size();
+    if (s < end && *s == '-') { neg = true; ++s; }
     int64_t v = 0;
-    while (*s) {
+    while (s < end) {
         if (*s == '.') { ++s; continue; }
-        if (*s >= '0' && *s <= '9')
-            v = v * 10 + (*s - '0');
+        if (*s >= '0' && *s <= '9') v = v * 10 + (*s - '0');
         ++s;
     }
     return neg ? -v : v;
 }
 
-// RAII wrapper for yyjson_doc* lifetime
-struct YyDoc {
-    yyjson_doc* doc = nullptr;
-    YyDoc() = default;
-    explicit YyDoc(yyjson_doc* d) : doc(d) {}
-    ~YyDoc() { if (doc) yyjson_doc_free(doc); }
-    YyDoc(const YyDoc&) = delete;
-    YyDoc& operator=(const YyDoc&) = delete;
-    YyDoc(YyDoc&& o) noexcept : doc(o.doc) { o.doc = nullptr; }
-    YyDoc& operator=(YyDoc&& o) noexcept {
-        if (doc) yyjson_doc_free(doc);
-        doc = o.doc; o.doc = nullptr;
-        return *this;
-    }
-    explicit operator bool() const { return doc != nullptr; }
-};
-
-// Combined stream parse result (owns document)
-struct YyCombinedResult {
+// Combined stream parse: classify + get data object.
+// Caller owns the document via this struct — it must stay alive while accessing data.
+struct SimdCombinedResult {
     UsdmStreamType type = UsdmStreamType::UNKNOWN;
-    YyDoc doc;
-    yyjson_val* data = nullptr;
+    simdjson::ondemand::document doc;
+    simdjson::ondemand::object data;
+    bool valid = false;
 };
 
-inline YyCombinedResult yy_parse_combined(const uint8_t* json, uint32_t len) {
-    YyCombinedResult res;
-    res.doc = YyDoc(yyjson_read(reinterpret_cast<const char*>(json), len, 0));
-    if (!res.doc) return res;
-    yyjson_val* root = yyjson_doc_get_root(res.doc.doc);
-    if (!root) return res;
-    yyjson_val* stream = yyjson_obj_get(root, "stream");
-    if (!stream) return res;
-    const char* sname = yyjson_get_str(stream);
-    size_t slen = yyjson_get_len(stream);
-    res.type = classify_stream(reinterpret_cast<const uint8_t*>(sname),
-                               static_cast<uint32_t>(slen));
-    res.data = yyjson_obj_get(root, "data");
+inline SimdCombinedResult simd_parse_combined(
+        simdjson::ondemand::parser& parser,
+        const uint8_t* padded_buf, size_t len, size_t capacity) {
+    SimdCombinedResult res;
+    if (parser.iterate(padded_buf, len, capacity).get(res.doc))
+        return res;
+
+    std::string_view stream;
+    if (res.doc.find_field("stream").get_string().get(stream))
+        return res;
+    res.type = classify_stream(
+        reinterpret_cast<const uint8_t*>(stream.data()),
+        static_cast<uint32_t>(stream.size()));
+    if (res.type == UsdmStreamType::UNKNOWN) return res;
+    if (res.doc.find_field("data").get_object().get(res.data))
+        return res;
+    res.valid = true;
     return res;
 }
 
-inline AggTradeFields yy_parse_agg_trade(yyjson_val* data) {
+// Parse aggTrade from On Demand data object
+inline AggTradeFields simd_parse_agg_trade(simdjson::ondemand::object& data) {
     AggTradeFields f{};
-    f.valid = false;
-    if (!data) return f;
-    f.event_time_ms  = yyjson_get_sint(yyjson_obj_get(data, "E"));
-    f.agg_trade_id   = yyjson_get_sint(yyjson_obj_get(data, "a"));
-    f.price_mantissa = decimal_cstr_to_int64(yyjson_get_str(yyjson_obj_get(data, "p")));
-    f.qty_mantissa   = decimal_cstr_to_int64(yyjson_get_str(yyjson_obj_get(data, "q")));
-    f.trade_time_ms  = yyjson_get_sint(yyjson_obj_get(data, "T"));
-    f.buyer_is_maker = yyjson_get_bool(yyjson_obj_get(data, "m"));
+    int64_t val;
+    std::string_view sv;
+    bool bv;
+    if (data.find_field("E").get_int64().get(val)) return f;
+    f.event_time_ms = val;
+    if (data.find_field("a").get_int64().get(val)) return f;
+    f.agg_trade_id = val;
+    if (data.find_field("p").get_string().get(sv)) return f;
+    f.price_mantissa = decimal_sv_to_int64(sv);
+    if (data.find_field("q").get_string().get(sv)) return f;
+    f.qty_mantissa = decimal_sv_to_int64(sv);
+    if (data.find_field("T").get_int64().get(val)) return f;
+    f.trade_time_ms = val;
+    if (data.find_field("m").get_bool().get(bv)) return f;
+    f.buyer_is_maker = bv;
     f.valid = true;
     return f;
 }
 
-// Depth result with yyjson_val* array pointers (instead of uint8_t*)
-struct YyDepthFields {
-    int64_t event_time_ms;
-    int64_t txn_time_ms;
-    int64_t last_update_id;
-    yyjson_val* bids_val;
-    yyjson_val* asks_val;
-    bool valid;
+// Depth header — scalar fields only. Caller must then get "b"/"a" arrays
+// from the same data object (On Demand cursor is positioned after "u").
+struct SimdDepthHeader {
+    int64_t event_time_ms = 0;
+    int64_t txn_time_ms = 0;
+    int64_t last_update_id = 0;
+    bool valid = false;
 };
 
-inline YyDepthFields yy_parse_depth(yyjson_val* data) {
-    YyDepthFields f{};
-    f.valid = false;
-    f.bids_val = nullptr;
-    f.asks_val = nullptr;
-    if (!data) return f;
-    f.event_time_ms  = yyjson_get_sint(yyjson_obj_get(data, "E"));
-    f.txn_time_ms    = yyjson_get_sint(yyjson_obj_get(data, "T"));
-    f.last_update_id = yyjson_get_sint(yyjson_obj_get(data, "u"));
-    f.bids_val       = yyjson_obj_get(data, "b");
-    f.asks_val       = yyjson_obj_get(data, "a");
+inline SimdDepthHeader simd_parse_depth_header(simdjson::ondemand::object& data) {
+    SimdDepthHeader f{};
+    int64_t val;
+    if (data.find_field("E").get_int64().get(val)) return f;
+    f.event_time_ms = val;
+    if (data.find_field("T").get_int64().get(val)) return f;
+    f.txn_time_ms = val;
+    if (data.find_field("u").get_int64().get(val)) return f;
+    f.last_update_id = val;
     f.valid = true;
     return f;
 }
 
-inline uint8_t yy_parse_book_levels(yyjson_val* arr,
-                                     websocket::msg::BookLevel* out, uint8_t max) {
-    if (!arr) return 0;
+// Parse [[price,qty],...] from On Demand array into BookLevel[]
+inline uint8_t simd_parse_book_levels(simdjson::ondemand::array& arr,
+                                       websocket::msg::BookLevel* out, uint8_t max) {
     uint8_t count = 0;
-    size_t idx, max_arr;
-    yyjson_val* val;
-    yyjson_arr_foreach(arr, idx, max_arr, val) {
+    for (auto item : arr) {
         if (count >= max) break;
-        out[count].price = decimal_cstr_to_int64(yyjson_get_str(yyjson_arr_get(val, 0)));
-        out[count].qty   = decimal_cstr_to_int64(yyjson_get_str(yyjson_arr_get(val, 1)));
+        auto inner = item.get_array();
+        std::string_view price_sv, qty_sv;
+        auto it = inner.begin();
+        if ((*it).get_string().get(price_sv)) break;
+        ++it;
+        if ((*it).get_string().get(qty_sv)) break;
+        out[count].price = decimal_sv_to_int64(price_sv);
+        out[count].qty   = decimal_sv_to_int64(qty_sv);
         count++;
     }
     return count;
 }
 
-inline uint8_t yy_parse_delta_levels(yyjson_val* arr,
-                                      websocket::msg::DeltaEntry* out, uint8_t max,
-                                      bool is_ask) {
-    if (!arr) return 0;
+inline uint8_t simd_parse_delta_levels(simdjson::ondemand::array& arr,
+                                        websocket::msg::DeltaEntry* out, uint8_t max,
+                                        bool is_ask) {
     uint8_t count = 0;
-    size_t idx, max_arr;
-    yyjson_val* val;
-    yyjson_arr_foreach(arr, idx, max_arr, val) {
+    for (auto item : arr) {
         if (count >= max) break;
-        out[count].price = decimal_cstr_to_int64(yyjson_get_str(yyjson_arr_get(val, 0)));
-        out[count].qty   = decimal_cstr_to_int64(yyjson_get_str(yyjson_arr_get(val, 1)));
+        auto inner = item.get_array();
+        std::string_view price_sv, qty_sv;
+        auto it = inner.begin();
+        if ((*it).get_string().get(price_sv)) break;
+        ++it;
+        if ((*it).get_string().get(qty_sv)) break;
+        out[count].price  = decimal_sv_to_int64(price_sv);
+        out[count].qty    = decimal_sv_to_int64(qty_sv);
         out[count].action = (out[count].qty == 0)
             ? static_cast<uint8_t>(websocket::msg::DeltaAction::DELETE)
             : static_cast<uint8_t>(websocket::msg::DeltaAction::UPDATE);
-        out[count].flags = is_ask ? websocket::msg::DeltaFlags::SIDE_ASK : 0;
+        out[count].flags  = is_ask ? websocket::msg::DeltaFlags::SIDE_ASK : 0;
         std::memset(out[count]._pad, 0, sizeof(out[count]._pad));
         count++;
     }
     return count;
 }
 
-}  // namespace websocket::json::yy
+}  // namespace websocket::json::simd
 
 // ============================================================================
-// Part 2: BinanceUSDMYyjsonParser (requires pipeline_data.hpp)
+// Part 2: BinanceUSDMSimdjsonParser (requires pipeline_data.hpp)
 // ============================================================================
 
 #ifdef PIPELINE_DATA_HPP_INCLUDED
 
 namespace websocket::json {
 
-struct BinanceUSDMYyjsonParser {
+struct BinanceUSDMSimdjsonParser {
     static constexpr bool enabled = true;
     JsonParseState sbe_state_[PIPELINE_MAX_CONN]{};
 
@@ -186,6 +178,9 @@ struct BinanceUSDMYyjsonParser {
     int64_t pending_trades_max_id_ = 0;
     websocket::pipeline::WSFrameInfo pending_trades_info_{};
 
+    // simdjson reusable parser (allocates internal buffers once)
+    simdjson::ondemand::parser simd_parser_;
+
     // ── Main entry point (streaming: essential → metadata → dedup → streaming parse) ──
 
     void on_ws_data(JsonParseState& state, uint8_t ci,
@@ -209,7 +204,28 @@ struct BinanceUSDMYyjsonParser {
             info.mkt_event_seq = state.sequence;
             info.mkt_event_count = (state.bids_count > 0 || state.asks_count > 0)
                 ? state.bids_count + state.asks_count : state.group_count;
-            if (state.phase == JsonParseState::DONE) return;
+            if (state.phase == JsonParseState::DONE) {
+                if (state.deduped) info.set_discard_early(true);
+                return;
+            }
+
+            // ── Re-check dedup: another connection may have superseded while streaming ──
+            if (type == UsdmStreamType::AGG_TRADE) {
+                int64_t eff_tid = has_pending_trades_
+                    ? std::max(last_trade_id_, pending_trades_max_id_)
+                    : last_trade_id_;
+                if (state.sequence <= eff_tid) {
+                    state.deduped = true;
+                    state.phase = JsonParseState::DONE;
+                    info.set_discard_early(true);
+                    return;
+                }
+            } else if (state.sequence < last_book_seq_) {
+                state.deduped = true;
+                state.phase = JsonParseState::DONE;
+                info.set_discard_early(true);
+                return;
+            }
 
             current_info_ = &info;
             if (type == UsdmStreamType::AGG_TRADE)
@@ -241,6 +257,10 @@ struct BinanceUSDMYyjsonParser {
                 : last_trade_id_;
             if (e.sequence <= eff_tid) {
                 info.set_discard_early(true);
+                state.msg_type = e.msg_type;
+                state.sequence = e.sequence;
+                state.event_time_us = e.event_time_ms * 1000;
+                state.deduped = true;
                 state.phase = JsonParseState::DONE;
                 return;
             }
@@ -269,6 +289,10 @@ struct BinanceUSDMYyjsonParser {
 
             if (e.sequence <= last_book_seq_) {
                 info.set_discard_early(true);
+                state.msg_type = e.msg_type;
+                state.sequence = e.sequence;
+                state.event_time_us = e.event_time_ms * 1000;
+                state.deduped = true;
                 state.phase = JsonParseState::DONE;
                 return;
             }

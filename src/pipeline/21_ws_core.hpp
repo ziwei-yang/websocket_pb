@@ -617,7 +617,7 @@ private:
         info.ws_parse_cycle = rdtscp();
 
         if constexpr (HasMktEventHandler) {
-            if (pending_frame_[ci].opcode == 0x02 && info.payload_len >= 8) {
+            if ((pending_frame_[ci].opcode == 0x01 || pending_frame_[ci].opcode == 0x02) && info.payload_len >= 64) {
                 const uint8_t* payload = msg_inbox_[ci]->data_at(info.msg_inbox_offset);
                 WSFrameInfo frag_info{};
                 mkt_event_handler_.on_ws_data(mkt_event_handler_.sbe_state_[ci],
@@ -626,15 +626,21 @@ private:
                 info.mkt_event_count = frag_info.mkt_event_count;
                 info.mkt_event_seq = frag_info.mkt_event_seq;
                 info.exchange_event_time_us = frag_info.exchange_event_time_us;
+                info.flags |= (frag_info.flags & 0xF0);  // Propagate discard_early etc.
             } else if (pending_frame_[ci].opcode == 0x00) {
                 // Continuation frame partial: propagate type from SBE state for display
                 auto& st = mkt_event_handler_.sbe_state_[ci];
                 if (st.msg_type != 0) {
                     switch (st.msg_type) {
+                    // SBE template IDs
                     case 10002: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT); break;
                     case 10003: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA); break;
                     case 10000: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY); break;
                     case 10001: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BBO_ARRAY); break;
+                    // JSON UsdmStreamType values
+                    case 1: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY); break;
+                    case 2: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT); break;
+                    case 3: info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA); break;
                     }
                     info.mkt_event_seq = st.sequence;
                     info.exchange_event_time_us = st.event_time_us;
@@ -1050,12 +1056,35 @@ private:
 
                 // Single code path: pass full accumulated payload for fragments,
                 // or current payload for complete frames
-                const uint8_t* ws_payload = is_fragmented
-                    ? msg_inbox_[ci]->data_at(ps.fragment_start_offset)
-                    : msg_inbox_[ci]->data_at(info.msg_inbox_offset);
+                uint32_t payload_offset_raw = is_fragmented
+                    ? ps.fragment_start_offset
+                    : info.msg_inbox_offset;
+                const uint8_t* ws_payload = msg_inbox_[ci]->data_at(payload_offset_raw);
                 uint32_t avail = is_fragmented
                     ? ps.fragment_total_len
                     : static_cast<uint32_t>(payload_len);
+
+                // Pre-populate from state (baseline for TLS-split frames where
+                // partial already parsed essential fields)
+                auto& st = mkt_event_handler_.sbe_state_[ci];
+                if (st.msg_type != 0) {
+                    switch (st.msg_type) {
+                    // SBE template IDs
+                    case 10002: saved_mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT); break;
+                    case 10003: saved_mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA); break;
+                    case 10000: saved_mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY); break;
+                    case 10001: saved_mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BBO_ARRAY); break;
+                    // JSON UsdmStreamType values
+                    case 1: saved_mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY); break;
+                    case 2: saved_mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT); break;
+                    case 3: saved_mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA); break;
+                    }
+                    saved_mkt_event_seq = st.sequence;
+                    saved_exchange_event_time_us = st.event_time_us;
+                    saved_mkt_event_count = (st.bids_count > 0 || st.asks_count > 0)
+                        ? st.bids_count + st.asks_count : st.group_count;
+                }
+
                 if (avail >= 8)
                     mkt_event_handler_.on_ws_data(mkt_event_handler_.sbe_state_[ci],
                                                   ci, ws_payload, avail, info);
@@ -1063,10 +1092,13 @@ private:
                 if (!is_fragmented || is_last_fragment)
                     mkt_event_handler_.sbe_state_[ci].reset();
 
-                saved_mkt_event_type = info.mkt_event_type;
-                saved_mkt_event_count = info.mkt_event_count;
-                saved_mkt_event_seq = info.mkt_event_seq;
-                saved_exchange_event_time_us = info.exchange_event_time_us;
+                // Override with handler values if it produced useful metadata
+                if (info.exchange_event_time_us != 0 || info.mkt_event_count != 0) {
+                    saved_mkt_event_type = info.mkt_event_type;
+                    saved_mkt_event_count = info.mkt_event_count;
+                    saved_mkt_event_seq = info.mkt_event_seq;
+                    saved_exchange_event_time_us = info.exchange_event_time_us;
+                }
                 app_flags = info.flags & 0xF0;  // Preserve MktEventHandler-set bits (4+)
             }
         }
