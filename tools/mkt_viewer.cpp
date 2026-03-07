@@ -49,6 +49,7 @@ static constexpr const char* DIM    = "\033[2m";
 static constexpr const char* BG_GREEN  = "\033[42m";
 static constexpr const char* BG_YELLOW = "\033[43m";
 static constexpr const char* BG_RED    = "\033[41m";
+static constexpr const char* BG_CYAN   = "\033[46m";
 
 // ============================================================================
 // Data structures
@@ -61,7 +62,33 @@ static uint64_t delta_content_key(const DeltaEntry& de) {
 static constexpr int MAX_LATENCY_SAMPLES = 65536;
 
 struct ViewerState {
-    OrderBook ob;
+    static constexpr int DEPTH_CHANNELS = 3;
+    OrderBook ob_channels[DEPTH_CHANNELS];
+    int64_t   ob_channel_seq[DEPTH_CHANNELS] = {};
+    int64_t   ob_channel_recv_ns[DEPTH_CHANNELS] = {};  // recv_ts of last depth update per channel
+    int       latest_ob_channel = -1;
+    int64_t   bbo_recv_ns = 0;                           // recv_ts of last BBO update
+    // Cached BBO for re-application after delta
+    int64_t   last_bbo_seq = 0;
+    int64_t   cached_bbo_bid_price = 0, cached_bbo_bid_qty = 0;
+    int64_t   cached_bbo_ask_price = 0, cached_bbo_ask_qty = 0;
+
+    OrderBook& latest_orderbook() {
+        if (latest_ob_channel >= 0) return ob_channels[latest_ob_channel];
+        return ob_channels[0];
+    }
+    const OrderBook& latest_orderbook() const {
+        if (latest_ob_channel >= 0) return ob_channels[latest_ob_channel];
+        return ob_channels[0];
+    }
+    void update_latest_channel() {
+        int best = -1;
+        int64_t best_seq = -1;
+        for (int i = 0; i < DEPTH_CHANNELS; i++) {
+            if (ob_channel_seq[i] > best_seq) { best_seq = ob_channel_seq[i]; best = i; }
+        }
+        latest_ob_channel = best;
+    }
 
     static constexpr size_t TRADE_BUF = 65536;
     static constexpr size_t TRADE_MASK = TRADE_BUF - 1;
@@ -70,8 +97,7 @@ struct ViewerState {
     size_t     trade_count = 0;
     int64_t    trade_seq = 0;
     int64_t    bbo_seq = 0;        // last BBO src_seq (book_update_id)
-    int64_t    ob_seq = 0;         // last OB/depth src_seq (book_update_id / last_update_id)
-    std::unordered_set<uint64_t> ob_seen_deltas;  // content keys for current ob_seq batch
+    std::unordered_set<uint64_t> ob_seen_deltas[DEPTH_CHANNELS];  // content keys per channel
     uint64_t   dup_count = 0;      // non-monotonic event count
 
     uint64_t   total_events = 0;
@@ -244,10 +270,10 @@ static void pad_to_decimals(char* s, int target) {
 
 static void sample_depth(ViewerState& s, int64_t ts_ns) {
     double inst_depth = 0;
-    for (int i = 0; i < 10 && i < s.ob.bid_count; i++)
-        inst_depth += mantissa_to_double(s.ob.bids[i].qty, QTY_EXP);
-    for (int i = 0; i < 10 && i < s.ob.ask_count; i++)
-        inst_depth += mantissa_to_double(s.ob.asks[i].qty, QTY_EXP);
+    for (int i = 0; i < 10 && i < s.latest_orderbook().bid_count; i++)
+        inst_depth += mantissa_to_double(s.latest_orderbook().bids[i].qty, QTY_EXP);
+    for (int i = 0; i < 10 && i < s.latest_orderbook().ask_count; i++)
+        inst_depth += mantissa_to_double(s.latest_orderbook().asks[i].qty, QTY_EXP);
 
     // Advance depth segments
     if (s.depth_seg_start_ns == 0)
@@ -344,48 +370,97 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
         s.latency_sum += lat;
     }
 
-    if (evt.is_book_snapshot() || evt.is_bbo_array() || evt.is_book_delta()) {
-        int64_t& type_seq = evt.is_bbo_array() ? s.bbo_seq : s.ob_seq;
-        if (evt.src_seq > 0 && evt.src_seq <= type_seq) {
-            bool is_book = !evt.is_bbo_array();
-            if (is_book && evt.src_seq == type_seq) {
+    if (evt.is_book_snapshot()) {
+        // Snapshot: per-channel overwrite — only overwrite channels behind this snapshot
+        bool any_applied = false;
+        for (int c = 0; c < ViewerState::DEPTH_CHANNELS; c++) {
+            if (evt.src_seq >= s.ob_channel_seq[c]) {
+                s.ob_channels[c].apply_snapshot(evt);
+                s.ob_channel_seq[c] = evt.src_seq;
+                s.ob_channel_recv_ns[c] = evt.recv_ts_ns;
+                any_applied = true;
+            }
+        }
+        if (!any_applied) {
+            s.dup_count++;
+        } else {
+            s.update_latest_channel();
+            for (int c = 0; c < ViewerState::DEPTH_CHANNELS; c++)
+                s.ob_seen_deltas[c].clear();
+        }
+        s.snap_count++;
+        sample_depth(s, evt.recv_ts_ns);
+    } else if (evt.is_book_delta()) {
+        uint8_t ch = evt.depth_channel();
+        if (ch >= ViewerState::DEPTH_CHANNELS) ch = 0;
+        int64_t& ch_seq = s.ob_channel_seq[ch];
+
+        if (evt.src_seq > 0 && evt.src_seq <= ch_seq) {
+            if (evt.src_seq == ch_seq) {
                 // Same seq — content-based dedup for multi-flush
                 uint8_t overlap = 0;
                 for (uint8_t i = 0; i < evt.count; i++) {
-                    if (s.ob_seen_deltas.count(delta_content_key(evt.payload.deltas.entries[i])))
+                    if (s.ob_seen_deltas[ch].count(delta_content_key(evt.payload.deltas.entries[i])))
                         overlap++;
                 }
                 if (overlap == evt.count) {
-                    // All deltas already seen — true duplicate
                     s.dup_count++;
-                    if (evt.is_book_snapshot()) s.snap_count++;
-                    else s.delta_count++;
+                    s.delta_count++;
                     return;
                 }
-                // Has new deltas — accept as continuation
                 for (uint8_t i = 0; i < evt.count; i++)
-                    s.ob_seen_deltas.insert(delta_content_key(evt.payload.deltas.entries[i]));
+                    s.ob_seen_deltas[ch].insert(delta_content_key(evt.payload.deltas.entries[i]));
             } else {
-                // BBO dup or strictly older seq — discard
                 s.dup_count++;
-                if (evt.is_book_snapshot()) s.snap_count++;
-                else if (evt.is_bbo_array()) s.bbo_count++;
-                else s.delta_count++;
+                s.delta_count++;
                 return;
             }
         } else {
-            // New sequence — track content for future dedup
-            if (!evt.is_bbo_array()) {
-                s.ob_seen_deltas.clear();
-                for (uint8_t i = 0; i < evt.count; i++)
-                    s.ob_seen_deltas.insert(delta_content_key(evt.payload.deltas.entries[i]));
-            }
+            s.ob_seen_deltas[ch].clear();
+            for (uint8_t i = 0; i < evt.count; i++)
+                s.ob_seen_deltas[ch].insert(delta_content_key(evt.payload.deltas.entries[i]));
         }
-        type_seq = std::max(type_seq, evt.src_seq);
-        s.ob.apply(evt);
-        if (evt.is_book_snapshot()) s.snap_count++;
-        else if (evt.is_bbo_array()) s.bbo_count++;
-        else s.delta_count++;
+        ch_seq = std::max(ch_seq, evt.src_seq);
+        s.ob_channel_recv_ns[ch] = evt.recv_ts_ns;
+        s.ob_channels[ch].apply_deltas(evt);
+        // Re-apply cached BBO if it's newer than this channel's book
+        if (s.last_bbo_seq > ch_seq) {
+            auto& ob = s.ob_channels[ch];
+            ob.bbo_seq = s.last_bbo_seq;
+            ob.bbo_bid_price = s.cached_bbo_bid_price;
+            ob.bbo_bid_qty = s.cached_bbo_bid_qty;
+            ob.bbo_ask_price = s.cached_bbo_ask_price;
+            ob.bbo_ask_qty = s.cached_bbo_ask_qty;
+            ob.reconcile_bbo();
+        }
+        s.update_latest_channel();
+        s.delta_count++;
+        sample_depth(s, evt.recv_ts_ns);
+    } else if (evt.is_bbo_array()) {
+        if (evt.src_seq > 0 && evt.src_seq <= s.bbo_seq) {
+            s.dup_count++;
+            s.bbo_count++;
+            return;
+        }
+        s.bbo_seq = std::max(s.bbo_seq, evt.src_seq);
+        s.bbo_recv_ns = evt.recv_ts_ns;
+        // Cache BBO values
+        auto entries = evt.bbo_entries();
+        if (entries.count > 0) {
+            auto& last = entries.data[entries.count - 1];
+            s.last_bbo_seq = last.book_update_id;
+            s.cached_bbo_bid_price = last.bid_price;
+            s.cached_bbo_bid_qty = last.bid_qty;
+            s.cached_bbo_ask_price = last.ask_price;
+            s.cached_bbo_ask_qty = last.ask_qty;
+        }
+        // Only apply to orderbook if BBO is newer than latest depth
+        if (s.latest_ob_channel >= 0) {
+            int64_t latest_depth_seq = s.ob_channel_seq[s.latest_ob_channel];
+            if (s.last_bbo_seq > latest_depth_seq)
+                s.ob_channels[s.latest_ob_channel].apply_bbo(evt);
+        }
+        s.bbo_count++;
         sample_depth(s, evt.recv_ts_ns);
     } else if (evt.is_trade_array()) {
         if (evt.src_seq > 0 && evt.src_seq <= s.trade_seq) {
@@ -814,23 +889,24 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
     FmtLevel fl[MAX_BOOK];
     int max_pdec = 0, max_qdec = 0;
 
-    for (int i = 0; i < book_rows; i++) {
+    int book_level_rows = book_rows - 1;  // last row reserved for channel status
+    for (int i = 0; i < book_level_rows; i++) {
         auto& f = fl[i];
         f.bp[0] = f.bq[0] = f.ap[0] = f.aq[0] = '\0';
-        if (i < s.ob.bid_count) {
-            fmt_price(f.bp, sizeof(f.bp), s.ob.bids[i].price, PRICE_EXP);
-            fmt_qty(f.bq, sizeof(f.bq), s.ob.bids[i].qty, QTY_EXP);
+        if (i < s.latest_orderbook().bid_count) {
+            fmt_price(f.bp, sizeof(f.bp), s.latest_orderbook().bids[i].price, PRICE_EXP);
+            fmt_qty(f.bq, sizeof(f.bq), s.latest_orderbook().bids[i].qty, QTY_EXP);
             max_pdec = std::max(max_pdec, decimal_digits(f.bp));
             max_qdec = std::max(max_qdec, decimal_digits(f.bq));
         }
-        if (i < s.ob.ask_count) {
-            fmt_price(f.ap, sizeof(f.ap), s.ob.asks[i].price, PRICE_EXP);
-            fmt_qty(f.aq, sizeof(f.aq), s.ob.asks[i].qty, QTY_EXP);
+        if (i < s.latest_orderbook().ask_count) {
+            fmt_price(f.ap, sizeof(f.ap), s.latest_orderbook().asks[i].price, PRICE_EXP);
+            fmt_qty(f.aq, sizeof(f.aq), s.latest_orderbook().asks[i].qty, QTY_EXP);
             max_pdec = std::max(max_pdec, decimal_digits(f.ap));
             max_qdec = std::max(max_qdec, decimal_digits(f.aq));
         }
     }
-    for (int i = 0; i < book_rows; i++) {
+    for (int i = 0; i < book_level_rows; i++) {
         auto& f = fl[i];
         if (f.bp[0]) pad_to_decimals(f.bp, max_pdec);
         if (f.bq[0]) pad_to_decimals(f.bq, max_qdec);
@@ -839,7 +915,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
     }
 
     // ── Pre-format trades (fold consecutive same-price same-side) ───────────
-    int max_trade_show = wide_mode ? book_rows : trade_rows;
+    int max_trade_show = wide_mode ? book_level_rows : trade_rows;
     static constexpr int MAX_TRADE_DISPLAY = 16;
     if (max_trade_show > MAX_TRADE_DISPLAY) max_trade_show = MAX_TRADE_DISPLAY;
     struct FmtTrade { char tp[32], tq[32], tt[16], tf[12]; bool is_buyer; bool valid; };
@@ -935,7 +1011,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
     float strength_scale = std::max(1.0f, std::max(buy_strength, sell_strength));
 
     // ── Book rows (+ trades in wide mode) ───────────────────────────────────
-    for (int i = 0; i < book_rows; i++) {
+    for (int i = 0; i < book_level_rows; i++) {
         auto& f = fl[i];
         int n;
 
@@ -1039,6 +1115,71 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
                     // Rows beyond histogram — pad full hist column width
                     for (int j = 0; j < hist_bar_width + 6; j++) fb[pos++] = ' ';
                 }
+            }
+        }
+
+        pos = fb_puts(fb, pos, K);
+        fb[pos++] = '\n';
+    }
+
+    // ── Channel status row (last book row) ────────────────────────────────
+    {
+        // 4 items (D0, D1, D2, BBO) spread across book column width
+        int book_col_w = wide_mode ? 41 : 35;  // 19+3+19 or 17+1+17
+        int field_w = book_col_w / 4;           // ~10 wide, ~8 narrow
+        int visible = 0;
+        int n;
+
+        for (int c = 0; c < ViewerState::DEPTH_CHANNELS; c++) {
+            bool is_active = (c == s.latest_ob_channel);
+            char label[24];
+            if (s.ob_channel_recv_ns[c] == 0)
+                n = snprintf(label, sizeof(label), "D%d -", c);
+            else {
+                int64_t ms_ago = (s.last_recv_ts_ns - s.ob_channel_recv_ns[c]) / 1'000'000;
+                if (ms_ago < 0) ms_ago = 0;
+                n = snprintf(label, sizeof(label), "D%d %ldms", c, (long)ms_ago);
+            }
+            pos = fb_puts(fb, pos, is_active ? BOLD : DIM);
+            if (is_active) pos = fb_puts(fb, pos, BG_GREEN);
+            pos = fb_put(fb, pos, label, n);
+            pos = fb_puts(fb, pos, RST);
+            for (int j = n; j < field_w; j++) fb[pos++] = ' ';
+            visible += field_w;
+        }
+        // BBO — fills remaining width
+        {
+            int bbo_w = book_col_w - visible;
+            char label[24];
+            if (s.bbo_recv_ns == 0)
+                n = snprintf(label, sizeof(label), "BBO -");
+            else {
+                int64_t ms_ago = (s.last_recv_ts_ns - s.bbo_recv_ns) / 1'000'000;
+                if (ms_ago < 0) ms_ago = 0;
+                n = snprintf(label, sizeof(label), "BBO %ldms", (long)ms_ago);
+            }
+            bool bbo_active = (s.latest_ob_channel >= 0 &&
+                               s.last_bbo_seq > s.ob_channel_seq[s.latest_ob_channel]);
+            pos = fb_puts(fb, pos, bbo_active ? BOLD : DIM);
+            if (bbo_active) pos = fb_puts(fb, pos, BG_CYAN);
+            pos = fb_put(fb, pos, label, n);
+            pos = fb_puts(fb, pos, RST);
+            for (int j = n; j < bbo_w; j++) fb[pos++] = ' ';
+        }
+
+        if (wide_mode) {
+            pos = fb_puts(fb, pos, " | ");
+            auto& aob = s.latest_orderbook();
+            char depth_label[32];
+            int dn = snprintf(depth_label, sizeof(depth_label),
+                              "max %d/%d", aob.max_bid_depth, aob.max_ask_depth);
+            pos = fb_puts(fb, pos, DIM);
+            pos = fb_put(fb, pos, depth_label, dn);
+            pos = fb_puts(fb, pos, RST);
+            for (int j = dn; j < 40; j++) fb[pos++] = ' ';
+            if (show_hist) {
+                pos = fb_puts(fb, pos, " | ");
+                for (int j = 0; j < hist_bar_width + 6; j++) fb[pos++] = ' ';
             }
         }
 
@@ -1176,15 +1317,15 @@ int main(int argc, char* argv[]) {
 
             // Reclaim unused book/trade rows for logs
             if (wide_mode) {
-                int data_depth = std::max((int)state.ob.book_depth(), (int)state.trade_count);
-                int needed = std::max(data_depth, BOOK_MIN);
+                int data_depth = std::max((int)state.latest_orderbook().book_depth(), (int)state.trade_count);
+                int needed = std::max(data_depth, BOOK_MIN) + 1;  // +1 for channel status row
                 if (needed < book_rows) {
                     log_rows += book_rows - needed;
                     book_rows = needed;
                 }
             } else {
-                int book_depth = state.ob.book_depth();
-                int needed_book = std::max(book_depth, BOOK_MIN);
+                int book_depth = state.latest_orderbook().book_depth();
+                int needed_book = std::max(book_depth, BOOK_MIN) + 1;  // +1 for channel status row
                 if (needed_book < book_rows) {
                     log_rows += book_rows - needed_book;
                     book_rows = needed_book;

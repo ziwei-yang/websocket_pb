@@ -1086,6 +1086,9 @@ void test_streaming_depth_diff() {
     assert(info.mkt_event_seq == 505);
     assert(info.mkt_event_count == 5);  // 3 bids + 2 asks
 
+    // Depth now deferred to batch end
+    h.idle();
+
     auto events = h.published();
     assert(events.size() == 1);
     assert(events[0].is_book_delta());
@@ -1269,9 +1272,11 @@ void test_print_timeline_fragment_suffix_book_delta() {
     assert(n > 0);
     captured[n] = '\0';
 
-    // Should show "Dp" type and "Fg" suffix, NOT hex dump
+    // Should show "Dp" type with underline (fragment indicator), NOT hex dump or Fg suffix
     assert(strstr(captured, "Dp") != nullptr);
-    assert(strstr(captured, "Fg") != nullptr);
+    assert(strstr(captured, "\033[4m") != nullptr);   // underline on
+    assert(strstr(captured, "\033[24m") != nullptr);  // underline off
+    assert(strstr(captured, " Fg") == nullptr);        // no Fg suffix
     assert(strstr(captured, "[op=") == nullptr);
 }
 
@@ -1367,9 +1372,10 @@ void test_depth_delta_overflow() {
                                    20, ap.data(), aq.data(), "BTCUSDT");
 
     h.feed_frame(0, b);
+    h.idle();  // depth now deferred to batch end
 
     auto events = h.published();
-    // 45 deltas, MAX_DELTAS=19: 2 mid-stream flushes (19 each) + 1 final flush (7)
+    // 45 deltas, MAX_DELTAS=19: 2 overflow publishes (19 each) + 1 final at idle (7)
     assert(events.size() == 3);
     assert(events[0].count == 19);
     assert(events[1].count == 19);
@@ -1515,9 +1521,10 @@ void test_cross_type_flush_trades_then_depth() {
     auto depth = build_depth_diff_msg(2000000, 500, 505, -8, -8,
                                        1, bp, bq, 1, ap, aq, "BTCUSDT");
     h.feed_frame(0, depth);
+    h.idle();  // depth now deferred to batch end
 
     auto events = h.published();
-    // Should have trades event (from cross-type flush) + depth event
+    // Should have trades event (from cross-type flush) + depth event (from idle)
     assert(events.size() == 2);
     assert(events[0].is_trade_array());
     assert(events[0].count == 3);
@@ -2086,6 +2093,315 @@ void test_fragment_depth_deduped_done_propagates_discard() {
 }
 
 // ============================================================================
+// Test: print_timeline() column alignment across varying digit counts
+// ============================================================================
+
+void test_print_timeline_column_alignment() {
+    // 9 test cases from real Binance DPDK output, varying digit counts
+    // in nic_packet_ct, ssl_read_ct, payload_len/ssl_read_total_bytes, and mkt_event_count
+    struct Case {
+        uint8_t  conn;
+        uint8_t  pkt;
+        uint8_t  ssl;
+        uint32_t payload;
+        uint32_t total;
+        uint16_t batch;
+        uint16_t evt_count;  // mkt_event_count: 0, 1-9, 10-99, 100-999
+    };
+    constexpr Case cases[] = {
+        {7,  9,  9, 13116, 13120,  9,   5},  // 5-digit sz, 1-digit pkt/ssl, 1-digit cnt
+        {0,  1,  1,  1436,  1440,  1,   0},  // 4-digit sz, 1-digit, 0 cnt (discard_early)
+        {7, 10, 10, 14588, 14592, 10,   5},  // 5-digit sz, 2-digit pkt/ssl
+        {0,  2,  2,  2908,  2912,  2,   1},  // 4-digit sz, 1-digit cnt
+        {2,  9,  9, 13116, 13120,  9, 219},  // 3-digit cnt (the key alignment case)
+        {0,  3,  3,  4364,  4368,  3,  42},  // 2-digit cnt
+        {2, 11, 10, 14609, 14613, 10,   9},  // mismatched pkt/ssl, 1-digit cnt
+        {0,  4,  4,  4782,  4786,  4, 219},  // 3-digit cnt, active conn
+        {5,  1,  1,  1436,  1440,  1,   0},  // 0 cnt, discard_early, different conn
+    };
+    constexpr int N = sizeof(cases) / sizeof(cases[0]);
+
+    constexpr uint64_t TSC_FREQ = 3000000000ULL;
+    constexpr uint64_t REF_CYCLE = 9000000000ULL;
+    constexpr uint64_t PUBLISH_MONO = 1000000000000ULL;
+
+    // Capture all outputs
+    std::string lines[N];
+    for (int i = 0; i < N; ++i) {
+        WSFrameInfo info{};
+        info.clear();
+        info.connection_id = cases[i].conn;
+        info.nic_packet_ct = cases[i].pkt;
+        info.ssl_read_ct = cases[i].ssl;
+        info.payload_len = cases[i].payload;
+        info.ssl_read_total_bytes = cases[i].total;
+        info.ssl_read_batch_num = cases[i].batch;
+        info.opcode = 0x02;
+        info.mkt_event_type = 0;  // BOOK_DELTA
+        info.mkt_event_count = cases[i].evt_count;
+        info.exchange_event_time_us = 1000000;
+        if (cases[i].evt_count == 0) {
+            info.set_discard_early(true);  // X mark for 0-count
+        }
+        info.transport_mode = static_cast<uint8_t>(TransportMode::DPDK_DISRUPTOR);
+        info.first_bpf_entry_ns = PUBLISH_MONO - 500000;
+        info.latest_bpf_entry_ns = PUBLISH_MONO - 400000;
+        info.ws_frame_publish_cycle = REF_CYCLE;
+        info.publish_time_ts = PUBLISH_MONO;
+        // Vary poll cycles so each is detected as a new packet
+        info.first_poll_cycle = REF_CYCLE - 900000 - i * 1000;
+        info.latest_poll_cycle = REF_CYCLE - 800000 - i * 1000;
+        info.first_ssl_read_start_cycle = REF_CYCLE - 600000;
+        info.latest_ssl_read_end_cycle = REF_CYCLE - 300000;
+        info.ws_parse_cycle = REF_CYCLE - 150000;
+
+        int pipefd[2];
+        assert(pipe(pipefd) == 0);
+        int saved_stderr = dup(STDERR_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+
+        info.print_timeline(TSC_FREQ);
+
+        fflush(stderr);
+        dup2(saved_stderr, STDERR_FILENO);
+        close(saved_stderr);
+        close(pipefd[1]);
+
+        char captured[4096] = {};
+        ssize_t n = read(pipefd[0], captured, sizeof(captured) - 1);
+        close(pipefd[0]);
+        assert(n > 0);
+        captured[n] = '\0';
+        lines[i] = captured;
+    }
+
+    // Strip ANSI escape sequences from each line
+    auto strip_ansi = [](const std::string& s) -> std::string {
+        std::string out;
+        out.reserve(s.size());
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '\033' && i + 1 < s.size() && s[i + 1] == '[') {
+                i += 2;
+                while (i < s.size() && s[i] != 'm') ++i;
+            } else {
+                out += s[i];
+            }
+        }
+        return out;
+    };
+
+    // Find column positions in stripped lines
+    size_t ssl_pos[N], ws_pos[N], at_pos[N];
+    for (int i = 0; i < N; ++i) {
+        std::string stripped = strip_ansi(lines[i]);
+        // Find "ssl " (matches both "*ssl " and " ssl ")
+        size_t p = stripped.find("ssl ");
+        if (p == std::string::npos) {
+            fprintf(stderr, "FAIL: line[%d] missing 'ssl ': %s", i, stripped.c_str());
+        }
+        assert(p != std::string::npos);
+        ssl_pos[i] = p;
+
+        p = stripped.find("| WS");
+        if (p == std::string::npos) {
+            fprintf(stderr, "FAIL: line[%d] missing '| WS': %s", i, stripped.c_str());
+        }
+        assert(p != std::string::npos);
+        ws_pos[i] = p;
+
+        // Find "@ " in the mkt section (after "| WS")
+        p = stripped.find("@ ", ws_pos[i]);
+        if (p == std::string::npos) {
+            fprintf(stderr, "FAIL: line[%d] missing '@ ': %s", i, stripped.c_str());
+        }
+        assert(p != std::string::npos);
+        at_pos[i] = p;
+    }
+
+    // Assert all ssl column positions are identical
+    for (int i = 1; i < N; ++i) {
+        if (ssl_pos[i] != ssl_pos[0]) {
+            fprintf(stderr, "FAIL: ssl column mismatch: line[0]=%zu vs line[%d]=%zu\n",
+                    ssl_pos[0], i, ssl_pos[i]);
+            fprintf(stderr, "  line[0]: %s", strip_ansi(lines[0]).c_str());
+            fprintf(stderr, "  line[%d]: %s", i, strip_ansi(lines[i]).c_str());
+        }
+        assert(ssl_pos[i] == ssl_pos[0]);
+    }
+
+    // Assert all WS column positions are identical
+    for (int i = 1; i < N; ++i) {
+        if (ws_pos[i] != ws_pos[0]) {
+            fprintf(stderr, "FAIL: WS column mismatch: line[0]=%zu vs line[%d]=%zu\n",
+                    ws_pos[0], i, ws_pos[i]);
+            fprintf(stderr, "  line[0]: %s", strip_ansi(lines[0]).c_str());
+            fprintf(stderr, "  line[%d]: %s", i, strip_ansi(lines[i]).c_str());
+        }
+        assert(ws_pos[i] == ws_pos[0]);
+    }
+
+    // Assert all @ column positions are identical (mkt_event_count alignment)
+    for (int i = 1; i < N; ++i) {
+        if (at_pos[i] != at_pos[0]) {
+            fprintf(stderr, "FAIL: @ column mismatch: line[0]=%zu vs line[%d]=%zu\n",
+                    at_pos[0], i, at_pos[i]);
+            fprintf(stderr, "  line[0]: %s", strip_ansi(lines[0]).c_str());
+            fprintf(stderr, "  line[%d]: %s", i, strip_ansi(lines[i]).c_str());
+        }
+        assert(at_pos[i] == at_pos[0]);
+    }
+}
+
+// ============================================================================
+// Test: Fragment depth flush at boundary — deltas flushed when fragment ends
+// ============================================================================
+
+void test_fragment_depth_flush_at_boundary() {
+    TestHarness h;
+
+    // Build depth diff: 60 bids, 0 asks
+    // SBE layout: header(8) + root(26) + bids_group_hdr(4) + 60×16(960) + asks_group_hdr(4) + 0 + var_str(~8) = ~1010 bytes
+    std::vector<int64_t> bp(60), bq(60);
+    for (int i = 0; i < 60; i++) { bp[i] = 50000 - i * 100; bq[i] = 1000 + i; }
+
+    std::vector<int64_t> ap, aq;  // 0 asks
+    auto b = build_depth_diff_msg(1000000, 500, 505, -8, -8,
+                                   60, bp.data(), bq.data(),
+                                   0, ap.data(), aq.data(), "BTCUSDT");
+
+    // Verify layout: 8+26+4+960+4+0+8 = 1010
+    assert(b.size() == 1010);
+
+    // Fragment 1: truncate at 600 bytes
+    // 600 - 8(header) - 26(root) - 4(bids_group_hdr) = 562 bytes of bid entries
+    // 35 complete entries (35×16=560), 2 bytes leftover
+    SBEParseState state{};
+    WSFrameInfo info{};
+    info.clear();
+    h.handler.on_ws_data(state, 0, b.data(), 600, info);
+
+    assert(state.phase == SBEParseState::BIDS_ENTRIES);
+    assert(state.bids_published == 35);
+
+    // Fragment 2: feed full payload — resumes from entry 35, parses remaining 25 bids + 0 asks
+    WSFrameInfo info2{};
+    info2.clear();
+    h.handler.on_ws_data(state, 0, b.data(), static_cast<uint32_t>(b.size()), info2);
+    assert(state.phase == SBEParseState::DONE);
+    state.reset();
+    h.idle();  // depth now deferred to batch end
+
+    auto events = h.published();
+    // Expected: flush#0=19 (overflow), flush#1=16 (overflow), flush#2=19 (overflow), flush#3=6 (idle)
+    assert(events.size() == 4);
+    assert(events[0].count == 19);
+    assert(events[1].count == 16);
+    assert(events[2].count == 19);
+    assert(events[3].count == 6);
+
+    // All BOOK_DELTA, all bids
+    for (auto& ev : events) {
+        assert(ev.is_book_delta());
+        for (uint8_t i = 0; i < ev.count; i++)
+            assert(ev.payload.deltas.entries[i].is_bid());
+    }
+
+    // Flags: first has no CONTINUATION, rest have CONTINUATION; only last has LAST_IN_BATCH
+    assert(!events[0].is_continuation());
+    assert(!events[0].is_last_in_batch());
+    assert(events[1].is_continuation());
+    assert(!events[1].is_last_in_batch());
+    assert(events[2].is_continuation());
+    assert(!events[2].is_last_in_batch());
+    assert(events[3].is_continuation());
+    assert(events[3].is_last_in_batch());
+
+    // Total deltas: 19+16+19+6 = 60
+    uint32_t total = 0;
+    for (auto& ev : events) total += ev.count;
+    assert(total == 60);
+}
+
+// ============================================================================
+// Test: Cross-frame depth merge within single batch
+// Two complete depth diffs without idle → merged into 1 MktEvent at idle
+// ============================================================================
+
+void test_cross_frame_depth_merge_within_batch() {
+    TestHarness h;
+
+    // Depth diff 1: 8 deltas (4 bids + 4 asks), seq=100
+    int64_t bp1[] = {50000, 49000, 48000, 47000}, bq1[] = {1000, 2000, 3000, 4000};
+    int64_t ap1[] = {50100, 51000, 52000, 53000}, aq1[] = {1500, 2500, 3500, 4500};
+    auto d1 = build_depth_diff_msg(1000000, 90, 100, -8, -8,
+                                    4, bp1, bq1, 4, ap1, aq1, "BTCUSDT");
+
+    // Depth diff 2: 6 deltas (3 bids + 3 asks), seq=101
+    int64_t bp2[] = {46000, 45000, 44000}, bq2[] = {5000, 6000, 7000};
+    int64_t ap2[] = {54000, 55000, 56000}, aq2[] = {5500, 6500, 7500};
+    auto d2 = build_depth_diff_msg(2000000, 100, 101, -8, -8,
+                                    3, bp2, bq2, 3, ap2, aq2, "BTCUSDT");
+
+    h.feed_frame(0, d1);
+    h.feed_frame(0, d2);
+    assert(h.published().empty());  // all buffered
+
+    h.idle();
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_book_delta());
+    assert(events[0].count == 14);  // 8 + 6 merged
+    assert(events[0].src_seq == 101);  // latest seq
+    assert(events[0].is_last_in_batch());
+    assert(!events[0].is_continuation());
+
+    // Verify bid/ask flags: 4 bids, 4 asks, 3 bids, 3 asks
+    for (uint8_t i = 0; i < 4; i++)
+        assert(events[0].payload.deltas.entries[i].is_bid());
+    for (uint8_t i = 4; i < 8; i++)
+        assert(events[0].payload.deltas.entries[i].is_ask());
+    for (uint8_t i = 8; i < 11; i++)
+        assert(events[0].payload.deltas.entries[i].is_bid());
+    for (uint8_t i = 11; i < 14; i++)
+        assert(events[0].payload.deltas.entries[i].is_ask());
+}
+
+// ============================================================================
+// Test: Cross-type depth flush — trade after depth flushes pending depth
+// ============================================================================
+
+void test_cross_type_depth_then_trades() {
+    TestHarness h;
+
+    // Accumulate depth (3 deltas, 2 bids + 1 ask)
+    int64_t bp[] = {50000, 49000}, bq[] = {1000, 2000};
+    int64_t ap[] = {50100}, aq[] = {1500};
+    auto depth = build_depth_diff_msg(1000000, 500, 505, -8, -8,
+                                       2, bp, bq, 1, ap, aq, "BTCUSDT");
+    h.feed_frame(0, depth);
+    assert(h.published().empty());  // depth buffered
+    assert(h.handler.has_pending_depth_ == true);
+
+    // Feed trades → should trigger cross-type flush of pending depth first
+    TradeSet ts(1, 3);
+    h.feed_frame(0, ts.build(2000000));
+
+    // Depth should have been flushed by cross-type flush
+    auto events = h.published();
+    assert(events.size() == 1);
+    assert(events[0].is_book_delta());
+    assert(events[0].count == 3);
+    assert(events[0].src_seq == 505);
+
+    // Trades still pending until idle
+    h.idle();
+    events = h.published();
+    assert(events.size() == 2);
+    assert(events[1].is_trade_array());
+    assert(events[1].count == 3);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -2242,6 +2558,20 @@ int main() {
     cleanup_ring_files();
 
     RUN_TEST(test_fragment_depth_deduped_done_propagates_discard);
+    cleanup_ring_files();
+
+    std::printf("\n--- Fragment depth flush at boundary ---\n");
+    RUN_TEST(test_fragment_depth_flush_at_boundary);
+    cleanup_ring_files();
+
+    std::printf("\n--- print_timeline column alignment ---\n");
+    RUN_TEST(test_print_timeline_column_alignment);
+
+    std::printf("\n--- Deferred depth merge ---\n");
+    RUN_TEST(test_cross_frame_depth_merge_within_batch);
+    cleanup_ring_files();
+
+    RUN_TEST(test_cross_type_depth_then_trades);
     cleanup_ring_files();
 
     std::printf("\n=== %d/%d tests passed ===\n", tests_passed, tests_total);

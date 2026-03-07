@@ -501,7 +501,7 @@ struct alignas(64) WSFrameInfo {
         const char* discard_mark = is_discard_early() ? "X" : is_merged() ? "M" : " ";
         char sz[24];
         int n = std::snprintf(sz, sizeof(sz), "%u/%u", payload_len, ssl_read_total_bytes);
-        while (n < 10 && n < (int)sizeof(sz) - 1) sz[n++] = ' ';
+        while (n < 11 && n < (int)sizeof(sz) - 1) sz[n++] = ' ';
         sz[n] = '\0';
         // Compute MONOTONIC→REALTIME offset for publish-time diff
         int64_t publish_realtime_ms = 0;
@@ -548,7 +548,7 @@ struct alignas(64) WSFrameInfo {
         // Seq suffix for matching WSFrameInfo with MktEvent Σ lines
         char seq_suffix[40] = "";
         if (mkt_event_seq != 0) {
-            std::snprintf(seq_suffix, sizeof(seq_suffix), " | seq %ld", mkt_event_seq);
+            std::snprintf(seq_suffix, sizeof(seq_suffix), " | #%ld", mkt_event_seq);
         }
         const char* frag_ul_on = "";
         const char* frag_ul_off = "";
@@ -556,7 +556,6 @@ struct alignas(64) WSFrameInfo {
         if (is_fragmented() && !is_last_fragment() && (mkt_event_type != 0 || mkt_event_count != 0 || exchange_event_time_us != 0)) {
             frag_ul_on = "\033[4m";
             frag_ul_off = "\033[24m";
-            std::snprintf(frag_suffix, sizeof(frag_suffix), " Fg");
         }
         bool is_mkt = ((mkt_event_type != 0 || mkt_event_count != 0 || exchange_event_time_us != 0) && !is_discard_early() && !is_merged());
         // Connection ID prefix character: 0-9, a-f
@@ -603,9 +602,9 @@ struct alignas(64) WSFrameInfo {
             fprintf(stderr,
                     "%s%s%s%s"
                     "| socket %5u %10s "
-                    "|%s %u %s %4s~%6s "
+                    "|%s %2u %s %4s~%6s "
                     "| WS %3u %6s "
-                    "|%s%s%2s %-2s @%6s%s |%s%s%s%s%s%s\n",
+                    "|%s%s%3s %-2s @%6s%s |%s%s%s%s%s%s\n",
                     conn_prefix, line_color, bpf_prefix, nic_col,
                     nic_packet_ct, t[1],
                     ssl_prefix, ssl_read_ct, sz, t[2], t[3],
@@ -613,10 +612,10 @@ struct alignas(64) WSFrameInfo {
         } else {
             fprintf(stderr,
                     "%s%s%s"
-                    "| %u pkt %5u %4s~%6s "
-                    "|%s %u %s %4s~%6s "
+                    "| %2u pkt %5u %4s~%6s "
+                    "|%s %2u %s %4s~%6s "
                     "| WS %3u %6s "
-                    "|%s%s%2s %-2s @%6s%s |%s%s%s%s%s%s\n",
+                    "|%s%s%3s %-2s @%6s%s |%s%s%s%s%s%s\n",
                     conn_prefix, line_color, bpf_prefix,
                     nic_packet_ct, last_pkt_mem_idx, t[0], t[1],
                     ssl_prefix, ssl_read_ct, sz, t[2], t[3],

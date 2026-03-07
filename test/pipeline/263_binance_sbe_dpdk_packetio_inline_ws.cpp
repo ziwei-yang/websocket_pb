@@ -286,8 +286,9 @@ int main(int argc, char* argv[]) {
     // MktEvent monotonic sequence check (per-type to avoid BBO/OB false positives)
     int64_t mkt_trade_seq = 0;
     int64_t mkt_bbo_seq = 0;
-    int64_t mkt_ob_seq = 0;  // depth snapshot + delta
-    std::unordered_set<uint64_t> ob_seen_deltas;  // content-based dedup for multi-flush BOOK events
+    static constexpr int DEPTH_CHANNELS = 3;
+    int64_t mkt_ob_seq[DEPTH_CHANNELS] = {};    // per depth-diff channel
+    std::unordered_set<uint64_t> ob_seen_deltas[DEPTH_CHANNELS];  // content-based dedup per channel
     uint64_t mkt_dup_count = 0;
     uint64_t mkt_event_count = 0;
 
@@ -361,31 +362,46 @@ int main(int argc, char* argv[]) {
                         mkt_event_count++;
                         // Per-type monotonic sequence check
                         if (mkt.src_seq > 0) {
-                            if (mkt.is_book_delta() || mkt.is_book_snapshot()) {
-                                if (mkt.src_seq > mkt_ob_seq) {
-                                    // New sequence — accept, reset buffer
-                                    ob_seen_deltas.clear();
+                            if (mkt.is_book_delta()) {
+                                uint8_t ch = mkt.depth_channel();
+                                if (ch >= DEPTH_CHANNELS) ch = 0;
+                                int64_t& ch_seq = mkt_ob_seq[ch];
+                                auto& ch_seen = ob_seen_deltas[ch];
+                                if (mkt.src_seq > ch_seq) {
+                                    ch_seen.clear();
                                     for (uint8_t i = 0; i < mkt.count; i++)
-                                        ob_seen_deltas.insert(delta_key(mkt.payload.deltas.entries[i]));
-                                    mkt_ob_seq = mkt.src_seq;
-                                } else if (mkt.src_seq == mkt_ob_seq) {
-                                    // Same seq — check content overlap (multi-flush vs real dup)
+                                        ch_seen.insert(delta_key(mkt.payload.deltas.entries[i]));
+                                    ch_seq = mkt.src_seq;
+                                } else if (mkt.src_seq == ch_seq) {
                                     uint8_t overlap = 0;
                                     for (uint8_t i = 0; i < mkt.count; i++) {
                                         auto k = delta_key(mkt.payload.deltas.entries[i]);
-                                        if (ob_seen_deltas.count(k)) overlap++;
-                                        else ob_seen_deltas.insert(k);
+                                        if (ch_seen.count(k)) overlap++;
+                                        else ch_seen.insert(k);
                                     }
                                     if (overlap > 0) {
                                         mkt_dup_count++;
-                                        fprintf(stderr, "\033[91m[DUP] BOOK seq %ld (dup #%lu, %u/%u overlap)\033[0m\n",
-                                                mkt.src_seq, mkt_dup_count, overlap, mkt.count);
+                                        fprintf(stderr, "\033[91m[DUP] BOOK ch%u seq %ld (dup #%lu, %u/%u overlap)\033[0m\n",
+                                                ch, mkt.src_seq, mkt_dup_count, overlap, mkt.count);
                                     }
                                 } else {
-                                    // Old sequence
                                     mkt_dup_count++;
-                                    fprintf(stderr, "\033[91m[DUP] BOOK seq %ld < %ld (dup #%lu)\033[0m\n",
-                                            mkt.src_seq, mkt_ob_seq, mkt_dup_count);
+                                    fprintf(stderr, "\033[91m[DUP] BOOK ch%u seq %ld < %ld (dup #%lu)\033[0m\n",
+                                            ch, mkt.src_seq, ch_seq, mkt_dup_count);
+                                }
+                            } else if (mkt.is_book_snapshot()) {
+                                bool any_new = false;
+                                for (int c = 0; c < DEPTH_CHANNELS; c++) {
+                                    if (mkt.src_seq > mkt_ob_seq[c]) {
+                                        mkt_ob_seq[c] = mkt.src_seq;
+                                        ob_seen_deltas[c].clear();
+                                        any_new = true;
+                                    }
+                                }
+                                if (!any_new) {
+                                    mkt_dup_count++;
+                                    fprintf(stderr, "\033[91m[DUP] SNAP seq %ld behind all channels (dup #%lu)\033[0m\n",
+                                            mkt.src_seq, mkt_dup_count);
                                 }
                             } else {
                                 // TRADE / BBO — keep simple seq check
@@ -460,23 +476,37 @@ int main(int argc, char* argv[]) {
             } else {
                 mkt_event_count++;
                 if (mkt.src_seq > 0) {
-                    if (mkt.is_book_delta() || mkt.is_book_snapshot()) {
-                        if (mkt.src_seq > mkt_ob_seq) {
-                            ob_seen_deltas.clear();
+                    if (mkt.is_book_delta()) {
+                        uint8_t ch = mkt.depth_channel();
+                        if (ch >= DEPTH_CHANNELS) ch = 0;
+                        int64_t& ch_seq = mkt_ob_seq[ch];
+                        auto& ch_seen = ob_seen_deltas[ch];
+                        if (mkt.src_seq > ch_seq) {
+                            ch_seen.clear();
                             for (uint8_t i = 0; i < mkt.count; i++)
-                                ob_seen_deltas.insert(delta_key(mkt.payload.deltas.entries[i]));
-                            mkt_ob_seq = mkt.src_seq;
-                        } else if (mkt.src_seq == mkt_ob_seq) {
+                                ch_seen.insert(delta_key(mkt.payload.deltas.entries[i]));
+                            ch_seq = mkt.src_seq;
+                        } else if (mkt.src_seq == ch_seq) {
                             uint8_t overlap = 0;
                             for (uint8_t i = 0; i < mkt.count; i++) {
                                 auto k = delta_key(mkt.payload.deltas.entries[i]);
-                                if (ob_seen_deltas.count(k)) overlap++;
-                                else ob_seen_deltas.insert(k);
+                                if (ch_seen.count(k)) overlap++;
+                                else ch_seen.insert(k);
                             }
                             if (overlap > 0) mkt_dup_count++;
                         } else {
                             mkt_dup_count++;
                         }
+                    } else if (mkt.is_book_snapshot()) {
+                        bool any_new = false;
+                        for (int c = 0; c < DEPTH_CHANNELS; c++) {
+                            if (mkt.src_seq > mkt_ob_seq[c]) {
+                                mkt_ob_seq[c] = mkt.src_seq;
+                                ob_seen_deltas[c].clear();
+                                any_new = true;
+                            }
+                        }
+                        if (!any_new) mkt_dup_count++;
                     } else {
                         int64_t* seq_p = mkt.is_trade_array() ? &mkt_trade_seq : &mkt_bbo_seq;
                         if (mkt.src_seq <= *seq_p) mkt_dup_count++;

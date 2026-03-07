@@ -161,7 +161,8 @@ struct BinanceUSDMSimdjsonParser {
     websocket::pipeline::IPCRingProducer<websocket::msg::MktEvent>* mkt_event_prod = nullptr;
     websocket::pipeline::ConnStateShm* conn_state = nullptr;
     bool merge_enabled = true;
-    int64_t last_book_seq_ = 0;
+    static constexpr int DEPTH_CHANNELS = 3;
+    int64_t last_book_seq_[DEPTH_CHANNELS] = {};
     int64_t last_trade_id_ = 0;
     uint8_t active_ci_ = 0xFF;
     websocket::pipeline::WSFrameInfo* current_info_ = nullptr;
@@ -177,6 +178,19 @@ struct BinanceUSDMSimdjsonParser {
     int64_t pending_trades_event_ts_ns_ = 0;
     int64_t pending_trades_max_id_ = 0;
     websocket::pipeline::WSFrameInfo pending_trades_info_{};
+
+    // Per-channel pending depth delta accumulation buffer
+    struct PendingDepth {
+        bool has_pending = false;
+        uint8_t ci = 0;
+        uint8_t count = 0;
+        uint8_t flush_count = 0;
+        websocket::msg::DeltaEntry entries[websocket::msg::MAX_DELTAS];
+        int64_t seq = 0;
+        int64_t event_ts_ns = 0;
+        websocket::pipeline::WSFrameInfo info{};
+    };
+    PendingDepth pending_depth_[DEPTH_CHANNELS];
 
     // simdjson reusable parser (allocates internal buffers once)
     simdjson::ondemand::parser simd_parser_;
@@ -197,6 +211,8 @@ struct BinanceUSDMSimdjsonParser {
             case UsdmStreamType::DEPTH_PARTIAL:
                 info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT); break;
             case UsdmStreamType::DEPTH_DIFF:
+            case UsdmStreamType::DEPTH_DIFF_1:
+            case UsdmStreamType::DEPTH_DIFF_2:
                 info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA); break;
             default: break;
             }
@@ -220,11 +236,25 @@ struct BinanceUSDMSimdjsonParser {
                     info.set_discard_early(true);
                     return;
                 }
-            } else if (state.sequence < last_book_seq_) {
-                state.deduped = true;
-                state.phase = JsonParseState::DONE;
-                info.set_discard_early(true);
-                return;
+            } else if (is_depth_diff_type(type)) {
+                uint8_t ch = depth_channel_index(type);
+                if (state.sequence < last_book_seq_[ch]) {
+                    state.deduped = true;
+                    state.phase = JsonParseState::DONE;
+                    info.set_discard_early(true);
+                    return;
+                }
+            } else if (type == UsdmStreamType::DEPTH_PARTIAL) {
+                bool stale = true;
+                for (int c = 0; c < DEPTH_CHANNELS; c++) {
+                    if (state.sequence >= last_book_seq_[c]) { stale = false; break; }
+                }
+                if (stale) {
+                    state.deduped = true;
+                    state.phase = JsonParseState::DONE;
+                    info.set_discard_early(true);
+                    return;
+                }
             }
 
             current_info_ = &info;
@@ -248,6 +278,8 @@ struct BinanceUSDMSimdjsonParser {
 
         switch (type) {
         case UsdmStreamType::AGG_TRADE: {
+            for (int ch = 0; ch < DEPTH_CHANNELS; ch++)
+                if (pending_depth_[ch].has_pending) publish_pending_depth(ch, true);
             info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY);
             info.mkt_event_count = 1;
 
@@ -281,22 +313,42 @@ struct BinanceUSDMSimdjsonParser {
         }
 
         case UsdmStreamType::DEPTH_PARTIAL:
-        case UsdmStreamType::DEPTH_DIFF: {
+        case UsdmStreamType::DEPTH_DIFF:
+        case UsdmStreamType::DEPTH_DIFF_1:
+        case UsdmStreamType::DEPTH_DIFF_2: {
             if (has_pending_trades_) flush_pending_trades();
             bool is_snapshot = (type == UsdmStreamType::DEPTH_PARTIAL);
             info.mkt_event_type = static_cast<uint8_t>(
                 is_snapshot ? websocket::msg::EventType::BOOK_SNAPSHOT : websocket::msg::EventType::BOOK_DELTA);
 
-            if (e.sequence <= last_book_seq_) {
-                info.set_discard_early(true);
-                state.msg_type = e.msg_type;
-                state.sequence = e.sequence;
-                state.event_time_us = e.event_time_ms * 1000;
-                state.deduped = true;
-                state.phase = JsonParseState::DONE;
-                return;
+            if (is_snapshot) {
+                int64_t max_seq = 0;
+                for (int c = 0; c < DEPTH_CHANNELS; c++)
+                    max_seq = std::max(max_seq, last_book_seq_[c]);
+                if (e.sequence <= max_seq) {
+                    info.set_discard_early(true);
+                    state.msg_type = e.msg_type;
+                    state.sequence = e.sequence;
+                    state.event_time_us = e.event_time_ms * 1000;
+                    state.deduped = true;
+                    state.phase = JsonParseState::DONE;
+                    return;
+                }
+                for (int c = 0; c < DEPTH_CHANNELS; c++)
+                    last_book_seq_[c] = e.sequence;
+            } else {
+                uint8_t ch = depth_channel_index(type);
+                if (e.sequence <= last_book_seq_[ch]) {
+                    info.set_discard_early(true);
+                    state.msg_type = e.msg_type;
+                    state.sequence = e.sequence;
+                    state.event_time_us = e.event_time_ms * 1000;
+                    state.deduped = true;
+                    state.phase = JsonParseState::DONE;
+                    return;
+                }
+                last_book_seq_[ch] = e.sequence;
             }
-            last_book_seq_ = e.sequence;
 
             state.phase = JsonParseState::HEADER_PARSED;
             state.msg_type = e.msg_type;
@@ -323,6 +375,8 @@ struct BinanceUSDMSimdjsonParser {
     // ── Batch boundary / lifecycle (identical to BinanceUSDMJsonParser) ──────
 
     void on_batch_end(uint8_t) {
+        for (int ch = 0; ch < DEPTH_CHANNELS; ch++)
+            publish_pending_depth(ch, true);
         flush_pending_trades();
     }
 
@@ -342,6 +396,35 @@ struct BinanceUSDMSimdjsonParser {
     }
 
     // ── Event publishing (identical to BinanceUSDMJsonParser) ────────────────
+
+    void publish_pending_depth(uint8_t ch, bool is_final) {
+        auto& pd = pending_depth_[ch];
+        if (!pd.has_pending || pd.count == 0) return;
+        record_win(pd.ci);
+        current_info_ = &pd.info;
+        uint8_t count = pd.count;
+        uint8_t fc = pd.flush_count;
+        publish_event([&](websocket::msg::MktEvent& e) {
+            e.event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA);
+            uint16_t f = 0;
+            if (fc > 0)    f |= websocket::msg::EventFlags::CONTINUATION;
+            if (is_final)  f |= websocket::msg::EventFlags::LAST_IN_BATCH;
+            e.flags = f;
+            e.set_depth_channel(ch);
+            e.src_seq = pd.seq;
+            e.event_ts_ns = pd.event_ts_ns;
+            e.count = count;
+            std::memcpy(e.payload.deltas.entries, pd.entries,
+                        count * sizeof(websocket::msg::DeltaEntry));
+        });
+        current_info_ = nullptr;
+        pd.flush_count++;
+        pd.count = 0;
+        if (is_final) {
+            pd.has_pending = false;
+            pd.flush_count = 0;
+        }
+    }
 
     void flush_pending_trades(bool clear_merged = true) {
         if (!has_pending_trades_) return;

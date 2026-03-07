@@ -40,6 +40,11 @@ constexpr const char* DEPTH_DIFF_DELETE_JSON = R"({"stream":"btcusdt@depth@250ms
 // aggTrade with reordered fields: "a" before "s" (actual Binance field order)
 constexpr const char* AGG_TRADE_REORDERED_JSON = R"({"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","E":123456789,"a":5933014,"s":"BTCUSDT","p":"0.001","q":"100","nq":"100","f":100,"l":105,"T":123456785,"m":true}})";
 
+// Per-channel depth diff payloads (100ms=ch0, 250ms=ch1, 500ms=ch2)
+constexpr const char* DEPTH_DIFF_100MS_JSON = R"({"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","E":123456789,"T":123456788,"s":"BTCUSDT","U":97,"u":100,"pu":96,"b":[["0.0024","10"]],"a":[["0.0026","100"]]}})";
+constexpr const char* DEPTH_DIFF_250MS_JSON = R"({"stream":"btcusdt@depth@250ms","data":{"e":"depthUpdate","E":123456790,"T":123456789,"s":"BTCUSDT","U":47,"u":50,"pu":46,"b":[["0.0025","20"]],"a":[["0.0027","200"]]}})";
+constexpr const char* DEPTH_DIFF_500MS_JSON = R"({"stream":"btcusdt@depth@500ms","data":{"e":"depthUpdate","E":123456791,"T":123456790,"s":"BTCUSDT","U":27,"u":30,"pu":26,"b":[["0.0028","30"]],"a":[["0.0029","300"]]}})";
+
 // depth20 with 10 bids + 10 asks (exercises level-count loop more than the 5+5 payload)
 constexpr const char* DEPTH_PARTIAL_LARGE_JSON = R"({"stream":"btcusdt@depth20","data":{"e":"depthUpdate","E":1571889248277,"T":1571889248276,"s":"BTCUSDT","U":390497796,"u":390497900,"pu":390497794,"b":[["7403.89","0.002"],["7403.90","3.906"],["7404.00","1.428"],["7404.85","5.239"],["7405.43","2.562"],["7405.50","1.100"],["7405.60","0.750"],["7405.70","2.300"],["7405.80","4.500"],["7405.90","0.123"]],"a":[["7405.96","3.340"],["7406.63","4.525"],["7407.08","2.475"],["7407.15","4.800"],["7407.20","0.175"],["7407.30","1.200"],["7407.40","0.900"],["7407.50","3.100"],["7407.60","2.800"],["7407.70","0.456"]]}})";
 
@@ -430,7 +435,7 @@ void test_classify_stream() {
     {
         const char* s = "btcusdt@depth@250ms";
         auto t = classify_stream((const uint8_t*)s, strlen(s));
-        assert(t == UsdmStreamType::DEPTH_DIFF);
+        assert(t == UsdmStreamType::DEPTH_DIFF_1);
     }
     {
         const char* s = "unknown_stream";
@@ -966,6 +971,7 @@ template<typename H>
 void test_depth_delta_parse() {
     TestHarness<H> h;
     h.feed_frame(0, DEPTH_DIFF_JSON);
+    h.idle();  // flush pending depth buffer
 
     auto events = h.published();
     assert(events.size() == 1);
@@ -995,8 +1001,10 @@ void test_depth_delta_delete() {
     TestHarness<H> h;
     // First feed a diff to set baseline seq
     h.feed_frame(0, DEPTH_DIFF_JSON);
+    h.idle();  // flush pending depth buffer
     // Then feed the delete diff (higher seq)
     h.feed_frame(0, DEPTH_DIFF_DELETE_JSON);
+    h.idle();  // flush pending depth buffer
 
     auto events = h.published();
     assert(events.size() == 2);
@@ -1024,6 +1032,7 @@ void test_depth_delta_dedup() {
     h.feed_frame(0, DEPTH_DIFF_JSON);
     // Same seq (160) should be discarded
     h.feed_frame(0, DEPTH_DIFF_JSON);
+    h.idle();  // flush pending depth buffer
 
     auto events = h.published();
     assert(events.size() == 1);
@@ -1271,7 +1280,7 @@ void test_equiv_depth_snapshot_large() {
 }
 
 void test_equiv_depth_diff() {
-    auto run = [](auto& h) { h.feed_frame(0, DEPTH_DIFF_JSON); return h.published(); };
+    auto run = [](auto& h) { h.feed_frame(0, DEPTH_DIFF_JSON); h.idle(); return h.published(); };
     std::vector<MktEvent> ec, es;
     { TestHarness<BinanceUSDMJsonParser> h; ec = run(h); } cleanup_ring_files();
     { TestHarness<BinanceUSDMSimdjsonParser> h; es = run(h); }
@@ -1281,7 +1290,9 @@ void test_equiv_depth_diff() {
 void test_equiv_depth_diff_delete() {
     auto run = [](auto& h) {
         h.feed_frame(0, DEPTH_DIFF_JSON);
+        h.idle();
         h.feed_frame(0, DEPTH_DIFF_DELETE_JSON);
+        h.idle();
         return h.published();
     };
     std::vector<MktEvent> ec, es;
@@ -1592,6 +1603,7 @@ void test_stream_depth_diff_truncated() {
     assert(st.phase != JsonParseState::DONE);
 
     h.feed_final_fragment(0, DEPTH_DIFF_JSON);
+    h.idle();  // flush pending depth buffer
 
     auto events = h.published();
     assert(events.size() == 1);
@@ -1606,6 +1618,7 @@ void test_stream_depth_diff_overflow_flush() {
     auto json = build_large_depth_json(false, 1600000000001LL, 600000, 25, 5);
 
     h.feed_frame(0, json.c_str());
+    h.idle();  // flush pending depth buffer
 
     auto events = h.published();
     // Should produce 2+ events (first flush at 19, second with remaining 11)
@@ -1622,6 +1635,7 @@ template<typename H>
 void test_stream_depth_diff_complete_in_one() {
     TestHarness<H> h;
     h.feed_frame(0, DEPTH_DIFF_JSON);
+    h.idle();  // flush pending depth buffer
 
     auto events = h.published();
     assert(events.size() == 1);
@@ -1648,6 +1662,7 @@ void test_stream_depth_diff_many_bids_regression() {
     auto json = build_large_depth_json(false, 1600000000002LL, 700000, 39, 5);
 
     h.feed_frame(0, json.c_str());
+    h.idle();  // flush pending depth buffer
 
     auto events = h.published();
     assert(events.size() == 3);
@@ -1668,6 +1683,7 @@ void test_stream_depth_diff_exactly_38_bids() {
     auto json = build_large_depth_json(false, 1600000000003LL, 700001, 38, 5);
 
     h.feed_frame(0, json.c_str());
+    h.idle();  // flush pending depth buffer
 
     auto events = h.published();
     assert(events.size() == 3);
@@ -1686,6 +1702,7 @@ void test_stream_depth_diff_all_bids_no_asks() {
     auto json = build_large_depth_json(false, 1600000000004LL, 700002, 39, 0);
 
     h.feed_frame(0, json.c_str());
+    h.idle();  // flush pending depth buffer
 
     auto events = h.published();
     assert(events.size() == 3);
@@ -1764,6 +1781,7 @@ void test_stream_state_reset_between_messages() {
 
     // Feed completely different depth message
     h.feed_frame(0, DEPTH_DIFF_JSON);
+    h.idle();  // flush pending depth buffer
 
     auto events = h.published();
     assert(events.size() == 1);
@@ -1807,6 +1825,7 @@ void test_stream_equivalence_depth_diff() {
         uint32_t trunc = static_cast<uint32_t>(bid_start + 5);
         h.feed_fragment(0, DEPTH_DIFF_JSON, trunc);
         h.feed_final_fragment(0, DEPTH_DIFF_JSON);
+        h.idle();
         return h.published();
     };
     std::vector<MktEvent> ec, es;
@@ -1871,6 +1890,7 @@ void test_stream_depth_first_fragment_has_event_count() {
 
     // Feed full payload — final result should be correct
     h.feed_final_fragment(0, json.c_str());
+    h.idle();  // flush pending depth buffer
 
     auto events = h.published();
     // Large diff (130+5=135) produces multiple flush events
@@ -1880,6 +1900,149 @@ void test_stream_depth_first_fragment_has_event_count() {
         total += e.count;
     }
     assert(total == 135);
+}
+
+// ============================================================================
+// Multi-channel depth tests
+// ============================================================================
+
+void test_classify_stream_depth_channels() {
+    // 100ms → DEPTH_DIFF (channel 0)
+    {
+        const char* s = "btcusdt@depth@100ms";
+        auto t = classify_stream((const uint8_t*)s, strlen(s));
+        assert(t == UsdmStreamType::DEPTH_DIFF);
+    }
+    // 250ms → DEPTH_DIFF_1 (channel 1)
+    {
+        const char* s = "btcusdt@depth@250ms";
+        auto t = classify_stream((const uint8_t*)s, strlen(s));
+        assert(t == UsdmStreamType::DEPTH_DIFF_1);
+    }
+    // 500ms → DEPTH_DIFF_2 (channel 2)
+    {
+        const char* s = "btcusdt@depth@500ms";
+        auto t = classify_stream((const uint8_t*)s, strlen(s));
+        assert(t == UsdmStreamType::DEPTH_DIFF_2);
+    }
+    // @depth (no suffix) = 250ms default → DEPTH_DIFF_1 (channel 1)
+    {
+        const char* s = "btcusdt@depth";
+        auto t = classify_stream((const uint8_t*)s, strlen(s));
+        assert(t == UsdmStreamType::DEPTH_DIFF_1);
+    }
+    // Unrecognized interval → UNKNOWN
+    {
+        const char* s = "btcusdt@depth@999ms";
+        auto t = classify_stream((const uint8_t*)s, strlen(s));
+        assert(t == UsdmStreamType::UNKNOWN);
+    }
+    // Helper functions
+    assert(depth_channel_index(UsdmStreamType::DEPTH_DIFF) == 0);
+    assert(depth_channel_index(UsdmStreamType::DEPTH_DIFF_1) == 1);
+    assert(depth_channel_index(UsdmStreamType::DEPTH_DIFF_2) == 2);
+    assert(depth_channel_index(UsdmStreamType::AGG_TRADE) == 0xFF);
+    assert(is_depth_diff_type(UsdmStreamType::DEPTH_DIFF));
+    assert(is_depth_diff_type(UsdmStreamType::DEPTH_DIFF_1));
+    assert(is_depth_diff_type(UsdmStreamType::DEPTH_DIFF_2));
+    assert(!is_depth_diff_type(UsdmStreamType::DEPTH_PARTIAL));
+    assert(!is_depth_diff_type(UsdmStreamType::AGG_TRADE));
+}
+
+template<typename H>
+void test_depth_channel_separate_seq() {
+    TestHarness<H> h;
+
+    // Feed depth@100ms seq=100 (channel 0)
+    h.feed_frame(0, DEPTH_DIFF_100MS_JSON);  // u=100
+    h.idle();
+
+    // Feed depth@250ms seq=50 (channel 1) — must NOT be deduped
+    // With single last_book_seq_, 50 <= 100 would cause dedup. With per-channel, it passes.
+    h.feed_frame(0, DEPTH_DIFF_250MS_JSON);  // u=50
+    h.idle();
+
+    auto events = h.published();
+    assert(events.size() == 2);
+    assert(events[0].is_book_delta());
+    assert(events[0].src_seq == 100);
+    assert(events[1].is_book_delta());
+    assert(events[1].src_seq == 50);
+}
+
+template<typename H>
+void test_depth_channel_flag() {
+    TestHarness<H> h;
+
+    // Feed each channel and verify depth_channel() accessor
+    h.feed_frame(0, DEPTH_DIFF_100MS_JSON);  // ch0
+    h.idle();
+    h.feed_frame(0, DEPTH_DIFF_250MS_JSON);  // ch1
+    h.idle();
+    h.feed_frame(0, DEPTH_DIFF_500MS_JSON);  // ch2
+    h.idle();
+
+    auto events = h.published();
+    assert(events.size() == 3);
+    assert(events[0].depth_channel() == 0);
+    assert(events[1].depth_channel() == 1);
+    assert(events[2].depth_channel() == 2);
+}
+
+template<typename H>
+void test_snapshot_resets_all_channels() {
+    TestHarness<H> h;
+
+    // Feed depth@100ms seq=100 (channel 0)
+    h.feed_frame(0, DEPTH_DIFF_100MS_JSON);  // u=100
+    h.idle();
+
+    // Feed snapshot seq=200 — should reset all channels
+    // Use DEPTH_PARTIAL_JSON which has u=390497878 (much higher)
+    h.feed_frame(0, DEPTH_PARTIAL_JSON);  // u=390497878
+
+    // Feed depth@250ms seq=150 (< snapshot seq 390497878) — should be deduped
+    char dedup_250[512];
+    snprintf(dedup_250, sizeof(dedup_250),
+        R"({"stream":"btcusdt@depth@250ms","data":{"e":"depthUpdate","E":123456800,"T":123456799,"s":"BTCUSDT","U":147,"u":150,"pu":146,"b":[["0.0030","5"]],"a":[["0.0031","50"]]}})");
+    h.feed_frame(0, dedup_250);
+    h.idle();
+
+    auto events = h.published();
+    // Should have: ch0 delta (seq=100), snapshot, and NOT the ch1 delta (seq=150 < 390497878)
+    int delta_count = 0, snap_count = 0;
+    for (auto& e : events) {
+        if (e.is_book_delta()) delta_count++;
+        if (e.is_book_snapshot()) snap_count++;
+    }
+    assert(snap_count == 1);
+    assert(delta_count == 1);  // only the ch0 delta before snapshot
+}
+
+template<typename H>
+void test_depth_channel_pending_independent() {
+    TestHarness<H> h;
+
+    // Feed depth@100ms and depth@250ms in same batch (no idle between)
+    h.feed_frame(0, DEPTH_DIFF_100MS_JSON);  // ch0, u=100
+    h.feed_frame(0, DEPTH_DIFF_250MS_JSON);  // ch1, u=50
+    h.idle();  // flush all channels
+
+    auto events = h.published();
+    // Should have 2 separate events with correct channel IDs
+    assert(events.size() == 2);
+    assert(events[0].is_book_delta());
+    assert(events[1].is_book_delta());
+    // Verify different channel IDs
+    assert(events[0].depth_channel() != events[1].depth_channel());
+    // Verify correct sequences
+    bool found_100 = false, found_50 = false;
+    for (auto& e : events) {
+        if (e.src_seq == 100) found_100 = true;
+        if (e.src_seq == 50) found_50 = true;
+    }
+    assert(found_100);
+    assert(found_50);
 }
 
 // ============================================================================
@@ -1972,6 +2135,20 @@ int main() {
     run_handler_tests.template operator()<BinanceUSDMSimdjsonParser>("BinanceUSDMSimdjsonParser");
 
     // ── Cross-handler equivalence tests ──
+    // ── Multi-channel depth tests ──
+    std::printf("\n--- Multi-channel depth ---\n");
+    RUN_TEST(test_classify_stream_depth_channels);
+
+    auto run_multichannel_tests = [&]<typename H>(const char* label) {
+        std::printf("  -- %s --\n", label);
+        RUN_TEST_T((test_depth_channel_separate_seq<H>));
+        RUN_TEST_T((test_depth_channel_flag<H>));
+        RUN_TEST_T((test_snapshot_resets_all_channels<H>));
+        RUN_TEST_T((test_depth_channel_pending_independent<H>));
+    };
+    run_multichannel_tests.template operator()<BinanceUSDMJsonParser>("JsonParser multichannel");
+    run_multichannel_tests.template operator()<BinanceUSDMSimdjsonParser>("SimdjsonParser multichannel");
+
     std::printf("\n--- Cross-handler equivalence ---\n");
     RUN_TEST_T(test_equiv_agg_trade);
     RUN_TEST_T(test_equiv_agg_trade_merge);

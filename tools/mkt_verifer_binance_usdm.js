@@ -58,12 +58,17 @@ const EVT_FLAG_SNAPSHOT      = 0x0001;
 const EVT_FLAG_CONTINUATION  = 0x0002;
 const EVT_FLAG_LAST_IN_BATCH = 0x0004;
 const EVT_FLAG_CONN_ID_SHIFT = 8;
+const EVT_FLAG_DEPTH_CH_SHIFT = 3;
 
 // Stream types (01_binance_usdm_json.hpp:140-142)
 const STREAM_UNKNOWN       = 0;
 const STREAM_AGG_TRADE     = 1;
 const STREAM_DEPTH_PARTIAL = 2;
 const STREAM_DEPTH_DIFF    = 3;
+const STREAM_DEPTH_DIFF_1  = 4;  // @depth@250ms
+const STREAM_DEPTH_DIFF_2  = 5;  // @depth@500ms
+
+const DEPTH_CHANNELS = 3;
 
 // ============================================================================
 // Section 2: JSON Scanning Primitives
@@ -236,10 +241,30 @@ function classifyStream(name) {
     const idx = name.indexOf('@depth');
     if (idx >= 0) {
         const after = name[idx + 6];
-        if (after === '@') return STREAM_DEPTH_DIFF;
+        if (after === '@') {
+            const interval = parseInt(name.slice(idx + 7));
+            if (interval === 100) return STREAM_DEPTH_DIFF;
+            if (interval === 250) return STREAM_DEPTH_DIFF_1;
+            if (interval === 500) return STREAM_DEPTH_DIFF_2;
+            return STREAM_UNKNOWN;
+        }
         if (after >= '0' && after <= '9') return STREAM_DEPTH_PARTIAL;
+        if (after === undefined) return STREAM_DEPTH_DIFF_1;
     }
     return STREAM_UNKNOWN;
+}
+
+function depthChannelIndex(streamType) {
+    switch (streamType) {
+    case STREAM_DEPTH_DIFF:   return 0;
+    case STREAM_DEPTH_DIFF_1: return 1;
+    case STREAM_DEPTH_DIFF_2: return 2;
+    default: return -1;
+    }
+}
+
+function isDepthDiff(streamType) {
+    return streamType === STREAM_DEPTH_DIFF || streamType === STREAM_DEPTH_DIFF_1 || streamType === STREAM_DEPTH_DIFF_2;
 }
 
 // ============================================================================
@@ -336,7 +361,9 @@ function decodeEssential(payload) {
     }
 
     case STREAM_DEPTH_PARTIAL:
-    case STREAM_DEPTH_DIFF: {
+    case STREAM_DEPTH_DIFF:
+    case STREAM_DEPTH_DIFF_1:
+    case STREAM_DEPTH_DIFF_2: {
         // Field order: e(skip), E(extract), T(extract), s(skip), U(skip), u(extract=seq)
         // Mirrors lines 273-284
         p = skipField(payload, p);   // skip "e"
@@ -599,7 +626,8 @@ class ConnectionParseContext {
 class MktEventBuilder {
     constructor(opts = {}) {
         // Dedup counters per domain
-        this.lastBookSeq = -1n;     // shared by BOOK_SNAPSHOT + BOOK_DELTA
+        this.lastBookSeq = [-1n, -1n, -1n];  // per depth-diff channel
+        this.lastSnapshotSeq = -1n;  // dedup depth20 snapshots across connections
         this.lastTradeSeq = -1n;    // TRADE_ARRAY only
 
         // Trade merge buffer (mirrors lines 1012-1018)
@@ -608,6 +636,14 @@ class MktEventBuilder {
         this.pendingTradesMaxId = -1n;
         this.pendingTradesConnId = -1;
         this.pendingTradesEventTsNs = 0n;
+
+        // Per-channel depth delta merge buffers (mirrors C++ PendingDepth[DEPTH_CHANNELS])
+        this.pendingDepth = [[], [], []];
+        this.hasPendingDepth = [false, false, false];
+        this.pendingDepthSeq = [-1n, -1n, -1n];
+        this.pendingDepthConnId = [-1, -1, -1];
+        this.pendingDepthEventTsNs = [0n, 0n, 0n];
+        this.pendingDepthFlushCount = [0, 0, 0];
 
         // Output
         this.events = [];
@@ -630,9 +666,9 @@ class MktEventBuilder {
         return seq <= effTid;
     }
 
-    // Book dedup: seq <= last_book_seq (line 1101)
-    isBookDuplicate(seq) {
-        return seq <= this.lastBookSeq;
+    // Book dedup: seq <= last_book_seq[ch] (line 1101)
+    isBookDuplicate(seq, ch) {
+        return seq <= this.lastBookSeq[ch];
     }
 
     // --- Event builders ---
@@ -693,26 +729,52 @@ class MktEventBuilder {
     // Emit BOOK_DELTA(s) from delta array.
     // deltas: array of {price, qty, action, flags} — raw mantissa, scale applied here (lines 810-812).
     // Chunks at MAX_DELTAS if needed (line 903).
-    emitBookDelta(connId, seq, eventTsNs, deltas, flushCount = 0, isFinal = false) {
-        const evtFlags = (flushCount > 0 ? EVT_FLAG_CONTINUATION : 0)
+    emitBookDelta(connId, seq, eventTsNs, deltas, ch, flushCount = 0, isFinal = false) {
+        // Buffer deltas into per-channel pending buffer
+        const scaled = deltas.map(d => ({
+            price: d.price * PRICE_SCALE,
+            qty: d.qty * QTY_SCALE,
+            action: d.action,
+            flags: d.flags,
+        }));
+
+        // Overflow: pending + new > MAX_DELTAS → publish pending first
+        if (this.hasPendingDepth[ch] && this.pendingDepth[ch].length + scaled.length > MAX_DELTAS)
+            this.publishPendingDepth(ch, false);
+
+        if (!this.hasPendingDepth[ch]) {
+            this.hasPendingDepth[ch] = true;
+            this.pendingDepthConnId[ch] = connId;
+            this.pendingDepthFlushCount[ch] = 0;
+        }
+
+        this.pendingDepth[ch].push(...scaled);
+        this.pendingDepthSeq[ch] = seq;
+        this.pendingDepthEventTsNs[ch] = eventTsNs;
+    }
+
+    publishPendingDepth(ch, isFinal) {
+        if (!this.hasPendingDepth[ch] || this.pendingDepth[ch].length === 0) return;
+        const fc = this.pendingDepthFlushCount[ch];
+        const evtFlags = (fc > 0 ? EVT_FLAG_CONTINUATION : 0)
             | (isFinal ? EVT_FLAG_LAST_IN_BATCH : 0)
-            | (connId << EVT_FLAG_CONN_ID_SHIFT);
-        for (let i = 0; i < deltas.length; i += MAX_DELTAS) {
-            const chunk = deltas.slice(i, i + MAX_DELTAS);
-            this._pushEvent({
-                type: 'BOOK_DELTA',
-                seq: seq,
-                event_ts_ns: eventTsNs,
-                count: chunk.length,
-                conn_id: connId,
-                flags: evtFlags,
-                deltas: chunk.map(d => ({
-                    price: d.price * PRICE_SCALE,
-                    qty: d.qty * QTY_SCALE,
-                    action: d.action,
-                    flags: d.flags,
-                })),
-            });
+            | (this.pendingDepthConnId[ch] << EVT_FLAG_CONN_ID_SHIFT)
+            | (ch << EVT_FLAG_DEPTH_CH_SHIFT);
+        this._pushEvent({
+            type: 'BOOK_DELTA',
+            seq: this.pendingDepthSeq[ch],
+            event_ts_ns: this.pendingDepthEventTsNs[ch],
+            count: this.pendingDepth[ch].length,
+            conn_id: this.pendingDepthConnId[ch],
+            flags: evtFlags,
+            depth_channel: ch,
+            deltas: this.pendingDepth[ch].slice(),
+        });
+        this.pendingDepthFlushCount[ch]++;
+        this.pendingDepth[ch] = [];
+        if (isFinal) {
+            this.hasPendingDepth[ch] = false;
+            this.pendingDepthFlushCount[ch] = 0;
         }
     }
 
@@ -749,8 +811,16 @@ class MktEventBuilder {
         this.flushPendingTrades();
     }
 
-    // Batch end: flush any remaining trades (line 1132-1134)
+    // Flush depth before processing trades
+    flushDepthBeforeTrades() {
+        for (let ch = 0; ch < DEPTH_CHANNELS; ch++)
+            this.publishPendingDepth(ch, true);
+    }
+
+    // Batch end: flush any remaining depth + trades (line 1132-1134)
     onBatchEnd() {
+        for (let ch = 0; ch < DEPTH_CHANNELS; ch++)
+            this.publishPendingDepth(ch, true);
         this.flushPendingTrades();
     }
 
@@ -837,8 +907,9 @@ class BinanceUSDMVerifier {
                     ctx.phase = PHASE_DONE;
                     return;
                 }
-            } else if (ctx.streamType === STREAM_DEPTH_PARTIAL || ctx.streamType === STREAM_DEPTH_DIFF) {
-                if (ctx.seq < this.builder.lastBookSeq) {
+            } else if (isDepthDiff(ctx.streamType)) {
+                const ch = depthChannelIndex(ctx.streamType);
+                if (ctx.seq < this.builder.lastBookSeq[ch]) {
                     ctx.deduped = true;
                     ctx.phase = PHASE_DONE;
                     return;
@@ -847,7 +918,7 @@ class BinanceUSDMVerifier {
 
             if (ctx.streamType === STREAM_AGG_TRADE)
                 this.tradeStreamingContinue(ctx, ci, payload);
-            else if (ctx.streamType === STREAM_DEPTH_PARTIAL || ctx.streamType === STREAM_DEPTH_DIFF)
+            else if (ctx.streamType === STREAM_DEPTH_PARTIAL || isDepthDiff(ctx.streamType))
                 this.depthStreamingContinue(ctx, ci, payload);
             else
                 throw new Error(`onWsData resume: unknown streamType ${ctx.streamType}`);
@@ -860,6 +931,7 @@ class BinanceUSDMVerifier {
 
         switch (e.msgType) {
         case STREAM_AGG_TRADE: {
+            this.builder.flushDepthBeforeTrades();
             // Stage 4: early dedup by agg_trade_id (line 1073)
             if (this.builder.isTradeDuplicate(e.seq)) {
                 ctx.deduped = true;
@@ -879,17 +951,34 @@ class BinanceUSDMVerifier {
         }
 
         case STREAM_DEPTH_PARTIAL:
-        case STREAM_DEPTH_DIFF: {
+        case STREAM_DEPTH_DIFF:
+        case STREAM_DEPTH_DIFF_1:
+        case STREAM_DEPTH_DIFF_2: {
             // Flush pending trades before depth (line 1096)
             this.builder.flushTradesBeforeDepth();
 
-            // Dedup (line 1101)
-            if (this.builder.isBookDuplicate(e.seq)) {
-                ctx.deduped = true;
-                ctx.phase = PHASE_DONE;
-                return;
+            if (e.msgType === STREAM_DEPTH_PARTIAL) {
+                // Snapshot: dedup against max of all channels
+                const maxSeq = this.builder.lastBookSeq.reduce((a, b) => a > b ? a : b);
+                if (e.seq < maxSeq || e.seq <= this.builder.lastSnapshotSeq) {
+                    ctx.deduped = true;
+                    ctx.phase = PHASE_DONE;
+                    return;
+                }
+                this.builder.lastSnapshotSeq = e.seq;
+                // Reset all channels
+                for (let ch = 0; ch < DEPTH_CHANNELS; ch++)
+                    this.builder.lastBookSeq[ch] = e.seq;
+            } else {
+                // Diff: per-channel dedup
+                const ch = depthChannelIndex(e.msgType);
+                if (this.builder.isBookDuplicate(e.seq, ch)) {
+                    ctx.deduped = true;
+                    ctx.phase = PHASE_DONE;
+                    return;
+                }
+                this.builder.lastBookSeq[ch] = e.seq;
             }
-            this.builder.lastBookSeq = e.seq;
 
             // Initialize streaming state (lines 1108-1117)
             ctx.phase = PHASE_HEADER_PARSED;
@@ -989,7 +1078,11 @@ class BinanceUSDMVerifier {
                     ctx.phase = PHASE_ASKS_PARSING;
                     break;
                 }
-                if (sr.newLevels.length === 0) return;  // truncated, wait for more data
+                if (sr.newLevels.length === 0) {
+                    if (!isSnapshot && ctx.deltaBuf.length > 0)
+                        this.flushDeltaChunk(ctx, ci);
+                    return;
+                }
             }
         }
 
@@ -998,13 +1091,25 @@ class BinanceUSDMVerifier {
             // Find "a":[ if needed (lines 928-940)
             let p = ctx.resumeOffset;
             while (p < payload.length && (payload[p] === ',' || payload[p] === ' ' || payload[p] === '\n' || payload[p] === '\r')) p++;
-            if (p >= payload.length) return;
+            if (p >= payload.length) {
+                if (!isSnapshot && ctx.deltaBuf.length > 0)
+                    this.flushDeltaChunk(ctx, ci);
+                return;
+            }
             if (payload[p] === '"') {
                 // Skip "a" key and ':' to get to array, then skip outer '['
                 p = toValue(payload, p);
-                if (p === -1 || p >= payload.length) return;
+                if (p === -1 || p >= payload.length) {
+                    if (!isSnapshot && ctx.deltaBuf.length > 0)
+                        this.flushDeltaChunk(ctx, ci);
+                    return;
+                }
                 if (payload[p] === '[') p++;
-                if (p >= payload.length) return;
+                if (p >= payload.length) {
+                    if (!isSnapshot && ctx.deltaBuf.length > 0)
+                        this.flushDeltaChunk(ctx, ci);
+                    return;
+                }
                 ctx.resumeOffset = p;
             }
 
@@ -1048,7 +1153,11 @@ class BinanceUSDMVerifier {
                     ctx.phase = PHASE_DONE;
                     return;
                 }
-                if (sr.newLevels.length === 0) return;  // truncated, wait
+                if (sr.newLevels.length === 0) {
+                    if (!isSnapshot && ctx.deltaBuf.length > 0)
+                        this.flushDeltaChunk(ctx, ci);
+                    return;
+                }
             }
         }
     }
@@ -1057,8 +1166,8 @@ class BinanceUSDMVerifier {
     flushDeltaChunk(ctx, ci, isFinal = false) {
         if (ctx.deltaBuf.length === 0) return;
         const eventTsNs = ctx.eventTimeMs * 1000000n;
-        // addBookDelta applies scale and chunks internally
-        this.builder.emitBookDelta(ci, ctx.seq, eventTsNs, ctx.deltaBuf, ctx.flushCount, isFinal);
+        const ch = depthChannelIndex(ctx.streamType);
+        this.builder.emitBookDelta(ci, ctx.seq, eventTsNs, ctx.deltaBuf, ch >= 0 ? ch : 0, ctx.flushCount, isFinal);
         ctx.flushCount++;
         ctx.deltaBuf = [];
     }
@@ -1146,6 +1255,9 @@ function parseEventLineBigInt(line) {
     }
     if (obj.seq !== undefined) obj.seq = toBigInt(obj.seq);
     if (obj.event_ts_ns !== undefined) obj.event_ts_ns = toBigInt(obj.event_ts_ns);
+    // Extract depth_channel from flags if not already present
+    if (obj.depth_channel === undefined && obj.flags !== undefined)
+        obj.depth_channel = (obj.flags >> EVT_FLAG_DEPTH_CH_SHIFT) & 0x07;
     if (obj.trades) {
         for (const t of obj.trades) {
             t.price = toBigInt(t.price);
@@ -1269,7 +1381,8 @@ function compareEvents(jsEvents, cppEvents) {
     function buildGroups(events) {
         const groups = new Map();
         for (const e of events) {
-            const k = `${e.seq}|${e.type}`;
+            const ch = e.depth_channel || 0;
+            const k = `${e.seq}|${e.type}|${ch}`;
             if (!groups.has(k)) groups.set(k, []);
             groups.get(k).push(e);
         }
@@ -1528,12 +1641,13 @@ if (require.main === module) {
         WS_FLAG_FIN, WS_FLAG_FRAGMENTED, WS_FLAG_LAST_FRAGMENT,
         WS_FLAG_DISCARD_EARLY, WS_FLAG_MERGED, WS_FLAG_LAST_IN_BATCH,
         STREAM_UNKNOWN, STREAM_AGG_TRADE, STREAM_DEPTH_PARTIAL, STREAM_DEPTH_DIFF,
+        STREAM_DEPTH_DIFF_1, STREAM_DEPTH_DIFF_2, DEPTH_CHANNELS,
         PHASE_IDLE, PHASE_HEADER_PARSED, PHASE_BIDS_PARSING, PHASE_ASKS_PARSING, PHASE_DONE,
         // Scanning primitives
         skipString, skipNumber, skipValue, skipField, toValue, parseInt64, parseDecStr, parseBool,
         parseDecimal,
         // Stream classification
-        classifyStream,
+        classifyStream, depthChannelIndex, isDepthDiff,
         // Parsers
         decodeEssential, parseAggTradeRemaining, parseDepthRemaining, parseLevelsStreaming,
         // Formatting

@@ -563,6 +563,18 @@ struct BinanceSBEHandler {
     int64_t pending_trades_max_id_ = 0;
     websocket::pipeline::WSFrameInfo pending_trades_info_{};
 
+    // Pending depth delta accumulation buffer — merges consecutive DEPTH_DIFF frames
+    bool has_pending_depth_ = false;
+    uint8_t pending_depth_ci_ = 0;
+    uint8_t pending_depth_count_ = 0;
+    websocket::msg::DeltaEntry pending_depth_entries_[websocket::msg::MAX_DELTAS];
+    int64_t pending_depth_seq_ = 0;
+    int64_t pending_depth_event_ts_ns_ = 0;
+    websocket::msg::EventType pending_depth_event_type_{};
+    uint16_t pending_depth_extra_flags_ = 0;
+    uint8_t pending_depth_flush_count_ = 0;
+    websocket::pipeline::WSFrameInfo pending_depth_info_{};
+
     // Per-connection streaming SBE parse state
     SBEParseState sbe_state_[PIPELINE_MAX_CONN]{};
 
@@ -672,6 +684,9 @@ struct BinanceSBEHandler {
                 flush_pending_trades();
             if (has_pending_bbo_ && state.msg_type != BEST_BID_ASK_STREAM)
                 flush_pending_bbo();
+            if (has_pending_depth_ &&
+                state.msg_type != DEPTH_DIFF_STREAM && state.msg_type != DEPTH_SNAPSHOT_STREAM)
+                publish_pending_depth(true);
 
             // Stale detection (once, at header parse)
             // Trade stale check is deferred to TRADES_HEADER when we know the last trade_id
@@ -1044,10 +1059,18 @@ private:
 
         // Parse asks group header
         if (state.phase == SBEParseState::ASKS_HEADER) {
-            if (len < state.bytes_consumed + 4) return;
+            if (len < state.bytes_consumed + 4) {
+                if (state.delta_count > 0 && event_type != websocket::msg::EventType::BOOK_SNAPSHOT)
+                    flush_depth_deltas(state, ci, info, event_type, extra_flags);
+                return;
+            }
             const uint8_t* cursor = payload + state.bytes_consumed;
             GroupSize16 gs;
-            if (!read_group_size16(cursor, len - state.bytes_consumed, gs)) return;
+            if (!read_group_size16(cursor, len - state.bytes_consumed, gs)) {
+                if (state.delta_count > 0 && event_type != websocket::msg::EventType::BOOK_SNAPSHOT)
+                    flush_depth_deltas(state, ci, info, event_type, extra_flags);
+                return;
+            }
             state.asks_count = gs.num_in_group;
             state.asks_published = 0;
             // group_block_len for asks (should be same as bids, but read from wire)
@@ -1105,6 +1128,13 @@ private:
                 state.phase = SBEParseState::DONE;
             }
         }
+
+        // Fragment boundary: flush partial deltas so downstream gets parsed data immediately.
+        // Skipped for snapshots (different flush path, capped at SNAPSHOT_HALF).
+        if (state.phase != SBEParseState::DONE && state.delta_count > 0 &&
+            event_type != websocket::msg::EventType::BOOK_SNAPSHOT) {
+            flush_depth_deltas(state, ci, info, event_type, extra_flags);
+        }
     }
 
     void flush_depth_deltas(SBEParseState& state, uint8_t ci,
@@ -1113,24 +1143,59 @@ private:
                             uint16_t extra_flags,
                             bool is_final = false) {
         if (state.delta_count == 0) return;
-        record_win(ci);
         uint8_t count = state.delta_count;
-        int64_t seq = state.sequence;
-        uint8_t fc = state.flush_count;
+
+        // Overflow: pending + new > MAX_DELTAS → publish pending first
+        if (has_pending_depth_ && pending_depth_count_ + count > websocket::msg::MAX_DELTAS)
+            publish_pending_depth(false);
+
+        // Initialize pending on first entry in batch
+        if (!has_pending_depth_) {
+            has_pending_depth_ = true;
+            pending_depth_ci_ = ci;
+            pending_depth_count_ = 0;
+            pending_depth_event_type_ = event_type;
+            pending_depth_extra_flags_ = extra_flags;
+            pending_depth_flush_count_ = 0;
+            pending_depth_info_ = info;
+        }
+
+        // Append to pending buffer
+        std::memcpy(pending_depth_entries_ + pending_depth_count_, state.delta_buf,
+                    count * sizeof(websocket::msg::DeltaEntry));
+        pending_depth_count_ += count;
+        pending_depth_seq_ = state.sequence;
+        pending_depth_event_ts_ns_ = state.event_time_us * 1000;
+
+        state.flush_count++;
+        state.delta_count = 0;
+    }
+
+    void publish_pending_depth(bool is_final) {
+        if (!has_pending_depth_ || pending_depth_count_ == 0) return;
+        record_win(pending_depth_ci_);
+        current_info_ = &pending_depth_info_;
+        uint8_t count = pending_depth_count_;
+        uint8_t fc = pending_depth_flush_count_;
         publish_event([&](websocket::msg::MktEvent& e) {
-            e.event_type = static_cast<uint8_t>(event_type);
-            uint16_t f = extra_flags;
+            e.event_type = static_cast<uint8_t>(pending_depth_event_type_);
+            uint16_t f = pending_depth_extra_flags_;
             if (fc > 0)    f |= websocket::msg::EventFlags::CONTINUATION;
             if (is_final)  f |= websocket::msg::EventFlags::LAST_IN_BATCH;
             e.flags = f;
-            e.src_seq = seq;
-            e.event_ts_ns = state.event_time_us * 1000;
+            e.src_seq = pending_depth_seq_;
+            e.event_ts_ns = pending_depth_event_ts_ns_;
             e.count = count;
-            std::memcpy(e.payload.deltas.entries, state.delta_buf,
+            std::memcpy(e.payload.deltas.entries, pending_depth_entries_,
                         count * sizeof(websocket::msg::DeltaEntry));
         });
-        state.flush_count++;
-        state.delta_count = 0;
+        current_info_ = nullptr;
+        pending_depth_flush_count_++;
+        pending_depth_count_ = 0;
+        if (is_final) {
+            has_pending_depth_ = false;
+            pending_depth_flush_count_ = 0;
+        }
     }
 
     void flush_depth_snapshot(SBEParseState& state, uint8_t ci,
@@ -1203,6 +1268,7 @@ public:
     }
 
     void on_batch_end(uint8_t) {
+        publish_pending_depth(true);
         flush_pending_bbo();
         flush_pending_trades();
     }

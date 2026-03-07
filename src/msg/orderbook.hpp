@@ -20,6 +20,8 @@ struct OrderBook {
     int64_t bbo_seq = 0;    // highest BBO seq applied
     int64_t bbo_bid_price = 0, bbo_bid_qty = 0;
     int64_t bbo_ask_price = 0, bbo_ask_qty = 0;
+    uint8_t max_bid_depth = OB_MAX_LEVELS;  // set by apply_snapshot
+    uint8_t max_ask_depth = OB_MAX_LEVELS;
 
     void apply_snapshot(const MktEvent& evt) {
         auto b = evt.bids(), a = evt.asks();
@@ -27,6 +29,8 @@ struct OrderBook {
         ask_count = std::min<uint8_t>(a.count, OB_MAX_LEVELS);
         std::memcpy(bids, b.data, bid_count * sizeof(BookLevel));
         std::memcpy(asks, a.data, ask_count * sizeof(BookLevel));
+        max_bid_depth = bid_count;
+        max_ask_depth = ask_count;
         book_seq = evt.src_seq;
         reconcile_bbo();
     }
@@ -95,11 +99,11 @@ struct OrderBook {
         if (bid_count > 0 && bids[0].price == bbo_bid_price) {
             bids[0].qty = bbo_bid_qty;
         } else {
-            if (bid_count < OB_MAX_LEVELS) {
+            if (bid_count < max_bid_depth) {
                 std::memmove(&bids[1], &bids[0], bid_count * sizeof(BookLevel));
                 bid_count++;
             } else {
-                std::memmove(&bids[1], &bids[0], (OB_MAX_LEVELS - 1) * sizeof(BookLevel));
+                std::memmove(&bids[1], &bids[0], (max_bid_depth - 1) * sizeof(BookLevel));
             }
             bids[0] = { bbo_bid_price, bbo_bid_qty };
         }
@@ -116,11 +120,11 @@ struct OrderBook {
         if (ask_count > 0 && asks[0].price == bbo_ask_price) {
             asks[0].qty = bbo_ask_qty;
         } else {
-            if (ask_count < OB_MAX_LEVELS) {
+            if (ask_count < max_ask_depth) {
                 std::memmove(&asks[1], &asks[0], ask_count * sizeof(BookLevel));
                 ask_count++;
             } else {
-                std::memmove(&asks[1], &asks[0], (OB_MAX_LEVELS - 1) * sizeof(BookLevel));
+                std::memmove(&asks[1], &asks[0], (max_ask_depth - 1) * sizeof(BookLevel));
             }
             asks[0] = { bbo_ask_price, bbo_ask_qty };
         }
@@ -140,7 +144,8 @@ private:
                 return;
             }
         }
-        if (d.qty > 0 && count < OB_MAX_LEVELS) {
+        uint8_t max_depth = is_bid ? max_bid_depth : max_ask_depth;
+        if (d.qty > 0 && count < max_depth) {
             uint8_t pos = count;
             for (uint8_t i = 0; i < count; i++) {
                 if (is_bid ? (d.price > levels[i].price) : (d.price < levels[i].price)) {
