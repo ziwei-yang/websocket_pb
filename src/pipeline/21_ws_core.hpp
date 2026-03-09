@@ -1239,7 +1239,10 @@ private:
         // All N must exceed threshold
         bool all_dead = true;
         for (size_t i = 0; i < n_active_; ++i) {
-            uint64_t gap = ((now - last_data_cycle_[i]) * 1000ULL) / freq;
+            uint64_t last_alive = last_data_cycle_[i];
+            if (wd_[i].last_pong_recv_cycle > last_alive)
+                last_alive = wd_[i].last_pong_recv_cycle;
+            uint64_t gap = ((now - last_alive) * 1000ULL) / freq;
             if (gap <= threshold_ms) { all_dead = false; break; }
         }
 
@@ -1248,7 +1251,10 @@ private:
             fprintf(stderr, "[%ld.%06ld] [WS-ALL-DEAD] All %u connections silent (threshold: %lums)\n",
                     ts.tv_sec, ts.tv_nsec / 1000, n_active_, (unsigned long)threshold_ms);
             for (size_t i = 0; i < n_active_; ++i) {
-                uint64_t gap = ((now - last_data_cycle_[i]) * 1000ULL) / freq;
+                uint64_t last_alive = last_data_cycle_[i];
+                if (wd_[i].last_pong_recv_cycle > last_alive)
+                    last_alive = wd_[i].last_pong_recv_cycle;
+                uint64_t gap = ((now - last_alive) * 1000ULL) / freq;
                 fprintf(stderr, "  conn %zu: %lums ago\n", i, (unsigned long)gap);
             }
 
