@@ -835,8 +835,8 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
         }
 
         if (s.dedup.dup_count > 0) {
-            char dup[32];
-            int dup_len = snprintf(dup, sizeof(dup), " dup: %lu ", s.dedup.dup_count);
+            char dup[48];
+            int dup_len = snprintf(dup, sizeof(dup), " dup:%lu #%ld ", s.dedup.dup_count, s.dedup.last_dup_seq);
             pos = fb_puts(fb, pos, " ");
             pos = fb_puts(fb, pos, "\033[97m\033[41m");  // bright white on red bg
             pos = fb_put(fb, pos, dup, dup_len);

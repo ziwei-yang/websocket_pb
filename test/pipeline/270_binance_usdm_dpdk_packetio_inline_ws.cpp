@@ -260,7 +260,7 @@ int main(int argc, char* argv[]) {
     uint64_t json_frames = 0;
 
     // MktEvent dedup state (shared logic from mkt_dedup.hpp)
-    websocket::msg::MktDedupState<3> mkt_dedup;
+    websocket::msg::MktDedupState<4> mkt_dedup;
     uint64_t mkt_event_count = 0;
     uint64_t discard_early_count = 0;
 

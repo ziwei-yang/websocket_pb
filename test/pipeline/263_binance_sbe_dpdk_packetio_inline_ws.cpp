@@ -285,7 +285,7 @@ int main(int argc, char* argv[]) {
     uint64_t sbe_decode_errors = 0;
 
     // MktEvent dedup state (shared logic from mkt_dedup.hpp)
-    websocket::msg::MktDedupState<3> mkt_dedup;
+    websocket::msg::MktDedupState<4> mkt_dedup;
     uint64_t mkt_event_count = 0;
 
     printf("\n--- SBE DirectIO Stream Test (%s) ---\n",

@@ -36,6 +36,7 @@ struct MktDedupState {
     int64_t  liq_seq   = 0;
     int64_t  mark_price_seq = 0;
     uint64_t dup_count = 0;
+    int64_t  last_dup_seq = 0;
     std::unordered_set<uint64_t> ob_seen_deltas[DepthChannels];
 
     MktDedupResult check(const MktEvent& evt) {
@@ -54,6 +55,7 @@ struct MktDedupState {
             if (!any_accepted) {
                 r.verdict = DupVerdict::DUP_SNAP;
                 dup_count++;
+                last_dup_seq = evt.src_seq;
             }
             return r;
         }
@@ -78,6 +80,7 @@ struct MktDedupState {
                         // ALL entries already seen = true dup
                         r.verdict = DupVerdict::DUP_CONTENT;
                         dup_count++;
+                        last_dup_seq = evt.src_seq;
                         return r;
                     }
                     // Partial overlap = multi-flush fragment, insert new keys
@@ -87,6 +90,7 @@ struct MktDedupState {
                     // Older seq
                     r.verdict = DupVerdict::DUP_SEQ;
                     dup_count++;
+                    last_dup_seq = evt.src_seq;
                     return r;
                 }
             } else {
@@ -108,6 +112,7 @@ struct MktDedupState {
             if (evt.src_seq <= *seq_p) {
                 r.verdict = DupVerdict::DUP_SEQ;
                 dup_count++;
+                last_dup_seq = evt.src_seq;
             }
             *seq_p = std::max(*seq_p, evt.src_seq);
         }
@@ -124,6 +129,7 @@ struct MktDedupState {
         liq_seq = 0;
         mark_price_seq = 0;
         dup_count = 0;
+        last_dup_seq = 0;
     }
 };
 
