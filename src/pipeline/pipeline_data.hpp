@@ -1150,8 +1150,8 @@ using MsgMetadataIPCRing = IPCRingBuffer<MsgMetadata, MSG_METADATA_SIZE>;
 using WSFrameInfoIPCRing = IPCRingBuffer<WSFrameInfo, WS_FRAME_INFO_SIZE>;
 using MsgOutboxIPCRing = IPCRingBuffer<MsgOutboxEvent, MSG_OUTBOX_SIZE>;
 
-// 64K entries × 512 bytes = 32 MB. Holds ~10+ minutes at 100 msg/sec.
-inline constexpr size_t MKT_EVENT_RING_SIZE = 65536;
+// 1M entries × 512 bytes = 512 MB. Holds ~160+ minutes at 100 msg/sec.
+inline constexpr size_t MKT_EVENT_RING_SIZE = 1048576;
 using MktEventIPCRing = IPCRingBuffer<websocket::msg::MktEvent, MKT_EVENT_RING_SIZE>;
 
 // ============================================================================
