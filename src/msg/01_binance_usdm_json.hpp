@@ -1033,6 +1033,7 @@ inline void flush_depth_deltas_json(Handler& self, JsonParseState& state, uint8_
         // All entries already committed — skip entirely
         state.flush_count++;
         state.delta_count = 0;
+        info.set_discard_early(true);
         if (is_final) il.finished = true;
         return;
     }
@@ -1056,6 +1057,7 @@ inline void flush_depth_deltas_json(Handler& self, JsonParseState& state, uint8_
     }
 
     uint8_t publish_count = count - skip;
+    info.set_discard_early(false);
 
     auto& pd = self.pending_depth_[ch];
 

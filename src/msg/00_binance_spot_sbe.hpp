@@ -1188,7 +1188,7 @@ private:
     }
 
     void flush_depth_deltas(SBEParseState& state, uint8_t ci,
-                            [[maybe_unused]] websocket::pipeline::WSFrameInfo& info,
+                            websocket::pipeline::WSFrameInfo& info,
                             websocket::msg::EventType event_type,
                             uint16_t extra_flags,
                             bool is_final = false) {
@@ -1210,6 +1210,7 @@ private:
             // All entries already committed — skip entirely
             state.flush_count++;
             state.delta_count = 0;
+            info.set_discard_early(true);
             if (is_final) interleave_.finished = true;
             return;
         }
@@ -1231,6 +1232,7 @@ private:
         }
 
         uint8_t publish_count = count - skip;
+        info.set_discard_early(false);
 
         // Connection switch: if pending has entries from a different connection, flush first
         if (has_pending_depth_ && pending_depth_ci_ != ci)
