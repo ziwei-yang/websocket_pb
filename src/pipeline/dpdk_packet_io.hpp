@@ -89,7 +89,8 @@ struct DPDKPacketIO {
     static constexpr uint32_t kFrameSize = calculate_frame_size(NIC_MTU);
     static constexpr uint16_t kRxBatch = RX_BATCH;
     static constexpr uint16_t kTxBatch = 64;
-    static constexpr uint32_t TX_POOL_START = static_cast<uint32_t>(RX_FRAMES);
+    static constexpr uint32_t kRxPoolSize = PIPELINE_MAX_CONN * 4096;
+    static constexpr uint32_t TX_POOL_START = kRxPoolSize;
     static constexpr uint32_t kTxPoolSize = static_cast<uint32_t>(TX_POOL_SIZE);
 
     DPDKPacketIO() = default;
@@ -113,7 +114,7 @@ struct DPDKPacketIO {
             umem_size_ = config.umem_size;
             owns_umem_ = false;
         } else {
-            umem_size_ = UMEM_TOTAL_SIZE;
+            umem_size_ = static_cast<size_t>(kRxPoolSize + kTxPoolSize) * kFrameSize;
             umem_area_ = static_cast<uint8_t*>(
                 mmap(reinterpret_cast<void*>(DPDK_UMEM_BASE_VA), umem_size_,
                      PROT_READ | PROT_WRITE,
@@ -166,9 +167,13 @@ struct DPDKPacketIO {
             throw std::runtime_error("[DPDK-PIO] Queue setup or port start failed");
         }
 
-        // Step 7: Initialize TX shinfo and clear RX mbuf ring
+        // Step 7: Initialize TX shinfo and heap-allocate RX tracking arrays
+        // (kRxPoolSize can be 65536+; PacketTransportMulti embeds MaxConn
+        // copies of this struct on the stack — arrays must be on the heap)
         init_tx_shinfo();
-        memset(rx_mbuf_ring_, 0, sizeof(rx_mbuf_ring_));
+        rx_mbuf_ring_ = new struct rte_mbuf*[kRxPoolSize]();
+        rx_frame_idx_ring_ = new uint32_t[kRxPoolSize]();
+        rx_consumed_ = new bool[kRxPoolSize]();
 
         // Step 8: Get MAC address and export to ConnStateShm if provided
         rte_eth_macaddr_get(port_id_, &local_mac_);
@@ -201,12 +206,13 @@ struct DPDKPacketIO {
             frame_acked_[i] = false;
             frame_sent_[i] = false;
         }
-        for (uint32_t i = 0; i < RX_FRAMES; ++i) {
-            rx_consumed_[i] = false;
-        }
+        // Reset NIC stats to avoid residual counters from previous run
+        rte_eth_stats_reset(port_id_);
 
-        fprintf(stderr, "[DPDK-PIO] Initialized: port=%u, frame_size=%u, UMEM=%p\n",
-                port_id_, frame_size_, static_cast<void*>(umem_area_));
+        fprintf(stderr, "[DPDK-PIO] Initialized: port=%u, frame_size=%u, UMEM=%p, "
+                "rx_pool=%u mbufs\n",
+                port_id_, frame_size_, static_cast<void*>(umem_area_),
+                rte_mempool_avail_count(rx_pool_) + rte_mempool_in_use_count(rx_pool_));
     }
 
     void close() {
@@ -233,6 +239,9 @@ struct DPDKPacketIO {
             rte_eal_cleanup();
             eal_initialized_ = false;
         }
+        delete[] rx_mbuf_ring_;  rx_mbuf_ring_ = nullptr;
+        delete[] rx_frame_idx_ring_;  rx_frame_idx_ring_ = nullptr;
+        delete[] rx_consumed_;  rx_consumed_ = nullptr;
         if (owns_umem_ && umem_area_) {
             munmap(umem_area_, umem_size_);
             umem_area_ = nullptr;
@@ -299,6 +308,7 @@ struct DPDKPacketIO {
 
         rx_buffered_count_ = buffered;
         rx_buffered_pos_ = 0;
+
         return (buffered > 0) ? 1 : 0;
     }
 
@@ -316,7 +326,7 @@ struct DPDKPacketIO {
             uint32_t frame_idx = rx_buffered_frame_idx_[pos];
 
             // Track for FIFO release
-            uint32_t rel_idx = rx_process_pos_ % static_cast<uint32_t>(RX_FRAMES);
+            uint32_t rel_idx = rx_process_pos_ % kRxPoolSize;
             rx_frame_idx_ring_[rel_idx] = frame_idx;
             rx_process_pos_++;
 
@@ -329,26 +339,17 @@ struct DPDKPacketIO {
     }
 
     void mark_frame_consumed(uint32_t frame_idx) {
-        if (frame_idx >= RX_FRAMES) {
-            return;
-        }
-
+        if (frame_idx >= kRxPoolSize) return;
         rx_consumed_[frame_idx] = true;
-
         // FIFO release: free mbufs while contiguous consumed
         while (rx_consume_pos_ < rx_process_pos_) {
-            uint32_t consume_rel = rx_consume_pos_ % static_cast<uint32_t>(RX_FRAMES);
+            uint32_t consume_rel = rx_consume_pos_ % kRxPoolSize;
             uint32_t idx = rx_frame_idx_ring_[consume_rel];
-            if (!rx_consumed_[idx]) {
-                break;
-            }
-
-            // Free held mbuf → returns to DPDK pool → recycles UMEM frame
+            if (!rx_consumed_[idx]) break;
             if (rx_mbuf_ring_[idx]) {
                 rte_pktmbuf_free(rx_mbuf_ring_[idx]);
                 rx_mbuf_ring_[idx] = nullptr;
             }
-
             rx_consumed_[idx] = false;
             rx_consume_pos_++;
         }
@@ -753,21 +754,30 @@ private:
         int socket_id = rte_eth_dev_socket_id(port_id_);
         if (socket_id < 0) socket_id = 0;
 
+        // data_room_size=0: buf_addr is overridden by rx_mbuf_umem_init to point
+        // into external UMEM, so DPDK-allocated data room is unused. This keeps
+        // pool allocation small (~8MB for 65536 mbufs) instead of 264MB.
         rx_pool_ = rte_pktmbuf_pool_create("RX_POOL",
-            static_cast<uint32_t>(RX_FRAMES),
-            0, 0, frame_size_, socket_id);
+            kRxPoolSize,
+            0, 0, 0, socket_id);
 
         if (!rx_pool_) {
-            fprintf(stderr, "[DPDK-PIO] RX pool creation failed: %s\n",
-                    rte_strerror(rte_errno));
+            fprintf(stderr, "[DPDK-PIO] RX pool creation failed (n=%u): %s\n",
+                    kRxPoolSize, rte_strerror(rte_errno));
             return false;
         }
 
         RxPoolInitCtx ctx{umem_area_, frame_size_};
         rte_mempool_obj_iter(rx_pool_, rx_mbuf_umem_init, &ctx);
 
+        // Override pool-private mbuf_data_room_size so rte_eth_rx_queue_setup
+        // sees our actual UMEM frame size (not the 0 from pool creation).
+        auto* mbp_priv = rte_mempool_get_priv(rx_pool_);
+        static_cast<struct rte_pktmbuf_pool_private*>(mbp_priv)->mbuf_data_room_size =
+            static_cast<uint16_t>(frame_size_);
+
         fprintf(stderr, "[DPDK-PIO] RX pool: %u mbufs, frame_size=%u, buf_addr -> UMEM VA %p\n",
-                static_cast<uint32_t>(RX_FRAMES), frame_size_, static_cast<void*>(umem_area_));
+                kRxPoolSize, frame_size_, static_cast<void*>(umem_area_));
 
         tx_hdr_pool_ = rte_pktmbuf_pool_create("TX_HDR_POOL",
             static_cast<uint32_t>(TX_POOL_SIZE),
@@ -872,11 +882,15 @@ private:
         auto* arp = rte_pktmbuf_mtod_offset(m, struct rte_arp_hdr*,
                                               sizeof(struct rte_ether_hdr));
 
-        if (arp->arp_opcode != rte_cpu_to_be_16(RTE_ARP_OP_REQUEST))
+        if (arp->arp_opcode != rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
+            rte_pktmbuf_free(m);
             return true;
+        }
 
-        if (arp->arp_data.arp_tip != local_ip_)
+        if (arp->arp_data.arp_tip != local_ip_) {
+            rte_pktmbuf_free(m);
             return true;
+        }
 
         // Build ARP reply in place
         rte_ether_addr_copy(&eth->src_addr, &eth->dst_addr);
@@ -955,12 +969,13 @@ private:
     uint16_t rx_buffered_count_ = 0;
     uint16_t rx_buffered_pos_ = 0;
 
-    // RX: held mbufs and FIFO release tracking
-    struct rte_mbuf* rx_mbuf_ring_[RX_FRAMES] = {};
-    uint32_t rx_frame_idx_ring_[RX_FRAMES] = {};
+    // RX: held mbufs and FIFO release tracking (heap-allocated — kRxPoolSize
+    // can be 65536+, and PacketTransportMulti embeds MaxConn copies of this struct)
+    struct rte_mbuf** rx_mbuf_ring_ = nullptr;      // [kRxPoolSize]
+    uint32_t* rx_frame_idx_ring_ = nullptr;          // [kRxPoolSize]
     uint32_t rx_process_pos_ = 0;
     uint32_t rx_consume_pos_ = 0;
-    bool rx_consumed_[RX_FRAMES] = {};
+    bool* rx_consumed_ = nullptr;                    // [kRxPoolSize]
 
     // TX pool [RX_FRAMES, TOTAL_UMEM_FRAMES)
     uint32_t tx_alloc_pos_ = 0;
