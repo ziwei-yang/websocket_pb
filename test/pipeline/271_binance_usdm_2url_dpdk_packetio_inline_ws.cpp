@@ -1,17 +1,29 @@
-// test/pipeline/264_binance_sbe_xdp_packetio_inline_ws.cpp
-// XDP Direct PacketIO Binance SBE Test - Single child process (no poll process)
+// test/pipeline/271_binance_usdm_2url_dpdk_packetio_inline_ws.cpp
+// DPDK Direct PacketIO Binance USD-M Futures — 2-URL endpoint split (public + market)
 //
-// Uses WebSocketPipeline launcher with INLINE_WS=true and PacketIOType=XDPPacketIO.
-// Transport handles NIC I/O (AF_XDP) + TCP + SSL + WS parse directly — no IPC
+// Uses WebSocketPipeline launcher with INLINE_WS=true and PacketIOType=DPDKPacketIO.
+// Transport handles NIC I/O (DPDK PMD) + TCP + SSL + WS parse directly — no IPC
 // ring hop between a poll process and transport. 1 child process total.
 //
+// 2-URL split:
+//   even connections (ci=0,2,4,...) → /market/stream?streams=btcusdt@aggTrade
+//   odd  connections (ci=1,3,5,...) → /public/stream?streams=btcusdt@depth20/...
+//
+// CONN_PER_IP=2: each unique IP gets a pair of connections (market + public).
+// MAX_CONN=16 → 8 IPs × 2 connections each:
+//   ci=0  IP_0  /market/...
+//   ci=1  IP_0  /public/...
+//   ci=2  IP_1  /market/...
+//   ci=3  IP_1  /public/...
+//
 // Architecture:
-//   - DirectIO Transport Process (core 4): AF_XDP → recv → decrypt → WS parse → WSFrameInfo ring
-//   - Parent Process: consume WSFrameInfo + MktEvent rings, SBE decode + print_timeline
+//   - DirectIO Transport Process (core 4): DPDK PMD → recv → decrypt → WS parse → WSFrameInfo ring
+//   - Parent Process: consume WSFrameInfo + MktEvent rings, simdjson decode + print_timeline
 //
-// Usage: ./test_pipeline_264_binance_sbe_xdp_packetio_inline_ws <interface> <bpf_path> [--timeout <ms>]
+// Usage: sudo ./test_pipeline_271_binance_usdm_2url_dpdk_packetio_inline_ws <interface> [--timeout <ms>]
 //
-// Build: ENABLE_RECONNECT=1 MAX_CONN=2 USE_WOLFSSL=1 ./scripts/build_xdp.sh 264_binance_sbe_xdp_packetio_inline_ws.cpp
+// Build: ENABLE_RECONNECT=1 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 271_binance_usdm_2url_dpdk_packetio_inline_ws.cpp
+// Link: requires simdjson.o
 
 #include <cstdio>
 #include <cstdlib>
@@ -28,7 +40,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#ifdef USE_XDP
+#ifdef USE_DPDK
 
 #define DEBUG 0
 #define DEBUG_IPC 0
@@ -54,12 +66,12 @@ static constexpr bool RECONNECT_ENABLED = true;  // InlineWS requires AUTO_RECON
 
 #include "../../src/pipeline/websocket_pipeline.hpp"
 #include "../../src/policy/ssl.hpp"
-#include "../../src/msg/00_binance_spot_sbe.hpp"
+#include "../../src/msg/03_binance_usdm_simdjson.hpp"
 #include "../../src/msg/mkt_event.hpp"
+#include "../../src/msg/mkt_dedup.hpp"
 
 using namespace websocket::pipeline;
 using namespace websocket::ssl;
-namespace sbe = websocket::sbe;
 
 // Select SSL policy based on compile-time flags
 #if defined(USE_OPENSSL)
@@ -71,47 +83,39 @@ using SSLPolicyType = WolfSSLPolicy;
 #endif
 
 // ============================================================================
-// BinanceUpgradeCustomizer — adds X-MBX-APIKEY header from env var
+// PipelineTraits for Binance USD-M Futures — 2-URL split (DPDK DirectIO)
 // ============================================================================
 
-struct BinanceUpgradeCustomizer {
-    static void customize(const ConnStateShm*,
-        std::vector<std::pair<std::string, std::string>>& headers) {
-        const char* key = getenv("BINANCE_API_KEY");
-        if (key && key[0]) {
-            headers.emplace_back("X-MBX-APIKEY", key);
-        }
-    }
-};
-
-using SBEMktEventHandler = websocket::sbe::BinanceSBEHandler;
-
-// ============================================================================
-// PipelineTraits for Binance SBE (XDP DirectIO — no poll process)
-// ============================================================================
-
-struct BinanceSBETraits : DefaultPipelineConfig {
+struct BinanceUSDMTraits : DefaultPipelineConfig {
     using SSLPolicy          = SSLPolicyType;
-    using MktEventHandler    = SBEMktEventHandler;
-    using UpgradeCustomizer  = BinanceUpgradeCustomizer;
-    using PacketIOType       = websocket::xdp::XDPPacketIO;  // Direct NIC I/O (no poll process)
+    using MktEventHandler    = websocket::json::BinanceUSDMSimdjsonParser;
+    using UpgradeCustomizer  = NullUpgradeCustomizer;
+    using PacketIOType       = DPDKPacketIO;  // Direct NIC I/O (no poll process)
 
     static constexpr int XDP_POLL_CORE   = 2;   // unused (no poll process)
     static constexpr int TRANSPORT_CORE  = 4;
     static constexpr int WEBSOCKET_CORE  = 4;   // unused (InlineWS)
 
     static constexpr size_t MAX_CONN     = CONN_COUNT;
+    static constexpr size_t CONN_PER_IP  = 2;  // 2 connections per IP (market + public)
     static constexpr bool AUTO_RECONNECT = true;   // required for InlineWS
     static constexpr bool PROFILING      = true;
     static constexpr bool INLINE_WS      = true;   // key toggle
     static constexpr bool WS_FRAME_INFO_RING = true;  // publish to ring even with MktEventHandler
 
-    static constexpr const char* WSS_HOST = "stream-sbe.binance.com";
+    static constexpr const char* WSS_HOST = "fstream.binance.com";
     static constexpr uint16_t WSS_PORT    = 443;
-    static constexpr const char* WSS_PATH = "/stream?streams=btcusdt@trade/btcusdt@depth/btcusdt@depth20/btcusdt@bestBidAsk";
+    static constexpr const char* WSS_PATH =
+        "/public/stream?streams=btcusdt@depth20/btcusdt@depth@0ms/btcusdt@depth@100ms/btcusdt@depth/btcusdt@depth@500ms";
+
+    static const char* conn_path(uint8_t ci) {
+        return (ci % 2 == 0)
+            ? "/market/stream?streams=btcusdt@aggTrade/btcusdt@forceOrder/btcusdt@markPrice@1s"
+            : "/public/stream?streams=btcusdt@depth20/btcusdt@depth@0ms/btcusdt@depth@100ms/btcusdt@depth/btcusdt@depth@500ms";
+    }
 };
 
-static_assert(PipelineTraitsConcept<BinanceSBETraits>);
+static_assert(PipelineTraitsConcept<BinanceUSDMTraits>);
 
 // ============================================================================
 // Configuration
@@ -183,27 +187,21 @@ void profiling_save_thread(Pipeline& pipeline) {
 // ============================================================================
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <interface> <bpf_path> [--timeout <ms>]\n", argv[0]);
-        fprintf(stderr, "\nBinance SBE binary protocol test (XDP DirectIO mode).\n");
-        fprintf(stderr, "Requires BINANCE_API_KEY env var with Ed25519 API key.\n");
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <interface> [--timeout <ms>]\n", argv[0]);
+        fprintf(stderr, "\nBinance USD-M Futures 2-URL split test (DPDK DirectIO mode).\n");
+        fprintf(stderr, "Public streams — no API key required.\n");
         return 1;
     }
 
     const char* interface = argv[1];
-    const char* bpf_path = argv[2];
 
     parse_args(argc, argv);
 
-    // Check API key
-    const char* api_key = getenv("BINANCE_API_KEY");
-    if (!api_key || !api_key[0]) {
-        fprintf(stderr, "WARNING: BINANCE_API_KEY not set. SBE stream may reject connection.\n");
-    }
-
     if (geteuid() != 0) {
-        fprintf(stderr, "WARN: Not running as root. AF_XDP may fail without capabilities.\n");
-        fprintf(stderr, "      Fix: sudo setcap 'cap_net_admin,cap_net_raw,cap_bpf,cap_perfmon,cap_ipc_lock,cap_sys_nice+ep' %s\n", argv[0]);
+        fprintf(stderr, "WARN: Not running as root. DPDK may fail without capabilities.\n");
+        fprintf(stderr, "      Fix: sudo setcap 'cap_ipc_lock,cap_net_admin,cap_net_raw,cap_sys_nice,cap_sys_rawio+ep' %s\n", argv[0]);
+        fprintf(stderr, "      Or:  sudo %s %s ...\n", argv[0], argv[1]);
     }
 
     signal(SIGPIPE, SIG_IGN);
@@ -214,18 +212,21 @@ int main(int argc, char* argv[]) {
     bool run_forever = (g_timeout_ms <= 0);
 
     printf("==============================================\n");
-    printf("  Binance SBE Test (XDP DirectIO)             \n");
+    printf("  USDM 2-URL Split (public + market) — DPDK   \n");
     printf("==============================================\n");
     printf("  Interface:  %s\n", interface);
-    printf("  BPF Path:   %s\n", bpf_path);
-    printf("  I/O:        AF_XDP (Direct — no poll process)\n");
-    printf("  Target:     %s:%u (WSS)\n", BinanceSBETraits::WSS_HOST, BinanceSBETraits::WSS_PORT);
-    printf("  Path:       %s\n", BinanceSBETraits::WSS_PATH);
+    printf("  I/O:        DPDK PMD (Direct — no poll process)\n");
+    printf("  Target:     %s:%u (WSS)\n", BinanceUSDMTraits::WSS_HOST, BinanceUSDMTraits::WSS_PORT);
     printf("  SSL:        %s\n", SSLPolicyType::name());
     printf("  Mode:       DirectIO + InlineWS (single child process)\n");
     printf("  Processes:  1 child (Transport+NIC+WS)\n");
-    printf("  API Key:    %s\n", (api_key && api_key[0]) ? "set" : "NOT SET");
-    printf("  Connections: %zu\n", CONN_COUNT);
+    printf("  Connections: %zu (%zu per IP, CONN_PER_IP=2)\n", CONN_COUNT, BinanceUSDMTraits::CONN_PER_IP);
+    printf("  Layout:\n");
+    for (size_t i = 0; i < CONN_COUNT; ++i) {
+        printf("    conn%zu: %s  %s\n", i,
+               (i % 2 == 0) ? "[market]" : "[public]",
+               BinanceUSDMTraits::conn_path(i));
+    }
     printf("  Reconnect:  yes (required)\n");
     if (run_forever) {
         printf("  Timeout:    FOREVER (Ctrl+C to stop)\n");
@@ -235,19 +236,15 @@ int main(int argc, char* argv[]) {
     printf("==============================================\n\n");
 
     // Setup pipeline
-    WebSocketPipeline<BinanceSBETraits> pipeline;
+    WebSocketPipeline<BinanceUSDMTraits> pipeline;
 
-    if (!pipeline.setup(interface, bpf_path)) {
+    if (!pipeline.setup(interface, "/dev/null")) {
         fprintf(stderr, "\nFATAL: Setup failed\n");
         return 1;
     }
 
     g_conn_state = pipeline.conn_state();
     pipeline.mkt_event_handler().instrument_id = 1;  // btcusdt
-
-    // Set subscription JSON
-    pipeline.set_subscription_json(
-        R"({"method":"SUBSCRIBE","params":["btcusdt@trade","btcusdt@depth","btcusdt@depth20","btcusdt@bestBidAsk"],"id":1})");
 
     if (!pipeline.start()) {
         fprintf(stderr, "\nFATAL: Failed to start pipeline\n");
@@ -280,11 +277,14 @@ int main(int argc, char* argv[]) {
     uint64_t prev_latest_poll_cycle[NUM_CONN] = {};
 
     uint64_t total_frames = 0, prev_total = 0;
-    uint64_t text_frames = 0;
-    uint64_t binary_frames = 0;
-    uint64_t sbe_decode_errors = 0;
+    uint64_t json_frames = 0;
 
-    printf("\n--- SBE DirectIO Stream Test (%s) ---\n",
+    // MktEvent dedup state (shared logic from mkt_dedup.hpp)
+    websocket::msg::MktDedupState<3> mkt_dedup;
+    uint64_t mkt_event_count = 0;
+    uint64_t discard_early_count = 0;
+
+    printf("\n--- USDM 2-URL DirectIO Stream Test (%s) ---\n",
            run_forever ? "FOREVER MODE - Ctrl+C to stop" :
            (std::to_string(g_timeout_ms) + "ms").c_str());
 
@@ -295,13 +295,13 @@ int main(int argc, char* argv[]) {
         if (g_shutdown.load(std::memory_order_acquire)) {
             signal(SIGINT, SIG_IGN);
             signal(SIGQUIT, SIG_IGN);
-            printf("[SBE] Shutdown signal received\n");
+            printf("[USDM-2URL] Shutdown signal received\n");
             break;
         }
 
         // DirectIO InlineWS: check PROC_TRANSPORT (no separate WS or poll process)
         if (!pipeline.conn_state()->is_running(PROC_TRANSPORT)) {
-            fprintf(stderr, "[SBE] Transport process exited during streaming\n");
+            fprintf(stderr, "[USDM-2URL] Transport process exited during streaming\n");
             break;
         }
 
@@ -312,19 +312,9 @@ int main(int argc, char* argv[]) {
             uint8_t ci = frame.connection_id;
             const uint8_t* payload = pipeline.msg_inbox(ci)->data_at(frame.msg_inbox_offset);
 
-            // Extract exchange event time from SBE binary frames
-            int64_t event_time_ms = 0;
-            if (frame.opcode == 0x02 && frame.payload_len >= sbe::HEADER_SIZE + 8) {
-                binary_frames++;
-                sbe::SBEHeader hdr;
-                if (sbe::decode_header(payload, frame.payload_len, hdr)) {
-                    int64_t event_time_us = sbe::read_i64(payload + sbe::HEADER_SIZE);
-                    event_time_ms = event_time_us / 1000;
-                } else {
-                    sbe_decode_errors++;
-                }
-            } else if (frame.opcode == 0x01) {
-                text_frames++;
+            if (frame.opcode == 0x01) {
+                json_frames++;
+                if (frame.is_discard_early()) discard_early_count++;
             }
 
             frame.print_timeline(tsc_freq, prev_publish_mono_ns[ci],
@@ -346,6 +336,18 @@ int main(int argc, char* argv[]) {
                         fprintf(stderr, "[%ld.%06ld] [STATUS] %s conn=%u %s\n",
                                 ts.tv_sec, ts.tv_nsec / 1000, type_str, st.connection_id, st.message);
                     } else {
+                        mkt_event_count++;
+                        auto dr = mkt_dedup.check(mkt);
+                        if (dr.is_dup()) {
+                            const char* type_str =
+                                mkt.is_book_delta() ? "BOOK" :
+                                mkt.is_book_snapshot() ? "SNAP" :
+                                mkt.is_trade_array() ? "TRADE" :
+                                mkt.is_liquidation() ? "LIQ" :
+                                mkt.is_mark_price() ? "MPRICE" : "BBO";
+                            fprintf(stderr, "\033[91m[DUP] %s seq %ld (dup #%lu)\033[0m\n",
+                                    type_str, mkt.src_seq, mkt_dedup.dup_count);
+                        }
                         mkt.print();
                     }
                 }
@@ -361,9 +363,10 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            uint8_t ci = frame.connection_id;
-            if (frame.opcode == 0x02) binary_frames++;
-            else if (frame.opcode == 0x01) text_frames++;
+            if (frame.opcode == 0x01) {
+                json_frames++;
+                if (frame.is_discard_early()) discard_early_count++;
+            }
         }
     }
 
@@ -387,8 +390,10 @@ int main(int argc, char* argv[]) {
         WSFrameInfo frame;
         while (ws_frame_cons.try_consume(frame)) {
             total_frames++;
-            if (frame.opcode == 0x02) binary_frames++;
-            else if (frame.opcode == 0x01) text_frames++;
+            if (frame.opcode == 0x01) {
+                json_frames++;
+                if (frame.is_discard_early()) discard_early_count++;
+            }
         }
     }
     if (mkt_event_cons) {
@@ -405,6 +410,8 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "[%ld.%06ld] [STATUS] %s conn=%u %s\n",
                         ts.tv_sec, ts.tv_nsec / 1000, type_str, st.connection_id, st.message);
             } else {
+                mkt_event_count++;
+                mkt_dedup.check(mkt);
                 mkt.print();
             }
         }
@@ -437,12 +444,16 @@ int main(int argc, char* argv[]) {
     char summary[4096];
     int pos = 0;
     pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== Shutting down ===\n");
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== SBE DirectIO Test Results (XDP) ===\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "\n=== USDM 2-URL DirectIO Test Results (DPDK) ===\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Duration:        %ld ms\n", actual_duration);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  Total frames:    %lu\n", total_frames);
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  Binary (SBE):    %lu\n", binary_frames);
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  Text (JSON):     %lu\n", text_frames);
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  SBE errors:      %lu\n", sbe_decode_errors);
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  JSON frames:     %lu\n", json_frames);
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  MktEvents:       %lu\n", mkt_event_count);
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  MktEvent dups:   %lu%s\n", mkt_dedup.dup_count,
+           mkt_dedup.dup_count > 0 ? " *** DUPLICATES DETECTED ***" : " (clean)");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  Discard early:   %lu (%.1f%% of JSON)\n",
+           discard_early_count,
+           json_frames > 0 ? 100.0 * discard_early_count / json_frames : 0.0);
     pos += snprintf(summary + pos, sizeof(summary) - pos, "\n--- Ring Buffer Status (DirectIO) ---\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  WS_FRAME_INFO producer: %ld, consumer: %ld (%s)\n",
            ws_frame_prod, ws_frame_cons_seq, (ws_frame_cons_seq >= ws_frame_prod) ? "ok" : "BEHIND");
@@ -451,7 +462,7 @@ int main(int argc, char* argv[]) {
     pos += snprintf(summary + pos, sizeof(summary) - pos, "  (No raw_inbox/raw_outbox/metadata/pongs rings — DirectIO + InlineWS)\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "====================\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "\n==============================================\n");
-    pos += snprintf(summary + pos, sizeof(summary) - pos, "  SBE DIRECT_IO TEST COMPLETE (XDP)\n");
+    pos += snprintf(summary + pos, sizeof(summary) - pos, "  USDM 2-URL DIRECT_IO TEST COMPLETE (DPDK)\n");
     pos += snprintf(summary + pos, sizeof(summary) - pos, "==============================================\n");
 
     fflush(stdout);
@@ -468,7 +479,7 @@ int main(int argc, char* argv[]) {
     // Also save to /tmp for persistence
     {
         char path[256];
-        snprintf(path, sizeof(path), "/tmp/sbe_xdp_directio_summary_%d.txt", getpid());
+        snprintf(path, sizeof(path), "/tmp/usdm_dpdk_2url_directio_summary_%d.txt", getpid());
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {
             (void)write(fd, summary, pos);
@@ -481,12 +492,12 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 
-#else  // !USE_XDP
+#else  // !USE_DPDK
 
 int main() {
-    fprintf(stderr, "Error: Build with USE_XDP=1 USE_WOLFSSL=1 MAX_CONN=2 ENABLE_RECONNECT=1\n");
-    fprintf(stderr, "Example: ENABLE_RECONNECT=1 MAX_CONN=2 USE_WOLFSSL=1 ./scripts/build_xdp.sh 264_binance_sbe_xdp_packetio_inline_ws.cpp\n");
+    fprintf(stderr, "Error: Build with USE_DPDK=1 USE_WOLFSSL=1 MAX_CONN=4 ENABLE_RECONNECT=1\n");
+    fprintf(stderr, "Example: ENABLE_RECONNECT=1 MAX_CONN=4 USE_WOLFSSL=1 ./scripts/build_dpdk.sh 271_binance_usdm_2url_dpdk_packetio_inline_ws.cpp\n");
     return 1;
 }
 
-#endif  // USE_XDP
+#endif  // USE_DPDK

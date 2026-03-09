@@ -308,12 +308,21 @@ public:
             printf("%s%s", ips[i].c_str(), (i < ips.size() - 1) ? ", " : "\n");
         }
 
+        // Cache actual active connection count (may be < MaxConn when DNS-capped)
+        if constexpr (MaxConn > 1) {
+            n_active_ = conn_state_ ? conn_state_->actual_conn_count : NUM_CONN;
+            if (n_active_ > NUM_CONN) n_active_ = NUM_CONN;
+            if (n_active_ < MaxConn)
+                printf("[TRANSPORT] Active connections: %u / %zu (DNS-capped)\n",
+                       n_active_, MaxConn);
+        }
+
         if constexpr (AutoReconnect) {
-            // Non-blocking startup: initiate TCP connect for all connections
+            // Non-blocking startup: initiate TCP connect for active connections
             // State machine in run() handles TCP→TLS→TLS_READY→ACTIVE
             if constexpr (MaxConn > 1) {
                 // Use per-connection target IPs from parent probe
-                for (size_t ci = 0; ci < MaxConn; ++ci) {
+                for (size_t ci = 0; ci < n_active_; ++ci) {
                     transport_.start_connect_ip(ci, ntohl(conn_state_->conn_target_ip[ci]), parsed_url_.port);
                     reconn_[ci].phase = ConnPhase::TCP_CONNECTING;
                     reconn_[ci].phase_start_cycle = rdtsc();
@@ -326,7 +335,7 @@ public:
         } else {
             // Non-reconnect: blocking TCP + TLS handshake (original path)
             if constexpr (MaxConn > 1) {
-                for (size_t ci = 0; ci < MaxConn; ++ci) {
+                for (size_t ci = 0; ci < n_active_; ++ci) {
                     transport_.start_connect_ip(ci, ntohl(conn_state_->conn_target_ip[ci]), parsed_url_.port);
                     // Blocking wait for TCP
                     while (!transport_.handshake_complete(ci)) {
@@ -411,25 +420,21 @@ public:
             if constexpr (MaxConn > 1) {
                 if (active_conn_ptr_) {
                     uint8_t a = *active_conn_ptr_;
-                    if (a < NUM_CONN) conn_order[0] = a;
+                    if (a < n_active_) conn_order[0] = a;
                 }
-                // Fill remaining slots with all other connections
+                // Fill remaining slots with all other active connections
                 uint8_t pos = 1;
-                for (uint8_t c = 0; c < NUM_CONN; ++c) {
+                for (uint8_t c = 0; c < n_active_; ++c) {
                     if (c != conn_order[0]) conn_order[pos++] = c;
                 }
             }
 
-            // Prefetch both connections' recv buffer UMEM head frames early.
-            // The poll() above processes RX frames across many UMEM addresses,
-            // potentially evicting the head frame data from L2/L3 cache.
-            // Issuing prefetches here gives ~1-5us (outbox + ci=0 processing)
-            // for the DRAM fetch (~100-200ns) to complete before ssl_read_by_chunk.
-            for (size_t c = 0; c < NUM_CONN; ++c) {
+            // Prefetch active connections' recv buffer UMEM head frames early.
+            for (size_t c = 0; c < n_active_; ++c) {
                 get_transport(c).prefetch_recv_head();
             }
 
-            for (uint8_t i = 0; i < NUM_CONN; i++) {
+            for (uint8_t i = 0; i < n_active_; i++) {
                 uint8_t ci = conn_order[i];
                 if constexpr (AutoReconnect) {
                     // Check WS-initiated reconnect request
@@ -580,7 +585,7 @@ public:
 
     void cleanup() {
         printf("[TRANSPORT] Cleanup\n");
-        for (size_t i = 0; i < NUM_CONN; i++) {
+        for (size_t i = 0; i < n_active_; i++) {
             ssl_[i].shutdown();
         }
         transport_.close();
@@ -699,7 +704,7 @@ private:
             uint32_t other_ips[MaxConn > 1 ? MaxConn - 1 : 1]{};
             size_t other_count = 0;
             if constexpr (MaxConn > 1) {
-                for (size_t oc = 0; oc < MaxConn; ++oc) {
+                for (size_t oc = 0; oc < n_active_; ++oc) {
                     if (oc != ci) {
                         other_ips[other_count++] = conn_state_->conn_target_ip[oc];
                     }
@@ -1199,6 +1204,7 @@ private:
 
     // IPC interfaces
     static constexpr size_t NUM_CONN = MaxConn;
+    uint8_t n_active_ = NUM_CONN;  // Actual active connections (may be < NUM_CONN when DNS-capped)
     MsgInbox* msg_inbox_[NUM_CONN]{};
     MsgMetadataProd* msg_metadata_prod_[NUM_CONN]{};
     LowPrioCons* low_prio_cons_ = nullptr;

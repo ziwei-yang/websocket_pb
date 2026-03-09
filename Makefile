@@ -731,12 +731,19 @@ PIPELINE_HEADERS := \
     src/pipeline/00_xdp_poll_process.hpp \
     src/pipeline/01_dpdk_poll_process.hpp \
     src/pipeline/10_tcp_ssl_process.hpp \
+    src/pipeline/11_bsd_tcp_ssl_process.hpp \
     src/pipeline/20_ws_process.hpp \
+    src/pipeline/21_ws_core.hpp \
     src/pipeline/98_xdp_tcp_ssl_process.hpp \
     src/pipeline/99_xdp_tcp_ssl_ws_process.hpp \
+    src/pipeline/websocket_pipeline.hpp \
+    src/pipeline/bsd_websocket_pipeline.hpp \
     src/pipeline/pipeline_data.hpp \
     src/pipeline/pipeline_config.hpp \
     src/pipeline/msg_inbox.hpp \
+    src/pipeline/disruptor_packet_io.hpp \
+    src/pipeline/dpdk_packet_io.hpp \
+    src/net/ip_probe.hpp \
     src/stack/userspace_stack.hpp \
     src/xdp/xdp_packet_io.hpp \
     src/policy/ssl.hpp \
@@ -1244,6 +1251,30 @@ else
 endif
 
 build-test-pipeline-270_binance_usdm_dpdk_packetio_inline_ws: $(PIPELINE_DPDK_DIRECTIO_USDM_BIN)
+
+# ============================================================================
+# DPDK DirectIO Binance USDM 2-URL Split InlineWS Test (public + market endpoints)
+# ============================================================================
+
+PIPELINE_DPDK_DIRECTIO_USDM_2URL_SRC := test/pipeline/271_binance_usdm_2url_dpdk_packetio_inline_ws.cpp
+PIPELINE_DPDK_DIRECTIO_USDM_2URL_BIN := $(BUILD_DIR)/test_pipeline_271_binance_usdm_2url_dpdk_packetio_inline_ws
+
+$(PIPELINE_DPDK_DIRECTIO_USDM_2URL_BIN): $(PIPELINE_DPDK_DIRECTIO_USDM_2URL_SRC) $(PIPELINE_HEADERS) src/msg/03_binance_usdm_simdjson.hpp $(BUILD_DIR)/simdjson.o | $(BUILD_DIR)
+	@echo "Compiling DPDK DirectIO Binance USDM 2-URL InlineWS test..."
+ifdef USE_DPDK
+ifneq (,$(or $(USE_WOLFSSL),$(USE_OPENSSL)))
+	$(CXX) $(CXXFLAGS) -o $@ $< $(BUILD_DIR)/simdjson.o $(LDFLAGS)
+	@echo "DPDK DirectIO USDM 2-URL InlineWS test build complete: $@"
+else
+	@echo "Error: DPDK DirectIO USDM 2-URL test requires USE_WOLFSSL=1 or USE_OPENSSL=1"
+	@exit 1
+endif
+else
+	@echo "Error: DPDK DirectIO USDM 2-URL test requires USE_DPDK=1"
+	@exit 1
+endif
+
+build-test-pipeline-271_binance_usdm_2url_dpdk_packetio_inline_ws: $(PIPELINE_DPDK_DIRECTIO_USDM_2URL_BIN)
 
 # ============================================================================
 # WebSocket OKX Test (WebSocketProcess with OKX WSS stream)

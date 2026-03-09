@@ -476,7 +476,13 @@ public:
         msg_outbox_prod_ = msg_outbox_prod;
         conn_state_ = conn_state;
 
-        for (size_t i = 0; i < NUM_CONN; i++) {
+        // Cache actual active connection count (may be < NUM_CONN when DNS-capped)
+        if constexpr (MaxConn > 1) {
+            n_active_ = conn_state_ ? conn_state_->actual_conn_count : NUM_CONN;
+            if (n_active_ > NUM_CONN) n_active_ = NUM_CONN;
+        }
+
+        for (size_t i = 0; i < n_active_; i++) {
             pending_frame_[i].clear();
             has_pending_frame_[i] = false;
             reset_accumulator(i);
@@ -536,8 +542,8 @@ public:
         send_subscription_message(0);
 
         if constexpr (MaxConn > 1) {
-            // Remaining connections: HTTP upgrade + subscription
-            for (size_t ci = 1; ci < NUM_CONN; ++ci) {
+            // Remaining active connections: HTTP upgrade + subscription
+            for (size_t ci = 1; ci < n_active_; ++ci) {
                 send_http_upgrade_request(static_cast<uint8_t>(ci));
                 if (!recv_http_upgrade_response_blocking(static_cast<uint8_t>(ci))) {
                     fprintf(stderr, "[WS-PROCESS] HTTP upgrade failed (conn %zu)\n", ci);
@@ -553,8 +559,8 @@ public:
         printf("[WS-PROCESS] Handshake complete%s, ws_ready signaled\n",
                MaxConn > 1 ? " (Multi-conn)" : "");
 
-        // All connections start ACTIVE
-        for (size_t i = 0; i < NUM_CONN; i++) {
+        // All active connections start ACTIVE
+        for (size_t i = 0; i < n_active_; i++) {
             ws_phase_[i] = WsConnPhase::ACTIVE;
         }
 
@@ -609,7 +615,7 @@ public:
 
             if constexpr (MaxConn > 1) {
                 // Op 2: metadata consume + commit (connections 1..N-1)
-                for (size_t ci = 1; ci < NUM_CONN; ++ci) {
+                for (size_t ci = 1; ci < n_active_; ++ci) {
                     int32_t processed_n = 0;
                     processed_n = profile_op<Profiling>([this, ci]() -> int32_t {
                         size_t p = msg_metadata_cons_[ci]->process_manually(
@@ -629,17 +635,17 @@ public:
                 }
             }
 
-            // Ping/pong for all connections (idle only)
+            // Ping/pong for all active connections (idle only)
             profile_op<Profiling>([this]() -> int32_t {
                 int32_t count = 0;
-                for (size_t ci = 0; ci < NUM_CONN; ci++) {
+                for (size_t ci = 0; ci < n_active_; ci++) {
                     if (has_pending_ping_[ci]) {
                         flush_pending_pong(static_cast<uint8_t>(ci));
                         count++;
                     }
                 }
                 // Watchdog for all active connections
-                for (size_t ci = 0; ci < NUM_CONN; ci++) {
+                for (size_t ci = 0; ci < n_active_; ci++) {
                     if (ws_phase_[ci] == WsConnPhase::ACTIVE) {
                         maybe_send_client_ping(static_cast<uint8_t>(ci));
                     }
@@ -660,7 +666,7 @@ public:
                 profiling_data_->commit();
             }
         }
-        for (size_t ci = 0; ci < NUM_CONN; ci++) {
+        for (size_t ci = 0; ci < n_active_; ci++) {
             flush_pending_pong(static_cast<uint8_t>(ci));
         }
         printf("[WS-PROCESS] Exiting main loop\n");
@@ -696,7 +702,7 @@ private:
 
         size_t request_len = websocket::http::build_websocket_upgrade_request(
             conn_state_->target_host,
-            conn_state_->target_path,
+            conn_state_->target_path[ci],
             custom_headers,
             request_buf,
             sizeof(request_buf)
@@ -753,7 +759,7 @@ private:
                 // When MaxConn > 1, drain other connections' metadata during the wait
                 // to avoid ring buffer backup (initial handshake phase only)
                 if constexpr (MaxConn > 1) {
-                    for (size_t other = 0; other < NUM_CONN; ++other) {
+                    for (size_t other = 0; other < n_active_; ++other) {
                         if (other == ci) continue;
                         MsgMetadata other_meta;
                         while (msg_metadata_cons_[other]->try_consume(other_meta)) {
@@ -946,7 +952,7 @@ private:
         if (!ws_ready_signaled_) {
             // Check if all connections are ACTIVE before signaling
             bool all_active = true;
-            for (size_t i = 0; i < NUM_CONN; i++) {
+            for (size_t i = 0; i < n_active_; i++) {
                 if (ws_phase_[i] != WsConnPhase::ACTIVE) {
                     all_active = false;
                     break;
@@ -1689,7 +1695,7 @@ private:
 
         // Cross-connection diagnostic: log other connections' health
         if constexpr (MaxConn > 1) {
-            for (size_t other = 0; other < NUM_CONN; ++other) {
+            for (size_t other = 0; other < n_active_; ++other) {
                 if (other == ci) continue;
                 uint64_t other_data_gap_ms = (last_data_cycle_[other] > 0)
                     ? ((now_cycle - last_data_cycle_[other]) * 1000ULL) / tsc_freq : 0;
@@ -1723,8 +1729,8 @@ private:
     void check_all_dead() {
         if constexpr (MaxConn <= 1 || !AutoReconnect) return;
 
-        // All N connections must be ACTIVE with non-zero last_data_cycle_
-        for (size_t i = 0; i < NUM_CONN; ++i) {
+        // All active connections must be ACTIVE with non-zero last_data_cycle_
+        for (size_t i = 0; i < n_active_; ++i) {
             if (ws_phase_[i] != WsConnPhase::ACTIVE) return;
             if (last_data_cycle_[i] == 0) return;
         }
@@ -1734,23 +1740,23 @@ private:
         uint64_t threshold_ms = conn_state_->dual_dead_threshold_ms;
         if (threshold_ms == 0 || freq == 0) return;  // Disabled
 
-        // All N must exceed threshold
+        // All active must exceed threshold
         bool all_dead = true;
-        for (size_t i = 0; i < NUM_CONN; ++i) {
+        for (size_t i = 0; i < n_active_; ++i) {
             uint64_t gap = ((now - last_data_cycle_[i]) * 1000ULL) / freq;
             if (gap <= threshold_ms) { all_dead = false; break; }
         }
 
         if (all_dead) {
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            fprintf(stderr, "[%ld.%06ld] [WS-ALL-DEAD] All %zu connections silent (threshold: %lums)\n",
-                    ts.tv_sec, ts.tv_nsec / 1000, NUM_CONN, (unsigned long)threshold_ms);
-            for (size_t i = 0; i < NUM_CONN; ++i) {
+            fprintf(stderr, "[%ld.%06ld] [WS-ALL-DEAD] All %u connections silent (threshold: %lums)\n",
+                    ts.tv_sec, ts.tv_nsec / 1000, n_active_, (unsigned long)threshold_ms);
+            for (size_t i = 0; i < n_active_; ++i) {
                 uint64_t gap = ((now - last_data_cycle_[i]) * 1000ULL) / freq;
                 fprintf(stderr, "  conn %zu: %lums ago\n", i, (unsigned long)gap);
             }
 
-            for (size_t i = 0; i < NUM_CONN; ++i) {
+            for (size_t i = 0; i < n_active_; ++i) {
                 trigger_watchdog_reconnect(static_cast<uint8_t>(i), now, freq);
                 ws_phase_[i] = WsConnPhase::DISCONNECTED;
             }
@@ -1767,7 +1773,7 @@ private:
         uint64_t freq = conn_state_->tsc_freq_hz;
         if (freq == 0) return;
 
-        for (size_t ci = 0; ci < NUM_CONN; ci++) {
+        for (size_t ci = 0; ci < n_active_; ci++) {
             if (ws_phase_[ci] != WsConnPhase::WS_UPGRADE_SENT) continue;
             if (upgrade_sent_cycle_[ci] == 0) continue;
 
@@ -1793,7 +1799,7 @@ private:
         if constexpr (!HasMktEventHandler) return;
         if constexpr (MaxConn > 1) {
             bool all_down = true;
-            for (size_t i = 0; i < NUM_CONN; i++)
+            for (size_t i = 0; i < n_active_; i++)
                 if (ws_phase_[i] != WsConnPhase::DISCONNECTED) { all_down = false; break; }
             if (all_down && !all_disconnected_) {
                 all_disconnected_ = true;
@@ -1966,6 +1972,7 @@ private:
     MsgOutboxProd* msg_outbox_prod_ = nullptr;
     ConnStateShm* conn_state_ = nullptr;
     uint8_t transport_mode_ = 0;
+    uint8_t n_active_ = NUM_CONN;
 
     // MktEventHandler (inline callback, replaces WSFrameInfo ring when enabled)
     [[no_unique_address]] MktEventHandler mkt_event_handler_{};

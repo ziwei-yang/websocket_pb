@@ -32,9 +32,11 @@
 #include "pipeline_config.hpp"
 #include "../xdp/packet_frame_descriptor.hpp"
 
-// Compile-time maximum connection count (pass -DMAX_CONN=N, default 1)
+// Compile-time maximum connection count (pass -DMAX_CONN=N, default 16)
+// With DNS capping, 16 is safe as a generous default — actual connections
+// are capped to available DNS IPs at runtime.
 #ifndef MAX_CONN
-#define MAX_CONN 1
+#define MAX_CONN 16
 #endif
 static constexpr size_t PIPELINE_MAX_CONN = MAX_CONN;
 #undef MAX_CONN  // Prevent macro collision with Traits::MAX_CONN member names
@@ -460,6 +462,8 @@ struct alignas(64) WSFrameInfo {
             case 2: if (show_cnt) std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Td"); break;
             case 3: std::snprintf(mkt_typ, sizeof(mkt_typ), "Sy");     break;
             case 4: if (show_cnt) std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Bo"); break;
+            case 5: if (show_cnt) std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Lq"); break;
+            case 6: if (show_cnt) std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", cnt); std::snprintf(mkt_typ, sizeof(mkt_typ), "Mp"); break;
             }
         } else if (is_fragmented() && !is_last_fragment()) {
             std::snprintf(mkt_typ, sizeof(mkt_typ), "Fg");
@@ -776,7 +780,7 @@ struct alignas(CACHE_LINE_SIZE) ConnStateShm {
     alignas(CACHE_LINE_SIZE) char target_host[64];  // e.g., "stream.binance.com"
     uint16_t target_port;                           // e.g., 443
     uint8_t  _pad_url[6];
-    char target_path[128];                          // e.g., "/stream"
+    char target_path[PIPELINE_MAX_CONN][128];        // per-connection path (e.g., "/stream")
     uint64_t tsc_freq_hz;                           // TSC frequency for latency
 
     // ========================================================================

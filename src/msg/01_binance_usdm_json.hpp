@@ -139,32 +139,43 @@ inline bool parse_bool_fast(const uint8_t*& p, const uint8_t* end) {
 
 enum class UsdmStreamType : uint8_t {
     UNKNOWN = 0, AGG_TRADE = 1, DEPTH_PARTIAL = 2,
-    DEPTH_DIFF = 3, DEPTH_DIFF_1 = 4, DEPTH_DIFF_2 = 5
+    DEPTH_DIFF_0 = 3, DEPTH_DIFF_1 = 4, DEPTH_DIFF_2 = 5,
+    DEPTH_DIFF_3 = 6, MARK_PRICE = 7, FORCE_ORDER = 8
 };
 
 static constexpr uint8_t MAX_DEPTH_CHANNELS = websocket::msg::MAX_DEPTH_CHANNELS;
 
 inline uint8_t depth_channel_index(UsdmStreamType t) {
     switch (t) {
-    case UsdmStreamType::DEPTH_DIFF:   return 0;
-    case UsdmStreamType::DEPTH_DIFF_1: return 1;
-    case UsdmStreamType::DEPTH_DIFF_2: return 2;
+    case UsdmStreamType::DEPTH_DIFF_0: return 0;  // 0ms
+    case UsdmStreamType::DEPTH_DIFF_1: return 1;  // 100ms
+    case UsdmStreamType::DEPTH_DIFF_2: return 2;  // 250ms
+    case UsdmStreamType::DEPTH_DIFF_3: return 3;  // 500ms
     default: return 0xFF;  // not a depth diff type
     }
 }
 inline bool is_depth_diff_type(UsdmStreamType t) {
-    return t == UsdmStreamType::DEPTH_DIFF || t == UsdmStreamType::DEPTH_DIFF_1 || t == UsdmStreamType::DEPTH_DIFF_2;
+    return t == UsdmStreamType::DEPTH_DIFF_0 || t == UsdmStreamType::DEPTH_DIFF_1
+        || t == UsdmStreamType::DEPTH_DIFF_2 || t == UsdmStreamType::DEPTH_DIFF_3;
 }
 
 // Classify by suffix of stream name.
 // "btcusdt@aggTrade" -> AGG_TRADE
 // "btcusdt@depth5" / "depth10" / "depth20" -> DEPTH_PARTIAL
-// "btcusdt@depth@100ms" / "depth@250ms" -> DEPTH_DIFF
+// "btcusdt@depth@100ms" / "depth@250ms" -> DEPTH_DIFF_1
 inline UsdmStreamType classify_stream(const uint8_t* name, uint32_t len) {
     if (len < 5) return UsdmStreamType::UNKNOWN;
     // Check suffix for "aggTrade" (8 chars)
     if (len >= 8 && std::memcmp(name + len - 8, "aggTrade", 8) == 0)
         return UsdmStreamType::AGG_TRADE;
+    // Check suffix for "forceOrder" (10 chars)
+    if (len >= 10 && std::memcmp(name + len - 10, "forceOrder", 10) == 0)
+        return UsdmStreamType::FORCE_ORDER;
+    // Check for "@markPrice" substring
+    for (uint32_t i = 0; i + 10 <= len; i++) {
+        if (name[i] == '@' && std::memcmp(name + i + 1, "markPrice", 9) == 0)
+            return UsdmStreamType::MARK_PRICE;
+    }
     // Check for "depth@" pattern (diff depth: contains "@depth@")
     // depth@100ms / depth@250ms etc — the @ before ms distinguishes from partial
     // Pattern: has "@depth@" substring
@@ -179,16 +190,17 @@ inline UsdmStreamType classify_stream(const uint8_t* name, uint32_t len) {
                 int64_t interval = 0;
                 for (uint32_t j = 0; j < remain && istart[j] >= '0' && istart[j] <= '9'; j++)
                     interval = interval * 10 + (istart[j] - '0');
-                if (interval == 100) return UsdmStreamType::DEPTH_DIFF;
-                if (interval == 250) return UsdmStreamType::DEPTH_DIFF_1;
-                if (interval == 500) return UsdmStreamType::DEPTH_DIFF_2;
+                if (interval == 0)   return UsdmStreamType::DEPTH_DIFF_0;
+                if (interval == 100) return UsdmStreamType::DEPTH_DIFF_1;
+                if (interval == 250) return UsdmStreamType::DEPTH_DIFF_2;
+                if (interval == 500) return UsdmStreamType::DEPTH_DIFF_3;
                 return UsdmStreamType::UNKNOWN;  // unrecognized interval
             }
             if (i + 6 < len && name[i+6] >= '0' && name[i+6] <= '9')
                 return UsdmStreamType::DEPTH_PARTIAL;
             // @depth at end of name (no suffix) = 250ms default
             if (i + 6 == len)
-                return UsdmStreamType::DEPTH_DIFF_1;
+                return UsdmStreamType::DEPTH_DIFF_2;
         }
     }
     return UsdmStreamType::UNKNOWN;
@@ -298,9 +310,10 @@ struct BinanceUSDMJsonDecoder {
             e.resume_pos = p; e.valid = true;
             break;
         case UsdmStreamType::DEPTH_PARTIAL:
-        case UsdmStreamType::DEPTH_DIFF:
+        case UsdmStreamType::DEPTH_DIFF_0:
         case UsdmStreamType::DEPTH_DIFF_1:
         case UsdmStreamType::DEPTH_DIFF_2:
+        case UsdmStreamType::DEPTH_DIFF_3:
             // e(skip), E(extract), T(extract), s(skip), U(skip), u(extract=sequence)
             p = skip_field(p, end);
             p = to_value(p, end); e.event_time_ms = parse_int64_fast(p, end);
@@ -311,6 +324,23 @@ struct BinanceUSDMJsonDecoder {
             p = skip_field(p, end);
             p = to_value(p, end); e.sequence = parse_int64_fast(p, end);
             while (p < end && (*p == ',' || *p == ' ')) ++p;
+            e.resume_pos = p; e.valid = true;
+            break;
+        case UsdmStreamType::FORCE_ORDER:
+            // e(skip), E(extract as event_time_ms + sequence), resume after E
+            p = skip_field(p, end);
+            p = to_value(p, end); e.event_time_ms = parse_int64_fast(p, end);
+            e.sequence = e.event_time_ms;
+            while (p < end && (*p == ',' || *p == ' ')) ++p;
+            e.resume_pos = p; e.valid = true;
+            break;
+        case UsdmStreamType::MARK_PRICE:
+            // e(skip), E(extract as event_time_ms + sequence), s(skip), resume at "p"
+            p = skip_field(p, end);
+            p = to_value(p, end); e.event_time_ms = parse_int64_fast(p, end);
+            e.sequence = e.event_time_ms;
+            while (p < end && (*p == ',' || *p == ' ')) ++p;
+            p = skip_field(p, end);  // skip "s"
             e.resume_pos = p; e.valid = true;
             break;
         default: break;
@@ -391,6 +421,120 @@ inline DepthRemaining parse_depth_remaining(const uint8_t* p, const uint8_t* end
     if (p >= end || *p != '"') return r;
     p = to_value(p, end);
     r.asks_array = p;
+    return r;
+}
+
+// ── forceOrder remaining-field parser ──────────────────────────────────────
+
+struct ForceOrderRemaining {
+    int64_t price = 0;           // "p" order price
+    int64_t avg_price = 0;       // "ap" average fill price
+    int64_t orig_qty = 0;        // "q" original quantity
+    int64_t filled_qty = 0;      // "z" accumulated filled quantity
+    int64_t trade_time_ms = 0;   // "T" trade time
+    bool    is_sell = false;     // "S" == "SELL"
+    bool    valid = false;
+};
+
+// p at resume_pos (after "E":NNN,), skip to "o":{, then parse fields
+inline ForceOrderRemaining parse_force_order_remaining(const uint8_t* p, const uint8_t* end) {
+    ForceOrderRemaining r;
+    // Find the nested "o":{ object
+    while (p < end && *p != '{') ++p;
+    if (p >= end) return r;
+    ++p;  // skip '{'
+    while (p < end && *p == ' ') ++p;
+
+    // "s"(skip)
+    if (p >= end || *p != '"') return r;
+    p = skip_field(p, end);
+    // "S"(side) — extract single char after ":"
+    if (p >= end || *p != '"') return r;
+    p = to_value(p, end);
+    if (p >= end || *p != '"') return r;
+    ++p;  // skip opening '"'
+    if (p < end && *p == 'S') r.is_sell = true;
+    p = skip_string(p - 1, end);  // skip past value string
+    while (p < end && (*p == ',' || *p == ' ')) ++p;
+    // "o"(skip order type)
+    if (p >= end || *p != '"') return r;
+    p = skip_field(p, end);
+    // "f"(skip timeInForce)
+    if (p >= end || *p != '"') return r;
+    p = skip_field(p, end);
+    // "q"(orig_qty)
+    if (p >= end || *p != '"') return r;
+    p = to_value(p, end);
+    r.orig_qty = parse_decimal_string(p, end);
+    while (p < end && (*p == ',' || *p == ' ')) ++p;
+    // "p"(price)
+    if (p >= end || *p != '"') return r;
+    p = to_value(p, end);
+    r.price = parse_decimal_string(p, end);
+    while (p < end && (*p == ',' || *p == ' ')) ++p;
+    // "ap"(avg_price)
+    if (p >= end || *p != '"') return r;
+    p = to_value(p, end);
+    r.avg_price = parse_decimal_string(p, end);
+    while (p < end && (*p == ',' || *p == ' ')) ++p;
+    // "X"(skip status)
+    if (p >= end || *p != '"') return r;
+    p = skip_field(p, end);
+    // "l"(skip last filled qty)
+    if (p >= end || *p != '"') return r;
+    p = skip_field(p, end);
+    // "z"(filled_qty)
+    if (p >= end || *p != '"') return r;
+    p = to_value(p, end);
+    r.filled_qty = parse_decimal_string(p, end);
+    while (p < end && (*p == ',' || *p == ' ')) ++p;
+    // "T"(trade_time)
+    if (p >= end || *p != '"') return r;
+    p = to_value(p, end);
+    r.trade_time_ms = parse_int64_fast(p, end);
+    r.valid = true;
+    return r;
+}
+
+// ── markPriceUpdate remaining-field parser ─────────────────────────────────
+
+struct MarkPriceRemaining {
+    int64_t mark_price = 0;          // "p"
+    int64_t index_price = 0;         // "i"
+    int64_t settle_price = 0;        // "P"
+    int64_t funding_rate = 0;        // "r"
+    int64_t next_funding_time_ms = 0; // "T"
+    bool    valid = false;
+};
+
+// p at resume_pos (after "s" skip), pointing at "p" field
+inline MarkPriceRemaining parse_mark_price_remaining(const uint8_t* p, const uint8_t* end) {
+    MarkPriceRemaining r;
+    // "p"(mark_price)
+    if (p >= end || *p != '"') return r;
+    p = to_value(p, end);
+    r.mark_price = parse_decimal_string(p, end);
+    while (p < end && (*p == ',' || *p == ' ')) ++p;
+    // "i"(index_price)
+    if (p >= end || *p != '"') return r;
+    p = to_value(p, end);
+    r.index_price = parse_decimal_string(p, end);
+    while (p < end && (*p == ',' || *p == ' ')) ++p;
+    // "P"(settle_price)
+    if (p >= end || *p != '"') return r;
+    p = to_value(p, end);
+    r.settle_price = parse_decimal_string(p, end);
+    while (p < end && (*p == ',' || *p == ' ')) ++p;
+    // "r"(funding_rate)
+    if (p >= end || *p != '"') return r;
+    p = to_value(p, end);
+    r.funding_rate = parse_decimal_string(p, end);
+    while (p < end && (*p == ',' || *p == ' ')) ++p;
+    // "T"(next_funding_time)
+    if (p >= end || *p != '"') return r;
+    p = to_value(p, end);
+    r.next_funding_time_ms = parse_int64_fast(p, end);
+    r.valid = true;
     return r;
 }
 
@@ -675,6 +819,23 @@ struct JsonParseState {
     }
 };
 
+// ── Interleave state for multi-connection same-SEQ dedup ────────────────────
+//
+// When N connections receive the same depth delta (same seq), the first to flush
+// claims committed_count. Later connections verify the boundary entry and only
+// publish entries beyond the committed boundary.
+struct InterleaveState {
+    int64_t  seq = 0;
+    uint16_t committed_count = 0;   // entries committed for this seq
+    bool     finished = false;      // any connection fully parsed this seq
+    websocket::msg::DeltaEntry boundary_entry{};  // entry at committed_count-1
+
+    void reset(int64_t new_seq) {
+        seq = new_seq; committed_count = 0; finished = false;
+        boundary_entry = {};
+    }
+};
+
 // ── Streaming level parser ──────────────────────────────────────────────────
 
 struct StreamingParseResult {
@@ -833,11 +994,21 @@ inline void trade_streaming_continue(
 }
 
 // Flush accumulated delta_buf — buffer into pending_depth_[ch] for deferred publish
+// Interleave-aware: when multiple connections parse the same seq, entries beyond
+// the committed boundary are published after boundary verification.
 template<typename Handler>
 inline void flush_depth_deltas_json(Handler& self, JsonParseState& state, uint8_t ci,
                                      websocket::pipeline::WSFrameInfo& info,
                                      bool is_final = false) {
-    if (state.delta_count == 0) return;
+    if (state.delta_count == 0) {
+        if (is_final) {
+            uint8_t ch = depth_channel_index(static_cast<UsdmStreamType>(state.msg_type));
+            if (ch >= Handler::DEPTH_CHANNELS) ch = 0;
+            auto& il = self.interleave_[ch];
+            if (il.seq == state.sequence) il.finished = true;
+        }
+        return;
+    }
     uint8_t count = state.delta_count;
 
     // Apply scale factors before buffering
@@ -849,10 +1020,51 @@ inline void flush_depth_deltas_json(Handler& self, JsonParseState& state, uint8_
     // Determine depth channel from stream type
     uint8_t ch = depth_channel_index(static_cast<UsdmStreamType>(state.msg_type));
     if (ch >= Handler::DEPTH_CHANNELS) ch = 0;
+
+    // ── Interleave skip + verify ──
+    auto& il = self.interleave_[ch];
+    if (il.seq != state.sequence) il.reset(state.sequence);
+
+    uint16_t cumul = state.bids_count + state.asks_count;
+    uint16_t prev_cumul = cumul - count;
+    uint8_t skip = 0;
+
+    if (cumul <= il.committed_count) {
+        // All entries already committed — skip entirely
+        state.flush_count++;
+        state.delta_count = 0;
+        if (is_final) il.finished = true;
+        return;
+    }
+
+    if (prev_cumul < il.committed_count && il.committed_count > 0) {
+        // Boundary crossing — verify entry at committed_count - 1
+        uint16_t boundary_idx = il.committed_count - 1 - prev_cumul;
+        auto& cached = il.boundary_entry;
+        auto& check = state.delta_buf[boundary_idx];
+        if (check.price != cached.price || check.qty != cached.qty) {
+            std::fprintf(stderr, "WARN: interleave mismatch seq=%lld ch=%u at entry %u\n",
+                    (long long)state.sequence, ch, il.committed_count - 1);
+            // Reject this connection for this seq, don't set finished —
+            // wait for the original connection to complete
+            state.deduped = true;
+            state.phase = JsonParseState::DONE;
+            state.delta_count = 0;
+            return;
+        }
+        skip = static_cast<uint8_t>(il.committed_count - prev_cumul);
+    }
+
+    uint8_t publish_count = count - skip;
+
     auto& pd = self.pending_depth_[ch];
 
+    // Connection switch: if pending has entries from a different connection, flush first
+    if (pd.has_pending && pd.ci != ci)
+        self.publish_pending_depth(ch, false);
+
     // Overflow: pending + new > MAX_DELTAS → publish pending first
-    if (pd.has_pending && pd.count + count > websocket::msg::MAX_DELTAS)
+    if (pd.has_pending && pd.count + publish_count > websocket::msg::MAX_DELTAS)
         self.publish_pending_depth(ch, false);
 
     // Initialize pending on first entry in batch
@@ -864,12 +1076,17 @@ inline void flush_depth_deltas_json(Handler& self, JsonParseState& state, uint8_
         pd.info = info;
     }
 
-    // Append to pending buffer
-    std::memcpy(pd.entries + pd.count, state.delta_buf,
-                count * sizeof(websocket::msg::DeltaEntry));
-    pd.count += count;
+    // Append only the new entries (past the skip boundary)
+    std::memcpy(pd.entries + pd.count, state.delta_buf + skip,
+                publish_count * sizeof(websocket::msg::DeltaEntry));
+    pd.count += publish_count;
     pd.seq = state.sequence;
     pd.event_ts_ns = state.event_time_ms * 1000000LL;
+
+    // Update interleave state
+    il.boundary_entry = state.delta_buf[count - 1];
+    il.committed_count = cumul;
+    if (is_final) il.finished = true;
 
     state.flush_count++;
     state.delta_count = 0;
@@ -1074,10 +1291,14 @@ struct BinanceUSDMJsonParser {
     websocket::pipeline::IPCRingProducer<websocket::msg::MktEvent>* mkt_event_prod = nullptr;
     websocket::pipeline::ConnStateShm* conn_state = nullptr;
     bool merge_enabled = true;
-    static constexpr int DEPTH_CHANNELS = 3;
-    int64_t last_book_seq_[DEPTH_CHANNELS] = {};  // per depth-diff channel (0=100ms, 1=250ms, 2=500ms)
+    static constexpr int DEPTH_CHANNELS = 4;
+    int64_t last_book_seq_[DEPTH_CHANNELS] = {};  // per depth-diff channel (0=0ms, 1=100ms, 2=250ms, 3=500ms)
+    InterleaveState interleave_[DEPTH_CHANNELS]{};
     int64_t last_snapshot_seq_ = 0;  // dedup depth20 snapshots across connections
     int64_t last_trade_id_ = 0;
+    int64_t last_liq_time_ = 0;
+    int64_t last_mark_price_time_ = 0;
+    uint16_t instrument_id = 0;
     uint8_t active_ci_ = 0xFF;
     websocket::pipeline::WSFrameInfo* current_info_ = nullptr;
 
@@ -1152,9 +1373,10 @@ struct BinanceUSDMJsonParser {
                 info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY); break;
             case UsdmStreamType::DEPTH_PARTIAL:
                 info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT); break;
-            case UsdmStreamType::DEPTH_DIFF:
+            case UsdmStreamType::DEPTH_DIFF_0:
             case UsdmStreamType::DEPTH_DIFF_1:
             case UsdmStreamType::DEPTH_DIFF_2:
+            case UsdmStreamType::DEPTH_DIFF_3:
                 info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA); break;
             default: break;
             }
@@ -1185,6 +1407,15 @@ struct BinanceUSDMJsonParser {
                     state.phase = JsonParseState::DONE;
                     info.set_discard_early(true);
                     return;
+                }
+                if (state.sequence == last_book_seq_[ch]) {
+                    auto& il = interleave_[ch];
+                    if (il.seq == state.sequence && il.finished) {
+                        state.deduped = true;
+                        state.phase = JsonParseState::DONE;
+                        info.set_discard_early(true);
+                        return;
+                    }
                 }
             } else if (type == UsdmStreamType::DEPTH_PARTIAL) {
                 // Snapshot: check against all channels
@@ -1256,11 +1487,18 @@ struct BinanceUSDMJsonParser {
         }
 
         case UsdmStreamType::DEPTH_PARTIAL:
-        case UsdmStreamType::DEPTH_DIFF:
+        case UsdmStreamType::DEPTH_DIFF_0:
         case UsdmStreamType::DEPTH_DIFF_1:
-        case UsdmStreamType::DEPTH_DIFF_2: {
+        case UsdmStreamType::DEPTH_DIFF_2:
+        case UsdmStreamType::DEPTH_DIFF_3: {
             if (has_pending_trades_) flush_pending_trades();
             bool is_snapshot = (type == UsdmStreamType::DEPTH_PARTIAL);
+            if (is_snapshot) {
+                // Flush pending deltas before snapshot to prevent stale
+                // fragments from being published after the snapshot
+                for (int ch = 0; ch < DEPTH_CHANNELS; ch++)
+                    if (pending_depth_[ch].has_pending) publish_pending_depth(ch, true);
+            }
             info.mkt_event_type = static_cast<uint8_t>(
                 is_snapshot ? websocket::msg::EventType::BOOK_SNAPSHOT : websocket::msg::EventType::BOOK_DELTA);
 
@@ -1279,12 +1517,16 @@ struct BinanceUSDMJsonParser {
                     return;
                 }
                 last_snapshot_seq_ = e.sequence;
-                // Snapshot resets all channels
-                for (int c = 0; c < DEPTH_CHANNELS; c++)
+                // Snapshot resets all channels + interleave state (finished=true: snapshot claims seq)
+                for (int c = 0; c < DEPTH_CHANNELS; c++) {
                     last_book_seq_[c] = e.sequence;
+                    interleave_[c].reset(e.sequence);
+                    interleave_[c].finished = true;
+                }
             } else {
                 uint8_t ch = depth_channel_index(type);
-                if (e.sequence <= last_book_seq_[ch]) {
+                if (e.sequence < last_book_seq_[ch]) {
+                    // Strictly older — discard
                     info.set_discard_early(true);
                     state.msg_type = e.msg_type;
                     state.sequence = e.sequence;
@@ -1293,7 +1535,24 @@ struct BinanceUSDMJsonParser {
                     state.phase = JsonParseState::DONE;
                     return;
                 }
-                last_book_seq_[ch] = e.sequence;
+                if (e.sequence == last_book_seq_[ch]) {
+                    auto& il = interleave_[ch];
+                    if (il.seq == e.sequence && il.finished) {
+                        // Fully parsed already — discard
+                        info.set_discard_early(true);
+                        state.msg_type = e.msg_type;
+                        state.sequence = e.sequence;
+                        state.event_time_us = e.event_time_ms * 1000;
+                        state.deduped = true;
+                        state.phase = JsonParseState::DONE;
+                        return;
+                    }
+                    // Same seq, not finished — allow interleaving
+                } else {
+                    // New seq — claim and reset interleave
+                    last_book_seq_[ch] = e.sequence;
+                    interleave_[ch].reset(e.sequence);
+                }
             }
 
             state.phase = JsonParseState::HEADER_PARSED;
@@ -1310,6 +1569,95 @@ struct BinanceUSDMJsonParser {
             current_info_ = &info;
             depth_streaming_continue(*this, state, ci, payload, len, info);
             current_info_ = nullptr;
+            break;
+        }
+
+        case UsdmStreamType::FORCE_ORDER: {
+            if (has_pending_trades_) flush_pending_trades();
+            for (int ch = 0; ch < DEPTH_CHANNELS; ch++)
+                if (pending_depth_[ch].has_pending) publish_pending_depth(ch, true);
+            info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::LIQUIDATION);
+            info.mkt_event_count = 1;
+
+            if (e.sequence <= last_liq_time_) {
+                info.set_discard_early(true);
+                state.msg_type = e.msg_type;
+                state.sequence = e.sequence;
+                state.event_time_us = e.event_time_ms * 1000;
+                state.deduped = true;
+                state.phase = JsonParseState::DONE;
+                return;
+            }
+            last_liq_time_ = e.sequence;
+
+            auto fo = parse_force_order_remaining(e.resume_pos, e.data_end);
+            if (!fo.valid) return;
+
+            record_win(ci);
+            current_info_ = &info;
+            publish_event([&](websocket::msg::MktEvent& ev) {
+                ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::LIQUIDATION);
+                ev.src_seq = e.sequence;
+                ev.event_ts_ns = e.event_time_ms * 1000000LL;
+                ev.count = 1;
+                auto& liq = ev.payload.liquidations.entries[0];
+                liq.price = fo.price * websocket::market::BinanceUSDM::price_scale;
+                liq.avg_price = fo.avg_price * websocket::market::BinanceUSDM::price_scale;
+                liq.orig_qty = fo.orig_qty * websocket::market::BinanceUSDM::qty_scale;
+                liq.filled_qty = fo.filled_qty * websocket::market::BinanceUSDM::qty_scale;
+                liq.trade_time_ns = fo.trade_time_ms * 1000000LL;
+                liq.flags = fo.is_sell ? websocket::msg::LiqFlags::SIDE_SELL : 0;
+                std::memset(liq._pad, 0, sizeof(liq._pad));
+            });
+            current_info_ = nullptr;
+            state.msg_type = e.msg_type;
+            state.sequence = e.sequence;
+            state.event_time_us = e.event_time_ms * 1000;
+            state.phase = JsonParseState::DONE;
+            break;
+        }
+
+        case UsdmStreamType::MARK_PRICE: {
+            if (has_pending_trades_) flush_pending_trades();
+            for (int ch = 0; ch < DEPTH_CHANNELS; ch++)
+                if (pending_depth_[ch].has_pending) publish_pending_depth(ch, true);
+            info.mkt_event_type = static_cast<uint8_t>(websocket::msg::EventType::MARK_PRICE);
+            info.mkt_event_count = 1;
+
+            if (e.sequence <= last_mark_price_time_) {
+                info.set_discard_early(true);
+                state.msg_type = e.msg_type;
+                state.sequence = e.sequence;
+                state.event_time_us = e.event_time_ms * 1000;
+                state.deduped = true;
+                state.phase = JsonParseState::DONE;
+                return;
+            }
+            last_mark_price_time_ = e.sequence;
+
+            auto mp = parse_mark_price_remaining(e.resume_pos, e.data_end);
+            if (!mp.valid) return;
+
+            record_win(ci);
+            current_info_ = &info;
+            publish_event([&](websocket::msg::MktEvent& ev) {
+                ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::MARK_PRICE);
+                ev.src_seq = e.sequence;
+                ev.event_ts_ns = e.event_time_ms * 1000000LL;
+                ev.count = 1;
+                auto& entry = ev.payload.mark_prices.entries[0];
+                entry.mark_price = mp.mark_price * websocket::market::BinanceUSDM::BTCUSDT::mp_price_scale;
+                entry.index_price = mp.index_price * websocket::market::BinanceUSDM::BTCUSDT::mp_price_scale;
+                entry.settle_price = mp.settle_price * websocket::market::BinanceUSDM::BTCUSDT::mp_price_scale;
+                entry.funding_rate = mp.funding_rate * websocket::market::BinanceUSDM::BTCUSDT::mp_rate_scale;
+                entry.next_funding_ns = mp.next_funding_time_ms * 1000000LL;
+                std::memset(entry._pad, 0, sizeof(entry._pad));
+            });
+            current_info_ = nullptr;
+            state.msg_type = e.msg_type;
+            state.sequence = e.sequence;
+            state.event_time_us = e.event_time_ms * 1000;
+            state.phase = JsonParseState::DONE;
             break;
         }
 
@@ -1371,7 +1719,7 @@ struct BinanceUSDMJsonParser {
         if (slot < 0) return;
         auto& e = (*mkt_event_prod)[slot];
         e.clear();
-        e.venue_id = static_cast<uint8_t>(websocket::msg::VenueId::BINANCE);
+        e.venue_id = static_cast<uint8_t>(websocket::msg::VenueId::BINANCE_USDM);
         e.event_type = static_cast<uint8_t>(websocket::msg::EventType::SYSTEM_STATUS);
         struct timespec ts_real;
         clock_gettime(CLOCK_REALTIME, &ts_real);
@@ -1393,7 +1741,8 @@ struct BinanceUSDMJsonParser {
         if (slot < 0) return;
         auto& e = (*mkt_event_prod)[slot];
         e.clear();
-        e.venue_id = static_cast<uint8_t>(websocket::msg::VenueId::BINANCE);
+        e.venue_id = static_cast<uint8_t>(websocket::msg::VenueId::BINANCE_USDM);
+        e.instrument_id = instrument_id;
         struct timespec ts_real, ts_mono;
         clock_gettime(CLOCK_REALTIME, &ts_real);
         clock_gettime(CLOCK_MONOTONIC, &ts_mono);

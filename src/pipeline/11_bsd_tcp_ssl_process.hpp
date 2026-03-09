@@ -664,6 +664,7 @@ class BSDSocketTransportProcess {
 
     // Number of connections
     static constexpr size_t NUM_CONN = MaxConn;
+    uint8_t n_active_ = NUM_CONN;  // Actual active connections (may be < NUM_CONN when DNS-capped)
 
     // Ring buffer configuration
     static constexpr size_t RING_SIZE = 64;  // Must be power of 2
@@ -719,10 +720,19 @@ public:
             msg_metadata_prod_[i] = msg_metadata_prods[i];
         }
 
+        // Cache actual active connection count (may be < MaxConn when DNS-capped)
+        if constexpr (MaxConn > 1) {
+            n_active_ = conn_state_ ? conn_state_->actual_conn_count : NUM_CONN;
+            if (n_active_ > NUM_CONN) n_active_ = NUM_CONN;
+            if (n_active_ < MaxConn)
+                printf("[BSD-Transport] Active connections: %u / %zu (DNS-capped)\n",
+                       n_active_, MaxConn);
+        }
+
         if constexpr (AutoReconnect) {
-            // Non-blocking startup: initiate TCP connect for all connections
+            // Non-blocking startup: initiate TCP connect for active connections
             // State machine in run() handles TCP→TLS→TLS_READY→ACTIVE
-            for (size_t ci = 0; ci < NUM_CONN; ci++) {
+            for (size_t ci = 0; ci < n_active_; ci++) {
                 int rc = create_and_connect_nonblocking(ci);
                 reconn_[ci].phase = (rc == 0) ? BSDConnPhase::TCP_CONNECTING : BSDConnPhase::WAITING_RETRY;
                 reconn_[ci].phase_start_cycle = rdtsc();
@@ -746,8 +756,8 @@ public:
             return true;
         }
 
-        // !AutoReconnect: blocking TCP connect + SSL handshake for each connection
-        for (size_t ci = 0; ci < NUM_CONN; ci++) {
+        // !AutoReconnect: blocking TCP connect + SSL handshake for active connections
+        for (size_t ci = 0; ci < n_active_; ci++) {
             // Create socket
             sockfd_[ci] = socket(AF_INET, SOCK_STREAM, 0);
             if (sockfd_[ci] < 0) {
@@ -1255,7 +1265,7 @@ private:
             uint32_t other_ips[NUM_CONN > 1 ? NUM_CONN - 1 : 1];
             size_t other_count = 0;
             if constexpr (MaxConn > 1) {
-                for (size_t oi = 0; oi < NUM_CONN; oi++) {
+                for (size_t oi = 0; oi < n_active_; oi++) {
                     if (oi != ci) other_ips[other_count++] = conn_state_->conn_target_ip[oi];
                 }
             }
@@ -1813,13 +1823,13 @@ private:
         constexpr size_t RAW_RECV_BUFSIZE = 16384;
         [[maybe_unused]] uint8_t raw_recv_buf[RAW_RECV_BUFSIZE];  // Used by NoSSL path
 
-        for (size_t ci = 0; ci < NUM_CONN; ci++) {
+        for (size_t ci = 0; ci < n_active_; ci++) {
             reinit_event_policy(ci, event_policy[ci]);
             recv_buf[ci] = std::make_unique<BSDZeroCopyRecvBuffer>();
         }
 
         while (running_.load(std::memory_order_acquire)) {
-            for (size_t ci = 0; ci < NUM_CONN; ci++) {
+            for (size_t ci = 0; ci < n_active_; ci++) {
 
                 if constexpr (AutoReconnect) {
                     auto disp = dispatch_reconnect_phase(ci, event_policy[ci]);
@@ -2060,7 +2070,7 @@ private:
         constexpr size_t RAW_RECV_BUFSIZE = 16384;
         [[maybe_unused]] uint8_t raw_recv_buf[RAW_RECV_BUFSIZE];  // Used by NoSSL path
 
-        for (size_t ci = 0; ci < NUM_CONN; ci++) {
+        for (size_t ci = 0; ci < n_active_; ci++) {
             reinit_event_policy(ci, event_policy[ci]);
             recv_buf[ci] = std::make_unique<BSDZeroCopyRecvBuffer>();
         }
@@ -2078,7 +2088,7 @@ private:
 
             // ── AutoReconnect: drive state machines for non-ACTIVE connections ──
             if constexpr (AutoReconnect) {
-                for (size_t ci = 0; ci < NUM_CONN; ci++) {
+                for (size_t ci = 0; ci < n_active_; ci++) {
                     auto disp = dispatch_reconnect_phase(ci, event_policy[ci]);
                     if (disp == ReconnDispatch::TLS_READY) {
                         process_tls_ready_read(ci);
@@ -2097,12 +2107,12 @@ private:
             // Active connection appears first in pfds[] for priority processing
             int nfds = 0;
             uint8_t conn_order[NUM_CONN];
-            // Fill with 0..NUM_CONN-1 then move the active connection to front
-            for (size_t i = 0; i < NUM_CONN; i++) conn_order[i] = static_cast<uint8_t>(i);
+            // Fill with active connections then move the active connection to front
+            for (size_t i = 0; i < n_active_; i++) conn_order[i] = static_cast<uint8_t>(i);
             if constexpr (MaxConn > 1) {
                 if (active_conn_ptr_) {
                     uint8_t a = *active_conn_ptr_;
-                    if (a < NUM_CONN && a != 0) {
+                    if (a < n_active_ && a != 0) {
                         // Swap active to front
                         conn_order[0] = a;
                         conn_order[a] = 0;
@@ -2110,7 +2120,7 @@ private:
                 }
             }
 
-            for (size_t i = 0; i < NUM_CONN; i++) {
+            for (size_t i = 0; i < n_active_; i++) {
                 size_t ci = conn_order[i];
                 if (sockfd_[ci] < 0) continue;
                 if constexpr (AutoReconnect) {
@@ -2355,12 +2365,12 @@ private:
         uint8_t recv_buf[RECV_BUFSIZE];
 
         typename IOPolicy::event_policy_t event_policy[NUM_CONN];
-        for (size_t ci = 0; ci < NUM_CONN; ci++) {
+        for (size_t ci = 0; ci < n_active_; ci++) {
             reinit_event_policy(ci, event_policy[ci]);
         }
 
         while (running_.load(std::memory_order_acquire)) {
-            for (size_t ci = 0; ci < NUM_CONN; ci++) {
+            for (size_t ci = 0; ci < n_active_; ci++) {
 
                 if constexpr (AutoReconnect) {
                     auto disp = dispatch_reconnect_phase(ci, event_policy[ci]);
@@ -2433,7 +2443,7 @@ private:
             ChunkPoolBuffer chunk_pool_buf;
         };
         PerConnSSLState conn_ssl[NUM_CONN];
-        for (size_t ci = 0; ci < NUM_CONN; ci++) {
+        for (size_t ci = 0; ci < n_active_; ci++) {
             conn_ssl[ci].rx_pool = std::make_unique<std::array<EncryptedChunk, RX_POOL_SIZE>>();
             conn_ssl[ci].chunk_pool_buf.pool_ = conn_ssl[ci].rx_pool.get();
         }
@@ -2447,7 +2457,7 @@ private:
             }
 
             // ========== RX Path: Per-connection decrypt ==========
-            for (size_t ci = 0; ci < NUM_CONN; ci++) {
+            for (size_t ci = 0; ci < n_active_; ci++) {
                 auto& cs = conn_ssl[ci];
 
                 if constexpr (AutoReconnect) {

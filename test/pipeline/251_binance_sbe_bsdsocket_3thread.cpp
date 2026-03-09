@@ -630,6 +630,7 @@ int main(int argc, char* argv[]) {
     }
 
     g_conn_state = pipeline.conn_state();
+    pipeline.mkt_event_handler().instrument_id = 1;  // btcusdt
 
     // Set subscription JSON
     pipeline.set_subscription_json(

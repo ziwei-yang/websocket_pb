@@ -546,23 +546,38 @@ public:
                 return false;
             }
 
+            constexpr size_t UNIQUE_IPS = (MaxConn > 1)
+                ? (MaxConn + Traits::CONN_PER_IP - 1) / Traits::CONN_PER_IP
+                : 1;
             websocket::net::IpSelector selector;
-            if (selector.build(probe_result_) != 0) {
+            if (selector.build(probe_result_, UNIQUE_IPS) != 0) {
                 fprintf(stderr, "FAIL: No reachable IPs for %s\n", Traits::WSS_HOST);
                 return false;
             }
 
             if constexpr (MaxConn > 1) {
+                constexpr size_t CONN_PER_IP = Traits::CONN_PER_IP;
                 std::vector<const websocket::net::ProbeEntry*> assigned_ips;
-                size_t assigned = selector.assign_multi(MaxConn, assigned_ips);
-                actual_conn_count_ = static_cast<uint8_t>(assigned);
+                size_t assigned = selector.assign_multi(UNIQUE_IPS, assigned_ips);
+                actual_conn_count_ = static_cast<uint8_t>(
+                    std::min(MaxConn, assigned * CONN_PER_IP));
                 for (size_t i = 0; i < MaxConn; ++i) {
-                    conn_target_ip_[i] = (i < assigned) ? assigned_ips[i]->ipv4_net()
-                                                         : assigned_ips[0]->ipv4_net();
+                    size_t ip_idx = i / CONN_PER_IP;
+                    if (ip_idx < assigned)
+                        conn_target_ip_[i] = assigned_ips[ip_idx]->ipv4_net();
+                    // else: stays 0 (dormant — never connected)
                 }
-                printf("Target: %zu connections assigned\n", assigned);
+                size_t unique_ips_used = std::min(UNIQUE_IPS, assigned);
+                printf("Target: %zu unique IPs, %zu conn/IP, %u connections",
+                       unique_ips_used, CONN_PER_IP, actual_conn_count_);
+                if (actual_conn_count_ < MaxConn)
+                    printf(" (capped from %zu by DNS)", MaxConn);
+                printf("\n");
                 for (size_t i = 0; i < assigned; ++i) {
-                    printf("  conn%zu=%s (%ldus)\n", i, assigned_ips[i]->ip_str, assigned_ips[i]->rtt_us);
+                    printf("  IP%zu=%s (%ldus)", i, assigned_ips[i]->ip_str, assigned_ips[i]->rtt_us);
+                    for (size_t c = i * CONN_PER_IP; c < std::min(MaxConn, (i + 1) * CONN_PER_IP); ++c)
+                        printf(" conn%zu", c);
+                    printf("\n");
                 }
             } else {
                 const auto* ip = selector.fastest();
@@ -572,7 +587,14 @@ public:
             }
         }
         printf("Host:       %s:%u\n", Traits::WSS_HOST, Traits::WSS_PORT);
-        printf("Path:       %s\n\n", Traits::WSS_PATH);
+        if constexpr (requires { Traits::conn_path(uint8_t{0}); }) {
+            printf("Paths:      (per-connection, %u active)\n", actual_conn_count_);
+            for (size_t i = 0; i < actual_conn_count_; ++i)
+                printf("  conn%zu: %s\n", i, Traits::conn_path(i));
+            printf("\n");
+        } else {
+            printf("Path:       %s\n\n", Traits::WSS_PATH);
+        }
 
         // TSC calibration
         tsc_freq_ghz_ = bsd_pipeline_helpers::calibrate_tsc_ghz();
@@ -621,7 +643,15 @@ public:
         // Populate shared state
         strncpy(conn_state_->target_host, Traits::WSS_HOST, sizeof(conn_state_->target_host) - 1);
         conn_state_->target_port = Traits::WSS_PORT;
-        strncpy(conn_state_->target_path, Traits::WSS_PATH, sizeof(conn_state_->target_path) - 1);
+        for (size_t i = 0; i < NUM_CONN; ++i) {
+            if constexpr (requires { Traits::conn_path(uint8_t{0}); }) {
+                strncpy(conn_state_->target_path[i], Traits::conn_path(i),
+                        sizeof(conn_state_->target_path[i]) - 1);
+            } else {
+                strncpy(conn_state_->target_path[i], Traits::WSS_PATH,
+                        sizeof(conn_state_->target_path[i]) - 1);
+            }
+        }
         conn_state_->tsc_freq_hz = static_cast<uint64_t>(tsc_freq_ghz_ * 1e9);
 
         // IP probe target IPs

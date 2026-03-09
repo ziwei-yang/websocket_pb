@@ -278,6 +278,24 @@ struct TestHarness {
         }
     }
 
+    // Feed truncated payload — does NOT reset state (simulates continuation fragment)
+    void feed_fragment(uint8_t ci, const SBEBuilder& b, uint32_t truncated_len) {
+        WSFrameInfo info{};
+        info.clear();
+        info.connection_id = ci;
+        handler.on_ws_data(handler.sbe_state_[ci], ci, b.data(), truncated_len, info);
+        // Do NOT reset state — continuation fragment
+
+        int64_t seq = ws_prod->try_claim();
+        assert(seq >= 0);
+        (*ws_prod)[seq] = info;
+        ws_prod->publish(seq);
+        if (handler.pending_ring_seq_slot_) {
+            *handler.pending_ring_seq_slot_ = seq;
+            handler.pending_ring_seq_slot_ = nullptr;
+        }
+    }
+
     void idle() {
         handler.on_batch_end(0);
     }
@@ -2402,6 +2420,123 @@ void test_cross_type_depth_then_trades() {
 }
 
 // ============================================================================
+// Same-SEQ interleave tests
+// ============================================================================
+
+// Helper: count delta entries across all BOOK_DELTA events
+static int sbe_count_delta_entries(const std::vector<MktEvent>& events) {
+    int total = 0;
+    for (auto& e : events) {
+        if (e.is_book_delta()) total += e.count;
+    }
+    return total;
+}
+
+// Test: conn0 finishes depth diff, conn1 same seq → fully deduped
+void test_sbe_interleave_basic() {
+    TestHarness h;
+
+    int64_t bp[] = {50000, 49000, 48000}, bq[] = {1000, 2000, 3000};
+    int64_t ap[] = {50100, 51000}, aq[] = {1500, 2500};
+    auto b = build_depth_diff_msg(1000000, 500, 505, -8, -8,
+                                   3, bp, bq, 2, ap, aq, "BTCUSDT");
+
+    // conn0: complete frame → 5 entries committed, finished=true
+    h.feed_frame(0, b);
+    h.idle();
+
+    auto events0 = h.published();
+    int entries0 = sbe_count_delta_entries(events0);
+    assert(entries0 == 5);
+
+    // conn1: same seq=505, same data → deduped (finished fast-path)
+    h.feed_frame(1, b);
+    h.idle();
+
+    auto events1 = h.published();
+    int entries1 = sbe_count_delta_entries(events1);
+    assert(entries1 == entries0);  // no new entries
+}
+
+// Test: conn0 fragment (partial), conn1 complete → conn1 fills in excess entries
+void test_sbe_interleave_conn1_faster() {
+    TestHarness h;
+
+    // Build depth diff with 5 bids + 5 asks = 10 entries
+    int64_t bp[5], bq[5], ap[5], aq[5];
+    for (int i = 0; i < 5; i++) {
+        bp[i] = 50000 + i * 100;
+        bq[i] = 1000 + i;
+        ap[i] = 60000 + i * 100;
+        aq[i] = 2000 + i;
+    }
+    auto b = build_depth_diff_msg(1000000, 500, 505, -8, -8,
+                                   5, bp, bq, 5, ap, aq, "BTCUSDT");
+
+    // conn0: fragment — truncate partway through bids group entries.
+    // Header(8) + root(26) = 34 bytes. Then bids group header(4) + 3 entries(48) = 52.
+    // Total for 3 bids parsed: 34 + 4 + 48 = 86 bytes.
+    uint32_t trunc_after_3_bids = 8 + 26 + 4 + 3 * 16;  // 86
+    assert(trunc_after_3_bids < b.size());
+
+    h.feed_fragment(0, b, trunc_after_3_bids);
+    // interleave_.committed_count = 3 (3 bids parsed and flushed)
+
+    // conn1: complete frame (10 entries total)
+    // Bids (5 entries): cumul=5, committed=3 → prev_cumul=0 < committed=3 < 5=cumul
+    //   boundary check at entry[2]: should match → skip=3, publish 2 bids
+    // Asks (5 entries): cumul=10, prev_cumul=5, committed=5 → prev_cumul < committed is false
+    //   skip=0, publish all 5 asks
+    h.feed_frame(1, b);
+    h.idle();
+
+    auto events_after_conn1 = h.published();
+    int entries_after_conn1 = sbe_count_delta_entries(events_after_conn1);
+    // 3 from conn0 fragment + 2 from conn1 bids + 5 from conn1 asks = 10
+    assert(entries_after_conn1 >= 10);
+
+    // Finish conn0 — should not add more (conn1 finished)
+    {
+        WSFrameInfo info2{};
+        info2.clear();
+        info2.connection_id = 0;
+        h.handler.on_ws_data(h.handler.sbe_state_[0], 0, b.data(),
+                             static_cast<uint32_t>(b.size()), info2);
+        h.handler.sbe_state_[0].reset();
+    }
+    h.idle();
+
+    auto events_final = h.published();
+    int final_entries = sbe_count_delta_entries(events_final);
+    assert(final_entries == entries_after_conn1);
+}
+
+// Test: conn0 finishes, conn1 arrives → immediate discard
+void test_sbe_interleave_finished_fast_path() {
+    TestHarness h;
+
+    int64_t bp[] = {50000, 49000}, bq[] = {1000, 2000};
+    int64_t ap[] = {50100, 51000}, aq[] = {1500, 2500};
+    auto b = build_depth_diff_msg(1000000, 500, 505, -8, -8,
+                                   2, bp, bq, 2, ap, aq, "BTCUSDT");
+
+    // conn0: complete
+    h.feed_frame(0, b);
+    h.idle();
+
+    auto events0 = h.published();
+    int entries0 = sbe_count_delta_entries(events0);
+    assert(entries0 == 4);
+
+    // conn1: same seq → deduped immediately
+    h.feed_frame(1, b);
+    h.idle();
+
+    auto events1 = h.published();
+    assert(sbe_count_delta_entries(events1) == entries0);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -2572,6 +2707,16 @@ int main() {
     cleanup_ring_files();
 
     RUN_TEST(test_cross_type_depth_then_trades);
+    cleanup_ring_files();
+
+    std::printf("\n--- Same-SEQ interleave ---\n");
+    RUN_TEST(test_sbe_interleave_basic);
+    cleanup_ring_files();
+
+    RUN_TEST(test_sbe_interleave_conn1_faster);
+    cleanup_ring_files();
+
+    RUN_TEST(test_sbe_interleave_finished_fast_path);
     cleanup_ring_files();
 
     std::printf("\n=== %d/%d tests passed ===\n", tests_passed, tests_total);

@@ -528,14 +528,29 @@ namespace websocket::sbe {
         }
     };
 
+    // Interleave state for multi-connection same-SEQ dedup (SBE single channel)
+    struct InterleaveState {
+        int64_t  seq = 0;
+        uint16_t committed_count = 0;
+        bool     finished = false;
+        websocket::msg::DeltaEntry boundary_entry{};
+
+        void reset(int64_t new_seq) {
+            seq = new_seq; committed_count = 0; finished = false;
+            boundary_entry = {};
+        }
+    };
+
 struct BinanceSBEHandler {
     static constexpr bool enabled = true;
     websocket::pipeline::IPCRingProducer<websocket::msg::MktEvent>* mkt_event_prod = nullptr;
     websocket::pipeline::ConnStateShm* conn_state = nullptr;
     bool merge_enabled = true;
     int64_t last_book_seq_ = 0;
+    InterleaveState interleave_{};
     int64_t last_bbo_seq_ = 0;
     int64_t last_trade_id_ = 0;
+    uint16_t instrument_id = 0;
     uint8_t active_ci_ = 0xFF;
     websocket::pipeline::WSFrameInfo* current_info_ = nullptr;
 
@@ -624,6 +639,14 @@ struct BinanceSBEHandler {
                     info.set_discard_early(true);
                     return;
                 }
+                if (state.msg_type == DEPTH_DIFF_STREAM &&
+                    state.sequence == last_book_seq_ &&
+                    interleave_.seq == state.sequence && interleave_.finished) {
+                    state.deduped = true;
+                    state.phase = SBEParseState::DONE;
+                    info.set_discard_early(true);
+                    return;
+                }
             }
         }
 
@@ -684,25 +707,52 @@ struct BinanceSBEHandler {
                 flush_pending_trades();
             if (has_pending_bbo_ && state.msg_type != BEST_BID_ASK_STREAM)
                 flush_pending_bbo();
-            if (has_pending_depth_ &&
-                state.msg_type != DEPTH_DIFF_STREAM && state.msg_type != DEPTH_SNAPSHOT_STREAM)
+            if (has_pending_depth_ && state.msg_type != DEPTH_DIFF_STREAM)
                 publish_pending_depth(true);
 
             // Stale detection (once, at header parse)
             // Trade stale check is deferred to TRADES_HEADER when we know the last trade_id
             if (state.sequence > 0 && state.msg_type != TRADES_STREAM
                 && state.msg_type != BEST_BID_ASK_STREAM) {
-                if (state.sequence <= last_book_seq_) {
-                    info.set_discard_early(true);
-                    state.deduped = true;
-                    state.phase = SBEParseState::DONE;
-                    return;
-                }
-                // For depth types, claim seq now so mid-stream delta flushes
-                // don't re-check. BBO uses its own last_bbo_seq_ tracking.
-                if (state.msg_type == DEPTH_SNAPSHOT_STREAM ||
-                    state.msg_type == DEPTH_DIFF_STREAM) {
+                if (state.msg_type == DEPTH_DIFF_STREAM) {
+                    if (state.sequence < last_book_seq_) {
+                        // Strictly older — discard
+                        info.set_discard_early(true);
+                        state.deduped = true;
+                        state.phase = SBEParseState::DONE;
+                        return;
+                    }
+                    if (state.sequence == last_book_seq_) {
+                        if (interleave_.seq == state.sequence && interleave_.finished) {
+                            // Fully parsed already — discard
+                            info.set_discard_early(true);
+                            state.deduped = true;
+                            state.phase = SBEParseState::DONE;
+                            return;
+                        }
+                        // Same seq, not finished — allow interleaving
+                    } else {
+                        // New seq — claim and reset interleave
+                        last_book_seq_ = state.sequence;
+                        interleave_.reset(state.sequence);
+                    }
+                } else if (state.msg_type == DEPTH_SNAPSHOT_STREAM) {
+                    if (state.sequence <= last_book_seq_) {
+                        info.set_discard_early(true);
+                        state.deduped = true;
+                        state.phase = SBEParseState::DONE;
+                        return;
+                    }
                     last_book_seq_ = state.sequence;
+                    interleave_.reset(state.sequence);
+                    interleave_.finished = true;  // snapshot claims seq
+                } else {
+                    if (state.sequence <= last_book_seq_) {
+                        info.set_discard_early(true);
+                        state.deduped = true;
+                        state.phase = SBEParseState::DONE;
+                        return;
+                    }
                 }
             }
 
@@ -1142,11 +1192,52 @@ private:
                             websocket::msg::EventType event_type,
                             uint16_t extra_flags,
                             bool is_final = false) {
-        if (state.delta_count == 0) return;
+        if (state.delta_count == 0) {
+            if (is_final && interleave_.seq == state.sequence)
+                interleave_.finished = true;
+            return;
+        }
         uint8_t count = state.delta_count;
 
+        // ── Interleave skip + verify ──
+        if (interleave_.seq != state.sequence) interleave_.reset(state.sequence);
+
+        uint16_t cumul = state.bids_published + state.asks_published;
+        uint16_t prev_cumul = cumul - count;
+        uint8_t skip = 0;
+
+        if (cumul <= interleave_.committed_count) {
+            // All entries already committed — skip entirely
+            state.flush_count++;
+            state.delta_count = 0;
+            if (is_final) interleave_.finished = true;
+            return;
+        }
+
+        if (prev_cumul < interleave_.committed_count && interleave_.committed_count > 0) {
+            // Boundary crossing — verify entry at committed_count - 1
+            uint16_t boundary_idx = interleave_.committed_count - 1 - prev_cumul;
+            auto& cached = interleave_.boundary_entry;
+            auto& check = state.delta_buf[boundary_idx];
+            if (check.price != cached.price || check.qty != cached.qty) {
+                std::fprintf(stderr, "WARN: interleave mismatch seq=%lld at entry %u\n",
+                        (long long)state.sequence, interleave_.committed_count - 1);
+                state.deduped = true;
+                state.phase = SBEParseState::DONE;
+                state.delta_count = 0;
+                return;
+            }
+            skip = static_cast<uint8_t>(interleave_.committed_count - prev_cumul);
+        }
+
+        uint8_t publish_count = count - skip;
+
+        // Connection switch: if pending has entries from a different connection, flush first
+        if (has_pending_depth_ && pending_depth_ci_ != ci)
+            publish_pending_depth(false);
+
         // Overflow: pending + new > MAX_DELTAS → publish pending first
-        if (has_pending_depth_ && pending_depth_count_ + count > websocket::msg::MAX_DELTAS)
+        if (has_pending_depth_ && pending_depth_count_ + publish_count > websocket::msg::MAX_DELTAS)
             publish_pending_depth(false);
 
         // Initialize pending on first entry in batch
@@ -1160,12 +1251,17 @@ private:
             pending_depth_info_ = info;
         }
 
-        // Append to pending buffer
-        std::memcpy(pending_depth_entries_ + pending_depth_count_, state.delta_buf,
-                    count * sizeof(websocket::msg::DeltaEntry));
-        pending_depth_count_ += count;
+        // Append only the new entries (past the skip boundary)
+        std::memcpy(pending_depth_entries_ + pending_depth_count_, state.delta_buf + skip,
+                    publish_count * sizeof(websocket::msg::DeltaEntry));
+        pending_depth_count_ += publish_count;
         pending_depth_seq_ = state.sequence;
         pending_depth_event_ts_ns_ = state.event_time_us * 1000;
+
+        // Update interleave state
+        interleave_.boundary_entry = state.delta_buf[count - 1];
+        interleave_.committed_count = cumul;
+        if (is_final) interleave_.finished = true;
 
         state.flush_count++;
         state.delta_count = 0;
@@ -1339,6 +1435,7 @@ public:
         auto& e = (*mkt_event_prod)[slot];
         e.clear();
         e.venue_id = static_cast<uint8_t>(websocket::msg::VenueId::BINANCE);
+        e.instrument_id = instrument_id;
         struct timespec ts_real, ts_mono;
         clock_gettime(CLOCK_REALTIME, &ts_real);
         clock_gettime(CLOCK_MONOTONIC, &ts_mono);

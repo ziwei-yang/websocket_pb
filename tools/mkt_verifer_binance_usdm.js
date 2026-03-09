@@ -35,6 +35,9 @@ const EVENT_BOOK_DELTA    = 0;
 const EVENT_BOOK_SNAPSHOT = 1;
 const EVENT_TRADE_ARRAY   = 2;
 const EVENT_SYSTEM_STATUS = 3;
+const EVENT_BBO_ARRAY     = 4;
+const EVENT_LIQUIDATION   = 5;
+const EVENT_MARK_PRICE    = 6;
 
 // DeltaAction enum (mkt_event.hpp:34-38)
 const ACTION_NEW    = 0;
@@ -64,11 +67,17 @@ const EVT_FLAG_DEPTH_CH_SHIFT = 3;
 const STREAM_UNKNOWN       = 0;
 const STREAM_AGG_TRADE     = 1;
 const STREAM_DEPTH_PARTIAL = 2;
-const STREAM_DEPTH_DIFF    = 3;
-const STREAM_DEPTH_DIFF_1  = 4;  // @depth@250ms
-const STREAM_DEPTH_DIFF_2  = 5;  // @depth@500ms
+const STREAM_DEPTH_DIFF_0  = 3;  // @depth@0ms
+const STREAM_DEPTH_DIFF_1  = 4;  // @depth@100ms
+const STREAM_DEPTH_DIFF_2  = 5;  // @depth@250ms
+const STREAM_DEPTH_DIFF_3  = 6;  // @depth@500ms
+const STREAM_MARK_PRICE    = 7;
+const STREAM_FORCE_ORDER   = 8;
 
-const DEPTH_CHANNELS = 3;
+// LiqFlags
+const LIQ_FLAG_SIDE_SELL = 0x01;
+
+const DEPTH_CHANNELS = 4;
 
 // ============================================================================
 // Section 2: JSON Scanning Primitives
@@ -238,33 +247,38 @@ function parseDecimal(s) {
 
 function classifyStream(name) {
     if (name.endsWith('aggTrade')) return STREAM_AGG_TRADE;
+    if (name.endsWith('forceOrder')) return STREAM_FORCE_ORDER;
+    if (name.indexOf('@markPrice') >= 0) return STREAM_MARK_PRICE;
     const idx = name.indexOf('@depth');
     if (idx >= 0) {
         const after = name[idx + 6];
         if (after === '@') {
             const interval = parseInt(name.slice(idx + 7));
-            if (interval === 100) return STREAM_DEPTH_DIFF;
-            if (interval === 250) return STREAM_DEPTH_DIFF_1;
-            if (interval === 500) return STREAM_DEPTH_DIFF_2;
+            if (interval === 0)   return STREAM_DEPTH_DIFF_0;
+            if (interval === 100) return STREAM_DEPTH_DIFF_1;
+            if (interval === 250) return STREAM_DEPTH_DIFF_2;
+            if (interval === 500) return STREAM_DEPTH_DIFF_3;
             return STREAM_UNKNOWN;
         }
         if (after >= '0' && after <= '9') return STREAM_DEPTH_PARTIAL;
-        if (after === undefined) return STREAM_DEPTH_DIFF_1;
+        if (after === undefined) return STREAM_DEPTH_DIFF_2;
     }
     return STREAM_UNKNOWN;
 }
 
 function depthChannelIndex(streamType) {
     switch (streamType) {
-    case STREAM_DEPTH_DIFF:   return 0;
+    case STREAM_DEPTH_DIFF_0: return 0;
     case STREAM_DEPTH_DIFF_1: return 1;
     case STREAM_DEPTH_DIFF_2: return 2;
+    case STREAM_DEPTH_DIFF_3: return 3;
     default: return -1;
     }
 }
 
 function isDepthDiff(streamType) {
-    return streamType === STREAM_DEPTH_DIFF || streamType === STREAM_DEPTH_DIFF_1 || streamType === STREAM_DEPTH_DIFF_2;
+    return streamType === STREAM_DEPTH_DIFF_0 || streamType === STREAM_DEPTH_DIFF_1
+        || streamType === STREAM_DEPTH_DIFF_2 || streamType === STREAM_DEPTH_DIFF_3;
 }
 
 // ============================================================================
@@ -361,9 +375,10 @@ function decodeEssential(payload) {
     }
 
     case STREAM_DEPTH_PARTIAL:
-    case STREAM_DEPTH_DIFF:
+    case STREAM_DEPTH_DIFF_0:
     case STREAM_DEPTH_DIFF_1:
-    case STREAM_DEPTH_DIFF_2: {
+    case STREAM_DEPTH_DIFF_2:
+    case STREAM_DEPTH_DIFF_3: {
         // Field order: e(skip), E(extract), T(extract), s(skip), U(skip), u(extract=seq)
         // Mirrors lines 273-284
         p = skipField(payload, p);   // skip "e"
@@ -402,8 +417,45 @@ function decodeEssential(payload) {
         result.valid = true;
         break;
     }
+    case STREAM_FORCE_ORDER: {
+        // e(skip), E(extract as event_time_ms + sequence)
+        p = skipField(payload, p);       // skip "e"
+        if (p === -1) return result;
+        p = toValue(payload, p);         // "E" value
+        if (p === -1) return result;
+        const eRes = parseInt64(payload, p);
+        if (!eRes) return result;
+        result.eventTimeMs = eRes.value;
+        result.seq = eRes.value;
+        p = eRes.endPos;
+        while (p < payload.length && (payload[p] === ',' || payload[p] === ' ')) p++;
+        result.resumePos = p;
+        result.valid = true;
+        break;
+    }
+
+    case STREAM_MARK_PRICE: {
+        // e(skip), E(extract as event_time_ms + sequence), s(skip)
+        p = skipField(payload, p);       // skip "e"
+        if (p === -1) return result;
+        p = toValue(payload, p);         // "E" value
+        if (p === -1) return result;
+        const eRes = parseInt64(payload, p);
+        if (!eRes) return result;
+        result.eventTimeMs = eRes.value;
+        result.seq = eRes.value;
+        p = eRes.endPos;
+        while (p < payload.length && (payload[p] === ',' || payload[p] === ' ')) p++;
+        p = skipField(payload, p);       // skip "s"
+        if (p === -1) return result;
+        result.resumePos = p;
+        result.valid = true;
+        break;
+    }
+
     default:
-        throw new Error(`decodeEssential: unknown streamType ${streamType}`);
+        // Unknown stream type — skip silently (no throw for extensibility)
+        return result;
     }
     return result;
 }
@@ -504,6 +556,148 @@ function parseDepthRemaining(payload, startPos) {
     if (p === -1) return r;
     r.asksArrayPos = p;
 
+    r.valid = true;
+    return r;
+}
+
+// Parse forceOrder remaining fields.
+// p at resume_pos (after "E":NNN,), skip to "o":{, then parse fields
+function parseForceOrderRemaining(payload, startPos) {
+    const r = { valid: false, price: 0n, avgPrice: 0n, origQty: 0n, filledQty: 0n, tradeTimeMs: 0n, isSell: false };
+    let p = startPos;
+
+    // Find nested "o":{ object
+    while (p < payload.length && payload[p] !== '{') p++;
+    if (p >= payload.length) return r;
+    p++;  // skip '{'
+    while (p < payload.length && payload[p] === ' ') p++;
+
+    // "s"(skip)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = skipField(payload, p);
+    if (p === -1) return r;
+    // "S"(side)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = toValue(payload, p);
+    if (p === -1 || p >= payload.length || payload[p] !== '"') return r;
+    p++;  // skip opening '"'
+    if (p < payload.length && payload[p] === 'S') r.isSell = true;
+    // skip past string value
+    while (p < payload.length && payload[p] !== '"') p++;
+    if (p < payload.length) p++;  // skip closing '"'
+    while (p < payload.length && (payload[p] === ',' || payload[p] === ' ')) p++;
+    // "o"(skip order type)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = skipField(payload, p);
+    if (p === -1) return r;
+    // "f"(skip timeInForce)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = skipField(payload, p);
+    if (p === -1) return r;
+    // "q"(orig_qty)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = toValue(payload, p);
+    if (p === -1) return r;
+    const qRes = parseDecStr(payload, p);
+    if (!qRes) return r;
+    r.origQty = qRes.value;
+    p = qRes.endPos;
+    while (p < payload.length && (payload[p] === ',' || payload[p] === ' ')) p++;
+    // "p"(price)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = toValue(payload, p);
+    if (p === -1) return r;
+    const pRes = parseDecStr(payload, p);
+    if (!pRes) return r;
+    r.price = pRes.value;
+    p = pRes.endPos;
+    while (p < payload.length && (payload[p] === ',' || payload[p] === ' ')) p++;
+    // "ap"(avg_price)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = toValue(payload, p);
+    if (p === -1) return r;
+    const apRes = parseDecStr(payload, p);
+    if (!apRes) return r;
+    r.avgPrice = apRes.value;
+    p = apRes.endPos;
+    while (p < payload.length && (payload[p] === ',' || payload[p] === ' ')) p++;
+    // "X"(skip status)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = skipField(payload, p);
+    if (p === -1) return r;
+    // "l"(skip last filled qty)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = skipField(payload, p);
+    if (p === -1) return r;
+    // "z"(filled_qty)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = toValue(payload, p);
+    if (p === -1) return r;
+    const zRes = parseDecStr(payload, p);
+    if (!zRes) return r;
+    r.filledQty = zRes.value;
+    p = zRes.endPos;
+    while (p < payload.length && (payload[p] === ',' || payload[p] === ' ')) p++;
+    // "T"(trade_time)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = toValue(payload, p);
+    if (p === -1) return r;
+    const tRes = parseInt64(payload, p);
+    if (!tRes) return r;
+    r.tradeTimeMs = tRes.value;
+    r.valid = true;
+    return r;
+}
+
+// Parse markPriceUpdate remaining fields.
+// p at resume_pos (after "s" skip), pointing at "p" field
+function parseMarkPriceRemaining(payload, startPos) {
+    const r = { valid: false, markPrice: 0n, indexPrice: 0n, settlePrice: 0n, fundingRate: 0n, nextFundingTimeMs: 0n };
+    let p = startPos;
+
+    // "p"(mark_price)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = toValue(payload, p);
+    if (p === -1) return r;
+    const pRes = parseDecStr(payload, p);
+    if (!pRes) return r;
+    r.markPrice = pRes.value;
+    p = pRes.endPos;
+    while (p < payload.length && (payload[p] === ',' || payload[p] === ' ')) p++;
+    // "i"(index_price)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = toValue(payload, p);
+    if (p === -1) return r;
+    const iRes = parseDecStr(payload, p);
+    if (!iRes) return r;
+    r.indexPrice = iRes.value;
+    p = iRes.endPos;
+    while (p < payload.length && (payload[p] === ',' || payload[p] === ' ')) p++;
+    // "P"(settle_price)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = toValue(payload, p);
+    if (p === -1) return r;
+    const bigPRes = parseDecStr(payload, p);
+    if (!bigPRes) return r;
+    r.settlePrice = bigPRes.value;
+    p = bigPRes.endPos;
+    while (p < payload.length && (payload[p] === ',' || payload[p] === ' ')) p++;
+    // "r"(funding_rate)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = toValue(payload, p);
+    if (p === -1) return r;
+    const rRes = parseDecStr(payload, p);
+    if (!rRes) return r;
+    r.fundingRate = rRes.value;
+    p = rRes.endPos;
+    while (p < payload.length && (payload[p] === ',' || payload[p] === ' ')) p++;
+    // "T"(next_funding_time)
+    if (p >= payload.length || payload[p] !== '"') return r;
+    p = toValue(payload, p);
+    if (p === -1) return r;
+    const tRes = parseInt64(payload, p);
+    if (!tRes) return r;
+    r.nextFundingTimeMs = tRes.value;
     r.valid = true;
     return r;
 }
@@ -626,9 +820,11 @@ class ConnectionParseContext {
 class MktEventBuilder {
     constructor(opts = {}) {
         // Dedup counters per domain
-        this.lastBookSeq = [-1n, -1n, -1n];  // per depth-diff channel
+        this.lastBookSeq = [-1n, -1n, -1n, -1n];  // per depth-diff channel
         this.lastSnapshotSeq = -1n;  // dedup depth20 snapshots across connections
         this.lastTradeSeq = -1n;    // TRADE_ARRAY only
+        this.lastLiqTime = -1n;     // LIQUIDATION dedup
+        this.lastMarkPriceTime = -1n; // MARK_PRICE dedup
 
         // Trade merge buffer (mirrors lines 1012-1018)
         this.pendingTrades = [];
@@ -638,12 +834,18 @@ class MktEventBuilder {
         this.pendingTradesEventTsNs = 0n;
 
         // Per-channel depth delta merge buffers (mirrors C++ PendingDepth[DEPTH_CHANNELS])
-        this.pendingDepth = [[], [], []];
-        this.hasPendingDepth = [false, false, false];
-        this.pendingDepthSeq = [-1n, -1n, -1n];
-        this.pendingDepthConnId = [-1, -1, -1];
-        this.pendingDepthEventTsNs = [0n, 0n, 0n];
-        this.pendingDepthFlushCount = [0, 0, 0];
+        this.pendingDepth = [[], [], [], []];
+        this.hasPendingDepth = [false, false, false, false];
+        this.pendingDepthSeq = [-1n, -1n, -1n, -1n];
+        this.pendingDepthConnId = [-1, -1, -1, -1];
+        this.pendingDepthEventTsNs = [0n, 0n, 0n, 0n];
+        this.pendingDepthFlushCount = [0, 0, 0, 0];
+
+        // Per-channel interleave state for multi-connection same-SEQ dedup
+        this.interleave = Array.from({length: DEPTH_CHANNELS}, () => ({
+            seq: -1n, committedCount: 0, finished: false,
+            boundaryPrice: 0n, boundaryQty: 0n,
+        }));
 
         // Output
         this.events = [];
@@ -666,9 +868,14 @@ class MktEventBuilder {
         return seq <= effTid;
     }
 
-    // Book dedup: seq <= last_book_seq[ch] (line 1101)
+    // Book dedup: interleave-aware (allows same-seq if not finished)
     isBookDuplicate(seq, ch) {
-        return seq <= this.lastBookSeq[ch];
+        if (seq < this.lastBookSeq[ch]) return true;
+        if (seq === this.lastBookSeq[ch]) {
+            const il = this.interleave[ch];
+            return il.seq === seq && il.finished;
+        }
+        return false;
     }
 
     // --- Event builders ---
@@ -729,7 +936,7 @@ class MktEventBuilder {
     // Emit BOOK_DELTA(s) from delta array.
     // deltas: array of {price, qty, action, flags} — raw mantissa, scale applied here (lines 810-812).
     // Chunks at MAX_DELTAS if needed (line 903).
-    emitBookDelta(connId, seq, eventTsNs, deltas, ch, flushCount = 0, isFinal = false) {
+    emitBookDelta(connId, seq, eventTsNs, deltas, ch, flushCount = 0, isFinal = false, cumul = 0) {
         // Buffer deltas into per-channel pending buffer
         const scaled = deltas.map(d => ({
             price: d.price * PRICE_SCALE,
@@ -738,8 +945,39 @@ class MktEventBuilder {
             flags: d.flags,
         }));
 
+        const count = scaled.length;
+
+        // ── Interleave skip + verify ──
+        const il = this.interleave[ch];
+        if (il.seq !== seq) { il.seq = seq; il.committedCount = 0; il.finished = false; il.boundaryPrice = 0n; il.boundaryQty = 0n; }
+
+        const prevCumul = cumul - count;
+        let skip = 0;
+
+        if (cumul <= il.committedCount) {
+            if (isFinal) il.finished = true;
+            return;
+        }
+
+        if (prevCumul < il.committedCount && il.committedCount > 0) {
+            const boundaryIdx = il.committedCount - 1 - prevCumul;
+            if (scaled[boundaryIdx].price !== il.boundaryPrice ||
+                scaled[boundaryIdx].qty !== il.boundaryQty) {
+                // Mismatch — discard this connection's entries for this seq
+                if (isFinal) il.finished = true;
+                return;
+            }
+            skip = il.committedCount - prevCumul;
+        }
+
+        const toPublish = scaled.slice(skip);
+
+        // Connection switch: publish existing pending from different conn first
+        if (this.hasPendingDepth[ch] && this.pendingDepthConnId[ch] !== connId)
+            this.publishPendingDepth(ch, false);
+
         // Overflow: pending + new > MAX_DELTAS → publish pending first
-        if (this.hasPendingDepth[ch] && this.pendingDepth[ch].length + scaled.length > MAX_DELTAS)
+        if (this.hasPendingDepth[ch] && this.pendingDepth[ch].length + toPublish.length > MAX_DELTAS)
             this.publishPendingDepth(ch, false);
 
         if (!this.hasPendingDepth[ch]) {
@@ -748,9 +986,15 @@ class MktEventBuilder {
             this.pendingDepthFlushCount[ch] = 0;
         }
 
-        this.pendingDepth[ch].push(...scaled);
+        this.pendingDepth[ch].push(...toPublish);
         this.pendingDepthSeq[ch] = seq;
         this.pendingDepthEventTsNs[ch] = eventTsNs;
+
+        // Update interleave state
+        il.boundaryPrice = scaled[count - 1].price;
+        il.boundaryQty = scaled[count - 1].qty;
+        il.committedCount = cumul;
+        if (isFinal) il.finished = true;
     }
 
     publishPendingDepth(ch, isFinal) {
@@ -776,6 +1020,45 @@ class MktEventBuilder {
             this.hasPendingDepth[ch] = false;
             this.pendingDepthFlushCount[ch] = 0;
         }
+    }
+
+    // Emit single LIQUIDATION event
+    emitLiquidation(connId, seq, eventTsNs, parsed) {
+        this._pushEvent({
+            type: 'LIQUIDATION',
+            seq: seq,
+            event_ts_ns: eventTsNs,
+            count: 1,
+            conn_id: connId,
+            flags: (connId << EVT_FLAG_CONN_ID_SHIFT),
+            entries: [{
+                price: parsed.price * PRICE_SCALE,
+                avg_price: parsed.avgPrice * PRICE_SCALE,
+                orig_qty: parsed.origQty * QTY_SCALE,
+                filled_qty: parsed.filledQty * QTY_SCALE,
+                trade_time_ns: parsed.tradeTimeMs * 1000000n,
+                flags: parsed.isSell ? LIQ_FLAG_SIDE_SELL : 0,
+            }],
+        });
+    }
+
+    // Emit single MARK_PRICE event
+    emitMarkPrice(connId, seq, eventTsNs, parsed) {
+        this._pushEvent({
+            type: 'MARK_PRICE',
+            seq: seq,
+            event_ts_ns: eventTsNs,
+            count: 1,
+            conn_id: connId,
+            flags: (connId << EVT_FLAG_CONN_ID_SHIFT),
+            entries: [{
+                mark_price: parsed.markPrice,
+                index_price: parsed.indexPrice,
+                settle_price: parsed.settlePrice,
+                funding_rate: parsed.fundingRate,
+                next_funding_ns: parsed.nextFundingTimeMs * 1000000n,
+            }],
+        });
     }
 
     // --- Flush triggers ---
@@ -914,6 +1197,14 @@ class BinanceUSDMVerifier {
                     ctx.phase = PHASE_DONE;
                     return;
                 }
+                if (ctx.seq === this.builder.lastBookSeq[ch]) {
+                    const il = this.builder.interleave[ch];
+                    if (il.seq === ctx.seq && il.finished) {
+                        ctx.deduped = true;
+                        ctx.phase = PHASE_DONE;
+                        return;
+                    }
+                }
             }
 
             if (ctx.streamType === STREAM_AGG_TRADE)
@@ -951,13 +1242,17 @@ class BinanceUSDMVerifier {
         }
 
         case STREAM_DEPTH_PARTIAL:
-        case STREAM_DEPTH_DIFF:
+        case STREAM_DEPTH_DIFF_0:
         case STREAM_DEPTH_DIFF_1:
-        case STREAM_DEPTH_DIFF_2: {
+        case STREAM_DEPTH_DIFF_2:
+        case STREAM_DEPTH_DIFF_3: {
             // Flush pending trades before depth (line 1096)
             this.builder.flushTradesBeforeDepth();
 
             if (e.msgType === STREAM_DEPTH_PARTIAL) {
+                // Flush pending deltas before snapshot to prevent stale
+                // fragments from being published after the snapshot
+                this.builder.flushDepthBeforeTrades();
                 // Snapshot: dedup against max of all channels
                 const maxSeq = this.builder.lastBookSeq.reduce((a, b) => a > b ? a : b);
                 if (e.seq < maxSeq || e.seq <= this.builder.lastSnapshotSeq) {
@@ -966,18 +1261,29 @@ class BinanceUSDMVerifier {
                     return;
                 }
                 this.builder.lastSnapshotSeq = e.seq;
-                // Reset all channels
-                for (let ch = 0; ch < DEPTH_CHANNELS; ch++)
+                // Reset all channels + interleave state (finished=true: snapshot claims seq)
+                for (let ch = 0; ch < DEPTH_CHANNELS; ch++) {
                     this.builder.lastBookSeq[ch] = e.seq;
+                    const il = this.builder.interleave[ch];
+                    il.seq = e.seq; il.committedCount = 0; il.finished = true;
+                    il.boundaryPrice = 0n; il.boundaryQty = 0n;
+                }
             } else {
-                // Diff: per-channel dedup
+                // Diff: per-channel interleave-aware dedup
                 const ch = depthChannelIndex(e.msgType);
                 if (this.builder.isBookDuplicate(e.seq, ch)) {
                     ctx.deduped = true;
                     ctx.phase = PHASE_DONE;
                     return;
                 }
-                this.builder.lastBookSeq[ch] = e.seq;
+                if (e.seq > this.builder.lastBookSeq[ch]) {
+                    // New seq — claim and reset interleave
+                    this.builder.lastBookSeq[ch] = e.seq;
+                    const il = this.builder.interleave[ch];
+                    il.seq = e.seq; il.committedCount = 0; il.finished = false;
+                    il.boundaryPrice = 0n; il.boundaryQty = 0n;
+                }
+                // else: same seq, allow interleaving (interleave state already set)
             }
 
             // Initialize streaming state (lines 1108-1117)
@@ -994,8 +1300,49 @@ class BinanceUSDMVerifier {
             this.depthStreamingContinue(ctx, ci, payload);
             break;
         }
+        case STREAM_FORCE_ORDER: {
+            this.builder.flushPendingTrades();
+            this.builder.flushDepthBeforeTrades();
+            // Dedup
+            if (e.seq <= this.builder.lastLiqTime) {
+                ctx.deduped = true;
+                ctx.phase = PHASE_DONE;
+                return;
+            }
+            this.builder.lastLiqTime = e.seq;
+
+            const fo = parseForceOrderRemaining(payload, e.resumePos);
+            if (!fo.valid) return;
+
+            const eventTsNs = e.eventTimeMs * 1000000n;
+            this.builder.emitLiquidation(ci, e.seq, eventTsNs, fo);
+            ctx.phase = PHASE_DONE;
+            break;
+        }
+
+        case STREAM_MARK_PRICE: {
+            this.builder.flushPendingTrades();
+            this.builder.flushDepthBeforeTrades();
+            // Dedup
+            if (e.seq <= this.builder.lastMarkPriceTime) {
+                ctx.deduped = true;
+                ctx.phase = PHASE_DONE;
+                return;
+            }
+            this.builder.lastMarkPriceTime = e.seq;
+
+            const mp = parseMarkPriceRemaining(payload, e.resumePos);
+            if (!mp.valid) return;
+
+            const eventTsNs = e.eventTimeMs * 1000000n;
+            this.builder.emitMarkPrice(ci, e.seq, eventTsNs, mp);
+            ctx.phase = PHASE_DONE;
+            break;
+        }
+
         default:
-            throw new Error(`onWsData: unknown msgType ${e.msgType}`);
+            // Unknown stream type — skip silently
+            break;
         }
     }
 
@@ -1164,10 +1511,19 @@ class BinanceUSDMVerifier {
 
     // Flush accumulated delta_buf as BOOK_DELTA (lines 799-825)
     flushDeltaChunk(ctx, ci, isFinal = false) {
-        if (ctx.deltaBuf.length === 0) return;
+        if (ctx.deltaBuf.length === 0) {
+            if (isFinal) {
+                const ch = depthChannelIndex(ctx.streamType);
+                const chIdx = ch >= 0 ? ch : 0;
+                const il = this.builder.interleave[chIdx];
+                if (il.seq === ctx.seq) il.finished = true;
+            }
+            return;
+        }
         const eventTsNs = ctx.eventTimeMs * 1000000n;
         const ch = depthChannelIndex(ctx.streamType);
-        this.builder.emitBookDelta(ci, ctx.seq, eventTsNs, ctx.deltaBuf, ch >= 0 ? ch : 0, ctx.flushCount, isFinal);
+        const cumul = ctx.bidsCount + ctx.asksCount;
+        this.builder.emitBookDelta(ci, ctx.seq, eventTsNs, ctx.deltaBuf, ch >= 0 ? ch : 0, ctx.flushCount, isFinal, cumul);
         ctx.flushCount++;
         ctx.deltaBuf = [];
     }
@@ -1318,6 +1674,14 @@ function formatEvent(ev) {
         }
         case 'BOOK_SNAPSHOT':
             return `BOOK_SNAPSHOT seq=${ev.seq} conn=${ev.conn_id} bids=${ev.count} asks=${ev.count2}${f}`;
+        case 'LIQUIDATION': {
+            const e = ev.entries[0];
+            return `LIQUIDATION seq=${ev.seq} conn=${ev.conn_id} ${e.flags & LIQ_FLAG_SIDE_SELL ? 'SELL' : 'BUY'} price=${e.price} qty=${e.filled_qty}${f}`;
+        }
+        case 'MARK_PRICE': {
+            const e = ev.entries[0];
+            return `MARK_PRICE seq=${ev.seq} conn=${ev.conn_id} mark=${e.mark_price} fund=${e.funding_rate}${f}`;
+        }
         default:
             return `${ev.type} seq=${ev.seq}`;
     }
@@ -1375,8 +1739,9 @@ function compareEvents(jsEvents, cppEvents) {
 
     // --- Book events: group by (seq, type) and compare aggregated content ---
     // JS and C++ may chunk differently but aggregated deltas/levels must match.
-    const jsBooks = jsEvents.filter(e => e.type !== 'TRADE_ARRAY');
-    const cppBooks = cppFiltered.filter(e => e.type !== 'TRADE_ARRAY');
+    const bookTypes = new Set(['BOOK_DELTA', 'BOOK_SNAPSHOT']);
+    const jsBooks = jsEvents.filter(e => bookTypes.has(e.type));
+    const cppBooks = cppFiltered.filter(e => bookTypes.has(e.type));
 
     function buildGroups(events) {
         const groups = new Map();
@@ -1577,7 +1942,8 @@ function main() {
 
     // Filter C++ events: keep only those whose seq or trade_id overlaps JS events.
     // Book events match by seq; trade events match by individual trade_id overlap.
-    const jsBookSeqs = new Set(jsEvents.filter(e => e.type !== 'TRADE_ARRAY').map(e => e.seq));
+    const seqEventTypes = new Set(['BOOK_DELTA', 'BOOK_SNAPSHOT', 'LIQUIDATION', 'MARK_PRICE']);
+    const jsBookSeqs = new Set(jsEvents.filter(e => seqEventTypes.has(e.type)).map(e => e.seq));
     const jsTradeIds = new Set();
     for (const ev of jsEvents.filter(e => e.type === 'TRADE_ARRAY'))
         for (const t of ev.trades || [])
@@ -1640,8 +2006,8 @@ if (require.main === module) {
         FLAG_SIDE_ASK, FLAG_IS_BUYER,
         WS_FLAG_FIN, WS_FLAG_FRAGMENTED, WS_FLAG_LAST_FRAGMENT,
         WS_FLAG_DISCARD_EARLY, WS_FLAG_MERGED, WS_FLAG_LAST_IN_BATCH,
-        STREAM_UNKNOWN, STREAM_AGG_TRADE, STREAM_DEPTH_PARTIAL, STREAM_DEPTH_DIFF,
-        STREAM_DEPTH_DIFF_1, STREAM_DEPTH_DIFF_2, DEPTH_CHANNELS,
+        STREAM_UNKNOWN, STREAM_AGG_TRADE, STREAM_DEPTH_PARTIAL, STREAM_DEPTH_DIFF_0,
+        STREAM_DEPTH_DIFF_1, STREAM_DEPTH_DIFF_2, STREAM_DEPTH_DIFF_3, DEPTH_CHANNELS,
         PHASE_IDLE, PHASE_HEADER_PARSED, PHASE_BIDS_PARSING, PHASE_ASKS_PARSING, PHASE_DONE,
         // Scanning primitives
         skipString, skipNumber, skipValue, skipField, toValue, parseInt64, parseDecStr, parseBool,

@@ -596,7 +596,8 @@ struct IpSelector {
 
     /// Build from ProbeResult with latency filtering.
     /// Returns 0 on success, -1 if no reachable IPs.
-    int build(const ProbeResult& result) {
+    /// If requested_ips >= reachable count, skip outlier filter (need all IPs).
+    int build(const ProbeResult& result, size_t requested_ips = 0) {
         preferred.clear();
         rotation_index = 0;
 
@@ -607,6 +608,9 @@ struct IpSelector {
         if (preferred.empty()) return -1;
 
         // Already sorted by RTT from probe_and_rank()
+
+        // Skip outlier filter when we need all (or more) IPs than available
+        if (requested_ips >= preferred.size()) return 0;
 
         // If <=2 IPs: keep all, no filtering needed
         if (preferred.size() <= 2) return 0;

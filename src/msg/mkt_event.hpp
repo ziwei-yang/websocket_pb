@@ -23,12 +23,15 @@ enum class EventType : uint8_t {
     TRADE_ARRAY   = 2,
     SYSTEM_STATUS = 3,
     BBO_ARRAY     = 4,
+    LIQUIDATION   = 5,
+    MARK_PRICE    = 6,
 };
 
 enum class VenueId : uint8_t {
-    UNKNOWN  = 0,
-    BINANCE  = 1,
-    OKX      = 2,
+    UNKNOWN      = 0,
+    BINANCE      = 1,
+    OKX          = 2,
+    BINANCE_USDM = 3,
 };
 
 enum class DeltaAction : uint8_t {
@@ -68,6 +71,10 @@ namespace TradeFlags {
     inline constexpr uint8_t AUCTION     = 0x02;
     inline constexpr uint8_t SELF_TRADE  = 0x04;
     inline constexpr uint8_t LIQUIDATION = 0x08;
+}
+
+namespace LiqFlags {
+    inline constexpr uint8_t SIDE_SELL = 0x01;  // 0=buy, 1=sell
 }
 
 // ============================================================================
@@ -117,6 +124,27 @@ struct BboEntry {
 };
 static_assert(sizeof(BboEntry) == 48);
 
+struct LiquidationEntry {
+    int64_t price;           // order price mantissa
+    int64_t avg_price;       // average fill price mantissa
+    int64_t orig_qty;        // original quantity mantissa
+    int64_t filled_qty;      // accumulated filled quantity mantissa
+    int64_t trade_time_ns;   // trade timestamp (ns)
+    uint8_t flags;           // LiqFlags (SIDE_SELL=0x01)
+    uint8_t _pad[7];
+};
+static_assert(sizeof(LiquidationEntry) == 48);
+
+struct MarkPriceEntry {
+    int64_t mark_price;      // mark price mantissa
+    int64_t index_price;     // index price mantissa
+    int64_t settle_price;    // est. settlement price mantissa
+    int64_t funding_rate;    // funding rate mantissa (all digits, no dot)
+    int64_t next_funding_ns; // next funding time (ns)
+    uint8_t _pad[8];
+};
+static_assert(sizeof(MarkPriceEntry) == 48);
+
 // ============================================================================
 // Payload types (all exactly 472 bytes)
 // ============================================================================
@@ -160,6 +188,24 @@ struct BboArrayPayload {
 };
 static_assert(sizeof(BboArrayPayload) == PAYLOAD_SIZE);
 
+// LIQUIDATION: header.count = number of liquidation orders (max 9)
+static constexpr size_t MAX_LIQUIDATIONS = PAYLOAD_SIZE / sizeof(LiquidationEntry);  // 9
+
+struct LiquidationPayload {
+    LiquidationEntry entries[MAX_LIQUIDATIONS];
+    uint8_t _pad[PAYLOAD_SIZE - MAX_LIQUIDATIONS * sizeof(LiquidationEntry)];
+};
+static_assert(sizeof(LiquidationPayload) == PAYLOAD_SIZE);
+
+// MARK_PRICE: header.count = number of mark price updates (max 9)
+static constexpr size_t MAX_MARK_PRICES = PAYLOAD_SIZE / sizeof(MarkPriceEntry);  // 9
+
+struct MarkPricePayload {
+    MarkPriceEntry entries[MAX_MARK_PRICES];
+    uint8_t _pad[PAYLOAD_SIZE - MAX_MARK_PRICES * sizeof(MarkPriceEntry)];
+};
+static_assert(sizeof(MarkPricePayload) == PAYLOAD_SIZE);
+
 // SYSTEM_STATUS: header.count = 0
 struct SystemStatusPayload {
     uint8_t  status_type;      // SystemStatusType
@@ -194,6 +240,8 @@ struct alignas(512) MktEvent {
         TradeArrayPayload   trades;
         BboArrayPayload     bbo_array;
         SystemStatusPayload status;
+        LiquidationPayload  liquidations;
+        MarkPricePayload    mark_prices;
     } payload;
 
     // ========================================================================
@@ -205,6 +253,8 @@ struct alignas(512) MktEvent {
     bool is_trade_array()   const { return event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY); }
     bool is_system_status() const { return event_type == static_cast<uint8_t>(EventType::SYSTEM_STATUS); }
     bool is_bbo_array()   const { return event_type == static_cast<uint8_t>(EventType::BBO_ARRAY); }
+    bool is_liquidation() const { return event_type == static_cast<uint8_t>(EventType::LIQUIDATION); }
+    bool is_mark_price()  const { return event_type == static_cast<uint8_t>(EventType::MARK_PRICE); }
 
     // ========================================================================
     // Event flag queries
@@ -275,14 +325,14 @@ struct alignas(512) MktEvent {
         switch (event_type) {
         case 0: {
             std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", count);
-            uint8_t dch = depth_channel();
-            if (dch > 0) std::snprintf(mkt_typ, sizeof(mkt_typ), "D%u", dch);
-            else         std::snprintf(mkt_typ, sizeof(mkt_typ), "Dp");
+            std::snprintf(mkt_typ, sizeof(mkt_typ), "D%u", depth_channel());
             break;
         }
         case 1: std::snprintf(mkt_typ, sizeof(mkt_typ), "OB"); break;
         case 2: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", count); std::snprintf(mkt_typ, sizeof(mkt_typ), "Td"); break;
         case 4: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", count); std::snprintf(mkt_typ, sizeof(mkt_typ), "Bo"); break;
+        case 5: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", count); std::snprintf(mkt_typ, sizeof(mkt_typ), "Lq"); break;
+        case 6: std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", count); std::snprintf(mkt_typ, sizeof(mkt_typ), "Mp"); break;
         }
 
         char lat[16] = "     -";
@@ -330,5 +380,7 @@ static_assert(std::is_trivially_copyable_v<DeltaEntry>);
 static_assert(std::is_trivially_copyable_v<BookLevel>);
 static_assert(std::is_trivially_copyable_v<TradeEntry>);
 static_assert(std::is_trivially_copyable_v<BboEntry>);
+static_assert(std::is_trivially_copyable_v<LiquidationEntry>);
+static_assert(std::is_trivially_copyable_v<MarkPriceEntry>);
 
 }  // namespace websocket::msg

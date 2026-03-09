@@ -42,7 +42,7 @@
 #ifdef MAX_CONN
 static constexpr size_t CONN_COUNT = MAX_CONN;
 #else
-static constexpr size_t CONN_COUNT = 1;
+static constexpr size_t CONN_COUNT = 16;  // DNS capping limits to available IPs
 #endif
 
 // ENABLE_RECONNECT is required for InlineWS — always force true
@@ -243,6 +243,7 @@ int main(int argc, char* argv[]) {
     }
 
     g_conn_state = pipeline.conn_state();
+    pipeline.mkt_event_handler().instrument_id = 1;  // btcusdt
 
     // Set subscription JSON
     pipeline.set_subscription_json(

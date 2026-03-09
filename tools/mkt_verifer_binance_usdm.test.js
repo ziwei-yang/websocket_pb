@@ -101,13 +101,13 @@ describe('classifyStream', () => {
         assert.equal(V.classifyStream('btcusdt@depth20'), V.STREAM_DEPTH_PARTIAL);
     });
     it('depth@100ms', () => {
-        assert.equal(V.classifyStream('btcusdt@depth@100ms'), V.STREAM_DEPTH_DIFF);
+        assert.equal(V.classifyStream('btcusdt@depth@100ms'), V.STREAM_DEPTH_DIFF_1);
     });
     it('depth@250ms', () => {
-        assert.equal(V.classifyStream('btcusdt@depth@250ms'), V.STREAM_DEPTH_DIFF_1);
+        assert.equal(V.classifyStream('btcusdt@depth@250ms'), V.STREAM_DEPTH_DIFF_2);
     });
     it('depth (no suffix, 250ms default)', () => {
-        assert.equal(V.classifyStream('btcusdt@depth'), V.STREAM_DEPTH_DIFF_1);
+        assert.equal(V.classifyStream('btcusdt@depth'), V.STREAM_DEPTH_DIFF_2);
     });
     it('unknown stream', () => {
         assert.equal(V.classifyStream('btcusdt@ticker'), V.STREAM_UNKNOWN);
@@ -239,7 +239,7 @@ describe('decodeEssential: depth', () => {
         const payload = makeDepthDiffJSON(9999, 1700000000000, [['97000.00','1.000']], [['97001.00','2.000']]);
         const e = V.decodeEssential(payload);
         assert.equal(e.valid, true);
-        assert.equal(e.msgType, V.STREAM_DEPTH_DIFF);
+        assert.equal(e.msgType, V.STREAM_DEPTH_DIFF_1);
         assert.equal(e.seq, 9999n);
         assert.equal(e.eventTimeMs, 1700000000000n);
     });
@@ -895,7 +895,7 @@ describe('Streaming trade superseded by other connection', () => {
 
 describe('Snapshot dedup across connections', () => {
     it('depth20 snapshot with seq == depth_diff seq is accepted', () => {
-        // depth_diff on channel 0 sets lastBookSeq[0] = 100
+        // depth_diff on channel 1 (100ms) sets lastBookSeq[1] = 100
         // depth20 snapshot with seq=100 should still be accepted (seq < maxSeq is false)
         const v = new V.BinanceUSDMVerifier();
         const bids = [['50000.00', '1.0'], ['49999.00', '2.0']];
@@ -903,7 +903,7 @@ describe('Snapshot dedup across connections', () => {
         const diffPayload = makeDepthDiffJSON(100, 1700000000000, [['49000.00', '1.0']], [['51000.00', '2.0']]);
         v.processFrame(makeFrame(0, diffPayload, V.WS_FLAG_FIN | V.WS_FLAG_LAST_IN_BATCH));
         assert.equal(v.events.length, 1, 'depth_diff should produce 1 event');
-        assert.equal(v.builder.lastBookSeq[0], 100n);
+        assert.equal(v.builder.lastBookSeq[1], 100n);
 
         const snapPayload = makeDepthPartialJSON(100, 1700000000001, bids, asks);
         v.processFrame(makeFrame(1, snapPayload, V.WS_FLAG_FIN | V.WS_FLAG_LAST_IN_BATCH));
@@ -928,7 +928,7 @@ describe('Snapshot dedup across connections', () => {
 
     it('snapshot with seq < maxBookSeq is rejected', () => {
         const v = new V.BinanceUSDMVerifier();
-        // Advance channel 0 to seq=200
+        // Advance channel 1 (100ms) to seq=200
         const diffPayload = makeDepthDiffJSON(200, 1700000000000, [['49000.00', '1.0']], [['51000.00', '2.0']]);
         v.processFrame(makeFrame(0, diffPayload, V.WS_FLAG_FIN | V.WS_FLAG_LAST_IN_BATCH));
         // Snapshot with seq=100 (stale): should be rejected
@@ -946,23 +946,23 @@ describe('Snapshot dedup across connections', () => {
 describe('Per-channel BOOK_DELTA comparison', () => {
     it('depth@100ms and depth@500ms with same seq produce separate groups', () => {
         const v = new V.BinanceUSDMVerifier();
-        // depth@100ms (channel 0) with seq=100
-        const ch0bids = [['50000.00', '1.0']];
-        const ch0asks = [['50001.00', '1.5']];
-        const ch0 = makeDepthDiffJSON(100, 1700000000000, ch0bids, ch0asks, { stream: 'btcusdt@depth@100ms' });
-        v.processFrame(makeFrame(0, ch0, V.WS_FLAG_FIN | V.WS_FLAG_LAST_IN_BATCH));
+        // depth@100ms (channel 1) with seq=100
+        const ch1bids = [['50000.00', '1.0']];
+        const ch1asks = [['50001.00', '1.5']];
+        const ch1 = makeDepthDiffJSON(100, 1700000000000, ch1bids, ch1asks, { stream: 'btcusdt@depth@100ms' });
+        v.processFrame(makeFrame(0, ch1, V.WS_FLAG_FIN | V.WS_FLAG_LAST_IN_BATCH));
 
-        // depth@500ms (channel 2) with same seq=100, different content
-        const ch2bids = [['49000.00', '3.0'], ['48000.00', '5.0']];
-        const ch2asks = [['51000.00', '2.0']];
-        const ch2 = makeDepthDiffJSON(100, 1700000000000, ch2bids, ch2asks, { stream: 'btcusdt@depth@500ms' });
-        v.processFrame(makeFrame(0, ch2, V.WS_FLAG_FIN | V.WS_FLAG_LAST_IN_BATCH));
+        // depth@500ms (channel 3) with same seq=100, different content
+        const ch3bids = [['49000.00', '3.0'], ['48000.00', '5.0']];
+        const ch3asks = [['51000.00', '2.0']];
+        const ch3 = makeDepthDiffJSON(100, 1700000000000, ch3bids, ch3asks, { stream: 'btcusdt@depth@500ms' });
+        v.processFrame(makeFrame(0, ch3, V.WS_FLAG_FIN | V.WS_FLAG_LAST_IN_BATCH));
 
         // Should produce 2 events on different channels
         const deltas = v.events.filter(e => e.type === 'BOOK_DELTA');
         assert.equal(deltas.length, 2, 'should have 2 delta events');
-        assert.equal(deltas[0].depth_channel, 0);
-        assert.equal(deltas[1].depth_channel, 2);
+        assert.equal(deltas[0].depth_channel, 1);
+        assert.equal(deltas[1].depth_channel, 3);
 
         // compareEvents should group them separately (not mix deltas)
         const result = V.compareEvents(deltas, deltas);

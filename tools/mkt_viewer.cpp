@@ -14,12 +14,12 @@
 #include <ctime>
 #include <string>
 #include <algorithm>
-#include <unordered_set>
 #include <unistd.h>
 #include <sys/ioctl.h>
 
 #include "pipeline/pipeline_data.hpp"
 #include "msg/mkt_event.hpp"
+#include "msg/mkt_dedup.hpp"
 #include "msg/orderbook.hpp"
 #include "msg/market_conf.hpp"
 
@@ -31,6 +31,15 @@ using namespace websocket::pipeline;
 // ============================================================================
 
 static constexpr int MAX_BOOK   = 29;  // matches MAX_BOOK_LEVELS in MktEvent
+
+static const char* venue_name(uint8_t venue_id) {
+    switch (venue_id) {
+    case static_cast<uint8_t>(VenueId::BINANCE):      return "Binance";
+    case static_cast<uint8_t>(VenueId::OKX):           return "OKX";
+    case static_cast<uint8_t>(VenueId::BINANCE_USDM):  return "BinanceUSDM";
+    default:                                            return nullptr;
+    }
+}
 
 // Layout bounds
 static constexpr int BOOK_MAX    = 10;
@@ -55,16 +64,12 @@ static constexpr const char* BG_CYAN   = "\033[46m";
 // Data structures
 // ============================================================================
 
-static uint64_t delta_content_key(const DeltaEntry& de) {
-    return (static_cast<uint64_t>(de.price) << 1) | (de.flags & DeltaFlags::SIDE_ASK);
-}
-
 static constexpr int MAX_LATENCY_SAMPLES = 65536;
 
 struct ViewerState {
-    static constexpr int DEPTH_CHANNELS = 3;
+    static constexpr int DEPTH_CHANNELS = 4;
     OrderBook ob_channels[DEPTH_CHANNELS];
-    int64_t   ob_channel_seq[DEPTH_CHANNELS] = {};
+    MktDedupState<DEPTH_CHANNELS> dedup;
     int64_t   ob_channel_recv_ns[DEPTH_CHANNELS] = {};  // recv_ts of last depth update per channel
     int       latest_ob_channel = -1;
     int64_t   bbo_recv_ns = 0;                           // recv_ts of last BBO update
@@ -85,7 +90,7 @@ struct ViewerState {
         int best = -1;
         int64_t best_seq = -1;
         for (int i = 0; i < DEPTH_CHANNELS; i++) {
-            if (ob_channel_seq[i] > best_seq) { best_seq = ob_channel_seq[i]; best = i; }
+            if (dedup.ob_channel_seq[i] > best_seq) { best_seq = dedup.ob_channel_seq[i]; best = i; }
         }
         latest_ob_channel = best;
     }
@@ -95,10 +100,6 @@ struct ViewerState {
     TradeEntry trades[TRADE_BUF];
     size_t     trade_write = 0;
     size_t     trade_count = 0;
-    int64_t    trade_seq = 0;
-    int64_t    bbo_seq = 0;        // last BBO src_seq (book_update_id)
-    std::unordered_set<uint64_t> ob_seen_deltas[DEPTH_CHANNELS];  // content keys per channel
-    uint64_t   dup_count = 0;      // non-monotonic event count
 
     uint64_t   total_events = 0;
     uint64_t   snap_count = 0, delta_count = 0, bbo_count = 0, trade_msg_count = 0;
@@ -162,6 +163,25 @@ struct ViewerState {
     uint32_t evt_segs[VOL_SEGMENTS] = {};
     int     evt_seg_cur = 0;
     int64_t evt_seg_start_ns = 0;
+
+    // Perpetual contract data (detected from mark_price/liquidation events)
+    bool     is_perp = false;
+    uint64_t liq_count = 0;
+    uint64_t mark_price_count = 0;
+    // Latest mark price data
+    int64_t  last_mark_price = 0;
+    int64_t  last_index_price = 0;
+    int64_t  last_funding_rate = 0;
+    int64_t  last_next_funding_ns = 0;
+    int64_t  last_mark_recv_ns = 0;
+    // Liquidation tape (circular buffer)
+    static constexpr size_t LIQ_BUF = 256;
+    static constexpr size_t LIQ_MASK = LIQ_BUF - 1;
+    LiquidationEntry liqs[LIQ_BUF];
+    size_t   liq_write = 0;
+    size_t   liq_tape_count = 0;
+    // Liquidation volume segments (rolling 60s)
+    VolSegment liq_vol_segs[VOL_SEGMENTS] = {};
 
     char       exchange[32];
     char       symbol[32];
@@ -310,6 +330,15 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
     }
 
     s.total_events++;
+    // Update venue and symbol from every event
+    const char* vn = venue_name(evt.venue_id);
+    if (vn) std::strncpy(s.exchange, vn, sizeof(s.exchange) - 1);
+    else    std::strncpy(s.exchange, "????", sizeof(s.exchange) - 1);
+
+    if (evt.instrument_id != 0)
+        std::snprintf(s.symbol, sizeof(s.symbol), "#%u", evt.instrument_id);
+    else
+        std::strncpy(s.symbol, "????", sizeof(s.symbol) - 1);
     s.last_recv_ts_ns = evt.recv_ts_ns;
     s.last_event_ts_ns = evt.event_ts_ns;
     s.last_nic_ts_ns = evt.nic_ts_ns;
@@ -370,60 +399,25 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
         s.latency_sum += lat;
     }
 
+    auto dr = s.dedup.check(evt);
+
     if (evt.is_book_snapshot()) {
-        // Snapshot: per-channel overwrite — only overwrite channels behind this snapshot
-        bool any_applied = false;
         for (int c = 0; c < ViewerState::DEPTH_CHANNELS; c++) {
-            if (evt.src_seq >= s.ob_channel_seq[c]) {
+            if (dr.snap_accepted & (1 << c)) {
                 s.ob_channels[c].apply_snapshot(evt);
-                s.ob_channel_seq[c] = evt.src_seq;
                 s.ob_channel_recv_ns[c] = evt.recv_ts_ns;
-                any_applied = true;
             }
         }
-        if (!any_applied) {
-            s.dup_count++;
-        } else {
-            s.update_latest_channel();
-            for (int c = 0; c < ViewerState::DEPTH_CHANNELS; c++)
-                s.ob_seen_deltas[c].clear();
-        }
+        if (!dr.is_dup()) s.update_latest_channel();
         s.snap_count++;
         sample_depth(s, evt.recv_ts_ns);
     } else if (evt.is_book_delta()) {
-        uint8_t ch = evt.depth_channel();
-        if (ch >= ViewerState::DEPTH_CHANNELS) ch = 0;
-        int64_t& ch_seq = s.ob_channel_seq[ch];
-
-        if (evt.src_seq > 0 && evt.src_seq <= ch_seq) {
-            if (evt.src_seq == ch_seq) {
-                // Same seq — content-based dedup for multi-flush
-                uint8_t overlap = 0;
-                for (uint8_t i = 0; i < evt.count; i++) {
-                    if (s.ob_seen_deltas[ch].count(delta_content_key(evt.payload.deltas.entries[i])))
-                        overlap++;
-                }
-                if (overlap == evt.count) {
-                    s.dup_count++;
-                    s.delta_count++;
-                    return;
-                }
-                for (uint8_t i = 0; i < evt.count; i++)
-                    s.ob_seen_deltas[ch].insert(delta_content_key(evt.payload.deltas.entries[i]));
-            } else {
-                s.dup_count++;
-                s.delta_count++;
-                return;
-            }
-        } else {
-            s.ob_seen_deltas[ch].clear();
-            for (uint8_t i = 0; i < evt.count; i++)
-                s.ob_seen_deltas[ch].insert(delta_content_key(evt.payload.deltas.entries[i]));
-        }
-        ch_seq = std::max(ch_seq, evt.src_seq);
+        if (dr.is_dup()) { s.delta_count++; return; }
+        uint8_t ch = dr.channel;
         s.ob_channel_recv_ns[ch] = evt.recv_ts_ns;
         s.ob_channels[ch].apply_deltas(evt);
         // Re-apply cached BBO if it's newer than this channel's book
+        int64_t ch_seq = s.dedup.ob_channel_seq[ch];
         if (s.last_bbo_seq > ch_seq) {
             auto& ob = s.ob_channels[ch];
             ob.bbo_seq = s.last_bbo_seq;
@@ -437,12 +431,7 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
         s.delta_count++;
         sample_depth(s, evt.recv_ts_ns);
     } else if (evt.is_bbo_array()) {
-        if (evt.src_seq > 0 && evt.src_seq <= s.bbo_seq) {
-            s.dup_count++;
-            s.bbo_count++;
-            return;
-        }
-        s.bbo_seq = std::max(s.bbo_seq, evt.src_seq);
+        if (dr.is_dup()) { s.bbo_count++; return; }
         s.bbo_recv_ns = evt.recv_ts_ns;
         // Cache BBO values
         auto entries = evt.bbo_entries();
@@ -456,19 +445,14 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
         }
         // Only apply to orderbook if BBO is newer than latest depth
         if (s.latest_ob_channel >= 0) {
-            int64_t latest_depth_seq = s.ob_channel_seq[s.latest_ob_channel];
+            int64_t latest_depth_seq = s.dedup.ob_channel_seq[s.latest_ob_channel];
             if (s.last_bbo_seq > latest_depth_seq)
                 s.ob_channels[s.latest_ob_channel].apply_bbo(evt);
         }
         s.bbo_count++;
         sample_depth(s, evt.recv_ts_ns);
     } else if (evt.is_trade_array()) {
-        if (evt.src_seq > 0 && evt.src_seq <= s.trade_seq) {
-            s.dup_count++;
-            s.trade_msg_count++;
-            return;
-        }
-        s.trade_seq = std::max(s.trade_seq, evt.src_seq);
+        if (dr.is_dup()) { s.trade_msg_count++; return; }
 
         // Advance volume segments based on recv_ts
         if (s.vol_seg_start_ns == 0)
@@ -499,6 +483,36 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
             if (s.trade_count < ViewerState::TRADE_BUF) s.trade_count++;
         }
         s.trade_msg_count++;
+    } else if (evt.is_liquidation()) {
+        if (!dr.is_dup()) {
+            s.is_perp = true;
+            s.liq_count++;
+            for (uint8_t i = 0; i < evt.count && i < MAX_LIQUIDATIONS; i++) {
+                const auto& liq = evt.payload.liquidations.entries[i];
+                s.liqs[s.liq_write & ViewerState::LIQ_MASK] = liq;
+                s.liq_write++;
+                if (s.liq_tape_count < ViewerState::LIQ_BUF) s.liq_tape_count++;
+                // Accumulate liq volume into segments (same cadence as trades)
+                double q = mantissa_to_double(liq.filled_qty, QTY_EXP);
+                bool is_sell = (liq.flags & LiqFlags::SIDE_SELL);
+                auto& seg = s.liq_vol_segs[s.vol_seg_cur];
+                if (is_sell) { seg.sell_qty += q; seg.sell_count++; }
+                else         { seg.buy_qty += q; seg.buy_count++; }
+            }
+        }
+    } else if (evt.is_mark_price()) {
+        if (!dr.is_dup()) {
+            s.is_perp = true;
+            if (evt.count > 0) {
+                auto& mp = evt.payload.mark_prices.entries[0];
+                s.last_mark_price = mp.mark_price;
+                s.last_index_price = mp.index_price;
+                s.last_funding_rate = mp.funding_rate;
+                s.last_next_funding_ns = mp.next_funding_ns;
+                s.last_mark_recv_ns = evt.recv_ts_ns;
+            }
+            s.mark_price_count++;
+        }
     }
 }
 
@@ -509,6 +523,8 @@ static void add_log_line(ViewerState& s, const MktEvent& evt) {
         evt.is_book_snapshot() ? (evt.is_snapshot() ? "SNAPSHOT" : "BBO     ") :
         evt.is_bbo_array()     ? "BBO     " :
         evt.is_book_delta()    ? "DELTA   " :
+        evt.is_liquidation()   ? "LIQUIDAT" :
+        evt.is_mark_price()    ? "MARKPRIC" :
         evt.is_system_status() ? "STATUS  " : "?       ";
 
     char counts[16] = "";
@@ -520,6 +536,10 @@ static void add_log_line(ViewerState& s, const MktEvent& evt) {
         snprintf(counts, sizeof(counts), "%ub", evt.count);
     } else if (evt.is_trade_array()) {
         snprintf(counts, sizeof(counts), "%ut", evt.count);
+    } else if (evt.is_liquidation()) {
+        snprintf(counts, sizeof(counts), "%uL", evt.count);
+    } else if (evt.is_mark_price()) {
+        snprintf(counts, sizeof(counts), "%uM", evt.count);
     } else if (evt.is_system_status()) {
         const char* st_name =
             evt.payload.status.status_type == 0 ? "HBEAT" :
@@ -792,7 +812,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
             if (s.last_status_type == 0xFF)
                 snprintf(conn_name, sizeof(conn_name), "conn*");
             else
-                snprintf(conn_name, sizeof(conn_name), "conn%u", s.last_mkt_conn);
+                snprintf(conn_name, sizeof(conn_name), "conn%2u", s.last_mkt_conn);
             // Base color: RED for Disconn(1), GREEN for Heartbt(0)/Reconn(2)/Failovr(3)
             const char* bg_color = (s.last_status_type == 1) ? BG_RED : BG_GREEN;
             char badge[48];
@@ -814,9 +834,9 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
             used += 1 + badge_len;
         }
 
-        if (s.dup_count > 0) {
+        if (s.dedup.dup_count > 0) {
             char dup[32];
-            int dup_len = snprintf(dup, sizeof(dup), " dup: %lu ", s.dup_count);
+            int dup_len = snprintf(dup, sizeof(dup), " dup: %lu ", s.dedup.dup_count);
             pos = fb_puts(fb, pos, " ");
             pos = fb_puts(fb, pos, "\033[97m\033[41m");  // bright white on red bg
             pos = fb_put(fb, pos, dup, dup_len);
@@ -1010,6 +1030,59 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
     float sell_strength = (avg_depth > 0) ? static_cast<float>(sell_vol / avg_depth) : 0;
     float strength_scale = std::max(1.0f, std::max(buy_strength, sell_strength));
 
+    // ── Pre-compute perp liquidation strength + tape ─────────────────────────
+    double liq_buy_vol = 0, liq_sell_vol = 0;
+    float liq_buy_strength = 0, liq_sell_strength = 0;
+    float liq_strength_scale = 1.0f;
+
+    static constexpr int MAX_LIQ_DISPLAY = 16;
+    struct FmtLiq { char lp[32], lq[32], lt[16]; bool is_sell; bool valid; };
+    FmtLiq flq[MAX_LIQ_DISPLAY];
+    int actual_liqs = 0;
+    int lmax_pdec = 0, lmax_qdec = 0;
+
+    if (s.is_perp) {
+        for (int i = 0; i < ViewerState::VOL_SEGMENTS; i++) {
+            liq_buy_vol  += s.liq_vol_segs[i].buy_qty;
+            liq_sell_vol += s.liq_vol_segs[i].sell_qty;
+        }
+        liq_buy_strength  = (avg_depth > 0) ? static_cast<float>(liq_buy_vol / avg_depth) : 0;
+        liq_sell_strength = (avg_depth > 0) ? static_cast<float>(liq_sell_vol / avg_depth) : 0;
+        liq_strength_scale = std::max(1.0f, std::max(liq_buy_strength, liq_sell_strength));
+
+        int max_liq_show = wide_mode ? (book_rows - 4) : trade_rows;
+        if (max_liq_show > MAX_LIQ_DISPLAY) max_liq_show = MAX_LIQ_DISPLAY;
+        if (max_liq_show < 0) max_liq_show = 0;
+
+        for (int i = 0; i < max_liq_show && i < (int)s.liq_tape_count; i++) {
+            size_t idx = (s.liq_write - 1 - i) & ViewerState::LIQ_MASK;
+            const auto& liq = s.liqs[idx];
+            auto& f = flq[actual_liqs];
+            f.valid = true;
+            f.is_sell = (liq.flags & LiqFlags::SIDE_SELL);
+            fmt_price(f.lp, sizeof(f.lp), liq.price, PRICE_EXP);
+            fmt_qty(f.lq, sizeof(f.lq), liq.filled_qty, QTY_EXP);
+            lmax_pdec = std::max(lmax_pdec, decimal_digits(f.lp));
+            lmax_qdec = std::max(lmax_qdec, decimal_digits(f.lq));
+            f.lt[0] = '\0';
+            if (liq.trade_time_ns > 0) {
+                int64_t ts_ms = liq.trade_time_ns / 1000000;
+                time_t secs = static_cast<time_t>(ts_ms / 1000);
+                struct tm tm_buf;
+                localtime_r(&secs, &tm_buf);
+                snprintf(f.lt, sizeof(f.lt), "%02d:%02d:%02d",
+                         tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec);
+            }
+            actual_liqs++;
+        }
+        for (int i = actual_liqs; i < MAX_LIQ_DISPLAY; i++)
+            flq[i].valid = false;
+        for (int i = 0; i < actual_liqs; i++) {
+            pad_to_decimals(flq[i].lp, lmax_pdec);
+            pad_to_decimals(flq[i].lq, lmax_qdec);
+        }
+    }
+
     // ── Book rows (+ trades in wide mode) ───────────────────────────────────
     for (int i = 0; i < book_level_rows; i++) {
         auto& f = fl[i];
@@ -1077,8 +1150,8 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
             }
         }
 
-        // Wide + hist: append interval histogram column
-        if (show_hist) {
+        // Wide + hist/perp: append interval histogram or perp info column
+        if (show_hist && !s.is_perp) {
             pos = fb_puts(fb, pos, " | ");
             if (i == 0) {
                 // Title row — fills label(5)+pipe(1)+bar area
@@ -1116,6 +1189,55 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
                     for (int j = 0; j < hist_bar_width + 6; j++) fb[pos++] = ' ';
                 }
             }
+        } else if (wide_mode && s.is_perp) {
+            int perp_col_w = std::max(hist_bar_width + 6, 30);
+            pos = fb_puts(fb, pos, " | ");
+            if (i == 0) {
+                // Title: PERP Mark:XXXXX.XX Fund:X.XXXX% XhXXm
+                char mp_str[32] = "-";
+                if (s.last_mark_price != 0)
+                    fmt_price(mp_str, sizeof(mp_str), s.last_mark_price, PRICE_EXP);
+                char fund_str[16] = "-";
+                if (s.last_funding_rate != 0) {
+                    // funding_rate mantissa: e.g. 38167 from "0.00038167" → 0.038167%
+                    double rate_pct = mantissa_to_double(s.last_funding_rate, PRICE_EXP) * 100.0;
+                    snprintf(fund_str, sizeof(fund_str), "%.4f%%", rate_pct);
+                }
+                char countdown[16] = "";
+                if (s.last_next_funding_ns > 0 && s.last_mark_recv_ns > 0) {
+                    int64_t remain_s = (s.last_next_funding_ns - s.last_mark_recv_ns) / 1000000000LL;
+                    if (remain_s < 0) remain_s = 0;
+                    int hrs = static_cast<int>(remain_s / 3600);
+                    int mins = static_cast<int>((remain_s % 3600) / 60);
+                    snprintf(countdown, sizeof(countdown), " %dh%02dm", hrs, mins);
+                }
+                n = snprintf(tmp, sizeof(tmp), "PERP Mk:%s Fd:%s%s", mp_str, fund_str, countdown);
+                if (n > perp_col_w) n = perp_col_w;
+                pos = fb_puts(fb, pos, BOLD);
+                pos = fb_put(fb, pos, tmp, n);
+                pos = fb_puts(fb, pos, RST);
+                for (int j = n; j < perp_col_w; j++) fb[pos++] = ' ';
+            } else if (i == 1) {
+                // Liq sell strength bar
+                pos = render_strength_bar(fb, pos, RED, 'S', liq_sell_strength, perp_col_w - 2, liq_strength_scale);
+            } else if (i == 2) {
+                // Liq buy strength bar
+                pos = render_strength_bar(fb, pos, GREEN, 'B', liq_buy_strength, perp_col_w - 2, liq_strength_scale);
+            } else {
+                // Recent liquidation orders
+                int li = i - 3;
+                if (li < actual_liqs && flq[li].valid) {
+                    auto& f = flq[li];
+                    pos = fb_puts(fb, pos, f.is_sell ? RED : GREEN);
+                    n = snprintf(tmp, sizeof(tmp), "%c %9.9s %9.9s %8.8s",
+                                 f.is_sell ? 'S' : 'B', f.lp, f.lq, f.lt);
+                    pos = fb_put(fb, pos, tmp, n);
+                    pos = fb_puts(fb, pos, RST);
+                    for (int j = n; j < perp_col_w; j++) fb[pos++] = ' ';
+                } else {
+                    for (int j = 0; j < perp_col_w; j++) fb[pos++] = ' ';
+                }
+            }
         }
 
         pos = fb_puts(fb, pos, K);
@@ -1124,9 +1246,9 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
 
     // ── Channel status row (last book row) ────────────────────────────────
     {
-        // 4 items (D0, D1, D2, BBO) spread across book column width
+        // 5 items (D0, D1, D2, D3, BBO) spread across book column width
         int book_col_w = wide_mode ? 41 : 35;  // 19+3+19 or 17+1+17
-        int field_w = book_col_w / 4;           // ~10 wide, ~8 narrow
+        int field_w = book_col_w / 5;           // ~8 wide, ~7 narrow
         int visible = 0;
         int n;
 
@@ -1159,7 +1281,7 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
                 n = snprintf(label, sizeof(label), "BBO %ldms", (long)ms_ago);
             }
             bool bbo_active = (s.latest_ob_channel >= 0 &&
-                               s.last_bbo_seq > s.ob_channel_seq[s.latest_ob_channel]);
+                               s.last_bbo_seq > s.dedup.ob_channel_seq[s.latest_ob_channel]);
             pos = fb_puts(fb, pos, bbo_active ? BOLD : DIM);
             if (bbo_active) pos = fb_puts(fb, pos, BG_CYAN);
             pos = fb_put(fb, pos, label, n);
@@ -1177,9 +1299,10 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
             pos = fb_put(fb, pos, depth_label, dn);
             pos = fb_puts(fb, pos, RST);
             for (int j = dn; j < 40; j++) fb[pos++] = ' ';
-            if (show_hist) {
+            if ((show_hist && !s.is_perp) || (wide_mode && s.is_perp)) {
+                int col_w = s.is_perp ? std::max(hist_bar_width + 6, 30) : hist_bar_width + 6;
                 pos = fb_puts(fb, pos, " | ");
-                for (int j = 0; j < hist_bar_width + 6; j++) fb[pos++] = ' ';
+                for (int j = 0; j < col_w; j++) fb[pos++] = ' ';
             }
         }
 
@@ -1230,6 +1353,60 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
         }
     }
 
+    // ── Narrow: perp section below trades ──────────────────────────────────
+    if (!wide_mode && s.is_perp) {
+        int narrow_bar_w = term_cols - 3 - 6;
+        if (narrow_bar_w < 4) narrow_bar_w = 4;
+        int n;
+        // Perp title line
+        {
+            char mp_str[32] = "-";
+            if (s.last_mark_price != 0)
+                fmt_price(mp_str, sizeof(mp_str), s.last_mark_price, PRICE_EXP);
+            char fund_str[16] = "-";
+            if (s.last_funding_rate != 0) {
+                double rate_pct = mantissa_to_double(s.last_funding_rate, PRICE_EXP) * 100.0;
+                snprintf(fund_str, sizeof(fund_str), "%.4f%%", rate_pct);
+            }
+            char countdown[16] = "";
+            if (s.last_next_funding_ns > 0 && s.last_mark_recv_ns > 0) {
+                int64_t remain_s = (s.last_next_funding_ns - s.last_mark_recv_ns) / 1000000000LL;
+                if (remain_s < 0) remain_s = 0;
+                int hrs = static_cast<int>(remain_s / 3600);
+                int mins = static_cast<int>((remain_s % 3600) / 60);
+                snprintf(countdown, sizeof(countdown), " %dh%02dm", hrs, mins);
+            }
+            n = snprintf(tmp, sizeof(tmp), "PERP Mk:%s Fd:%s%s", mp_str, fund_str, countdown);
+            pos = fb_puts(fb, pos, BOLD);
+            pos = fb_put(fb, pos, tmp, n);
+            pos = fb_puts(fb, pos, RST);
+        }
+        pos = fb_puts(fb, pos, K);
+        fb[pos++] = '\n';
+        // Liq sell strength
+        fb[pos++] = ' ';
+        pos = render_strength_bar(fb, pos, RED, 'S', liq_sell_strength, narrow_bar_w, liq_strength_scale);
+        pos = fb_puts(fb, pos, K);
+        fb[pos++] = '\n';
+        // Liq buy strength
+        fb[pos++] = ' ';
+        pos = render_strength_bar(fb, pos, GREEN, 'B', liq_buy_strength, narrow_bar_w, liq_strength_scale);
+        pos = fb_puts(fb, pos, K);
+        fb[pos++] = '\n';
+        // Recent liquidations
+        for (int i = 0; i < std::min(actual_liqs, 4); i++) {
+            auto& f = flq[i];
+            if (!f.valid) break;
+            pos = fb_puts(fb, pos, f.is_sell ? RED : GREEN);
+            n = snprintf(tmp, sizeof(tmp), " %c %8.8s %8.8s %8.8s",
+                         f.is_sell ? 'S' : 'B', f.lp, f.lq, f.lt);
+            pos = fb_put(fb, pos, tmp, n);
+            pos = fb_puts(fb, pos, RST);
+            pos = fb_puts(fb, pos, K);
+            fb[pos++] = '\n';
+        }
+    }
+
     // ── Log lines ───────────────────────────────────────────────────────────
     for (int i = 0; i < log_rows; i++) {
         if (i < (int)s.log_count) {
@@ -1268,8 +1445,7 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, sighandler);
 
     ViewerState state{};
-    std::strncpy(state.exchange, argv[1], sizeof(state.exchange) - 1);
-    std::strncpy(state.symbol, argv[2], sizeof(state.symbol) - 1);
+    // exchange and symbol are populated from MktEvent fields, not argv
 
     tty_write("\033[?25l\033[2J", 10);
 

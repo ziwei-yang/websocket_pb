@@ -430,7 +430,8 @@ public:
         // Set target configuration
         strncpy(conn_state_->target_host, WSS_HOST, sizeof(conn_state_->target_host) - 1);
         conn_state_->target_port = WSS_PORT;
-        strncpy(conn_state_->target_path, WSS_PATH, sizeof(conn_state_->target_path) - 1);
+        for (size_t i = 0; i < CONN_COUNT; ++i)
+            strncpy(conn_state_->target_path[i], WSS_PATH, sizeof(conn_state_->target_path[i]) - 1);
         strncpy(conn_state_->bpf_path, bpf_path_, sizeof(conn_state_->bpf_path) - 1);
         strncpy(conn_state_->interface_name, interface_, sizeof(conn_state_->interface_name) - 1);
 
