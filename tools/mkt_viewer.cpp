@@ -844,18 +844,6 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
             used += 1 + dup_len;
         }
 
-        // Update frequency (rolling 60s)
-        uint32_t evt_total = 0;
-        for (int i = 0; i < ViewerState::VOL_SEGMENTS; i++)
-            evt_total += s.evt_segs[i];
-        if (evt_total > 0) {
-            char upd[32];
-            int upd_len = snprintf(upd, sizeof(upd), " updates: %u/60s", evt_total);
-            pos = fb_puts(fb, pos, DIM);
-            pos = fb_put(fb, pos, upd, upd_len);
-            used += upd_len;
-        }
-
         // Right part: latency stats + latest value (if available)
         if (s.latency_count > 0) {
             float p50 = percentile(s, 0.50f);
@@ -1408,6 +1396,17 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
     }
 
     // ── Log lines ───────────────────────────────────────────────────────────
+    // Pre-format updates/60s badge for bottom-right
+    char upd_badge[32] = "";
+    int upd_badge_len = 0;
+    {
+        uint32_t evt_total = 0;
+        for (int i = 0; i < ViewerState::VOL_SEGMENTS; i++)
+            evt_total += s.evt_segs[i];
+        if (evt_total > 0)
+            upd_badge_len = snprintf(upd_badge, sizeof(upd_badge), " %u/60s ", evt_total);
+    }
+
     for (int i = 0; i < log_rows; i++) {
         if (i < (int)s.log_count) {
             size_t idx = (s.log_write - 1 - i) & 63;
@@ -1416,6 +1415,17 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
             pos = fb_puts(fb, pos, RST);
         }
         pos = fb_puts(fb, pos, K);
+        // Last log row: right-align updates/60s badge
+        if (i == log_rows - 1 && upd_badge_len > 0) {
+            int col = term_cols - upd_badge_len + 1;
+            if (col < 1) col = 1;
+            char cuf[16];
+            int cuf_len = snprintf(cuf, sizeof(cuf), "\033[%dG", col);
+            pos = fb_put(fb, pos, cuf, cuf_len);
+            pos = fb_puts(fb, pos, DIM);
+            pos = fb_put(fb, pos, upd_badge, upd_badge_len);
+            pos = fb_puts(fb, pos, RST);
+        }
         // No trailing \n on the very last line — avoids scrolling the terminal
         if (i < log_rows - 1) fb[pos++] = '\n';
     }
