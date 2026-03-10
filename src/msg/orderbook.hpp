@@ -144,8 +144,7 @@ private:
                 return;
             }
         }
-        uint8_t max_depth = is_bid ? max_bid_depth : max_ask_depth;
-        if (d.qty > 0 && count < max_depth) {
+        if (d.qty > 0 && count < OB_MAX_LEVELS) {
             uint8_t pos = count;
             for (uint8_t i = 0; i < count; i++) {
                 if (is_bid ? (d.price > levels[i].price) : (d.price < levels[i].price)) {
