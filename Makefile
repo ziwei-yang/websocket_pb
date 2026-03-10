@@ -287,6 +287,7 @@ TEST_USDM_JSON_SRC := $(TEST_DIR)/msg_binance_usdm/test_usdm_json_parser.cpp
 TEST_USDM_JSON_BENCH_SRC := $(TEST_DIR)/msg_binance_usdm/test_usdm_json_bench.cpp
 TEST_ORDERBOOK_SRC := $(TEST_DIR)/test_orderbook.cpp
 TEST_MKT_VIEWER_DEDUP_SRC := $(TEST_DIR)/test_mkt_viewer_dedup.cpp
+TEST_WATCHDOG_POLICY_SRC := $(TEST_DIR)/test_watchdog_policy.cpp
 
 # Integration test source files
 TEST_BINANCE_SRC := $(INTEGRATION_DIR)/binance.cpp
@@ -328,6 +329,7 @@ TEST_USDM_JSON_BIN := $(BUILD_DIR)/test_usdm_json_parser
 TEST_USDM_JSON_BENCH_BIN := $(BUILD_DIR)/test_usdm_json_bench
 TEST_ORDERBOOK_BIN := $(BUILD_DIR)/test_orderbook
 TEST_MKT_VIEWER_DEDUP_BIN := $(BUILD_DIR)/test_mkt_viewer_dedup
+TEST_WATCHDOG_POLICY_BIN := $(BUILD_DIR)/test_watchdog_policy
 TEST_AES_CTR_SEQ_SRC := $(TEST_DIR)/test_aes_ctr_seq.cpp
 TEST_AES_CTR_SEQ_BIN := $(BUILD_DIR)/test_aes_ctr_seq
 TEST_TLS13_INNER_CT_SRC := $(TEST_DIR)/test_tls13_inner_ct.cpp
@@ -638,6 +640,17 @@ $(TEST_SSL_POLICY_BIN): $(TEST_SSL_POLICY_SRC) | $(BUILD_DIR)
 test-ssl-policy: $(TEST_SSL_POLICY_BIN)
 	@echo "🧪 Running SSL policy unit tests..."
 	./$(TEST_SSL_POLICY_BIN)
+
+# Build watchdog policy tests
+$(TEST_WATCHDOG_POLICY_BIN): $(TEST_WATCHDOG_POLICY_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling watchdog policy unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run watchdog policy tests
+test-watchdog-policy: $(TEST_WATCHDOG_POLICY_BIN)
+	@echo "🧪 Running watchdog policy unit tests..."
+	./$(TEST_WATCHDOG_POLICY_BIN)
 
 # Build WS parser tests
 $(TEST_WS_PARSER_BIN): $(TEST_WS_PARSER_SRC) | $(BUILD_DIR)
@@ -1893,7 +1906,7 @@ test-simulator: $(SIMULATOR_BIN)
 # Unified Test Target - Run All Unit Tests
 # ============================================================================
 
-test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-aes-ctr-seq test-tls13-inner-ct test-wolfssl-seq-num test-last-byte-ts test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-usdm-json-parser test-orderbook test-mkt-viewer-dedup
+test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-aes-ctr-seq test-tls13-inner-ct test-wolfssl-seq-num test-last-byte-ts test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-watchdog-policy test-ws-parser test-sbe-decoder test-sbe-handler test-usdm-json-parser test-orderbook test-mkt-viewer-dedup
 	@echo ""
 	@echo "╔════════════════════════════════════════════════════════════════════╗"
 	@echo "║                    ALL UNIT TESTS COMPLETED                        ║"

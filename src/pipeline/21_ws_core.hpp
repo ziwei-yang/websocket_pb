@@ -27,6 +27,7 @@
 #include "20_ws_process.hpp"
 #include "../core/http.hpp"
 #include "../core/timing.hpp"
+#include "../policy/watchdog.hpp"
 
 namespace websocket::pipeline {
 
@@ -807,43 +808,32 @@ private:
         {
             auto& w = wd_[ci];
             uint64_t now_cycle = rdtscp();
-            w.last_server_ping_cycle = now_cycle;
+            uint64_t tsc_freq = conn_state_->tsc_freq_hz;
 
-            uint32_t idx = w.server_ping_count;
-            if (idx < WatchdogState::PING_LEARN_SAMPLES) {
-                w.server_ping_cycles[idx] = now_cycle;
-            }
-            w.server_ping_count++;
+            if constexpr (MaxConn <= 1) {
+                // SelfLearnWatchdogPolicy: learn interval + log progress
+                using SLWP = websocket::policy::SelfLearnWatchdogPolicy;
+                uint32_t prev_count = w.server_ping_count;
+                w.on_server_ping(now_cycle, tsc_freq);
 
-            if (w.server_ping_count >= 2) {
-                uint32_t n = std::min(w.server_ping_count, WatchdogState::PING_LEARN_SAMPLES);
-                uint64_t total_delta = w.server_ping_cycles[n - 1] - w.server_ping_cycles[0];
-                uint64_t avg_delta = total_delta / (n - 1);
-
-                uint64_t tsc_freq = conn_state_->tsc_freq_hz;
-                uint64_t avg_ms = (avg_delta * 1000ULL) / tsc_freq;
-
-                // Reject bogus intervals < 1s (frame parse desync can produce fake PINGs)
-                if (avg_ms < 1000) {
-                    if (w.server_ping_count <= WatchdogState::PING_LEARN_SAMPLES) {
-                        fprintf(stderr, "[WS-WATCHDOG] Ignoring bogus PING interval (conn %u): %lums "
-                                "(%u/%u samples) — too short, resetting\n",
-                                ci, (unsigned long)avg_ms, n, WatchdogState::PING_LEARN_SAMPLES);
-                    }
-                    w.server_ping_count = 0;
-                    w.learned_interval_cycles = 0;
-                    w.learned_interval_ms = 0;
-                } else {
-                    w.learned_interval_cycles = avg_delta;
-                    w.learned_interval_ms = ((avg_ms + 50) / 100) * 100;
-
-                    if (w.server_ping_count <= WatchdogState::PING_LEARN_SAMPLES) {
+                if (prev_count >= 1) {
+                    if (w.server_ping_count == 0) {
+                        // Bogus interval detected (count was reset)
+                        fprintf(stderr, "[WS-WATCHDOG] Ignoring bogus PING interval (conn %u) "
+                                "— too short, resetting\n", ci);
+                    } else if (w.server_ping_count >= 2 && w.server_ping_count <= SLWP::PING_LEARN_SAMPLES
+                               && w.learned_interval_ms > 0) {
+                        uint32_t n = std::min(w.server_ping_count, SLWP::PING_LEARN_SAMPLES);
+                        uint64_t total_delta = w.server_ping_cycles[n - 1] - w.server_ping_cycles[0];
+                        uint64_t avg_ms = (total_delta / (n - 1) * 1000ULL) / tsc_freq;
                         fprintf(stderr, "[WS-WATCHDOG] Server PING interval (conn %u): %lums "
                                 "(avg %lums, %u/%u samples)\n",
                                 ci, (unsigned long)w.learned_interval_ms,
-                                (unsigned long)avg_ms, n, WatchdogState::PING_LEARN_SAMPLES);
+                                (unsigned long)avg_ms, n, SLWP::PING_LEARN_SAMPLES);
                     }
                 }
+            } else {
+                w.on_server_ping(now_cycle, tsc_freq);  // no-op for FixedWatchdogPolicy
             }
         }
 
@@ -935,7 +925,7 @@ private:
     void handle_pong(uint8_t ci, uint64_t payload_len) {
         auto& ps = parse_state_[ci];
 
-        wd_[ci].last_pong_recv_cycle = rdtscp();
+        wd_[ci].on_pong(rdtscp());
 
         struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
         char payload_str[128] = {0};
@@ -971,32 +961,13 @@ private:
 
         if (w.last_client_ping_cycle == 0) {
             w.last_client_ping_cycle = now_cycle;
-            w.last_pong_recv_cycle = now_cycle;
+            w.on_pong(now_cycle);
             return;
         }
 
         if ((now_cycle - w.last_client_ping_cycle) < tsc_freq) return;
 
-        bool interval_learned = (w.server_ping_count >= 2 && w.learned_interval_cycles > 0);
-        uint64_t pong_timeout_cycles = interval_learned
-            ? w.learned_interval_cycles
-            : (DEFAULT_PONG_TIMEOUT_MS * tsc_freq) / 1000;
-
-        uint64_t since_last_pong = now_cycle - w.last_pong_recv_cycle;
-        bool server_pong_missing = (since_last_pong > pong_timeout_cycles);
-
-        bool server_ping_missing = false;
-        if (interval_learned && w.last_server_ping_cycle > 0) {
-            uint64_t since_last_ping = now_cycle - w.last_server_ping_cycle;
-            uint64_t threshold = w.learned_interval_cycles + (w.learned_interval_cycles / 2);
-            server_ping_missing = (since_last_ping > threshold);
-        }
-
-        bool should_reconnect = interval_learned
-            ? (server_pong_missing && server_ping_missing)
-            : server_pong_missing;
-
-        if (should_reconnect) {
+        if (w.check_alert(now_cycle, tsc_freq)) {
             trigger_watchdog_reconnect(ci, now_cycle, tsc_freq);
             ws_phase_[ci] = WsConnPhase::DISCONNECTED;
             notify_disconnected(ci);
@@ -1174,26 +1145,34 @@ private:
         auto& w = wd_[ci];
         struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
         uint64_t pong_gap_ms = ((now_cycle - w.last_pong_recv_cycle) * 1000ULL) / tsc_freq;
-        uint64_t ping_gap_ms = (w.last_server_ping_cycle > 0)
-            ? ((now_cycle - w.last_server_ping_cycle) * 1000ULL) / tsc_freq : 0;
-        bool interval_learned = (w.server_ping_count >= 2 && w.learned_interval_cycles > 0);
 
         uint64_t data_gap_ms = (last_data_cycle_[ci] > 0)
             ? ((now_cycle - last_data_cycle_[ci]) * 1000ULL) / tsc_freq : 0;
 
-        fprintf(stderr, "[%ld.%06ld] [WS-WATCHDOG] %s: conn %u dead\n"
-                "  PONG missing: last %lums ago (threshold %lums)\n"
-                "  server PING missing: last %lums ago (threshold %lums)\n"
-                "  last DATA: %lums ago\n",
-                _ts.tv_sec, _ts.tv_nsec / 1000,
-                AutoReconnect ? "RECONNECT" : "FATAL", ci,
-                (unsigned long)pong_gap_ms,
-                (unsigned long)(interval_learned ? w.learned_interval_ms : DEFAULT_PONG_TIMEOUT_MS),
-                (unsigned long)ping_gap_ms,
-                (unsigned long)(interval_learned ? (w.learned_interval_ms * 3 / 2) : 0),
-                (unsigned long)data_gap_ms);
+        if constexpr (MaxConn <= 1) {
+            uint64_t ping_gap_ms = (w.last_server_ping_cycle > 0)
+                ? ((now_cycle - w.last_server_ping_cycle) * 1000ULL) / tsc_freq : 0;
+            fprintf(stderr, "[%ld.%06ld] [WS-WATCHDOG] %s: conn %u dead\n"
+                    "  PONG missing: last %lums ago (threshold %lums)\n"
+                    "  server PING missing: last %lums ago (threshold %lums)\n"
+                    "  last DATA: %lums ago\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000,
+                    AutoReconnect ? "RECONNECT" : "FATAL", ci,
+                    (unsigned long)pong_gap_ms,
+                    (unsigned long)w.timeout_display_ms(),
+                    (unsigned long)ping_gap_ms,
+                    (unsigned long)w.server_ping_display_ms(),
+                    (unsigned long)data_gap_ms);
+        } else {
+            fprintf(stderr, "[%ld.%06ld] [WS-WATCHDOG] %s: conn %u dead\n"
+                    "  PONG missing: last %lums ago (threshold %lums)\n"
+                    "  last DATA: %lums ago\n",
+                    _ts.tv_sec, _ts.tv_nsec / 1000,
+                    AutoReconnect ? "RECONNECT" : "FATAL", ci,
+                    (unsigned long)pong_gap_ms,
+                    (unsigned long)w.timeout_display_ms(),
+                    (unsigned long)data_gap_ms);
 
-        if constexpr (MaxConn > 1) {
             for (size_t other = 0; other < n_active_; ++other) {
                 if (other == ci) continue;
                 uint64_t other_data_gap_ms = (last_data_cycle_[other] > 0)
@@ -1208,10 +1187,7 @@ private:
 
         if constexpr (AutoReconnect) {
             conn_state_->set_reconnect_request(ci);
-            w.server_ping_count = 0;
-            w.last_server_ping_cycle = now_cycle;
-            w.last_client_ping_cycle = 0;
-            w.last_pong_recv_cycle = now_cycle;
+            w.reset(now_cycle);
         } else {
             conn_state_->set_disconnect(DisconnectReason::WS_PONG_TIMEOUT);
             conn_state_->shutdown_all();
@@ -1219,7 +1195,7 @@ private:
     }
 
     void reset_watchdog_state(uint8_t ci) {
-        wd_[ci] = WatchdogState{};
+        wd_[ci] = WatchdogPolicyType{};
     }
 
     void check_all_dead() {
@@ -1251,11 +1227,20 @@ private:
             fprintf(stderr, "[%ld.%06ld] [WS-ALL-DEAD] All %u connections silent (threshold: %lums)\n",
                     ts.tv_sec, ts.tv_nsec / 1000, n_active_, (unsigned long)threshold_ms);
             for (size_t i = 0; i < n_active_; ++i) {
+                uint64_t data_gap = (last_data_cycle_[i] > 0)
+                    ? ((now - last_data_cycle_[i]) * 1000ULL) / freq : 0;
+                uint64_t pong_gap = (wd_[i].last_pong_recv_cycle > 0)
+                    ? ((now - wd_[i].last_pong_recv_cycle) * 1000ULL) / freq : 0;
+                uint64_t ping_gap = (wd_[i].last_client_ping_cycle > 0)
+                    ? ((now - wd_[i].last_client_ping_cycle) * 1000ULL) / freq : 0;
                 uint64_t last_alive = last_data_cycle_[i];
                 if (wd_[i].last_pong_recv_cycle > last_alive)
                     last_alive = wd_[i].last_pong_recv_cycle;
                 uint64_t gap = ((now - last_alive) * 1000ULL) / freq;
-                fprintf(stderr, "  conn %zu: %lums ago\n", i, (unsigned long)gap);
+                const char* src = (wd_[i].last_pong_recv_cycle > last_data_cycle_[i]) ? "PONG" : "DATA";
+                fprintf(stderr, "  conn %zu: %lums ago (src=%s data=%lums pong=%lums ping_sent=%lums)\n",
+                        i, (unsigned long)gap, src,
+                        (unsigned long)data_gap, (unsigned long)pong_gap, (unsigned long)ping_gap);
             }
 
             for (size_t i = 0; i < n_active_; ++i) {
@@ -1460,23 +1445,12 @@ private:
     bool all_disconnected_ = false;
     uint64_t last_op_cycle_ = 0;
 
-    struct WatchdogState {
-        uint64_t last_client_ping_cycle = 0;
-        uint64_t last_pong_recv_cycle = 0;
-
-        static constexpr uint32_t PING_LEARN_SAMPLES = 5;
-        uint64_t server_ping_cycles[PING_LEARN_SAMPLES]{};
-        uint32_t server_ping_count = 0;
-        uint64_t learned_interval_cycles = 0;
-        uint64_t learned_interval_ms = 0;
-
-        uint64_t last_server_ping_cycle = 0;
-    };
-    WatchdogState wd_[NUM_CONN]{};
+    using WatchdogPolicyType = std::conditional_t<(MaxConn > 1),
+        websocket::policy::FixedWatchdogPolicy<5000>,
+        websocket::policy::SelfLearnWatchdogPolicy>;
+    WatchdogPolicyType wd_[NUM_CONN]{};
     uint64_t last_data_cycle_[NUM_CONN]{};
     uint64_t upgrade_sent_cycle_[NUM_CONN]{};
-
-    static constexpr uint64_t DEFAULT_PONG_TIMEOUT_MS = 5000;
 };
 
 }  // namespace websocket::pipeline
