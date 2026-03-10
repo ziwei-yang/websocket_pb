@@ -977,7 +977,7 @@ inline void trade_streaming_continue(
         self.last_trade_id_ = state.sequence;
         self.record_win(ci);
         self.publish_event([&](websocket::msg::MktEvent& ev) {
-            ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY);
+            ev.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY));
             ev.src_seq = state.sequence;
             ev.event_ts_ns = event_ts_ns;
             ev.count = 1;
@@ -1111,11 +1111,11 @@ inline void flush_depth_snapshot_json(Handler& self, JsonParseState& state, uint
         state.delta_buf[i].qty   *= websocket::market::BinanceUSDM::qty_scale;
     }
     self.publish_event([&](websocket::msg::MktEvent& e) {
-        e.event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT);
+        e.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT));
         uint16_t f = websocket::msg::EventFlags::SNAPSHOT;
         if (state.flush_count > 0) f |= websocket::msg::EventFlags::CONTINUATION;
         if (is_final)              f |= websocket::msg::EventFlags::LAST_IN_BATCH;
-        e.flags = f;
+        e.flags |= f;
         e.src_seq = seq;
         e.event_ts_ns = state.event_time_ms * 1000000LL;
         e.count = bid_n;
@@ -1128,7 +1128,7 @@ inline void flush_depth_snapshot_json(Handler& self, JsonParseState& state, uint
 }
 
 // Depth streaming: parse bids/asks incrementally, flush at capacity
-static constexpr uint8_t JSON_SNAPSHOT_HALF = websocket::msg::MAX_BOOK_LEVELS / 2;  // 14
+static constexpr uint8_t JSON_SNAPSHOT_HALF = websocket::msg::MAX_BOOK_LEVELS / 2;  // 15
 
 template<typename Handler>
 inline void depth_streaming_continue(
@@ -1339,11 +1339,11 @@ struct BinanceUSDMJsonParser {
         uint8_t count = pd.count;
         uint8_t fc = pd.flush_count;
         publish_event([&](websocket::msg::MktEvent& e) {
-            e.event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA);
+            e.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::BOOK_DELTA));
             uint16_t f = 0;
             if (fc > 0)    f |= websocket::msg::EventFlags::CONTINUATION;
             if (is_final)  f |= websocket::msg::EventFlags::LAST_IN_BATCH;
-            e.flags = f;
+            e.flags |= f;
             e.set_depth_channel(ch);
             e.src_seq = pd.seq;
             e.event_ts_ns = pd.event_ts_ns;
@@ -1598,7 +1598,7 @@ struct BinanceUSDMJsonParser {
             record_win(ci);
             current_info_ = &info;
             publish_event([&](websocket::msg::MktEvent& ev) {
-                ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::LIQUIDATION);
+                ev.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::LIQUIDATION));
                 ev.src_seq = e.sequence;
                 ev.event_ts_ns = e.event_time_ms * 1000000LL;
                 ev.count = 1;
@@ -1643,7 +1643,7 @@ struct BinanceUSDMJsonParser {
             record_win(ci);
             current_info_ = &info;
             publish_event([&](websocket::msg::MktEvent& ev) {
-                ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::MARK_PRICE);
+                ev.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::MARK_PRICE));
                 ev.src_seq = e.sequence;
                 ev.event_ts_ns = e.event_time_ms * 1000000LL;
                 ev.count = 1;
@@ -1703,7 +1703,7 @@ struct BinanceUSDMJsonParser {
         record_win(pending_trades_ci_);
         current_info_ = &pending_trades_info_;
         publish_event([&](websocket::msg::MktEvent& ev) {
-            ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY);
+            ev.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY));
             ev.src_seq = pending_trade_entries_[pending_trade_count_ - 1].trade_id;
             ev.event_ts_ns = pending_trades_event_ts_ns_;
             ev.count = pending_trade_count_;
@@ -1721,11 +1721,12 @@ struct BinanceUSDMJsonParser {
         if (slot < 0) return;
         auto& e = (*mkt_event_prod)[slot];
         e.clear();
-        e.venue_id = static_cast<uint8_t>(websocket::msg::VenueId::BINANCE_USDM);
-        e.event_type = static_cast<uint8_t>(websocket::msg::EventType::SYSTEM_STATUS);
+        e.set_venue_id(static_cast<uint8_t>(websocket::msg::VenueId::BINANCE_USDM));
+        e.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::SYSTEM_STATUS));
         struct timespec ts_real;
         clock_gettime(CLOCK_REALTIME, &ts_real);
-        e.recv_ts_ns = static_cast<int64_t>(ts_real.tv_sec) * 1000000000LL + ts_real.tv_nsec;
+        e.nic_ts_ns = static_cast<int64_t>(ts_real.tv_sec) * 1000000000LL + ts_real.tv_nsec;
+        e.recv_local_latency_ns = 0;
         e.payload.status.status_type = static_cast<uint8_t>(status);
         e.payload.status.connection_id = ci;
         e.payload.status.detail_code = detail;
@@ -1743,14 +1744,13 @@ struct BinanceUSDMJsonParser {
         if (slot < 0) return;
         auto& e = (*mkt_event_prod)[slot];
         e.clear();
-        e.venue_id = static_cast<uint8_t>(websocket::msg::VenueId::BINANCE_USDM);
-        e.instrument_id = instrument_id;
+        e.set_venue_id(static_cast<uint8_t>(websocket::msg::VenueId::BINANCE_USDM));
+        e.set_instrument_id(instrument_id);
         struct timespec ts_real, ts_mono;
         clock_gettime(CLOCK_REALTIME, &ts_real);
         clock_gettime(CLOCK_MONOTONIC, &ts_mono);
         int64_t real_ns = static_cast<int64_t>(ts_real.tv_sec) * 1000000000LL + ts_real.tv_nsec;
         int64_t mono_ns = static_cast<int64_t>(ts_mono.tv_sec) * 1000000000LL + ts_mono.tv_nsec;
-        e.recv_ts_ns = real_ns;
         if (current_info_) {
             int64_t mono_arrival = 0;
             if (current_info_->latest_bpf_entry_ns > 0)
@@ -1760,6 +1760,9 @@ struct BinanceUSDMJsonParser {
             if (mono_arrival > 0)
                 e.nic_ts_ns = real_ns - (mono_ns - mono_arrival);
         }
+        int64_t local_lat = real_ns - e.nic_ts_ns;
+        e.recv_local_latency_ns = (e.nic_ts_ns > 0 && local_lat > 0)
+            ? static_cast<uint16_t>(local_lat > 65535 ? 65535 : local_lat) : 0;
         build(e);
         e.set_connection_id(active_ci_);
         mkt_event_prod->publish(slot);

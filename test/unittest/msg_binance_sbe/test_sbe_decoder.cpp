@@ -973,12 +973,11 @@ void test_mkt_event_layout() {
     static_assert(sizeof(MktEvent) == 512);
     static_assert(alignof(MktEvent) == 512);
 
-    // Header offsets
+    // Header offsets (32-byte compact header)
     static_assert(offsetof(MktEvent, src_seq) == 8);
-    static_assert(offsetof(MktEvent, recv_ts_ns) == 16);
+    static_assert(offsetof(MktEvent, nic_ts_ns) == 16);
     static_assert(offsetof(MktEvent, event_ts_ns) == 24);
-    static_assert(offsetof(MktEvent, nic_ts_ns) == 32);
-    static_assert(offsetof(MktEvent, payload) == 40);
+    static_assert(offsetof(MktEvent, payload) == 32);
 
     // Entry sizes
     static_assert(sizeof(DeltaEntry) == 24);
@@ -986,9 +985,9 @@ void test_mkt_event_layout() {
     static_assert(sizeof(TradeEntry) == 40);
 
     // MAX constants
-    static_assert(MAX_DELTAS == 19);       // 472 / 24
-    static_assert(MAX_BOOK_LEVELS == 29);  // 472 / 16
-    static_assert(MAX_TRADES == 11);       // 472 / 40
+    static_assert(MAX_DELTAS == 20);       // 480 / 24
+    static_assert(MAX_BOOK_LEVELS == 30);  // 480 / 16
+    static_assert(MAX_TRADES == 12);       // 480 / 40
 
     // Trivially copyable
     static_assert(std::is_trivially_copyable_v<MktEvent>);
@@ -1001,14 +1000,14 @@ void test_mkt_event_layout() {
 
     // Runtime check: clear() zeroes everything
     alignas(512) MktEvent evt;
-    evt.event_type = 99;
-    evt.venue_id = 1;
+    evt.set_event_type(99);
+    evt.set_venue_id(1);
     evt.src_seq = 12345;
     evt.clear();
-    assert(evt.event_type == 0);
-    assert(evt.venue_id == 0);
+    assert(evt.event_type() == 0);
+    assert(evt.venue_id() == 0);
     assert(evt.src_seq == 0);
-    assert(evt.recv_ts_ns == 0);
+    assert(evt.recv_ts_ns() == 0);
 }
 
 // ============================================================================

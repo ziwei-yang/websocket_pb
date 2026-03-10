@@ -1,7 +1,7 @@
 // msg/mkt_event.hpp
 // Fixed-size market data event for disruptor ring IPC
-// 512 bytes aligned — fits depth10 snapshots, 11 trades, 19 deltas per event
-// C++20, zero-copy, trivially copyable
+// 512 bytes aligned — fits depth10 snapshots, 12 trades, 20 deltas per event
+// 32-byte header + 480-byte payload. C++20, zero-copy, trivially copyable
 #pragma once
 
 #include <cstdint>
@@ -56,8 +56,10 @@ namespace EventFlags {
     inline constexpr uint16_t LAST_IN_BATCH = 1 << 2;  // last in multi-event batch
     inline constexpr uint16_t DEPTH_CH_SHIFT = 3;
     inline constexpr uint16_t DEPTH_CH_MASK  = 0x0038;  // bits 3-5 (3 bits, 0-7)
-    inline constexpr uint16_t CONN_ID_SHIFT = 8;
-    inline constexpr uint16_t CONN_ID_MASK  = 0xFF00;
+    inline constexpr uint16_t EVT_TYPE_SHIFT = 6;
+    inline constexpr uint16_t EVT_TYPE_MASK  = 0x01C0;  // bits 6-8 (3 bits, 0-7)
+    inline constexpr uint16_t CONN_ID_SHIFT = 9;
+    inline constexpr uint16_t CONN_ID_MASK  = 0xFE00;   // bits 9-15 (7 bits, 0-127)
 }
 
 static constexpr uint8_t MAX_DEPTH_CHANNELS = 8;  // bits 3-5 support 0-7
@@ -146,63 +148,57 @@ struct MarkPriceEntry {
 static_assert(sizeof(MarkPriceEntry) == 48);
 
 // ============================================================================
-// Payload types (all exactly 472 bytes)
+// Payload types (all exactly 480 bytes)
 // ============================================================================
 
-static constexpr size_t PAYLOAD_SIZE = 472;
+static constexpr size_t PAYLOAD_SIZE = 480;
 
-// BOOK_DELTA: header.count = number of deltas (max 19)
-static constexpr size_t MAX_DELTAS = PAYLOAD_SIZE / sizeof(DeltaEntry);  // 19
+// BOOK_DELTA: header.count = number of deltas (max 20)
+static constexpr size_t MAX_DELTAS = PAYLOAD_SIZE / sizeof(DeltaEntry);  // 20
 
 struct BookDeltaPayload {
     DeltaEntry entries[MAX_DELTAS];
-    uint8_t _pad[PAYLOAD_SIZE - MAX_DELTAS * sizeof(DeltaEntry)];
 };
 static_assert(sizeof(BookDeltaPayload) == PAYLOAD_SIZE);
 
 // BOOK_SNAPSHOT: header.count = bid_count, header.count2 = ask_count
 // bids first (best→worst), then asks (best→worst)
-static constexpr size_t MAX_BOOK_LEVELS = PAYLOAD_SIZE / sizeof(BookLevel);  // 29
+static constexpr size_t MAX_BOOK_LEVELS = PAYLOAD_SIZE / sizeof(BookLevel);  // 30
 
 struct BookSnapshotPayload {
     BookLevel levels[MAX_BOOK_LEVELS];
-    uint8_t _pad[PAYLOAD_SIZE - MAX_BOOK_LEVELS * sizeof(BookLevel)];
 };
 static_assert(sizeof(BookSnapshotPayload) == PAYLOAD_SIZE);
 
-// TRADE_ARRAY: header.count = number of trades (max 11)
-static constexpr size_t MAX_TRADES = PAYLOAD_SIZE / sizeof(TradeEntry);  // 11
+// TRADE_ARRAY: header.count = number of trades (max 12)
+static constexpr size_t MAX_TRADES = PAYLOAD_SIZE / sizeof(TradeEntry);  // 12
 
 struct TradeArrayPayload {
     TradeEntry entries[MAX_TRADES];
-    uint8_t _pad[PAYLOAD_SIZE - MAX_TRADES * sizeof(TradeEntry)];
 };
 static_assert(sizeof(TradeArrayPayload) == PAYLOAD_SIZE);
 
-// BBO: header.count = number of BBOs (max 9)
-static constexpr size_t MAX_BBOS = PAYLOAD_SIZE / sizeof(BboEntry);  // 9
+// BBO: header.count = number of BBOs (max 10)
+static constexpr size_t MAX_BBOS = PAYLOAD_SIZE / sizeof(BboEntry);  // 10
 
 struct BboArrayPayload {
     BboEntry entries[MAX_BBOS];
-    uint8_t _pad[PAYLOAD_SIZE - MAX_BBOS * sizeof(BboEntry)];
 };
 static_assert(sizeof(BboArrayPayload) == PAYLOAD_SIZE);
 
-// LIQUIDATION: header.count = number of liquidation orders (max 9)
-static constexpr size_t MAX_LIQUIDATIONS = PAYLOAD_SIZE / sizeof(LiquidationEntry);  // 9
+// LIQUIDATION: header.count = number of liquidation orders (max 10)
+static constexpr size_t MAX_LIQUIDATIONS = PAYLOAD_SIZE / sizeof(LiquidationEntry);  // 10
 
 struct LiquidationPayload {
     LiquidationEntry entries[MAX_LIQUIDATIONS];
-    uint8_t _pad[PAYLOAD_SIZE - MAX_LIQUIDATIONS * sizeof(LiquidationEntry)];
 };
 static_assert(sizeof(LiquidationPayload) == PAYLOAD_SIZE);
 
-// MARK_PRICE: header.count = number of mark price updates (max 9)
-static constexpr size_t MAX_MARK_PRICES = PAYLOAD_SIZE / sizeof(MarkPriceEntry);  // 9
+// MARK_PRICE: header.count = number of mark price updates (max 10)
+static constexpr size_t MAX_MARK_PRICES = PAYLOAD_SIZE / sizeof(MarkPriceEntry);  // 10
 
 struct MarkPricePayload {
     MarkPriceEntry entries[MAX_MARK_PRICES];
-    uint8_t _pad[PAYLOAD_SIZE - MAX_MARK_PRICES * sizeof(MarkPriceEntry)];
 };
 static_assert(sizeof(MarkPricePayload) == PAYLOAD_SIZE);
 
@@ -212,7 +208,7 @@ struct SystemStatusPayload {
     uint8_t  connection_id;    // 0=A, 1=B
     uint8_t  _pad[6];
     int64_t  detail_code;      // status-specific code
-    char     message[456];     // null-terminated status text
+    char     message[464];     // null-terminated status text
 };
 static_assert(sizeof(SystemStatusPayload) == PAYLOAD_SIZE);
 
@@ -221,19 +217,17 @@ static_assert(sizeof(SystemStatusPayload) == PAYLOAD_SIZE);
 // ============================================================================
 
 struct alignas(512) MktEvent {
-    // --- Header (40 bytes, offset 0-39) ---
-    uint8_t  event_type;       // EventType enum
-    uint8_t  venue_id;         // VenueId enum
-    uint16_t instrument_id;    // pair index (externally mapped)
-    uint16_t flags;            // EventFlags bitset
-    uint8_t  count;            // primary count (deltas/trades/bid_levels)
-    uint8_t  count2;           // secondary count (ask_levels for snapshot, else 0)
-    int64_t  src_seq;          // exchange sequence number
-    int64_t  recv_ts_ns;       // local receive timestamp (ns)
-    int64_t  event_ts_ns;      // exchange event timestamp (ns)
-    int64_t  nic_ts_ns;        // NIC HW receive timestamp (ns, CLOCK_REALTIME)
+    // --- Header (32 bytes, offset 0-31) ---
+    uint16_t venue_instrument;       // [15:12]=venue_id (4b) [11:0]=instrument_id (12b)
+    uint16_t flags;                  // EventFlags: [2:0] snap/cont/last [5:3] depth_ch [8:6] event_type [15:9] conn_id
+    uint8_t  count;                  // primary count (deltas/trades/bid_levels)
+    uint8_t  count2;                 // secondary count (ask_levels for snapshot, else 0)
+    uint16_t recv_local_latency_ns;  // min(recv_ts - nic_ts, 65535), 0 = none
+    int64_t  src_seq;                // exchange sequence number
+    int64_t  nic_ts_ns;              // NIC HW receive timestamp (ns, CLOCK_REALTIME)
+    int64_t  event_ts_ns;            // exchange event timestamp (ns)
 
-    // --- Payload (472 bytes, offset 40-511) ---
+    // --- Payload (480 bytes, offset 32-511) ---
     union {
         BookDeltaPayload    deltas;
         BookSnapshotPayload snapshot;
@@ -245,16 +239,40 @@ struct alignas(512) MktEvent {
     } payload;
 
     // ========================================================================
+    // Packed field accessors
+    // ========================================================================
+
+    uint8_t event_type() const {
+        return (flags & EventFlags::EVT_TYPE_MASK) >> EventFlags::EVT_TYPE_SHIFT;
+    }
+    void set_event_type(uint8_t t) {
+        flags = (flags & ~EventFlags::EVT_TYPE_MASK) |
+                (static_cast<uint16_t>(t) << EventFlags::EVT_TYPE_SHIFT);
+    }
+
+    uint8_t venue_id() const { return venue_instrument >> 12; }
+    void set_venue_id(uint8_t v) {
+        venue_instrument = (venue_instrument & 0x0FFF) | (static_cast<uint16_t>(v) << 12);
+    }
+
+    uint16_t instrument_id() const { return venue_instrument & 0x0FFF; }
+    void set_instrument_id(uint16_t id) {
+        venue_instrument = (venue_instrument & 0xF000) | (id & 0x0FFF);
+    }
+
+    int64_t recv_ts_ns() const { return nic_ts_ns + recv_local_latency_ns; }
+
+    // ========================================================================
     // Type queries
     // ========================================================================
 
-    bool is_book_delta()    const { return event_type == static_cast<uint8_t>(EventType::BOOK_DELTA); }
-    bool is_book_snapshot() const { return event_type == static_cast<uint8_t>(EventType::BOOK_SNAPSHOT); }
-    bool is_trade_array()   const { return event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY); }
-    bool is_system_status() const { return event_type == static_cast<uint8_t>(EventType::SYSTEM_STATUS); }
-    bool is_bbo_array()   const { return event_type == static_cast<uint8_t>(EventType::BBO_ARRAY); }
-    bool is_liquidation() const { return event_type == static_cast<uint8_t>(EventType::LIQUIDATION); }
-    bool is_mark_price()  const { return event_type == static_cast<uint8_t>(EventType::MARK_PRICE); }
+    bool is_book_delta()    const { return event_type() == static_cast<uint8_t>(EventType::BOOK_DELTA); }
+    bool is_book_snapshot() const { return event_type() == static_cast<uint8_t>(EventType::BOOK_SNAPSHOT); }
+    bool is_trade_array()   const { return event_type() == static_cast<uint8_t>(EventType::TRADE_ARRAY); }
+    bool is_system_status() const { return event_type() == static_cast<uint8_t>(EventType::SYSTEM_STATUS); }
+    bool is_bbo_array()   const { return event_type() == static_cast<uint8_t>(EventType::BBO_ARRAY); }
+    bool is_liquidation() const { return event_type() == static_cast<uint8_t>(EventType::LIQUIDATION); }
+    bool is_mark_price()  const { return event_type() == static_cast<uint8_t>(EventType::MARK_PRICE); }
 
     // ========================================================================
     // Event flag queries
@@ -264,9 +282,11 @@ struct alignas(512) MktEvent {
     bool is_continuation()  const { return flags & EventFlags::CONTINUATION; }
     bool is_last_in_batch() const { return flags & EventFlags::LAST_IN_BATCH; }
 
-    uint8_t connection_id() const { return static_cast<uint8_t>(flags >> 8); }
+    uint8_t connection_id() const {
+        return static_cast<uint8_t>((flags & EventFlags::CONN_ID_MASK) >> EventFlags::CONN_ID_SHIFT);
+    }
     void set_connection_id(uint8_t ci) {
-        flags = (flags & 0x00FF) | (static_cast<uint16_t>(ci) << 8);
+        flags = (flags & ~EventFlags::CONN_ID_MASK) | (static_cast<uint16_t>(ci) << EventFlags::CONN_ID_SHIFT);
     }
 
     uint8_t depth_channel() const {
@@ -322,7 +342,7 @@ struct alignas(512) MktEvent {
 
         char mkt_cnt[4] = "";
         char mkt_typ[4] = "";
-        switch (event_type) {
+        switch (event_type()) {
         case 0: {
             std::snprintf(mkt_cnt, sizeof(mkt_cnt), "%u", count);
             std::snprintf(mkt_typ, sizeof(mkt_typ), "D%u", depth_channel());
@@ -336,8 +356,8 @@ struct alignas(512) MktEvent {
         }
 
         char lat[16] = "     -";
-        if (nic_ts_ns > 0 && recv_ts_ns > nic_ts_ns) {
-            double us = static_cast<double>(recv_ts_ns - nic_ts_ns) / 1000.0;
+        if (nic_ts_ns > 0 && recv_local_latency_ns > 0) {
+            double us = static_cast<double>(recv_local_latency_ns) / 1000.0;
             double a = std::fabs(us);
             if (a < 1000.0)         std::snprintf(lat, 16, a >= 100.0 ? "%4.0fus" : "%4.1fus", us);
             else if (a < 1000000.0) { double v = us / 1000.0; std::snprintf(lat, 16, std::fabs(v) >= 100.0 ? "%4.0fms" : "%4.1fms", v); }
@@ -345,8 +365,9 @@ struct alignas(512) MktEvent {
         }
 
         int64_t server_ms = 0;
-        if (event_ts_ns > 0 && recv_ts_ns > 0)
-            server_ms = (recv_ts_ns - event_ts_ns) / 1000000;
+        int64_t recv = recv_ts_ns();
+        if (event_ts_ns > 0 && recv > 0)
+            server_ms = (recv - event_ts_ns) / 1000000;
 
         std::fprintf(stderr,
                 "\033[2m%*s| %3s %-2s \xce\xa3%6s | %+ldms | #%ld\033[0m\n",
@@ -368,10 +389,9 @@ static_assert(sizeof(MktEvent) == 512, "MktEvent must be 512 bytes");
 static_assert(alignof(MktEvent) == 512, "MktEvent must be 512-byte aligned");
 
 static_assert(offsetof(MktEvent, src_seq) == 8);
-static_assert(offsetof(MktEvent, recv_ts_ns) == 16);
+static_assert(offsetof(MktEvent, nic_ts_ns) == 16);
 static_assert(offsetof(MktEvent, event_ts_ns) == 24);
-static_assert(offsetof(MktEvent, nic_ts_ns) == 32);
-static_assert(offsetof(MktEvent, payload) == 40);
+static_assert(offsetof(MktEvent, payload) == 32);
 
 static_assert(std::is_trivially_copyable_v<MktEvent>);
 static_assert(std::is_standard_layout_v<MktEvent>);

@@ -597,10 +597,10 @@ describe('Scale factor exact values', () => {
     });
 
     it('MAX constants match C++', () => {
-        assert.equal(V.MAX_TRADES, 11);
-        assert.equal(V.MAX_DELTAS, 19);
-        assert.equal(V.MAX_BOOK_LEVELS, 29);
-        assert.equal(V.SNAPSHOT_HALF, 14);
+        assert.equal(V.MAX_TRADES, 12);
+        assert.equal(V.MAX_DELTAS, 20);
+        assert.equal(V.MAX_BOOK_LEVELS, 30);
+        assert.equal(V.SNAPSHOT_HALF, 15);
     });
 });
 
@@ -609,7 +609,7 @@ describe('Scale factor exact values', () => {
 // ============================================================================
 
 describe('Snapshot level cap', () => {
-    it('depth5 with 20 bids + 20 asks → max 14+14', () => {
+    it('depth5 with 20 bids + 20 asks → max 15+15', () => {
         const bids = [];
         const asks = [];
         for (let i = 0; i < 20; i++) {
@@ -623,8 +623,8 @@ describe('Snapshot level cap', () => {
 
         assert.equal(v.events.length, 1);
         assert.equal(v.events[0].type, 'BOOK_SNAPSHOT');
-        assert.equal(v.events[0].count, V.SNAPSHOT_HALF);   // 14
-        assert.equal(v.events[0].count2, V.SNAPSHOT_HALF);  // 14
+        assert.equal(v.events[0].count, V.SNAPSHOT_HALF);   // 15
+        assert.equal(v.events[0].count2, V.SNAPSHOT_HALF);  // 15
         assert.equal(v.events[0].bids.length, V.SNAPSHOT_HALF);
         assert.equal(v.events[0].asks.length, V.SNAPSHOT_HALF);
     });

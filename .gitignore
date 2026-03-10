@@ -9,6 +9,8 @@ bin/
 *.exe
 
 # Compiled binaries
+tools/mkt_viewer
+tools/mkt_sampling
 ws_example
 io_echo_server
 test_ringbuffer

@@ -1781,7 +1781,7 @@ void test_cross_conn_merge_flush_before_mix() {
     int trade_count = 0;
     int64_t prev_seq = 0;
     for (auto& ev : events) {
-        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
+        if (ev.event_type() == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
             assert(ev.src_seq > prev_seq);
             prev_seq = ev.src_seq;
             trade_count++;
@@ -1793,7 +1793,7 @@ void test_cross_conn_merge_flush_before_mix() {
     // Second event should be conn 1's trades (src_seq = 209)
     bool found_109 = false, found_209 = false;
     for (auto& ev : events) {
-        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
+        if (ev.event_type() == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
             if (ev.src_seq == 109) found_109 = true;
             if (ev.src_seq == 209) found_209 = true;
         }
@@ -1854,7 +1854,7 @@ void test_fragment_interleave_stale_resumption() {
     auto events = h.published();
     int64_t prev_seq = 0;
     for (auto& ev : events) {
-        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
+        if (ev.event_type() == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
             assert(ev.src_seq > prev_seq);
             prev_seq = ev.src_seq;
         }
@@ -1901,7 +1901,7 @@ void test_fragment_interleave_non_merge() {
     auto events = h.published();
     int64_t prev_seq = 0;
     for (auto& ev : events) {
-        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
+        if (ev.event_type() == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
             assert(ev.src_seq > prev_seq);
             prev_seq = ev.src_seq;
         }
@@ -1940,7 +1940,7 @@ void test_cross_conn_pending_ci_attribution() {
     auto events = h.published();
     int trade_count = 0;
     for (auto& ev : events) {
-        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY))
+        if (ev.event_type() == static_cast<uint8_t>(EventType::TRADE_ARRAY))
             trade_count++;
     }
     // Two separate batches
@@ -1995,7 +1995,7 @@ void test_header_only_fragment_stale_on_resume() {
     auto events = h.published();
     int64_t prev_seq = 0;
     for (auto& ev : events) {
-        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
+        if (ev.event_type() == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
             assert(ev.src_seq > prev_seq);
             prev_seq = ev.src_seq;
         }

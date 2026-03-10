@@ -25,10 +25,10 @@ const fs = require('fs');
 const PRICE_SCALE = 1000000n;   // market_conf.hpp:21 — 10^(8-2) for BTCUSDT 2dp
 const QTY_SCALE   = 100000n;    // market_conf.hpp:22 — 10^(8-3) for BTCUSDT 3dp
 
-const MAX_TRADES      = 11;  // mkt_event.hpp:142 — 472/40 = 11
-const MAX_DELTAS      = 19;  // mkt_event.hpp:123 — 472/24 = 19
-const MAX_BOOK_LEVELS = 29;  // mkt_event.hpp:133 — 472/16 = 29
-const SNAPSHOT_HALF   = 14;  // 01_binance_usdm_json.hpp:856 — 29/2 = 14
+const MAX_TRADES      = 12;  // mkt_event.hpp — 480/40 = 12
+const MAX_DELTAS      = 20;  // mkt_event.hpp — 480/24 = 20
+const MAX_BOOK_LEVELS = 30;  // mkt_event.hpp — 480/16 = 30
+const SNAPSHOT_HALF   = 15;  // 01_binance_usdm_json.hpp — 30/2 = 15
 
 // EventType enum (mkt_event.hpp:20-26)
 const EVENT_BOOK_DELTA    = 0;
@@ -60,7 +60,8 @@ const WS_FLAG_LAST_IN_BATCH   = 0x80;
 const EVT_FLAG_SNAPSHOT      = 0x0001;
 const EVT_FLAG_CONTINUATION  = 0x0002;
 const EVT_FLAG_LAST_IN_BATCH = 0x0004;
-const EVT_FLAG_CONN_ID_SHIFT = 8;
+const EVT_FLAG_EVT_TYPE_SHIFT = 6;
+const EVT_FLAG_CONN_ID_SHIFT = 9;
 const EVT_FLAG_DEPTH_CH_SHIFT = 3;
 
 // Stream types (01_binance_usdm_json.hpp:140-142)

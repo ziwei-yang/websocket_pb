@@ -287,6 +287,7 @@ TEST_USDM_JSON_SRC := $(TEST_DIR)/msg_binance_usdm/test_usdm_json_parser.cpp
 TEST_USDM_JSON_BENCH_SRC := $(TEST_DIR)/msg_binance_usdm/test_usdm_json_bench.cpp
 TEST_ORDERBOOK_SRC := $(TEST_DIR)/test_orderbook.cpp
 TEST_MKT_VIEWER_DEDUP_SRC := $(TEST_DIR)/test_mkt_viewer_dedup.cpp
+TEST_MKT_EVENT_BITFIELDS_SRC := $(TEST_DIR)/test_mkt_event_bitfields.cpp
 TEST_WATCHDOG_POLICY_SRC := $(TEST_DIR)/test_watchdog_policy.cpp
 
 # Integration test source files
@@ -329,6 +330,7 @@ TEST_USDM_JSON_BIN := $(BUILD_DIR)/test_usdm_json_parser
 TEST_USDM_JSON_BENCH_BIN := $(BUILD_DIR)/test_usdm_json_bench
 TEST_ORDERBOOK_BIN := $(BUILD_DIR)/test_orderbook
 TEST_MKT_VIEWER_DEDUP_BIN := $(BUILD_DIR)/test_mkt_viewer_dedup
+TEST_MKT_EVENT_BITFIELDS_BIN := $(BUILD_DIR)/test_mkt_event_bitfields
 TEST_WATCHDOG_POLICY_BIN := $(BUILD_DIR)/test_watchdog_policy
 TEST_AES_CTR_SEQ_SRC := $(TEST_DIR)/test_aes_ctr_seq.cpp
 TEST_AES_CTR_SEQ_BIN := $(BUILD_DIR)/test_aes_ctr_seq
@@ -339,7 +341,7 @@ TEST_WOLFSSL_SEQ_BIN := $(BUILD_DIR)/test_wolfssl_seq_num
 TEST_LAST_BYTE_TS_SRC := $(TEST_DIR)/test_last_byte_ts.cpp
 TEST_LAST_BYTE_TS_BIN := $(BUILD_DIR)/test_last_byte_ts
 
-.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-aes-ctr-seq test-tls13-inner-ct test-wolfssl-seq-num test-last-byte-ts test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-usdm-json-parser test-orderbook test-mkt-viewer-dedup test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread build-test-pipeline-252_binance_sbe_bsdsocket_1thread test-pipeline-252-binance-sbe-bsdsocket-1thread build-test-pipeline-250_binance_sbe_bsdsocket_2thread test-pipeline-250-binance-sbe-bsdsocket-2thread build-test-pipeline-251_binance_sbe_bsdsocket_3thread test-pipeline-251-binance-sbe-bsdsocket-3thread build-test-pipeline-253_binance_sbe_bsdsocket_inline_ws test-pipeline-253-binance-sbe-bsdsocket-inline-ws build-test-pipeline-261_binance_sbe_xdp_inline_ws test-pipeline-261-binance-sbe-xdp-inline-ws build-test-pipeline-262_binance_sbe_dpdk_inline_ws build-test-pipeline-263_binance_sbe_dpdk_packetio_inline_ws build-test-pipeline-264_binance_sbe_xdp_packetio_inline_ws bench-usdm-json-parser
+.PHONY: all clean clean-bpf run help test test-ringbuffer test-shm-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-aes-ctr-seq test-tls13-inner-ct test-wolfssl-seq-num test-last-byte-ts test-binance benchmark-binance test-xdp-transport test-xdp-frame test-xdp-send-recv test-xdp-binance test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-ws-parser test-sbe-decoder test-sbe-handler test-usdm-json-parser test-orderbook test-mkt-viewer-dedup test-mkt-event-bitfields test-hftshm bpf check-ktls release debug epoll build-pipeline-binance test-pipeline-binance build-test-pipeline-xdp-poll test-pipeline-xdp-poll build-test-pipeline-xdp-poll-tcp test-pipeline-xdp-poll-tcp build-test-pipeline-transport-tcp test-pipeline-transport-tcp build-test-pipeline-transport-http test-pipeline-transport-http build-test-pipeline-transport_wss test-pipeline-transport-wss build-test-pipeline-bsd-transport-tcp test-pipeline-bsd-transport-tcp build-test-pipeline-bsd-transport test-pipeline-bsd-transport build-test-pipeline-websocket_binance_bsdsocket_2thread test-pipeline-websocket-binance-bsdsocket-2thread build-test-pipeline-websocket_binance_bsdsocket_3thread test-pipeline-websocket-binance-bsdsocket-3thread build-test-pipeline-252_binance_sbe_bsdsocket_1thread test-pipeline-252-binance-sbe-bsdsocket-1thread build-test-pipeline-250_binance_sbe_bsdsocket_2thread test-pipeline-250-binance-sbe-bsdsocket-2thread build-test-pipeline-251_binance_sbe_bsdsocket_3thread test-pipeline-251-binance-sbe-bsdsocket-3thread build-test-pipeline-253_binance_sbe_bsdsocket_inline_ws test-pipeline-253-binance-sbe-bsdsocket-inline-ws build-test-pipeline-261_binance_sbe_xdp_inline_ws test-pipeline-261-binance-sbe-xdp-inline-ws build-test-pipeline-262_binance_sbe_dpdk_inline_ws build-test-pipeline-263_binance_sbe_dpdk_packetio_inline_ws build-test-pipeline-264_binance_sbe_xdp_packetio_inline_ws bench-usdm-json-parser
 
 all: $(EXAMPLE_BIN)
 
@@ -733,6 +735,17 @@ $(TEST_MKT_VIEWER_DEDUP_BIN): $(TEST_MKT_VIEWER_DEDUP_SRC) | $(BUILD_DIR)
 test-mkt-viewer-dedup: $(TEST_MKT_VIEWER_DEDUP_BIN)
 	@echo "🧪 Running mkt_viewer dedup unit tests..."
 	./$(TEST_MKT_VIEWER_DEDUP_BIN)
+
+# Build MktEvent bitfield tests
+$(TEST_MKT_EVENT_BITFIELDS_BIN): $(TEST_MKT_EVENT_BITFIELDS_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling MktEvent bitfield unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run MktEvent bitfield tests
+test-mkt-event-bitfields: $(TEST_MKT_EVENT_BITFIELDS_BIN)
+	@echo "🧪 Running MktEvent bitfield unit tests..."
+	./$(TEST_MKT_EVENT_BITFIELDS_BIN)
 
 # ============================================================================
 # Pipeline Integration Tests (Multi-Process AF_XDP WebSocket)
@@ -1906,7 +1919,7 @@ test-simulator: $(SIMULATOR_BIN)
 # Unified Test Target - Run All Unit Tests
 # ============================================================================
 
-test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-aes-ctr-seq test-tls13-inner-ct test-wolfssl-seq-num test-last-byte-ts test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-watchdog-policy test-ws-parser test-sbe-decoder test-sbe-handler test-usdm-json-parser test-orderbook test-mkt-viewer-dedup
+test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-aes-ctr-seq test-tls13-inner-ct test-wolfssl-seq-num test-last-byte-ts test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-watchdog-policy test-ws-parser test-sbe-decoder test-sbe-handler test-usdm-json-parser test-orderbook test-mkt-viewer-dedup test-mkt-event-bitfields
 	@echo ""
 	@echo "╔════════════════════════════════════════════════════════════════════╗"
 	@echo "║                    ALL UNIT TESTS COMPLETED                        ║"

@@ -30,7 +30,7 @@ using namespace websocket::pipeline;
 // Constants
 // ============================================================================
 
-static constexpr int MAX_BOOK   = 29;  // matches MAX_BOOK_LEVELS in MktEvent
+static constexpr int MAX_BOOK   = 30;  // matches MAX_BOOK_LEVELS in MktEvent
 
 static const char* venue_name(uint8_t venue_id) {
     switch (venue_id) {
@@ -322,7 +322,7 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
         auto& st = evt.payload.status;
         s.last_status_type = st.status_type;
         s.last_status_conn = st.connection_id;
-        s.last_status_ts_ns = evt.recv_ts_ns;
+        s.last_status_ts_ns = evt.recv_ts_ns();
         std::strncpy(s.last_status_msg, st.message, sizeof(s.last_status_msg) - 1);
         s.last_status_msg[sizeof(s.last_status_msg) - 1] = '\0';
         s.total_events++;
@@ -331,24 +331,25 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
 
     s.total_events++;
     // Update venue and symbol from every event
-    const char* vn = venue_name(evt.venue_id);
+    const char* vn = venue_name(evt.venue_id());
     if (vn) std::strncpy(s.exchange, vn, sizeof(s.exchange) - 1);
     else    std::strncpy(s.exchange, "????", sizeof(s.exchange) - 1);
 
-    if (evt.instrument_id != 0)
-        std::snprintf(s.symbol, sizeof(s.symbol), "#%u", evt.instrument_id);
+    if (evt.instrument_id() != 0)
+        std::snprintf(s.symbol, sizeof(s.symbol), "#%u", evt.instrument_id());
     else
         std::strncpy(s.symbol, "????", sizeof(s.symbol) - 1);
-    s.last_recv_ts_ns = evt.recv_ts_ns;
+    int64_t evt_recv_ts_ns = evt.recv_ts_ns();
+    s.last_recv_ts_ns = evt_recv_ts_ns;
     s.last_event_ts_ns = evt.event_ts_ns;
     s.last_nic_ts_ns = evt.nic_ts_ns;
     s.last_mkt_conn = evt.connection_id();
 
     // Advance event-count segments (rolling 60s)
     if (s.evt_seg_start_ns == 0)
-        s.evt_seg_start_ns = evt.recv_ts_ns;
+        s.evt_seg_start_ns = evt_recv_ts_ns;
     int evt_advances = 0;
-    while (evt.recv_ts_ns >= s.evt_seg_start_ns + ViewerState::VOL_SEG_NS
+    while (evt_recv_ts_ns >= s.evt_seg_start_ns + ViewerState::VOL_SEG_NS
            && evt_advances < ViewerState::VOL_SEGMENTS) {
         s.evt_seg_cur = (s.evt_seg_cur + 1) % ViewerState::VOL_SEGMENTS;
         s.evt_segs[s.evt_seg_cur] = 0;
@@ -356,7 +357,7 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
         evt_advances++;
     }
     if (evt_advances >= ViewerState::VOL_SEGMENTS)
-        s.evt_seg_start_ns = evt.recv_ts_ns;
+        s.evt_seg_start_ns = evt_recv_ts_ns;
     s.evt_segs[s.evt_seg_cur]++;
 
     // Collect packet interval sample (rolling 10-min window)
@@ -389,8 +390,8 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
     s.prev_nic_ts_ns = evt.nic_ts_ns;
 
     // Collect latency sample
-    if (evt.nic_ts_ns > 0 && evt.recv_ts_ns > evt.nic_ts_ns) {
-        float lat = static_cast<float>(evt.recv_ts_ns - evt.nic_ts_ns) / 1000.0f;
+    if (evt.nic_ts_ns > 0 && evt.recv_local_latency_ns > 0) {
+        float lat = static_cast<float>(evt.recv_local_latency_ns) / 1000.0f;
         s.latency_us[s.latency_write % MAX_LATENCY_SAMPLES] = lat;
         s.latency_write++;
         if (s.latency_count < MAX_LATENCY_SAMPLES) s.latency_count++;
@@ -405,16 +406,16 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
         for (int c = 0; c < ViewerState::DEPTH_CHANNELS; c++) {
             if (dr.snap_accepted & (1 << c)) {
                 s.ob_channels[c].apply_snapshot(evt);
-                s.ob_channel_recv_ns[c] = evt.recv_ts_ns;
+                s.ob_channel_recv_ns[c] = evt_recv_ts_ns;
             }
         }
         if (!dr.is_dup()) s.update_latest_channel();
         s.snap_count++;
-        sample_depth(s, evt.recv_ts_ns);
+        sample_depth(s, evt_recv_ts_ns);
     } else if (evt.is_book_delta()) {
         if (dr.is_dup()) { s.delta_count++; return; }
         uint8_t ch = dr.channel;
-        s.ob_channel_recv_ns[ch] = evt.recv_ts_ns;
+        s.ob_channel_recv_ns[ch] = evt_recv_ts_ns;
         s.ob_channels[ch].apply_deltas(evt);
         // Re-apply cached BBO if it's newer than this channel's book
         int64_t ch_seq = s.dedup.ob_channel_seq[ch];
@@ -429,10 +430,10 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
         }
         s.update_latest_channel();
         s.delta_count++;
-        sample_depth(s, evt.recv_ts_ns);
+        sample_depth(s, evt_recv_ts_ns);
     } else if (evt.is_bbo_array()) {
         if (dr.is_dup()) { s.bbo_count++; return; }
-        s.bbo_recv_ns = evt.recv_ts_ns;
+        s.bbo_recv_ns = evt_recv_ts_ns;
         // Cache BBO values
         auto entries = evt.bbo_entries();
         if (entries.count > 0) {
@@ -450,15 +451,15 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
                 s.ob_channels[s.latest_ob_channel].apply_bbo(evt);
         }
         s.bbo_count++;
-        sample_depth(s, evt.recv_ts_ns);
+        sample_depth(s, evt_recv_ts_ns);
     } else if (evt.is_trade_array()) {
         if (dr.is_dup()) { s.trade_msg_count++; return; }
 
         // Advance volume segments based on recv_ts
         if (s.vol_seg_start_ns == 0)
-            s.vol_seg_start_ns = evt.recv_ts_ns;
+            s.vol_seg_start_ns = evt_recv_ts_ns;
         int vol_advances = 0;
-        while (evt.recv_ts_ns >= s.vol_seg_start_ns + ViewerState::VOL_SEG_NS
+        while (evt_recv_ts_ns >= s.vol_seg_start_ns + ViewerState::VOL_SEG_NS
                && vol_advances < ViewerState::VOL_SEGMENTS) {
             s.vol_seg_cur = (s.vol_seg_cur + 1) % ViewerState::VOL_SEGMENTS;
             s.vol_segs[s.vol_seg_cur] = {};
@@ -466,7 +467,7 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
             vol_advances++;
         }
         if (vol_advances >= ViewerState::VOL_SEGMENTS)
-            s.vol_seg_start_ns = evt.recv_ts_ns;
+            s.vol_seg_start_ns = evt_recv_ts_ns;
 
         for (uint8_t i = 0; i < evt.count && i < MAX_TRADES; i++) {
             const auto& t = evt.payload.trades.entries[i];
@@ -509,7 +510,7 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
                 s.last_index_price = mp.index_price;
                 s.last_funding_rate = mp.funding_rate;
                 s.last_next_funding_ns = mp.next_funding_ns;
-                s.last_mark_recv_ns = evt.recv_ts_ns;
+                s.last_mark_recv_ns = evt_recv_ts_ns;
             }
             s.mark_price_count++;
         }
@@ -551,7 +552,7 @@ static void add_log_line(ViewerState& s, const MktEvent& evt) {
     snprintf(line, 160,
              " c%u %-14ld %s %-8s r=%-19ld e=%ld",
              evt.connection_id(), evt.src_seq, type_str, counts,
-             evt.recv_ts_ns, evt.event_ts_ns);
+             evt.recv_ts_ns(), evt.event_ts_ns);
 
     s.log_write++;
     if (s.log_count < 64) s.log_count++;

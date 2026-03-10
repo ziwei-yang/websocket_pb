@@ -57,15 +57,16 @@ int main(int argc, char* argv[]) {
             // Compute delays
             double local_us = 0;
             int64_t svr_ms = 0;
-            if (evt.nic_ts_ns > 0)
-                local_us = static_cast<double>(evt.recv_ts_ns - evt.nic_ts_ns) / 1000.0;
+            int64_t recv_ts = evt.recv_ts_ns();
+            if (evt.nic_ts_ns > 0 && evt.recv_local_latency_ns > 0)
+                local_us = static_cast<double>(evt.recv_local_latency_ns) / 1000.0;
             if (evt.event_ts_ns > 0)
-                svr_ms = (evt.recv_ts_ns - evt.event_ts_ns) / 1000000;
+                svr_ms = (recv_ts - evt.event_ts_ns) / 1000000;
 
             printf("[%lu] type=%s seq=%ld local=%.1fus svr=%ldms recv=%ld evt=%ld nic=%ld flags=0x%04x",
                    count, type_str, evt.src_seq,
                    local_us, svr_ms,
-                   evt.recv_ts_ns, evt.event_ts_ns, evt.nic_ts_ns, evt.flags);
+                   recv_ts, evt.event_ts_ns, evt.nic_ts_ns, evt.flags);
 
             // Monotonicity check per domain
             if (evt.is_book_snapshot() || evt.is_book_delta() || evt.is_bbo_array()) {

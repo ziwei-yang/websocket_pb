@@ -108,8 +108,8 @@ static MktEvent make_deltas(int64_t seq, const DeltaEntry* deltas, uint8_t count
                              uint16_t extra_flags = 0) {
     MktEvent e;
     e.clear();
-    e.event_type = static_cast<uint8_t>(EventType::BOOK_DELTA);
-    e.flags = extra_flags;
+    e.set_event_type(static_cast<uint8_t>(EventType::BOOK_DELTA));
+    e.flags |= extra_flags;
     e.src_seq = seq;
     e.count = count;
     std::memcpy(e.payload.deltas.entries, deltas, count * sizeof(DeltaEntry));
@@ -121,8 +121,8 @@ static MktEvent make_snapshot(int64_t seq,
                               const BookLevel* asks, uint8_t ask_n) {
     MktEvent e;
     e.clear();
-    e.event_type = static_cast<uint8_t>(EventType::BOOK_SNAPSHOT);
-    e.flags = EventFlags::SNAPSHOT;
+    e.set_event_type(static_cast<uint8_t>(EventType::BOOK_SNAPSHOT));
+    e.flags |= EventFlags::SNAPSHOT;
     e.src_seq = seq;
     e.count = bid_n;
     e.count2 = ask_n;
@@ -138,7 +138,7 @@ static MktEvent make_bbo(int64_t book_update_id,
                          int64_t ask_price, int64_t ask_qty) {
     MktEvent e;
     e.clear();
-    e.event_type = static_cast<uint8_t>(EventType::BBO_ARRAY);
+    e.set_event_type(static_cast<uint8_t>(EventType::BBO_ARRAY));
     e.src_seq = book_update_id;  // dedup checks evt.src_seq
     e.count = 1;
     auto& be = e.payload.bbo_array.entries[0];
@@ -454,10 +454,10 @@ static void test_single_delta_replay_from_other_conn() {
     DedupState s;
     // Conn 0 sends delta
     DeltaEntry d[] = { bid_delta(10000, 50) };
-    apply_dedup(s, make_deltas(100, d, 1, 0 << 8));
+    apply_dedup(s, make_deltas(100, d, 1, 0 << EventFlags::CONN_ID_SHIFT));
 
     // Conn 1 sends exact same delta (same seq, same content)
-    apply_dedup(s, make_deltas(100, d, 1, 1 << 8));
+    apply_dedup(s, make_deltas(100, d, 1, 1 << EventFlags::CONN_ID_SHIFT));
     // Should be rejected since content fully overlaps
     assert(s.dup_count == 1);
     PASS();

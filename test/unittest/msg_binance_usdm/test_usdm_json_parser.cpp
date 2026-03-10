@@ -1139,7 +1139,7 @@ void test_cross_conn_merge_flush_before_mix() {
     int trade_count = 0;
     int64_t prev_seq = 0;
     for (auto& ev : events) {
-        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
+        if (ev.event_type() == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
             assert(ev.src_seq > prev_seq);
             prev_seq = ev.src_seq;
             trade_count++;
@@ -1151,7 +1151,7 @@ void test_cross_conn_merge_flush_before_mix() {
     // Second event should be conn 1's trade (src_seq = 2000)
     bool found_1000 = false, found_2000 = false;
     for (auto& ev : events) {
-        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
+        if (ev.event_type() == static_cast<uint8_t>(EventType::TRADE_ARRAY)) {
             if (ev.src_seq == 1000) found_1000 = true;
             if (ev.src_seq == 2000) found_2000 = true;
         }
@@ -1197,7 +1197,7 @@ void test_cross_conn_pending_ci_attribution() {
     auto events = h.published();
     int trade_count = 0;
     for (auto& ev : events) {
-        if (ev.event_type == static_cast<uint8_t>(EventType::TRADE_ARRAY))
+        if (ev.event_type() == static_cast<uint8_t>(EventType::TRADE_ARRAY))
             trade_count++;
     }
     // Two separate batches
@@ -1603,7 +1603,7 @@ void test_stream_depth_snapshot_truncated_asks() {
 template<typename H>
 void test_stream_depth_snapshot_capacity_publish() {
     TestHarness<H> h;
-    // 20 bids + 20 asks — exceeds SNAPSHOT_HALF=14 per side
+    // 20 bids + 20 asks — exceeds SNAPSHOT_HALF=15 per side
     auto json = build_large_depth_json(true, 1600000000000LL, 500002, 20, 20);
 
     h.feed_frame(0, json.c_str());
@@ -1612,8 +1612,8 @@ void test_stream_depth_snapshot_capacity_publish() {
     assert(events.size() == 1);
     assert(events[0].is_book_snapshot());
     // Should be capped at SNAPSHOT_HALF per side
-    assert(events[0].count <= 14);
-    assert(events[0].count2 <= 14);
+    assert(events[0].count <= 15);
+    assert(events[0].count2 <= 15);
 }
 
 template<typename H>

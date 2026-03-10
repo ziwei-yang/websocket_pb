@@ -20,8 +20,8 @@ static MktEvent make_snapshot(int64_t seq,
                               const BookLevel* asks, uint8_t ask_n) {
     MktEvent e;
     e.clear();
-    e.event_type = static_cast<uint8_t>(EventType::BOOK_SNAPSHOT);
-    e.flags = EventFlags::SNAPSHOT;
+    e.set_event_type(static_cast<uint8_t>(EventType::BOOK_SNAPSHOT));
+    e.flags |= EventFlags::SNAPSHOT;
     e.src_seq = seq;
     e.count = bid_n;
     e.count2 = ask_n;
@@ -36,7 +36,7 @@ static MktEvent make_deltas(int64_t seq,
                             const DeltaEntry* deltas, uint8_t count) {
     MktEvent e;
     e.clear();
-    e.event_type = static_cast<uint8_t>(EventType::BOOK_DELTA);
+    e.set_event_type(static_cast<uint8_t>(EventType::BOOK_DELTA));
     e.src_seq = seq;
     e.count = count;
     std::memcpy(e.payload.deltas.entries, deltas, count * sizeof(DeltaEntry));
@@ -48,7 +48,7 @@ static MktEvent make_bbo(int64_t book_update_id,
                          int64_t ask_price, int64_t ask_qty) {
     MktEvent e;
     e.clear();
-    e.event_type = static_cast<uint8_t>(EventType::BBO_ARRAY);
+    e.set_event_type(static_cast<uint8_t>(EventType::BBO_ARRAY));
     e.count = 1;
     auto& be = e.payload.bbo_array.entries[0];
     be.bid_price = bid_price;
@@ -371,14 +371,14 @@ static void test_apply_non_book() {
     // Trade event
     MktEvent trade;
     trade.clear();
-    trade.event_type = static_cast<uint8_t>(EventType::TRADE_ARRAY);
+    trade.set_event_type(static_cast<uint8_t>(EventType::TRADE_ARRAY));
     trade.count = 1;
     assert(ob.apply(trade) == false);
 
     // System status event
     MktEvent status;
     status.clear();
-    status.event_type = static_cast<uint8_t>(EventType::SYSTEM_STATUS);
+    status.set_event_type(static_cast<uint8_t>(EventType::SYSTEM_STATUS));
     assert(ob.apply(status) == false);
 
     // Book should be untouched

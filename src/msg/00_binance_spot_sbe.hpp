@@ -999,7 +999,7 @@ private:
                         record_win(ci);
                         uint8_t count = nm_count;
                         publish_event([&](websocket::msg::MktEvent& ev) {
-                            ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY);
+                            ev.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY));
                             ev.src_seq = nm_batch[count - 1].trade_id;
                             ev.event_ts_ns = event_ts_ns;
                             ev.count = count;
@@ -1019,7 +1019,7 @@ private:
                 record_win(ci);
                 uint8_t count = nm_count;
                 publish_event([&](websocket::msg::MktEvent& ev) {
-                    ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY);
+                    ev.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY));
                     ev.src_seq = nm_batch[count - 1].trade_id;
                     ev.event_ts_ns = event_ts_ns;
                     ev.count = count;
@@ -1048,7 +1048,7 @@ private:
     }
 
     // ── Depth streaming handler (shared by snapshot + diff) ─────────────────
-    static constexpr uint8_t SNAPSHOT_HALF = websocket::msg::MAX_BOOK_LEVELS / 2;  // 14
+    static constexpr uint8_t SNAPSHOT_HALF = websocket::msg::MAX_BOOK_LEVELS / 2;  // 15
 
     void on_ws_data_depth(SBEParseState& state, uint8_t ci,
                           const uint8_t* payload, uint32_t len,
@@ -1276,11 +1276,11 @@ private:
         uint8_t count = pending_depth_count_;
         uint8_t fc = pending_depth_flush_count_;
         publish_event([&](websocket::msg::MktEvent& e) {
-            e.event_type = static_cast<uint8_t>(pending_depth_event_type_);
+            e.set_event_type(static_cast<uint8_t>(pending_depth_event_type_));
             uint16_t f = pending_depth_extra_flags_;
             if (fc > 0)    f |= websocket::msg::EventFlags::CONTINUATION;
             if (is_final)  f |= websocket::msg::EventFlags::LAST_IN_BATCH;
-            e.flags = f;
+            e.flags |= f;
             e.src_seq = pending_depth_seq_;
             e.event_ts_ns = pending_depth_event_ts_ns_;
             e.count = count;
@@ -1305,8 +1305,8 @@ private:
         uint8_t bid_n = state.snapshot_bid_count;
         uint8_t ask_n = total - bid_n;
         publish_event([&](websocket::msg::MktEvent& e) {
-            e.event_type = static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT);
-            e.flags = websocket::msg::EventFlags::SNAPSHOT;
+            e.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::BOOK_SNAPSHOT));
+            e.flags |= websocket::msg::EventFlags::SNAPSHOT;
             e.src_seq = seq;
             e.event_ts_ns = state.event_time_us * 1000;
             e.count = bid_n;
@@ -1330,7 +1330,7 @@ public:
         record_win(pending_bbo_ci_);
         current_info_ = &pending_bbo_info_;
         publish_event([&](websocket::msg::MktEvent& ev) {
-            ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::BBO_ARRAY);
+            ev.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::BBO_ARRAY));
             ev.src_seq = pending_bbo_entries_[pending_bbo_count_ - 1].book_update_id;
             ev.event_ts_ns = pending_bbo_event_ts_ns_;
             ev.count = pending_bbo_count_;
@@ -1354,7 +1354,7 @@ public:
         record_win(pending_trades_ci_);
         current_info_ = &pending_trades_info_;
         publish_event([&](websocket::msg::MktEvent& ev) {
-            ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY);
+            ev.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::TRADE_ARRAY));
             ev.src_seq = pending_trade_entries_[pending_trade_count_ - 1].trade_id;
             ev.event_ts_ns = pending_trades_event_ts_ns_;
             ev.count = pending_trade_count_;
@@ -1393,11 +1393,12 @@ public:
         if (slot < 0) return;
         auto& e = (*mkt_event_prod)[slot];
         e.clear();
-        e.venue_id = static_cast<uint8_t>(websocket::msg::VenueId::BINANCE);
-        e.event_type = static_cast<uint8_t>(websocket::msg::EventType::SYSTEM_STATUS);
+        e.set_venue_id(static_cast<uint8_t>(websocket::msg::VenueId::BINANCE));
+        e.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::SYSTEM_STATUS));
         struct timespec ts_real;
         clock_gettime(CLOCK_REALTIME, &ts_real);
-        e.recv_ts_ns = static_cast<int64_t>(ts_real.tv_sec) * 1000000000LL + ts_real.tv_nsec;
+        e.nic_ts_ns = static_cast<int64_t>(ts_real.tv_sec) * 1000000000LL + ts_real.tv_nsec;
+        e.recv_local_latency_ns = 0;
         e.payload.status.status_type = static_cast<uint8_t>(status);
         e.payload.status.connection_id = ci;
         e.payload.status.detail_code = detail;
@@ -1414,7 +1415,7 @@ public:
         last_bbo_seq_ = seq;
         record_win(ci);
         publish_event([&](websocket::msg::MktEvent& ev) {
-            ev.event_type = static_cast<uint8_t>(websocket::msg::EventType::BBO_ARRAY);
+            ev.set_event_type(static_cast<uint8_t>(websocket::msg::EventType::BBO_ARRAY));
             ev.src_seq = seq;
             ev.event_ts_ns = bv.event_time_us() * 1000;
             ev.count = 1;
@@ -1436,14 +1437,13 @@ public:
         if (slot < 0) return;
         auto& e = (*mkt_event_prod)[slot];
         e.clear();
-        e.venue_id = static_cast<uint8_t>(websocket::msg::VenueId::BINANCE);
-        e.instrument_id = instrument_id;
+        e.set_venue_id(static_cast<uint8_t>(websocket::msg::VenueId::BINANCE));
+        e.set_instrument_id(instrument_id);
         struct timespec ts_real, ts_mono;
         clock_gettime(CLOCK_REALTIME, &ts_real);
         clock_gettime(CLOCK_MONOTONIC, &ts_mono);
         int64_t real_ns = static_cast<int64_t>(ts_real.tv_sec) * 1000000000LL + ts_real.tv_nsec;
         int64_t mono_ns = static_cast<int64_t>(ts_mono.tv_sec) * 1000000000LL + ts_mono.tv_nsec;
-        e.recv_ts_ns = real_ns;
         if (current_info_) {
             int64_t mono_arrival = 0;
             if (current_info_->latest_bpf_entry_ns > 0)
@@ -1453,6 +1453,9 @@ public:
             if (mono_arrival > 0)
                 e.nic_ts_ns = real_ns - (mono_ns - mono_arrival);
         }
+        int64_t local_lat = real_ns - e.nic_ts_ns;
+        e.recv_local_latency_ns = (e.nic_ts_ns > 0 && local_lat > 0)
+            ? static_cast<uint16_t>(local_lat > 65535 ? 65535 : local_lat) : 0;
         build(e);
         e.set_connection_id(active_ci_);
         mkt_event_prod->publish(slot);
