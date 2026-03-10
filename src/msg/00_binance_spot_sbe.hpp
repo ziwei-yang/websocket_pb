@@ -1235,8 +1235,10 @@ private:
         info.set_discard_early(false);
 
         // Connection switch: if pending has entries from a different connection, flush first
-        if (has_pending_depth_ && pending_depth_ci_ != ci)
+        if (has_pending_depth_ && pending_depth_ci_ != ci) {
             publish_pending_depth(false);
+            has_pending_depth_ = false;  // force re-init for new connection
+        }
 
         // Overflow: pending + new > MAX_DELTAS → publish pending first
         if (has_pending_depth_ && pending_depth_count_ + publish_count > websocket::msg::MAX_DELTAS)

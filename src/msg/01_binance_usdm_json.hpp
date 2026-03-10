@@ -1062,8 +1062,10 @@ inline void flush_depth_deltas_json(Handler& self, JsonParseState& state, uint8_
     auto& pd = self.pending_depth_[ch];
 
     // Connection switch: if pending has entries from a different connection, flush first
-    if (pd.has_pending && pd.ci != ci)
+    if (pd.has_pending && pd.ci != ci) {
         self.publish_pending_depth(ch, false);
+        pd.has_pending = false;  // force re-init for new connection
+    }
 
     // Overflow: pending + new > MAX_DELTAS → publish pending first
     if (pd.has_pending && pd.count + publish_count > websocket::msg::MAX_DELTAS)

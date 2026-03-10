@@ -25,6 +25,7 @@ struct DedupState {
     OrderBook ob;
     int64_t bbo_seq = 0;
     int64_t ob_seq = 0;
+    uint8_t ob_ci = 0;  // connection_id that established current seq
     std::unordered_set<uint64_t> ob_seen_deltas;
     uint64_t dup_count = 0;
     uint64_t snap_count = 0, delta_count = 0, bbo_count = 0;
@@ -38,20 +39,23 @@ static bool apply_dedup(DedupState& s, const MktEvent& evt) {
         if (evt.src_seq > 0 && evt.src_seq <= type_seq) {
             bool is_book = !evt.is_bbo_array();
             if (is_book && evt.src_seq == type_seq) {
-                // Same seq — content-based dedup for multi-flush
-                uint8_t overlap = 0;
-                for (uint8_t i = 0; i < evt.count; i++) {
-                    if (s.ob_seen_deltas.count(delta_content_key(evt.payload.deltas.entries[i])))
-                        overlap++;
+                uint8_t evt_ci = evt.connection_id();
+                if (evt_ci == s.ob_ci) {
+                    // Same connection, same seq — content-based dedup (genuine replay check)
+                    uint8_t overlap = 0;
+                    for (uint8_t i = 0; i < evt.count; i++) {
+                        if (s.ob_seen_deltas.count(delta_content_key(evt.payload.deltas.entries[i])))
+                            overlap++;
+                    }
+                    if (overlap == evt.count) {
+                        // All deltas already seen — true duplicate
+                        s.dup_count++;
+                        if (evt.is_book_snapshot()) s.snap_count++;
+                        else s.delta_count++;
+                        return false;
+                    }
                 }
-                if (overlap == evt.count) {
-                    // All deltas already seen — true duplicate
-                    s.dup_count++;
-                    if (evt.is_book_snapshot()) s.snap_count++;
-                    else s.delta_count++;
-                    return false;
-                }
-                // Has new deltas — accept as continuation
+                // Insert new keys (both same-conn continuation and cross-conn interleave)
                 for (uint8_t i = 0; i < evt.count; i++)
                     s.ob_seen_deltas.insert(delta_content_key(evt.payload.deltas.entries[i]));
             } else {
@@ -63,8 +67,9 @@ static bool apply_dedup(DedupState& s, const MktEvent& evt) {
                 return false;
             }
         } else {
-            // New sequence — track content for future dedup
+            // New sequence — track content and connection for future dedup
             if (!evt.is_bbo_array()) {
+                s.ob_ci = evt.connection_id();
                 s.ob_seen_deltas.clear();
                 for (uint8_t i = 0; i < evt.count; i++)
                     s.ob_seen_deltas.insert(delta_content_key(evt.payload.deltas.entries[i]));
@@ -449,16 +454,34 @@ static void test_same_price_bid_ask_both_tracked() {
 }
 
 static void test_single_delta_replay_from_other_conn() {
-    TEST("single delta replayed from other conn → rejected");
+    TEST("single delta from other conn same seq → accepted (interleave)");
 
     DedupState s;
     // Conn 0 sends delta
     DeltaEntry d[] = { bid_delta(10000, 50) };
     apply_dedup(s, make_deltas(100, d, 1, 0 << EventFlags::CONN_ID_SHIFT));
 
-    // Conn 1 sends exact same delta (same seq, same content)
-    apply_dedup(s, make_deltas(100, d, 1, 1 << EventFlags::CONN_ID_SHIFT));
-    // Should be rejected since content fully overlaps
+    // Conn 1 sends same content at same seq — different connection, trust interleave
+    assert(apply_dedup(s, make_deltas(100, d, 1, 1 << EventFlags::CONN_ID_SHIFT)) == true);
+    assert(s.dup_count == 0);
+    PASS();
+}
+
+static void test_cross_conn_same_seq_accepted() {
+    TEST("cross-conn overlapping content same seq → accepted");
+
+    DedupState s;
+    // Conn 0 sends 2 deltas at seq 100
+    DeltaEntry d1[] = { bid_delta(10000, 50), ask_delta(10100, 40) };
+    apply_dedup(s, make_deltas(100, d1, 2, 0 << EventFlags::CONN_ID_SHIFT));
+
+    // Conn 1 sends overlapping content at same seq — should be accepted (cross-conn)
+    DeltaEntry d2[] = { bid_delta(10000, 60) };
+    assert(apply_dedup(s, make_deltas(100, d2, 1, 1 << EventFlags::CONN_ID_SHIFT)) == true);
+    assert(s.dup_count == 0);
+
+    // Same conn 0 replaying d1 at same seq → should be rejected (same conn, full overlap)
+    assert(apply_dedup(s, make_deltas(100, d1, 2, 0 << EventFlags::CONN_ID_SHIFT)) == false);
     assert(s.dup_count == 1);
     PASS();
 }
@@ -492,6 +515,7 @@ int main() {
     test_zero_src_seq_bypasses_dedup();
     test_same_price_bid_ask_both_tracked();
     test_single_delta_replay_from_other_conn();
+    test_cross_conn_same_seq_accepted();
 
     std::fprintf(stderr, "\n  %d/%d tests passed\n\n", tests_passed, tests_run);
     if (tests_passed != tests_run) {

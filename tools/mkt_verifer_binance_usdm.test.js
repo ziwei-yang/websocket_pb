@@ -554,7 +554,7 @@ describe('Trade flush on batch end', () => {
 // ============================================================================
 
 describe('Delta chunking', () => {
-    it('25 bid levels → BOOK_DELTA(19) + BOOK_DELTA(6)', () => {
+    it('25 bid levels → BOOK_DELTA(20) + BOOK_DELTA(5)', () => {
         // Generate 25 bid levels, 0 asks
         const bids = [];
         for (let i = 0; i < 25; i++) {
@@ -568,9 +568,9 @@ describe('Delta chunking', () => {
 
         assert.equal(v.events.length, 2);
         assert.equal(v.events[0].type, 'BOOK_DELTA');
-        assert.equal(v.events[0].count, V.MAX_DELTAS);  // 19
+        assert.equal(v.events[0].count, V.MAX_DELTAS);  // 20
         assert.equal(v.events[1].type, 'BOOK_DELTA');
-        assert.equal(v.events[1].count, 6);
+        assert.equal(v.events[1].count, 5);
     });
 });
 
@@ -727,6 +727,63 @@ describe('compareEvents: seq-grouped book comparison', () => {
         assert.equal(r.fail, 0, 'should not be a failure');
         assert.equal(r.warn, 1, 'should be a warning');
         assert.equal(r.pass, 1, 'truncated group counts as pass');
+    });
+
+    it('C++ fewer deltas as suffix of JS is a warning (accumulated payload truncation)', () => {
+        // JS sees accumulated payload from message start, C++ only produced events
+        // from the non-discarded fragment onwards. C++ deltas are a suffix of JS.
+        const jsEvents = [
+            { type: 'BOOK_DELTA', seq: 300n, event_ts_ns: 7000n, count: 4,
+              deltas: [{ price: 100n, qty: 1n, action: 1, flags: 0 },
+                       { price: 200n, qty: 2n, action: 1, flags: 0 },
+                       { price: 300n, qty: 3n, action: 1, flags: 0 },
+                       { price: 400n, qty: 4n, action: 1, flags: 0 }] },
+        ];
+        const cppEvents = [
+            { type: 'BOOK_DELTA', seq: 300n, event_ts_ns: 7000n, count: 2,
+              deltas: [{ price: 300n, qty: 3n, action: 1, flags: 0 },
+                       { price: 400n, qty: 4n, action: 1, flags: 0 }] },
+        ];
+        const r = V.compareEvents(jsEvents, cppEvents);
+        assert.equal(r.fail, 0, 'suffix match should not be a failure');
+        assert.equal(r.warn, 1, 'should be a warning');
+        assert.equal(r.pass, 1, 'suffix-matched group counts as pass');
+    });
+
+    it('C++ fewer deltas as prefix of JS is a warning (sampling ended mid-message)', () => {
+        const jsEvents = [
+            { type: 'BOOK_DELTA', seq: 350n, event_ts_ns: 7500n, count: 4,
+              deltas: [{ price: 100n, qty: 1n, action: 1, flags: 0 },
+                       { price: 200n, qty: 2n, action: 1, flags: 0 },
+                       { price: 300n, qty: 3n, action: 1, flags: 0 },
+                       { price: 400n, qty: 4n, action: 1, flags: 0 }] },
+        ];
+        const cppEvents = [
+            { type: 'BOOK_DELTA', seq: 350n, event_ts_ns: 7500n, count: 2,
+              deltas: [{ price: 100n, qty: 1n, action: 1, flags: 0 },
+                       { price: 200n, qty: 2n, action: 1, flags: 0 }] },
+        ];
+        const r = V.compareEvents(jsEvents, cppEvents);
+        assert.equal(r.fail, 0, 'prefix match should not be a failure');
+        assert.equal(r.warn, 1, 'should be a warning');
+        assert.equal(r.pass, 1, 'prefix-matched group counts as pass');
+    });
+
+    it('C++ fewer deltas NOT a contiguous subset of JS is a failure', () => {
+        // C++ has fewer deltas but they don't match the tail of JS
+        const jsEvents = [
+            { type: 'BOOK_DELTA', seq: 400n, event_ts_ns: 8000n, count: 3,
+              deltas: [{ price: 100n, qty: 1n, action: 1, flags: 0 },
+                       { price: 200n, qty: 2n, action: 1, flags: 0 },
+                       { price: 300n, qty: 3n, action: 1, flags: 0 }] },
+        ];
+        const cppEvents = [
+            { type: 'BOOK_DELTA', seq: 400n, event_ts_ns: 8000n, count: 2,
+              deltas: [{ price: 999n, qty: 9n, action: 1, flags: 0 },
+                       { price: 300n, qty: 3n, action: 1, flags: 0 }] },
+        ];
+        const r = V.compareEvents(jsEvents, cppEvents);
+        assert.equal(r.fail, 1, 'non-suffix mismatch should be a failure');
     });
 
     it('JS fewer deltas with data mismatch is still a failure', () => {

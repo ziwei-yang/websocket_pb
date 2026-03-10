@@ -949,6 +949,11 @@ private:
 
         // Reset + resume watchdog for this connection
         reset_watchdog_state(ci);
+        if constexpr (MaxConn > 1 && HasMktEventHandler) {
+            uint64_t freq = conn_state_->tsc_freq_hz;
+            if (freq > 0)
+                latency_grace_until_cycle_[ci] = rdtscp() + (LATENCY_GRACE_PERIOD_MS * freq) / 1000;
+        }
 
         // Signal ws_ready on first successful handshake (for startup)
         if (!ws_ready_signaled_) {
@@ -1756,13 +1761,21 @@ private:
     // Latency-Based Outlier Detection (multi-conn only)
     // ========================================================================
 
+    static constexpr int64_t STALE_REJECT_NS = 500'000'000LL;           // 500ms — drop stale
+    static constexpr uint64_t LATENCY_GRACE_PERIOD_MS = 10000;          // 10s post-reconnect
+
     void on_latency_sample(uint8_t ci, int64_t exchange_event_time_us) {
         if constexpr (MaxConn <= 1 || !HasMktEventHandler) return;
         if (exchange_event_time_us <= 0) return;
+        if (latency_grace_until_cycle_[ci] > 0) {
+            if (rdtscp() < latency_grace_until_cycle_[ci]) return;
+            latency_grace_until_cycle_[ci] = 0;
+        }
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         int64_t recv_ns = ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
         int64_t latency_ns = recv_ns - exchange_event_time_us * 1000;
+        if (latency_ns > STALE_REJECT_NS) return;   // drop stale
         latency_tracker_[ci].on_sample(latency_ns);
     }
 
@@ -2049,6 +2062,7 @@ private:
 
     // Latency-based outlier detection (multi-conn only)
     websocket::policy::LatencyTracker latency_tracker_[NUM_CONN]{};
+    uint64_t latency_grace_until_cycle_[NUM_CONN]{};
     uint64_t last_outlier_check_cycle_ = 0;
     uint64_t last_outlier_disconnect_cycle_ = 0;
 };

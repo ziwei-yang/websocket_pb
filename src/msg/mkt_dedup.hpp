@@ -31,6 +31,7 @@ struct MktDedupResult {
 template<int DepthChannels = 3>
 struct MktDedupState {
     int64_t  ob_channel_seq[DepthChannels] = {};
+    uint8_t  ob_channel_ci[DepthChannels] = {};  // connection_id that established current seq
     int64_t  trade_seq = 0;
     int64_t  bbo_seq   = 0;
     int64_t  liq_seq   = 0;
@@ -69,21 +70,24 @@ struct MktDedupState {
 
             if (evt.src_seq > 0 && evt.src_seq <= ch_seq) {
                 if (evt.src_seq == ch_seq) {
-                    // Same seq — content-based dedup for multi-flush
-                    uint8_t overlap = 0;
-                    for (uint8_t i = 0; i < evt.count; i++) {
-                        if (ch_seen.count(delta_content_key(evt.payload.deltas.entries[i])))
-                            overlap++;
+                    uint8_t evt_ci = evt.connection_id();
+                    if (evt_ci == ob_channel_ci[ch]) {
+                        // Same connection, same seq — content-based dedup (genuine replay check)
+                        uint8_t overlap = 0;
+                        for (uint8_t i = 0; i < evt.count; i++) {
+                            if (ch_seen.count(delta_content_key(evt.payload.deltas.entries[i])))
+                                overlap++;
+                        }
+                        r.overlap = overlap;
+                        if (overlap == evt.count) {
+                            // ALL entries already seen = true dup
+                            r.verdict = DupVerdict::DUP_CONTENT;
+                            dup_count++;
+                            last_dup_seq = evt.src_seq;
+                            return r;
+                        }
                     }
-                    r.overlap = overlap;
-                    if (overlap == evt.count) {
-                        // ALL entries already seen = true dup
-                        r.verdict = DupVerdict::DUP_CONTENT;
-                        dup_count++;
-                        last_dup_seq = evt.src_seq;
-                        return r;
-                    }
-                    // Partial overlap = multi-flush fragment, insert new keys
+                    // Insert new keys (both same-conn continuation and cross-conn interleave)
                     for (uint8_t i = 0; i < evt.count; i++)
                         ch_seen.insert(delta_content_key(evt.payload.deltas.entries[i]));
                 } else {
@@ -95,6 +99,7 @@ struct MktDedupState {
                 }
             } else {
                 // New seq (or src_seq == 0)
+                ob_channel_ci[ch] = evt.connection_id();
                 ch_seen.clear();
                 for (uint8_t i = 0; i < evt.count; i++)
                     ch_seen.insert(delta_content_key(evt.payload.deltas.entries[i]));
@@ -122,6 +127,7 @@ struct MktDedupState {
     void reset() {
         for (int c = 0; c < DepthChannels; c++) {
             ob_channel_seq[c] = 0;
+            ob_channel_ci[c] = 0;
             ob_seen_deltas[c].clear();
         }
         trade_seq = 0;

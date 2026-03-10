@@ -398,7 +398,7 @@ void test_latency_ema_ms() {
 using websocket::policy::LatencyOutlierResult;
 
 // Helper: fill tracker with n identical samples
-static void fill_tracker(LT& t, int64_t ns, uint32_t count = LT::WARMUP_SAMPLES) {
+static void fill_tracker(LT& t, int64_t ns, uint32_t count = LT::OUTLIER_MIN_SAMPLES) {
     t.reset();
     for (uint32_t i = 0; i < count; ++i)
         t.on_sample(ns);
@@ -449,14 +449,38 @@ void test_outlier_no_trigger_small_abs_delta() {
 }
 
 void test_outlier_not_warmed_up() {
-    TEST("detect_latency_outlier: no detection when trackers not warmed up")
+    TEST("detect_latency_outlier: no detection when fewer than 2 eligible (1 eligible + 1 ineligible)")
+        LT trackers[2];
+        fill_tracker(trackers[0], 38'000'000LL);           // eligible
+        fill_tracker(trackers[1], 200'000'000LL, 32);      // ineligible (32 < 64)
+        ASSERT(trackers[0].is_outlier_eligible(), "tracker 0 should be eligible");
+        ASSERT(!trackers[1].is_outlier_eligible(), "tracker 1 should NOT be eligible");
+        auto r = websocket::policy::detect_latency_outlier(trackers, 2);
+        ASSERT(r.outlier_ci == -1, "No outlier when <2 eligible");
+    END_TEST
+}
+
+void test_outlier_not_eligible_at_warmup_boundary() {
+    TEST("detect_latency_outlier: no detection at WARMUP_SAMPLES (8) — needs 64")
         LT trackers[2];
         fill_tracker(trackers[0], 38'000'000LL);
-        // trackers[1] not warmed up (only 3 samples)
-        trackers[1].reset();
-        for (int i = 0; i < 3; ++i) trackers[1].on_sample(200'000'000LL);
+        fill_tracker(trackers[1], 200'000'000LL, LT::WARMUP_SAMPLES);
+        ASSERT(trackers[1].is_warmed_up(), "Should be warmed up at 8 samples");
+        ASSERT(!trackers[1].is_outlier_eligible(), "Should NOT be outlier-eligible at 8 samples");
         auto r = websocket::policy::detect_latency_outlier(trackers, 2);
-        ASSERT(r.outlier_ci == -1, "No outlier when not warmed up");
+        ASSERT(r.outlier_ci == -1, "No outlier at warmup boundary");
+    END_TEST
+}
+
+void test_outlier_detects_at_exact_min_samples() {
+    TEST("detect_latency_outlier: detection works at exactly OUTLIER_MIN_SAMPLES (64)")
+        LT trackers[2];
+        fill_tracker(trackers[0], 38'000'000LL, LT::OUTLIER_MIN_SAMPLES);
+        fill_tracker(trackers[1], 200'000'000LL, LT::OUTLIER_MIN_SAMPLES);
+        ASSERT(trackers[0].is_outlier_eligible(), "Should be outlier-eligible at 64 samples");
+        ASSERT(trackers[1].is_outlier_eligible(), "Should be outlier-eligible at 64 samples");
+        auto r = websocket::policy::detect_latency_outlier(trackers, 2);
+        ASSERT(r.outlier_ci == 1, "conn 1 should be outlier at exactly 64 samples");
     END_TEST
 }
 
@@ -478,6 +502,35 @@ void test_outlier_picks_worst() {
         auto r = websocket::policy::detect_latency_outlier(trackers, 3);
         ASSERT(r.outlier_ci == 2, "conn 2 should be worst outlier");
         ASSERT(r.outlier_ema_ns == 500'000'000LL, "outlier_ema should be 500ms");
+    END_TEST
+}
+
+void test_outlier_skips_ineligible() {
+    TEST("detect_latency_outlier: skips ineligible tracker, detects outlier among eligible pair")
+        LT trackers[3];
+        fill_tracker(trackers[0], 38'000'000LL);           // 38ms — eligible
+        fill_tracker(trackers[1], 200'000'000LL);          // 200ms — eligible outlier
+        fill_tracker(trackers[2], 999'000'000LL, 10);      // ineligible (10 < 64)
+        ASSERT(trackers[0].is_outlier_eligible(), "tracker 0 should be eligible");
+        ASSERT(trackers[1].is_outlier_eligible(), "tracker 1 should be eligible");
+        ASSERT(!trackers[2].is_outlier_eligible(), "tracker 2 should NOT be eligible");
+        auto r = websocket::policy::detect_latency_outlier(trackers, 3);
+        ASSERT(r.outlier_ci == 1, "conn 1 should be outlier (ineligible tracker skipped)");
+        ASSERT(r.min_ema_ns == 38'000'000LL, "min_ema should be 38ms");
+    END_TEST
+}
+
+void test_outlier_fewer_than_2_eligible() {
+    TEST("detect_latency_outlier: no detection when only 1 eligible among 3 trackers")
+        LT trackers[3];
+        fill_tracker(trackers[0], 38'000'000LL);           // eligible
+        fill_tracker(trackers[1], 200'000'000LL, 10);      // ineligible
+        fill_tracker(trackers[2], 500'000'000LL, 5);       // ineligible
+        ASSERT(trackers[0].is_outlier_eligible(), "tracker 0 should be eligible");
+        ASSERT(!trackers[1].is_outlier_eligible(), "tracker 1 should NOT be eligible");
+        ASSERT(!trackers[2].is_outlier_eligible(), "tracker 2 should NOT be eligible");
+        auto r = websocket::policy::detect_latency_outlier(trackers, 3);
+        ASSERT(r.outlier_ci == -1, "No outlier when <2 eligible");
     END_TEST
 }
 
@@ -526,8 +579,12 @@ int main() {
     test_outlier_no_trigger_under_2x();
     test_outlier_no_trigger_small_abs_delta();
     test_outlier_not_warmed_up();
+    test_outlier_not_eligible_at_warmup_boundary();
+    test_outlier_detects_at_exact_min_samples();
     test_outlier_single_connection();
     test_outlier_picks_worst();
+    test_outlier_skips_ineligible();
+    test_outlier_fewer_than_2_eligible();
 
     // Summary
     std::cout << "\n========================================" << std::endl;

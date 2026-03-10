@@ -8,6 +8,7 @@
 // Selection: FixedWatchdogPolicy<1000> for MaxConn > 1, SelfLearnWatchdogPolicy for single
 #pragma once
 
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
@@ -148,6 +149,10 @@ struct LatencyTracker {
     }
     void reset() { ema_ns = 0; last_sample_ns = 0; sample_count = 0; }
     bool is_warmed_up() const { return sample_count >= WARMUP_SAMPLES; }
+
+    static constexpr uint32_t OUTLIER_MIN_SAMPLES = 64;
+    bool is_outlier_eligible() const { return sample_count >= OUTLIER_MIN_SAMPLES; }
+
     int64_t ema_ms() const { return ema_ns / 1'000'000; }
 };
 
@@ -155,9 +160,10 @@ struct LatencyTracker {
 // detect_latency_outlier — cross-connection latency comparison
 //
 // Outlier criteria (all must hold):
-//   1. Connection EMA > OutlierRatio × minimum EMA across connections
+//   1. Connection EMA > OutlierRatio × minimum EMA across eligible connections
 //   2. Absolute delta > OutlierAbsDeltaNs
-//   3. All connections warmed up (≥WARMUP_SAMPLES each)
+//   3. At least 2 connections outlier-eligible (≥OUTLIER_MIN_SAMPLES each)
+//   Ineligible trackers are skipped (not compared, not blocking)
 // ============================================================================
 
 struct LatencyOutlierResult {
@@ -171,15 +177,19 @@ inline LatencyOutlierResult detect_latency_outlier(
         const LatencyTracker* trackers, uint8_t n_active) {
     LatencyOutlierResult r{};
     if (n_active < 2) return r;
+    uint8_t n_eligible = 0;
     for (uint8_t i = 0; i < n_active; ++i)
-        if (!trackers[i].is_warmed_up()) return r;
-    int64_t min_ema = trackers[0].ema_ns;
-    for (uint8_t i = 1; i < n_active; ++i)
-        if (trackers[i].ema_ns < min_ema) min_ema = trackers[i].ema_ns;
+        if (trackers[i].is_outlier_eligible()) n_eligible++;
+    if (n_eligible < 2) return r;
+    int64_t min_ema = INT64_MAX;
+    for (uint8_t i = 0; i < n_active; ++i)
+        if (trackers[i].is_outlier_eligible() && trackers[i].ema_ns < min_ema)
+            min_ema = trackers[i].ema_ns;
     r.min_ema_ns = min_ema;
     if (min_ema <= 0) return r;
     int64_t worst = 0;
     for (uint8_t i = 0; i < n_active; ++i) {
+        if (!trackers[i].is_outlier_eligible()) continue;
         int64_t ema = trackers[i].ema_ns;
         if (ema > OutlierRatio * min_ema && (ema - min_ema) > OutlierAbsDeltaNs && ema > worst) {
             worst = ema; r.outlier_ci = (int8_t)i;
