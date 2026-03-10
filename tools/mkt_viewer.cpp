@@ -1248,7 +1248,10 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
             else {
                 int64_t ms_ago = (s.last_recv_ts_ns - s.ob_channel_recv_ns[c]) / 1'000'000;
                 if (ms_ago < 0) ms_ago = 0;
-                n = snprintf(label, sizeof(label), "D%d %ldms", c, (long)ms_ago);
+                if (ms_ago >= 1000)
+                    n = snprintf(label, sizeof(label), "D%d %.1fs", c, ms_ago / 1000.0);
+                else
+                    n = snprintf(label, sizeof(label), "D%d %ldms", c, (long)ms_ago);
             }
             pos = fb_puts(fb, pos, is_active ? BOLD : DIM);
             if (is_active) pos = fb_puts(fb, pos, BG_GREEN);
@@ -1266,7 +1269,10 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
             else {
                 int64_t ms_ago = (s.last_recv_ts_ns - s.bbo_recv_ns) / 1'000'000;
                 if (ms_ago < 0) ms_ago = 0;
-                n = snprintf(label, sizeof(label), "BBO %ldms", (long)ms_ago);
+                if (ms_ago >= 1000)
+                    n = snprintf(label, sizeof(label), "BBO %.1fs", ms_ago / 1000.0);
+                else
+                    n = snprintf(label, sizeof(label), "BBO %ldms", (long)ms_ago);
             }
             bool bbo_active = (s.latest_ob_channel >= 0 &&
                                s.last_bbo_seq > s.dedup.ob_channel_seq[s.latest_ob_channel]);
