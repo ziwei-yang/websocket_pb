@@ -123,4 +123,70 @@ struct SelfLearnWatchdogPolicy {
     }
 };
 
+// ============================================================================
+// LatencyTracker — per-connection EMA of server latency (nanoseconds)
+// ============================================================================
+
+struct LatencyTracker {
+    int64_t ema_ns = 0;
+    int64_t last_sample_ns = 0;
+    uint32_t sample_count = 0;
+
+    static constexpr uint32_t WARMUP_SAMPLES = 8;
+    static constexpr int32_t EMA_SHIFT = 3;  // alpha = 1/8
+
+    bool on_sample(int64_t latency_ns) {
+        if (latency_ns <= 0) return false;
+        last_sample_ns = latency_ns;
+        if (sample_count < WARMUP_SAMPLES) {
+            ema_ns = (ema_ns * (int64_t)sample_count + latency_ns) / (int64_t)(sample_count + 1);
+        } else {
+            ema_ns = ema_ns - (ema_ns >> EMA_SHIFT) + (latency_ns >> EMA_SHIFT);
+        }
+        sample_count++;
+        return true;
+    }
+    void reset() { ema_ns = 0; last_sample_ns = 0; sample_count = 0; }
+    bool is_warmed_up() const { return sample_count >= WARMUP_SAMPLES; }
+    int64_t ema_ms() const { return ema_ns / 1'000'000; }
+};
+
+// ============================================================================
+// detect_latency_outlier — cross-connection latency comparison
+//
+// Outlier criteria (all must hold):
+//   1. Connection EMA > OutlierRatio × minimum EMA across connections
+//   2. Absolute delta > OutlierAbsDeltaNs
+//   3. All connections warmed up (≥WARMUP_SAMPLES each)
+// ============================================================================
+
+struct LatencyOutlierResult {
+    int8_t outlier_ci = -1;        // -1 = no outlier
+    int64_t min_ema_ns = 0;
+    int64_t outlier_ema_ns = 0;
+};
+
+template<int64_t OutlierRatio = 2, int64_t OutlierAbsDeltaNs = 50'000'000LL>
+inline LatencyOutlierResult detect_latency_outlier(
+        const LatencyTracker* trackers, uint8_t n_active) {
+    LatencyOutlierResult r{};
+    if (n_active < 2) return r;
+    for (uint8_t i = 0; i < n_active; ++i)
+        if (!trackers[i].is_warmed_up()) return r;
+    int64_t min_ema = trackers[0].ema_ns;
+    for (uint8_t i = 1; i < n_active; ++i)
+        if (trackers[i].ema_ns < min_ema) min_ema = trackers[i].ema_ns;
+    r.min_ema_ns = min_ema;
+    if (min_ema <= 0) return r;
+    int64_t worst = 0;
+    for (uint8_t i = 0; i < n_active; ++i) {
+        int64_t ema = trackers[i].ema_ns;
+        if (ema > OutlierRatio * min_ema && (ema - min_ema) > OutlierAbsDeltaNs && ema > worst) {
+            worst = ema; r.outlier_ci = (int8_t)i;
+        }
+    }
+    r.outlier_ema_ns = worst;
+    return r;
+}
+
 }  // namespace websocket::policy

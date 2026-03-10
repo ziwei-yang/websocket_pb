@@ -324,6 +324,164 @@ void test_selflearn_learn_then_reset_preserves_nothing() {
 }
 
 // ============================================================================
+// LatencyTracker Tests
+// ============================================================================
+
+using LT = websocket::policy::LatencyTracker;
+
+void test_latency_warmup_ema() {
+    TEST("LatencyTracker: warmup with 8 identical samples → EMA equals sample")
+        LT t{};
+        int64_t sample = 38'000'000LL;  // 38ms
+        for (uint32_t i = 0; i < LT::WARMUP_SAMPLES; ++i)
+            ASSERT(t.on_sample(sample), "Should accept positive sample");
+        ASSERT(t.is_warmed_up(), "Should be warmed up after 8 samples");
+        ASSERT(t.ema_ns == sample, "EMA should equal sample value after identical warmup");
+        ASSERT(t.ema_ms() == 38, "ema_ms should be 38");
+    END_TEST
+}
+
+void test_latency_ema_converges() {
+    TEST("LatencyTracker: EMA converges toward new values after warmup")
+        LT t{};
+        int64_t initial = 40'000'000LL;  // 40ms
+        for (uint32_t i = 0; i < LT::WARMUP_SAMPLES; ++i)
+            t.on_sample(initial);
+        ASSERT(t.ema_ns == initial, "EMA should be 40ms after warmup");
+        // Feed 100ms samples — EMA should move toward 100ms
+        int64_t higher = 100'000'000LL;
+        for (int i = 0; i < 32; ++i)
+            t.on_sample(higher);
+        ASSERT(t.ema_ns > initial, "EMA should have increased");
+        ASSERT(t.ema_ns > 90'000'000LL, "EMA should be near 100ms after 32 samples");
+    END_TEST
+}
+
+void test_latency_rejects_negative_zero() {
+    TEST("LatencyTracker: rejects negative and zero samples")
+        LT t{};
+        ASSERT(!t.on_sample(0), "Should reject zero");
+        ASSERT(!t.on_sample(-1), "Should reject negative");
+        ASSERT(t.sample_count == 0, "sample_count should be 0");
+        ASSERT(t.ema_ns == 0, "ema_ns should be 0");
+    END_TEST
+}
+
+void test_latency_reset() {
+    TEST("LatencyTracker: reset() clears all state")
+        LT t{};
+        for (uint32_t i = 0; i < LT::WARMUP_SAMPLES; ++i)
+            t.on_sample(50'000'000LL);
+        ASSERT(t.is_warmed_up(), "Should be warmed up");
+        t.reset();
+        ASSERT(t.ema_ns == 0, "ema_ns should be 0 after reset");
+        ASSERT(t.last_sample_ns == 0, "last_sample_ns should be 0 after reset");
+        ASSERT(t.sample_count == 0, "sample_count should be 0 after reset");
+        ASSERT(!t.is_warmed_up(), "Should not be warmed up after reset");
+    END_TEST
+}
+
+void test_latency_ema_ms() {
+    TEST("LatencyTracker: ema_ms() returns correct milliseconds")
+        LT t{};
+        int64_t sample = 123'456'789LL;  // ~123ms
+        for (uint32_t i = 0; i < LT::WARMUP_SAMPLES; ++i)
+            t.on_sample(sample);
+        ASSERT(t.ema_ms() == 123, "ema_ms should be 123");
+    END_TEST
+}
+
+// ============================================================================
+// detect_latency_outlier Tests
+// ============================================================================
+
+using websocket::policy::LatencyOutlierResult;
+
+// Helper: fill tracker with n identical samples
+static void fill_tracker(LT& t, int64_t ns, uint32_t count = LT::WARMUP_SAMPLES) {
+    t.reset();
+    for (uint32_t i = 0; i < count; ++i)
+        t.on_sample(ns);
+}
+
+void test_outlier_no_outlier_similar() {
+    TEST("detect_latency_outlier: no outlier when all latencies similar")
+        LT trackers[3];
+        fill_tracker(trackers[0], 38'000'000LL);   // 38ms
+        fill_tracker(trackers[1], 40'000'000LL);   // 40ms
+        fill_tracker(trackers[2], 42'000'000LL);   // 42ms
+        auto r = websocket::policy::detect_latency_outlier(trackers, 3);
+        ASSERT(r.outlier_ci == -1, "No outlier expected");
+    END_TEST
+}
+
+void test_outlier_detects_2x() {
+    TEST("detect_latency_outlier: detects 2x+ outlier (38ms vs 100ms)")
+        LT trackers[3];
+        fill_tracker(trackers[0], 38'000'000LL);   // 38ms
+        fill_tracker(trackers[1], 40'000'000LL);   // 40ms
+        fill_tracker(trackers[2], 100'000'000LL);  // 100ms — >2x min, delta>50ms
+        auto r = websocket::policy::detect_latency_outlier(trackers, 3);
+        ASSERT(r.outlier_ci == 2, "conn 2 should be outlier");
+        ASSERT(r.min_ema_ns == 38'000'000LL, "min_ema should be 38ms");
+        ASSERT(r.outlier_ema_ns == 100'000'000LL, "outlier_ema should be 100ms");
+    END_TEST
+}
+
+void test_outlier_no_trigger_under_2x() {
+    TEST("detect_latency_outlier: no trigger when ratio < 2x (100ms vs 180ms)")
+        LT trackers[2];
+        fill_tracker(trackers[0], 100'000'000LL);  // 100ms
+        fill_tracker(trackers[1], 180'000'000LL);  // 180ms — 1.8x, under 2x
+        auto r = websocket::policy::detect_latency_outlier(trackers, 2);
+        ASSERT(r.outlier_ci == -1, "No outlier at 1.8x ratio");
+    END_TEST
+}
+
+void test_outlier_no_trigger_small_abs_delta() {
+    TEST("detect_latency_outlier: no trigger when abs delta < 50ms (10ms vs 30ms)")
+        LT trackers[2];
+        fill_tracker(trackers[0], 10'000'000LL);   // 10ms
+        fill_tracker(trackers[1], 30'000'000LL);   // 30ms — 3x but delta=20ms<50ms
+        auto r = websocket::policy::detect_latency_outlier(trackers, 2);
+        ASSERT(r.outlier_ci == -1, "No outlier when abs delta < 50ms");
+    END_TEST
+}
+
+void test_outlier_not_warmed_up() {
+    TEST("detect_latency_outlier: no detection when trackers not warmed up")
+        LT trackers[2];
+        fill_tracker(trackers[0], 38'000'000LL);
+        // trackers[1] not warmed up (only 3 samples)
+        trackers[1].reset();
+        for (int i = 0; i < 3; ++i) trackers[1].on_sample(200'000'000LL);
+        auto r = websocket::policy::detect_latency_outlier(trackers, 2);
+        ASSERT(r.outlier_ci == -1, "No outlier when not warmed up");
+    END_TEST
+}
+
+void test_outlier_single_connection() {
+    TEST("detect_latency_outlier: no detection with single connection")
+        LT trackers[1];
+        fill_tracker(trackers[0], 38'000'000LL);
+        auto r = websocket::policy::detect_latency_outlier(trackers, 1);
+        ASSERT(r.outlier_ci == -1, "No outlier with single connection");
+    END_TEST
+}
+
+void test_outlier_picks_worst() {
+    TEST("detect_latency_outlier: picks worst outlier when multiple exceed threshold")
+        LT trackers[3];
+        fill_tracker(trackers[0], 38'000'000LL);   // 38ms (min)
+        fill_tracker(trackers[1], 200'000'000LL);  // 200ms — outlier
+        fill_tracker(trackers[2], 500'000'000LL);  // 500ms — worse outlier
+        auto r = websocket::policy::detect_latency_outlier(trackers, 3);
+        ASSERT(r.outlier_ci == 2, "conn 2 should be worst outlier");
+        ASSERT(r.outlier_ema_ns == 500'000'000LL, "outlier_ema should be 500ms");
+    END_TEST
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -354,6 +512,22 @@ int main() {
     test_selflearn_reset();
     test_selflearn_display_methods();
     test_selflearn_learn_then_reset_preserves_nothing();
+
+    std::cout << "\n--- LatencyTracker Tests ---" << std::endl;
+    test_latency_warmup_ema();
+    test_latency_ema_converges();
+    test_latency_rejects_negative_zero();
+    test_latency_reset();
+    test_latency_ema_ms();
+
+    std::cout << "\n--- detect_latency_outlier Tests ---" << std::endl;
+    test_outlier_no_outlier_similar();
+    test_outlier_detects_2x();
+    test_outlier_no_trigger_under_2x();
+    test_outlier_no_trigger_small_abs_delta();
+    test_outlier_not_warmed_up();
+    test_outlier_single_connection();
+    test_outlier_picks_worst();
 
     // Summary
     std::cout << "\n========================================" << std::endl;

@@ -233,6 +233,7 @@ public:
             }
         }
         check_all_dead();
+        check_latency_outlier();
         check_upgrade_timeout();
     }
 
@@ -1079,6 +1080,7 @@ private:
                     saved_exchange_event_time_us = info.exchange_event_time_us;
                 }
                 app_flags = info.flags & 0xF0;  // Preserve MktEventHandler-set bits (4+)
+                on_latency_sample(ci, saved_exchange_event_time_us);
             }
         }
 
@@ -1196,6 +1198,7 @@ private:
 
     void reset_watchdog_state(uint8_t ci) {
         wd_[ci] = WatchdogPolicyType{};
+        if constexpr (MaxConn > 1 && HasMktEventHandler) latency_tracker_[ci].reset();
     }
 
     void check_all_dead() {
@@ -1249,6 +1252,66 @@ private:
             }
             notify_disconnected(0);
         }
+    }
+
+    // ========================================================================
+    // Latency-Based Outlier Detection (multi-conn only)
+    // ========================================================================
+
+    void on_latency_sample(uint8_t ci, int64_t exchange_event_time_us) {
+        if constexpr (MaxConn <= 1 || !HasMktEventHandler) return;
+        if (exchange_event_time_us <= 0) return;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        int64_t recv_ns = ts.tv_sec * 1'000'000'000LL + ts.tv_nsec;
+        int64_t latency_ns = recv_ns - exchange_event_time_us * 1000;
+        latency_tracker_[ci].on_sample(latency_ns);
+    }
+
+    void check_latency_outlier() {
+        if constexpr (MaxConn <= 1 || !AutoReconnect || !HasMktEventHandler) return;
+
+        uint64_t now = rdtscp();
+        uint64_t freq = conn_state_->tsc_freq_hz;
+        if (freq == 0) return;
+
+        // Rate-limit: check at most once per second
+        if (last_outlier_check_cycle_ > 0) {
+            uint64_t elapsed_ms = ((now - last_outlier_check_cycle_) * 1000ULL) / freq;
+            if (elapsed_ms < 1000) return;
+        }
+        last_outlier_check_cycle_ = now;
+
+        // 10s cooldown between outlier disconnects
+        if (last_outlier_disconnect_cycle_ > 0) {
+            uint64_t cooldown_ms = ((now - last_outlier_disconnect_cycle_) * 1000ULL) / freq;
+            if (cooldown_ms < 10000) return;
+        }
+
+        // Require all connections ACTIVE
+        for (size_t i = 0; i < n_active_; ++i)
+            if (ws_phase_[i] != WsConnPhase::ACTIVE) return;
+
+        auto result = websocket::policy::detect_latency_outlier(
+            latency_tracker_, static_cast<uint8_t>(n_active_));
+        if (result.outlier_ci < 0) return;
+
+        uint8_t ci = static_cast<uint8_t>(result.outlier_ci);
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        fprintf(stderr, "[%ld.%06ld] [WS-LATENCY-OUTLIER] conn %u EMA=%ldms (min=%ldms)\n",
+                ts.tv_sec, ts.tv_nsec / 1000, ci,
+                result.outlier_ema_ns / 1'000'000, result.min_ema_ns / 1'000'000);
+        for (size_t i = 0; i < n_active_; ++i) {
+            fprintf(stderr, "  conn %zu: EMA=%ldms last=%ldms samples=%u\n",
+                    i, latency_tracker_[i].ema_ms(),
+                    latency_tracker_[i].last_sample_ns / 1'000'000,
+                    latency_tracker_[i].sample_count);
+        }
+
+        last_outlier_disconnect_cycle_ = now;
+        ws_phase_[ci] = WsConnPhase::DISCONNECTED;
+        notify_disconnected(ci);
+        conn_state_->set_reconnect_request(ci);
     }
 
     void check_upgrade_timeout() {
@@ -1451,6 +1514,11 @@ private:
     WatchdogPolicyType wd_[NUM_CONN]{};
     uint64_t last_data_cycle_[NUM_CONN]{};
     uint64_t upgrade_sent_cycle_[NUM_CONN]{};
+
+    // Latency-based outlier detection (multi-conn only)
+    websocket::policy::LatencyTracker latency_tracker_[NUM_CONN]{};
+    uint64_t last_outlier_check_cycle_ = 0;
+    uint64_t last_outlier_disconnect_cycle_ = 0;
 };
 
 }  // namespace websocket::pipeline
