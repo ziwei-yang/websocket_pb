@@ -25,6 +25,7 @@ struct MktDedupResult {
     uint8_t    overlap;        // overlapping entries (for DELTA same-seq)
     uint8_t    entry_count;    // total entries in event
     uint8_t    snap_accepted;  // bitmask of channels that accepted snapshot
+    bool       flush_gap;      // flush_index mismatch detected
     bool is_dup() const { return verdict != DupVerdict::NEW; }
 };
 
@@ -32,16 +33,18 @@ template<int DepthChannels = 3>
 struct MktDedupState {
     int64_t  ob_channel_seq[DepthChannels] = {};
     uint8_t  ob_channel_ci[DepthChannels] = {};  // connection_id that established current seq
+    uint8_t  ob_expected_flush[DepthChannels] = {};  // next expected flush_index per channel
     int64_t  trade_seq = 0;
     int64_t  bbo_seq   = 0;
     int64_t  liq_seq   = 0;
     int64_t  mark_price_seq = 0;
     uint64_t dup_count = 0;
+    uint64_t flush_gap_count = 0;
     int64_t  last_dup_seq = 0;
     std::unordered_set<uint64_t> ob_seen_deltas[DepthChannels];
 
     MktDedupResult check(const MktEvent& evt) {
-        MktDedupResult r{DupVerdict::NEW, 0, 0, evt.count, 0};
+        MktDedupResult r{DupVerdict::NEW, 0, 0, evt.count, 0, false};
 
         if (evt.is_book_snapshot()) {
             bool any_accepted = false;
@@ -87,6 +90,11 @@ struct MktDedupState {
                             return r;
                         }
                     }
+                    // Same seq continuation — verify flush_index
+                    if (evt.flush_index() != ob_expected_flush[ch]) {
+                        r.flush_gap = true;
+                        flush_gap_count++;
+                    }
                     // Insert new keys (both same-conn continuation and cross-conn interleave)
                     for (uint8_t i = 0; i < evt.count; i++)
                         ch_seen.insert(delta_content_key(evt.payload.deltas.entries[i]));
@@ -100,10 +108,16 @@ struct MktDedupState {
             } else {
                 // New seq (or src_seq == 0)
                 ob_channel_ci[ch] = evt.connection_id();
+                ob_expected_flush[ch] = 0;
+                if (evt.flush_index() != 0) {
+                    r.flush_gap = true;
+                    flush_gap_count++;
+                }
                 ch_seen.clear();
                 for (uint8_t i = 0; i < evt.count; i++)
                     ch_seen.insert(delta_content_key(evt.payload.deltas.entries[i]));
             }
+            ob_expected_flush[ch] = evt.flush_index() + 1;
             ch_seq = std::max(ch_seq, evt.src_seq);
             return r;
         }
@@ -128,6 +142,7 @@ struct MktDedupState {
         for (int c = 0; c < DepthChannels; c++) {
             ob_channel_seq[c] = 0;
             ob_channel_ci[c] = 0;
+            ob_expected_flush[c] = 0;
             ob_seen_deltas[c].clear();
         }
         trade_seq = 0;
@@ -135,6 +150,7 @@ struct MktDedupState {
         liq_seq = 0;
         mark_price_seq = 0;
         dup_count = 0;
+        flush_gap_count = 0;
         last_dup_seq = 0;
     }
 };

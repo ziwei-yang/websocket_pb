@@ -608,11 +608,14 @@ struct BinanceUSDMSimdjsonParser {
             e.src_seq = pd.seq;
             e.event_ts_ns = pd.event_ts_ns;
             e.count = count;
+            e.count2 = fc;  // flush_index
             std::memcpy(e.payload.deltas.entries, pd.entries,
                         count * sizeof(websocket::msg::DeltaEntry));
         });
         current_info_ = nullptr;
         pd.flush_count++;
+        auto& il = interleave_[ch];
+        if (il.seq == pd.seq) il.flush_count = pd.flush_count;
         pd.count = 0;
         if (is_final) {
             pd.has_pending = false;

@@ -8,6 +8,7 @@
 #include <unordered_set>
 
 #include "msg/mkt_event.hpp"
+#include "msg/mkt_dedup.hpp"
 #include "msg/orderbook.hpp"
 
 using namespace websocket::msg;
@@ -16,9 +17,8 @@ using namespace websocket::msg;
 // Reproduce mkt_viewer dedup logic (static in mkt_viewer.cpp)
 // ============================================================================
 
-static uint64_t delta_content_key(const DeltaEntry& de) {
-    return (static_cast<uint64_t>(de.price) << 1) | (de.flags & DeltaFlags::SIDE_ASK);
-}
+// Use delta_content_key from mkt_dedup.hpp
+using websocket::msg::delta_content_key;
 
 // Minimal dedup state (mirrors ViewerState fields relevant to dedup)
 struct DedupState {
@@ -110,13 +110,14 @@ static DeltaEntry ask_delta(int64_t price, int64_t qty) {
 }
 
 static MktEvent make_deltas(int64_t seq, const DeltaEntry* deltas, uint8_t count,
-                             uint16_t extra_flags = 0) {
+                             uint16_t extra_flags = 0, uint8_t flush_index = 0) {
     MktEvent e;
     e.clear();
     e.set_event_type(static_cast<uint8_t>(EventType::BOOK_DELTA));
     e.flags |= extra_flags;
     e.src_seq = seq;
     e.count = count;
+    e.count2 = flush_index;
     std::memcpy(e.payload.deltas.entries, deltas, count * sizeof(DeltaEntry));
     return e;
 }
@@ -290,17 +291,23 @@ static void test_multi_flush_three_batches() {
     TEST("3-batch multi-flush: all accepted, replay rejected");
 
     DedupState s;
-    // Flush 1: 2 deltas
+    // Flush 1: 2 deltas (flush_index=0)
     DeltaEntry d1[] = { bid_delta(10000, 50), bid_delta(9900, 30) };
-    assert(apply_dedup(s, make_deltas(100, d1, 2)) == true);
+    auto e1 = make_deltas(100, d1, 2, 0, 0);
+    assert(e1.count2 == 0);  // verify flush_index set
+    assert(apply_dedup(s, e1) == true);
 
-    // Flush 2: 2 new deltas (continuation)
+    // Flush 2: 2 new deltas (continuation, flush_index=1)
     DeltaEntry d2[] = { ask_delta(10100, 40), ask_delta(10200, 25) };
-    assert(apply_dedup(s, make_deltas(100, d2, 2)) == true);
+    auto e2 = make_deltas(100, d2, 2, 0, 1);
+    assert(e2.count2 == 1);  // verify flush_index set
+    assert(apply_dedup(s, e2) == true);
 
-    // Flush 3: 1 new delta (continuation)
+    // Flush 3: 1 new delta (continuation, flush_index=2)
     DeltaEntry d3[] = { bid_delta(9800, 15) };
-    assert(apply_dedup(s, make_deltas(100, d3, 1)) == true);
+    auto e3 = make_deltas(100, d3, 1, 0, 2);
+    assert(e3.count2 == 2);  // verify flush_index set
+    assert(apply_dedup(s, e3) == true);
 
     assert(s.dup_count == 0);
     assert(s.ob_seen_deltas.size() == 5);
@@ -487,6 +494,80 @@ static void test_cross_conn_same_seq_accepted() {
 }
 
 // ============================================================================
+// MktDedupState flush_gap tests
+// ============================================================================
+
+static void test_flush_gap_detection() {
+    TEST("MktDedupState: flush_gap detection sequence");
+
+    MktDedupState<4> dedup;
+
+    // delta seq=100, fi=0 → no gap (first event for this seq)
+    DeltaEntry d1[] = { bid_delta(10000, 50) };
+    auto e1 = make_deltas(100, d1, 1, 0, 0);
+    auto r1 = dedup.check(e1);
+    assert(!r1.flush_gap);
+    assert(dedup.flush_gap_count == 0);
+
+    // delta seq=100, fi=2 (skip 1) → flush_gap==true
+    DeltaEntry d2[] = { ask_delta(10100, 40) };
+    auto e2 = make_deltas(100, d2, 1, 0, 2);
+    auto r2 = dedup.check(e2);
+    assert(r2.flush_gap);
+    assert(dedup.flush_gap_count == 1);
+
+    // delta seq=101, fi=1 (should be 0 for new seq) → flush_gap==true
+    DeltaEntry d3[] = { bid_delta(9900, 30) };
+    auto e3 = make_deltas(101, d3, 1, 0, 1);
+    auto r3 = dedup.check(e3);
+    assert(r3.flush_gap);
+    assert(dedup.flush_gap_count == 2);
+
+    // delta seq=101, fi=2 (correct continuation after fi=1) → no gap
+    DeltaEntry d4[] = { ask_delta(10200, 25) };
+    auto e4 = make_deltas(101, d4, 1, 0, 2);
+    auto r4 = dedup.check(e4);
+    assert(!r4.flush_gap);
+    assert(dedup.flush_gap_count == 2);  // unchanged
+
+    PASS();
+}
+
+static void test_flush_gap_cross_conn_no_false_positive() {
+    TEST("MktDedupState: cross-conn flush_gap with globally monotonic fi");
+
+    MktDedupState<4> dedup;
+
+    // conn 0: delta seq=200, fi=0 → no gap
+    DeltaEntry d1[] = { bid_delta(10000, 50) };
+    auto e1 = make_deltas(200, d1, 1, 0, 0);
+    auto r1 = dedup.check(e1);
+    assert(!r1.flush_gap);
+
+    // conn 0: delta seq=200, fi=1 → no gap (continuation)
+    DeltaEntry d2[] = { ask_delta(10100, 40) };
+    auto e2 = make_deltas(200, d2, 1, 0, 1);
+    auto r2 = dedup.check(e2);
+    assert(!r2.flush_gap);
+
+    // conn 1: delta seq=200, fi=2 → no gap (globally monotonic, continues from conn 0)
+    DeltaEntry d3[] = { bid_delta(9900, 30) };
+    auto e3 = make_deltas(200, d3, 1, 1 << EventFlags::CONN_ID_SHIFT, 2);
+    auto r3 = dedup.check(e3);
+    assert(!r3.flush_gap);
+
+    // conn 1: delta seq=200, fi=3 → no gap
+    DeltaEntry d4[] = { ask_delta(10200, 25) };
+    auto e4 = make_deltas(200, d4, 1, 1 << EventFlags::CONN_ID_SHIFT, 3);
+    auto r4 = dedup.check(e4);
+    assert(!r4.flush_gap);
+
+    assert(dedup.flush_gap_count == 0);  // zero gaps throughout
+
+    PASS();
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -516,6 +597,10 @@ int main() {
     test_same_price_bid_ask_both_tracked();
     test_single_delta_replay_from_other_conn();
     test_cross_conn_same_seq_accepted();
+
+    // MktDedupState flush_gap tests
+    test_flush_gap_detection();
+    test_flush_gap_cross_conn_no_false_positive();
 
     std::fprintf(stderr, "\n  %d/%d tests passed\n\n", tests_passed, tests_run);
     if (tests_passed != tests_run) {

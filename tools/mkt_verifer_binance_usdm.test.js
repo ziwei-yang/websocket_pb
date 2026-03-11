@@ -569,8 +569,10 @@ describe('Delta chunking', () => {
         assert.equal(v.events.length, 2);
         assert.equal(v.events[0].type, 'BOOK_DELTA');
         assert.equal(v.events[0].count, V.MAX_DELTAS);  // 20
+        assert.equal(v.events[0].count2, 0);  // first chunk: flush_index=0
         assert.equal(v.events[1].type, 'BOOK_DELTA');
         assert.equal(v.events[1].count, 5);
+        assert.equal(v.events[1].count2, 1);  // second chunk: flush_index=1
     });
 });
 

@@ -534,10 +534,12 @@ namespace websocket::sbe {
         uint16_t committed_count = 0;
         bool     finished = false;
         websocket::msg::DeltaEntry boundary_entry{};
+        uint8_t  flush_count = 0;       // global MktEvent flush count for this seq
 
         void reset(int64_t new_seq) {
             seq = new_seq; committed_count = 0; finished = false;
             boundary_entry = {};
+            flush_count = 0;
         }
     };
 
@@ -1251,7 +1253,8 @@ private:
             pending_depth_count_ = 0;
             pending_depth_event_type_ = event_type;
             pending_depth_extra_flags_ = extra_flags;
-            pending_depth_flush_count_ = 0;
+            pending_depth_flush_count_ = (interleave_.seq == state.sequence)
+                ? interleave_.flush_count : 0;
             pending_depth_info_ = info;
         }
 
@@ -1286,11 +1289,14 @@ private:
             e.src_seq = pending_depth_seq_;
             e.event_ts_ns = pending_depth_event_ts_ns_;
             e.count = count;
+            e.count2 = fc;  // flush_index
             std::memcpy(e.payload.deltas.entries, pending_depth_entries_,
                         count * sizeof(websocket::msg::DeltaEntry));
         });
         current_info_ = nullptr;
         pending_depth_flush_count_++;
+        if (interleave_.seq == pending_depth_seq_)
+            interleave_.flush_count = pending_depth_flush_count_;
         pending_depth_count_ = 0;
         if (is_final) {
             has_pending_depth_ = false;

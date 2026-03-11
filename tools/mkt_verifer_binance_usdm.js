@@ -1012,6 +1012,7 @@ class MktEventBuilder {
             seq: this.pendingDepthSeq[ch],
             event_ts_ns: this.pendingDepthEventTsNs[ch],
             count: this.pendingDepth[ch].length,
+            count2: fc,  // flush_index
             conn_id: this.pendingDepthConnId[ch],
             flags: evtFlags,
             depth_channel: ch,

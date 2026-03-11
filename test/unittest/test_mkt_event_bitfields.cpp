@@ -231,6 +231,56 @@ static void test_recv_ts_ns_reconstruction() {
 }
 
 // ============================================================================
+// Test 9: flush_index() and ask_level_count() both return count2
+// ============================================================================
+
+static void test_flush_index_and_ask_level_count() {
+    TEST("flush_index() and ask_level_count() both return count2");
+
+    MktEvent e;
+    e.clear();
+    e.count2 = 7;
+    assert(e.flush_index() == 7);
+    assert(e.ask_level_count() == 7);
+
+    e.count2 = 0;
+    assert(e.flush_index() == 0);
+    assert(e.ask_level_count() == 0);
+
+    e.count2 = 255;
+    assert(e.flush_index() == 255);
+    assert(e.ask_level_count() == 255);
+
+    PASS();
+}
+
+// ============================================================================
+// Test 10: setting count2 for BOOK_DELTA doesn't corrupt other fields
+// ============================================================================
+
+static void test_count2_doesnt_corrupt_other_fields() {
+    TEST("count2 for BOOK_DELTA doesn't corrupt other fields");
+
+    MktEvent e;
+    e.clear();
+    e.set_event_type(static_cast<uint8_t>(EventType::BOOK_DELTA));
+    e.set_depth_channel(2);
+    e.set_connection_id(5);
+    e.count = 10;
+    e.src_seq = 12345;
+    e.count2 = 3;  // flush_index
+
+    assert(e.event_type() == static_cast<uint8_t>(EventType::BOOK_DELTA));
+    assert(e.depth_channel() == 2);
+    assert(e.connection_id() == 5);
+    assert(e.count == 10);
+    assert(e.flush_index() == 3);
+    assert(e.src_seq == 12345);
+
+    PASS();
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -245,6 +295,8 @@ int main() {
     test_all_fields_independent();
     test_clear_zeroes_all();
     test_recv_ts_ns_reconstruction();
+    test_flush_index_and_ask_level_count();
+    test_count2_doesnt_corrupt_other_fields();
 
     std::fprintf(stderr, "\n  %d/%d tests passed\n\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

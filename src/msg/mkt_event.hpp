@@ -221,7 +221,7 @@ struct alignas(512) MktEvent {
     uint16_t venue_instrument;       // [15:12]=venue_id (4b) [11:0]=instrument_id (12b)
     uint16_t flags;                  // EventFlags: [2:0] snap/cont/last [5:3] depth_ch [8:6] event_type [15:9] conn_id
     uint8_t  count;                  // primary count (deltas/trades/bid_levels)
-    uint8_t  count2;                 // secondary count (ask_levels for snapshot, else 0)
+    uint8_t  count2;                 // BOOK_SNAPSHOT: ask_level_count | BOOK_DELTA/TRADE: flush_index (0-based)
     uint16_t recv_local_latency_ns;  // min(recv_ts - nic_ts, 65535), 0 = none
     int64_t  src_seq;                // exchange sequence number
     int64_t  nic_ts_ns;              // NIC HW receive timestamp (ns, CLOCK_REALTIME)
@@ -296,6 +296,9 @@ struct alignas(512) MktEvent {
         flags = (flags & ~EventFlags::DEPTH_CH_MASK) | (static_cast<uint16_t>(ch) << EventFlags::DEPTH_CH_SHIFT);
     }
 
+    uint8_t flush_index() const { return count2; }       // delta/trade: 0-based chunk index
+    uint8_t ask_level_count() const { return count2; }   // snapshot: ask level count
+
     // ========================================================================
     // Snapshot accessors — return {pointer, count} for bids/asks
     // Bids: levels[0..count-1], Asks: levels[count..count+count2-1]
@@ -369,9 +372,21 @@ struct alignas(512) MktEvent {
         if (event_ts_ns > 0 && recv > 0)
             server_ms = (recv - event_ts_ns) / 1000000;
 
+        char flush_id[20] = "";
+        {
+            uint8_t ci = connection_id();
+            char cc = (ci < 10) ? ('0' + ci) : ('a' + ci - 10);
+            if (event_type() == 0)
+                std::snprintf(flush_id, sizeof(flush_id), "| %c %s ID %3u ",
+                              cc, is_last_in_batch() ? "last" : "    ", count2);
+            else
+                std::snprintf(flush_id, sizeof(flush_id), "| %c             ", cc);
+        }
+
         std::fprintf(stderr,
-                "\033[2m%*s| %3s %-2s \xce\xa3%6s | %+ldms | #%ld\033[0m\n",
-                padding, "", mkt_cnt, mkt_typ, lat, server_ms, src_seq);
+                "\033[2m%*s%s| %3s %-2s \xce\xa3%6s | %+ldms | #%ld\033[0m\n",
+                padding - static_cast<int>(std::strlen(flush_id)), "",
+                flush_id, mkt_cnt, mkt_typ, lat, server_ms, src_seq);
     }
 
     // ========================================================================

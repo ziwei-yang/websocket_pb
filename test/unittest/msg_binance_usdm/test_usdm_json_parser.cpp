@@ -176,7 +176,7 @@ static void assert_events_match(const std::vector<MktEvent>& a,
     for (size_t i = 0; i < a.size(); i++) {
         if (!events_equivalent(a[i], b[i])) {
             std::fprintf(stderr, "EQUIV FAIL [%s] event[%zu]:\n", label, i);
-            std::fprintf(stderr, "  event_type: %u vs %u\n", a[i].event_type, b[i].event_type);
+            std::fprintf(stderr, "  event_type: %u vs %u\n", a[i].event_type(), b[i].event_type());
             std::fprintf(stderr, "  flags:      0x%04x vs 0x%04x\n", a[i].flags, b[i].flags);
             std::fprintf(stderr, "  count:      %u vs %u\n", a[i].count, b[i].count);
             std::fprintf(stderr, "  count2:     %u vs %u\n", a[i].count2, b[i].count2);
@@ -894,7 +894,7 @@ template<typename H>
 void test_agg_trade_merge_overflow() {
     TestHarness<H> h;
 
-    // Feed 15 aggTrades — should flush at MAX_TRADES(11) + remainder(4)
+    // Feed 15 aggTrades — should flush at MAX_TRADES(12) + remainder(3)
     for (int i = 0; i < 15; i++) {
         char buf[512];
         snprintf(buf, sizeof(buf),
@@ -905,10 +905,10 @@ void test_agg_trade_merge_overflow() {
     h.idle();
 
     auto events = h.published();
-    // First flush at count=11, then remaining 4 flushed by idle()
+    // First flush at count=12, then remaining 3 flushed by idle()
     assert(events.size() == 2);
-    assert(events[0].count == 11);
-    assert(events[1].count == 4);
+    assert(events[0].count == 12);
+    assert(events[1].count == 3);
 }
 
 template<typename H>
@@ -1697,9 +1697,9 @@ void test_stream_depth_diff_complete_in_one() {
 template<typename H>
 void test_stream_depth_diff_many_bids_regression() {
     TestHarness<H> h;
-    // 39 bids + 5 asks = 44 total.  Requires 3 bid batches (19+19+1).
-    // With the bids_count bug: only 1 event (19 levels from first flush).
-    // With fix: 3 events (19 + 19 + 6 = 44 levels).
+    // 39 bids + 5 asks = 44 total.  Requires 2 bid batches (20+19).
+    // With the bids_count bug: only 1 event (20 levels from first flush).
+    // With fix: 3 events (20 + 20 + 4 = 44 levels).
     auto json = build_large_depth_json(false, 1600000000002LL, 700000, 39, 5);
 
     h.feed_frame(0, json.c_str());
@@ -1718,7 +1718,7 @@ void test_stream_depth_diff_many_bids_regression() {
 template<typename H>
 void test_stream_depth_diff_exactly_38_bids() {
     TestHarness<H> h;
-    // 38 bids + 5 asks = 43 total.  Boundary: exactly 2 bid batches (19+19),
+    // 38 bids + 5 asks = 43 total.  Boundary: exactly 2 bid batches (20+18),
     // second batch fills buf_max and post-loop finds ']' → array_done=true.
     // No underflow (loop doesn't iterate a 3rd time).
     auto json = build_large_depth_json(false, 1600000000003LL, 700001, 38, 5);
@@ -1739,14 +1739,14 @@ void test_stream_depth_diff_exactly_38_bids() {
 template<typename H>
 void test_stream_depth_diff_all_bids_no_asks() {
     TestHarness<H> h;
-    // 39 bids + 0 asks = 39 total.  Same underflow scenario, no asks at all.
+    // 39 bids + 0 asks = 39 total.  2 bid batches (20+19), no asks.
     auto json = build_large_depth_json(false, 1600000000004LL, 700002, 39, 0);
 
     h.feed_frame(0, json.c_str());
     h.idle();  // flush pending depth buffer
 
     auto events = h.published();
-    assert(events.size() == 3);
+    assert(events.size() == 2);
     uint16_t total = 0;
     for (auto& e : events) {
         assert(e.is_book_delta());
@@ -1757,7 +1757,7 @@ void test_stream_depth_diff_all_bids_no_asks() {
 
 // ── Overflow + snapshot interleaving regression test ──
 //
-// Bug: when a depth diff has >19 entries, frag1 is published mid-parse and
+// Bug: when a depth diff has >20 entries, frag1 is published mid-parse and
 // remaining entries stay in pending_depth_[ch].  If a depth20 snapshot arrives
 // in the same batch (before on_batch_end), the snapshot was published next,
 // pushing pending_depth_ frag2 to after the snapshot.  Ring order became:
@@ -1771,15 +1771,15 @@ template<typename H>
 void test_stream_depth_overflow_then_snapshot_ordering() {
     TestHarness<H> h;
 
-    // Step 1: feed large depth diff (25 bids + 5 asks = 30 > MAX_DELTAS=19)
-    // This overflows: frag1 (19 entries) published immediately,
-    // frag2 (11 entries) stays in pending_depth_[ch0]
+    // Step 1: feed large depth diff (25 bids + 5 asks = 30 > MAX_DELTAS=20)
+    // This overflows: frag1 (20 entries) published immediately,
+    // frag2 (10 entries) stays in pending_depth_[ch0]
     int64_t diff_seq = 600000;
     auto diff_json = build_large_depth_json(false, 1600000000001LL, diff_seq, 25, 5);
     h.feed_frame(0, diff_json.c_str());
 
     // Step 2: feed depth20 snapshot with higher sequence (before idle!)
-    // Use 5+5=10 entries so snapshot fits in one MktEvent (MAX_DELTAS=19)
+    // Use 5+5=10 entries so snapshot fits in one MktEvent (MAX_DELTAS=20)
     int64_t snap_seq = 700000;
     auto snap_json = build_large_depth_json(true, 1600000000002LL, snap_seq, 5, 5);
     h.feed_frame(0, snap_json.c_str());
@@ -2733,6 +2733,61 @@ void test_interleave_finished_fast_path() {
     assert(entries1 == entries0);  // no new entries
 }
 
+// Test 6: Flush count continuity across connection switch.
+// conn0 partially parses (fragment → bids only), conn1 completes (same seq).
+// Verify that published MktEvents have monotonically increasing count2 (flush_index).
+template<typename H>
+void test_interleave_flush_count_continuity() {
+    TestHarness<H> h;
+
+    // 5 bids + 5 asks = 10 entries, seq=700
+    auto json = build_interleave_depth_json(700, 5, 5);
+    uint32_t full_len = static_cast<uint32_t>(strlen(json.c_str()));
+
+    // Find truncation after bids array closes (conn0 parses 5 bids only)
+    uint32_t trunc_pos = 0;
+    {
+        const char* s = json.c_str();
+        const char* bids_start = strstr(s, "\"b\":[");
+        if (bids_start) {
+            const char* p = bids_start + 5;
+            int depth = 0;
+            for (; *p; p++) {
+                if (*p == '[') depth++;
+                if (*p == ']') {
+                    if (depth == 0) { trunc_pos = static_cast<uint32_t>(p + 1 - s); break; }
+                    depth--;
+                }
+            }
+        }
+    }
+    assert(trunc_pos > 0 && trunc_pos < full_len);
+
+    // conn0 fragment: parses 5 bids → pending buffer, interleave_.committed_count=5
+    h.feed_fragment(0, json.c_str(), trunc_pos);
+
+    // conn1: complete frame (same seq=700, 10 entries).
+    // First 5 (bids) ≤ committed → skip. Asks: conn switch → publish conn0's pending first.
+    // Then conn1's 5 asks added as new pending, idle() publishes them.
+    h.feed_frame(1, json.c_str());
+    h.idle();
+
+    auto events = h.published();
+
+    // Collect all BOOK_DELTA events and verify flush_index monotonicity
+    std::vector<uint8_t> flush_indices;
+    for (auto& e : events) {
+        if (e.is_book_delta() && e.src_seq == 700)
+            flush_indices.push_back(e.count2);
+    }
+    assert(flush_indices.size() >= 2);  // at least 2 flushes (conn0 bids + conn1 asks)
+
+    // Verify monotonically increasing: fi=0, fi=1, fi=2, ...
+    for (size_t i = 0; i < flush_indices.size(); i++) {
+        assert(flush_indices[i] == i);  // globally monotonic from 0
+    }
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -2861,6 +2916,7 @@ int main() {
         RUN_TEST_T((test_interleave_boundary_verify_pass<H>));
         RUN_TEST_T((test_interleave_boundary_verify_fail<H>));
         RUN_TEST_T((test_interleave_finished_fast_path<H>));
+        RUN_TEST_T((test_interleave_flush_count_continuity<H>));
     };
     run_interleave_tests.template operator()<BinanceUSDMJsonParser>("JsonParser interleave");
     run_interleave_tests.template operator()<BinanceUSDMSimdjsonParser>("SimdjsonParser interleave");

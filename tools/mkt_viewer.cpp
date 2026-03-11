@@ -402,6 +402,10 @@ static void apply_event(ViewerState& s, const MktEvent& evt) {
 
     auto dr = s.dedup.check(evt);
 
+    if (dr.flush_gap)
+        std::fprintf(stderr, "\033[33m[WARN] [FLUSH_GAP] ch=%u seq=%ld fi=%u\033[0m\n",
+                     dr.channel, evt.src_seq, evt.flush_index());
+
     if (evt.is_book_snapshot()) {
         for (int c = 0; c < ViewerState::DEPTH_CHANNELS; c++) {
             if (dr.snap_accepted & (1 << c)) {
@@ -532,7 +536,10 @@ static void add_log_line(ViewerState& s, const MktEvent& evt) {
     if (evt.is_book_snapshot()) {
         snprintf(counts, sizeof(counts), "%ub/%ua", evt.count, evt.count2);
     } else if (evt.is_book_delta()) {
-        snprintf(counts, sizeof(counts), "%ud", evt.count);
+        if (evt.count2 > 0)
+            snprintf(counts, sizeof(counts), "%ud#%u", evt.count, evt.count2);
+        else
+            snprintf(counts, sizeof(counts), "%ud", evt.count);
     } else if (evt.is_bbo_array()) {
         snprintf(counts, sizeof(counts), "%ub", evt.count);
     } else if (evt.is_trade_array()) {
@@ -843,6 +850,16 @@ static int render(const ViewerState& s, char* fb, int book_rows, int trade_rows,
             pos = fb_put(fb, pos, dup, dup_len);
             pos = fb_puts(fb, pos, RST);
             used += 1 + dup_len;
+        }
+
+        if (s.dedup.flush_gap_count > 0) {
+            char fg[48];
+            int fg_len = snprintf(fg, sizeof(fg), " flush_gap:%lu ", s.dedup.flush_gap_count);
+            pos = fb_puts(fb, pos, " ");
+            pos = fb_puts(fb, pos, "\033[97m\033[43m");  // bright white on yellow bg
+            pos = fb_put(fb, pos, fg, fg_len);
+            pos = fb_puts(fb, pos, RST);
+            used += 1 + fg_len;
         }
 
         // Right part: latency stats + latest value (if available)

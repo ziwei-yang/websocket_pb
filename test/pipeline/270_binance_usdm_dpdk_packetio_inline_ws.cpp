@@ -326,6 +326,9 @@ int main(int argc, char* argv[]) {
                             fprintf(stderr, "\033[91m[DUP] %s seq %ld (dup #%lu)\033[0m\n",
                                     type_str, mkt.src_seq, mkt_dedup.dup_count);
                         }
+                        if (dr.flush_gap)
+                            fprintf(stderr, "\033[33m[WARN] [FLUSH_GAP] ch=%u seq=%ld fi=%u\033[0m\n",
+                                    dr.channel, mkt.src_seq, mkt.flush_index());
                         mkt.print();
                     }
                 }
@@ -389,7 +392,10 @@ int main(int argc, char* argv[]) {
                         ts.tv_sec, ts.tv_nsec / 1000, type_str, st.connection_id, st.message);
             } else {
                 mkt_event_count++;
-                mkt_dedup.check(mkt);
+                auto dr = mkt_dedup.check(mkt);
+                if (dr.flush_gap)
+                    fprintf(stderr, "\033[33m[WARN] [FLUSH_GAP] ch=%u seq=%ld fi=%u\033[0m\n",
+                            dr.channel, mkt.src_seq, mkt.flush_index());
                 mkt.print();
             }
         }

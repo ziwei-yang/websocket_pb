@@ -118,8 +118,8 @@ static void write_mkt_event_json(FILE* f, const MktEvent& evt) {
 
     if (evt.is_book_delta()) {
         fprintf(f, "{\"type\":\"BOOK_DELTA\",\"seq\":%ld,\"event_ts_ns\":%ld,"
-                "\"count\":%u,\"conn_id\":%u,\"flags\":%u,\"deltas\":[",
-                evt.src_seq, evt.event_ts_ns, evt.count, conn_id, evt.flags);
+                "\"count\":%u,\"count2\":%u,\"conn_id\":%u,\"flags\":%u,\"deltas\":[",
+                evt.src_seq, evt.event_ts_ns, evt.count, evt.count2, conn_id, evt.flags);
         for (uint8_t i = 0; i < evt.count; i++) {
             auto& d = evt.payload.deltas.entries[i];
             if (i > 0) fputc(',', f);
