@@ -1069,6 +1069,12 @@ inline void flush_depth_deltas_json(Handler& self, JsonParseState& state, uint8_
         pd.has_pending = false;  // force re-init for new connection
     }
 
+    // Sequence change: flush old seq's pending entries before starting new seq
+    if (pd.has_pending && pd.seq != state.sequence) {
+        self.publish_pending_depth(ch, true);
+        pd.has_pending = false;
+    }
+
     // Overflow: pending + new > MAX_DELTAS → publish pending first
     if (pd.has_pending && pd.count + publish_count > websocket::msg::MAX_DELTAS)
         self.publish_pending_depth(ch, false);

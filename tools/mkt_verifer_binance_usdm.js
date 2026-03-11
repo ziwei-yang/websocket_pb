@@ -979,6 +979,12 @@ class MktEventBuilder {
             this.hasPendingDepth[ch] = false;  // force re-init for new connection
         }
 
+        // Sequence change: flush old seq's pending entries before starting new seq
+        if (this.hasPendingDepth[ch] && this.pendingDepthSeq[ch] !== seq) {
+            this.publishPendingDepth(ch, true);
+            this.hasPendingDepth[ch] = false;
+        }
+
         // Overflow: pending + new > MAX_DELTAS → publish pending first
         if (this.hasPendingDepth[ch] && this.pendingDepth[ch].length + toPublish.length > MAX_DELTAS)
             this.publishPendingDepth(ch, false);

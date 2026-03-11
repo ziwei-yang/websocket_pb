@@ -2536,6 +2536,53 @@ void test_sbe_interleave_finished_fast_path() {
     assert(sbe_count_delta_entries(events1) == entries0);
 }
 
+// Test: consecutive depth diffs with different sequences should reset flush_index
+void test_sbe_consecutive_depth_diff_seq_change_resets_flush_index() {
+    TestHarness h;
+
+    // Build large depth diff: 15 bids + 10 asks = 25 entries (> MAX_DELTAS=20)
+    // seq A (last_id=200)
+    int64_t bp_a[15], bq_a[15], ap_a[10], aq_a[10];
+    for (int i = 0; i < 15; i++) { bp_a[i] = 50000 + i * 100; bq_a[i] = 1000 + i; }
+    for (int i = 0; i < 10; i++) { ap_a[i] = 60000 + i * 100; aq_a[i] = 2000 + i; }
+    auto b_a = build_depth_diff_msg(1000000, 190, 200, -8, -8,
+                                     15, bp_a, bq_a, 10, ap_a, aq_a, "BTCUSDT");
+
+    // Build smaller depth diff: 3 bids + 2 asks = 5 entries
+    // seq B (last_id=300)
+    int64_t bp_b[] = {80000, 79000, 78000}, bq_b[] = {500, 600, 700};
+    int64_t ap_b[] = {81000, 82000}, aq_b[] = {800, 900};
+    auto b_b = build_depth_diff_msg(2000000, 290, 300, -8, -8,
+                                     3, bp_b, bq_b, 2, ap_b, aq_b, "BTCUSDT");
+
+    // Feed both without idle() between them
+    h.feed_frame(0, b_a);
+    h.feed_frame(0, b_b);
+    h.idle();
+
+    auto events = h.published();
+
+    // Collect flush_indices per seq
+    std::vector<uint8_t> fi_a, fi_b;
+    for (auto& e : events) {
+        if (!e.is_book_delta()) continue;
+        if (e.src_seq == 200) fi_a.push_back(e.flush_index());
+        if (e.src_seq == 300) fi_b.push_back(e.flush_index());
+    }
+
+    // seq A should have multiple flushes starting from 0
+    assert(fi_a.size() >= 2);
+    assert(fi_a[0] == 0);
+    for (size_t i = 1; i < fi_a.size(); i++)
+        assert(fi_a[i] == i);
+
+    // seq B MUST start from flush_index 0
+    assert(!fi_b.empty());
+    assert(fi_b[0] == 0);
+    for (size_t i = 1; i < fi_b.size(); i++)
+        assert(fi_b[i] == i);
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -2717,6 +2764,9 @@ int main() {
     cleanup_ring_files();
 
     RUN_TEST(test_sbe_interleave_finished_fast_path);
+    cleanup_ring_files();
+
+    RUN_TEST(test_sbe_consecutive_depth_diff_seq_change_resets_flush_index);
     cleanup_ring_files();
 
     std::printf("\n=== %d/%d tests passed ===\n", tests_passed, tests_total);

@@ -999,6 +999,50 @@ describe('Snapshot dedup across connections', () => {
 });
 
 // ============================================================================
+// Test Group: flush_index reset on sequence change
+// ============================================================================
+
+describe('Consecutive depth diffs with different seq reset flush_index', () => {
+    it('first event of new seq has count2 == 0', () => {
+        const v = new V.BinanceUSDMVerifier();
+
+        // Build a large depth diff (>20 entries) for seq A → multiple MktEvents
+        const bidsA = [];
+        for (let i = 0; i < 15; i++) bidsA.push([`${50000 + i}.00`, `${1 + i}.00`]);
+        const asksA = [];
+        for (let i = 0; i < 10; i++) asksA.push([`${60000 + i}.00`, `${2 + i}.00`]);
+        const diffA = makeDepthDiffJSON(200, 1700000000000, bidsA, asksA);
+
+        // Feed seq A — NOT last in batch (no WS_FLAG_LAST_IN_BATCH)
+        v.processFrame(makeFrame(0, diffA, V.WS_FLAG_FIN));
+
+        // Build a smaller depth diff for seq B
+        const bidsB = [['80000.00', '5.00'], ['79000.00', '6.00'], ['78000.00', '7.00']];
+        const asksB = [['81000.00', '8.00'], ['82000.00', '9.00']];
+        const diffB = makeDepthDiffJSON(300, 1700000001000, bidsB, asksB);
+
+        // Feed seq B — last in batch
+        v.processFrame(makeFrame(0, diffB, V.WS_FLAG_FIN | V.WS_FLAG_LAST_IN_BATCH));
+
+        // Collect flush indices per seq
+        const fiA = v.events.filter(e => e.type === 'BOOK_DELTA' && e.seq === 200n).map(e => e.count2);
+        const fiB = v.events.filter(e => e.type === 'BOOK_DELTA' && e.seq === 300n).map(e => e.count2);
+
+        // seq A should have multiple flushes starting from 0
+        assert.ok(fiA.length >= 2, `seq A should have >=2 events, got ${fiA.length}`);
+        assert.equal(fiA[0], 0, 'seq A first flush_index should be 0');
+        for (let i = 1; i < fiA.length; i++)
+            assert.equal(fiA[i], i, `seq A flush_index[${i}] should be ${i}`);
+
+        // seq B MUST start from flush_index 0
+        assert.ok(fiB.length >= 1, 'seq B should have at least 1 event');
+        assert.equal(fiB[0], 0, 'seq B first flush_index should be 0 (was inheriting old count)');
+        for (let i = 1; i < fiB.length; i++)
+            assert.equal(fiB[i], i, `seq B flush_index[${i}] should be ${i}`);
+    });
+});
+
+// ============================================================================
 // Test Group: Per-channel comparison grouping
 // ============================================================================
 

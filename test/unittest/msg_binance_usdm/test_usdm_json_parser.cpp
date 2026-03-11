@@ -2788,6 +2788,46 @@ void test_interleave_flush_count_continuity() {
     }
 }
 
+// Test: consecutive depth diffs with different sequences should reset flush_index
+// Bug: flush_count from old seq carries into new seq's MktEvents
+template<typename H>
+void test_consecutive_depth_diff_seq_change_resets_flush_index() {
+    TestHarness<H> h;
+
+    // Feed conn 0 a large depth diff (>20 entries, seq 200) → produces multiple MktEvents
+    // 15 bids + 10 asks = 25 entries → at least 2 flushes (MAX_DELTAS=20)
+    auto json_a = build_interleave_depth_json(200, 15, 10);
+    h.feed_frame(0, json_a.c_str());
+
+    // Feed conn 0 another depth diff (seq 300, same channel) WITHOUT calling on_batch_end
+    auto json_b = build_interleave_depth_json(300, 3, 2, 800000, 200);
+    h.feed_frame(0, json_b.c_str());
+
+    // Now flush
+    h.idle();
+    auto events = h.published();
+
+    // Collect flush_indices for each seq
+    std::vector<uint8_t> fi_seq_a, fi_seq_b;
+    for (auto& e : events) {
+        if (!e.is_book_delta()) continue;
+        if (e.src_seq == 200) fi_seq_a.push_back(e.flush_index());
+        if (e.src_seq == 300) fi_seq_b.push_back(e.flush_index());
+    }
+
+    // seq A should have multiple flushes starting from 0
+    assert(fi_seq_a.size() >= 2);
+    assert(fi_seq_a[0] == 0);
+    for (size_t i = 1; i < fi_seq_a.size(); i++)
+        assert(fi_seq_a[i] == i);
+
+    // seq B MUST start from flush_index 0 (this is the bug: without fix, it inherits old count)
+    assert(!fi_seq_b.empty());
+    assert(fi_seq_b[0] == 0);
+    for (size_t i = 1; i < fi_seq_b.size(); i++)
+        assert(fi_seq_b[i] == i);
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -2917,6 +2957,7 @@ int main() {
         RUN_TEST_T((test_interleave_boundary_verify_fail<H>));
         RUN_TEST_T((test_interleave_finished_fast_path<H>));
         RUN_TEST_T((test_interleave_flush_count_continuity<H>));
+        RUN_TEST_T((test_consecutive_depth_diff_seq_change_resets_flush_index<H>));
     };
     run_interleave_tests.template operator()<BinanceUSDMJsonParser>("JsonParser interleave");
     run_interleave_tests.template operator()<BinanceUSDMSimdjsonParser>("SimdjsonParser interleave");

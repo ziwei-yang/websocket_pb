@@ -1242,6 +1242,12 @@ private:
             has_pending_depth_ = false;  // force re-init for new connection
         }
 
+        // Sequence change: flush old seq's pending entries before starting new seq
+        if (has_pending_depth_ && pending_depth_seq_ != state.sequence) {
+            publish_pending_depth(true);
+            has_pending_depth_ = false;
+        }
+
         // Overflow: pending + new > MAX_DELTAS → publish pending first
         if (has_pending_depth_ && pending_depth_count_ + publish_count > websocket::msg::MAX_DELTAS)
             publish_pending_depth(false);
