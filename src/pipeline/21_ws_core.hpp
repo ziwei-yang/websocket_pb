@@ -98,12 +98,16 @@ struct DirectTXSink {
     uint8_t outbox_buf_[4096];
     uint8_t pong_buf_[131];      // PONG/PING frames (max 125 payload + 6 header)
     uint8_t pending_ci_ = 0;
+    int32_t tx_bytes_ = 0;
 
     uint8_t* outbox_claim(uint8_t ci) { pending_ci_ = ci; return outbox_buf_; }
     void outbox_publish(size_t len) { ssl_[pending_ci_].write(outbox_buf_, len); }
 
     uint8_t* pong_claim(uint8_t ci) { pending_ci_ = ci; return pong_buf_; }
-    void pong_publish(size_t len) { ssl_[pending_ci_].write(pong_buf_, len); }
+    void pong_publish(size_t len) {
+        ssl_[pending_ci_].write(pong_buf_, len);
+        tx_bytes_ += static_cast<int32_t>(len);
+    }
 };
 
 // ============================================================================

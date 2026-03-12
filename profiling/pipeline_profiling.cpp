@@ -85,7 +85,7 @@ static const char* TRANSPORT_OP_NAMES[CycleSample::N] = {
     "Poll",                // 0: transport_.poll() - always 0
     "MSG Outbox",          // 1: process_msg_outbox() - messages sent
     "RX Process",          // 2: per-conn SSL read + dispatch - total bytes read
-    "Low-Prio TX",         // 3: process_low_prio_outbox() - messages sent (IDLE only)
+    "Low-Prio TX",         // 3: PONG/PING TX bytes (low_prio_outbox or idle_tick)
     "(reserved)",           // 4: unused
     "(reserved)"           // 5: unused
 };

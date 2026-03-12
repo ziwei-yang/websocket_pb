@@ -559,8 +559,11 @@ public:
 
             // Op 3: Process LOW_MSG_OUTBOX (PONGs) / InlineWS idle tick
             if constexpr (InlineWS) {
-                // InlineWS: pongs handled by WSCore internally via DirectTXSink
-                inline_ws_.ws_core.idle_tick();
+                profile_op<Profiling>([this]{
+                    inline_ws_.tx_sink.tx_bytes_ = 0;
+                    inline_ws_.ws_core.idle_tick();
+                    return inline_ws_.tx_sink.tx_bytes_;
+                }, slot, 3);
             } else {
                 profile_op<Profiling>(
                     [this]{ return process_low_prio_outbox(); }, slot, 3);
