@@ -815,14 +815,14 @@ struct XDPTransport {
      * Defensive check: lowest_idx must equal (last_committed_idx + 1)
      * Frames are submitted to TX ring in order [lowest_idx, highest_idx]
      */
-    void commit_tx_frames(uint32_t lowest_idx, uint32_t highest_idx) {
+    uint32_t commit_tx_frames(uint32_t lowest_idx, uint32_t highest_idx) {
         // Defensive check: must commit in order
         // Note: tx_commit_pos_ tracks the next expected commit index
         if (lowest_idx != tx_commit_pos_) {
             // Allow wrap-around
             if (!(lowest_idx == tx_pool_start_ && tx_commit_pos_ == tx_pool_start_ + tx_pool_size_)) {
                 printf("[XDP] commit_tx_frames: expected idx %u, got %u\n", tx_commit_pos_, lowest_idx);
-                return;
+                return 0;
             }
         }
 
@@ -831,8 +831,25 @@ struct XDPTransport {
         // Reserve TX descriptors
         uint32_t idx;
         if (xsk_ring_prod__reserve(&tx_ring_, count, &idx) != count) {
-            printf("[XDP] commit_tx_frames: TX ring full, wanted %u frames\n", count);
-            return;
+            printf("[WARN][XDP] commit_tx_frames: TX ring full, wanted %u frames\n", count);
+            // Rollback: mark orphaned frames as acked so FIFO can drain
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t frame_idx = lowest_idx + i;
+                if (frame_idx >= tx_pool_start_ + tx_pool_size_) {
+                    frame_idx = tx_pool_start_ + (frame_idx - tx_pool_start_ - tx_pool_size_);
+                }
+                uint32_t relative_idx = (frame_idx - tx_pool_start_) % tx_pool_size_;
+                frame_acked_[relative_idx] = true;
+            }
+            // Drain FIFO past the rolled-back frames
+            while (tx_free_pos_ < tx_alloc_pos_) {
+                uint32_t free_rel = tx_free_pos_ % tx_pool_size_;
+                if (!frame_acked_[free_rel]) break;
+                frame_acked_[free_rel] = false;
+                frame_sent_[free_rel] = false;
+                tx_free_pos_++;
+            }
+            return 0;
         }
 
         // Submit each frame
@@ -892,6 +909,7 @@ struct XDPTransport {
 
         // Kick TX if kernel needs wakeup
         kick_tx();
+        return count;
     }
 
     /**

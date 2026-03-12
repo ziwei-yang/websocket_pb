@@ -195,8 +195,8 @@ struct DisruptorPacketIO {
         return static_cast<uint32_t>(batch.count);
     }
 
-    void commit_tx_frames([[maybe_unused]] uint32_t lowest_idx, [[maybe_unused]] uint32_t highest_idx) {
-        if (pending_tx_count_ == 0) return;
+    uint32_t commit_tx_frames([[maybe_unused]] uint32_t lowest_idx, [[maybe_unused]] uint32_t highest_idx) {
+        if (pending_tx_count_ == 0) return 0;
 
         // Mark all pending frames as sent
         // The frames were allocated at positions [tx_alloc_pos_ - pending_tx_count_, tx_alloc_pos_)
@@ -207,7 +207,9 @@ struct DisruptorPacketIO {
         }
 
         raw_outbox_prod_->publish_batch(pending_batch_.start, pending_batch_.end);
+        uint32_t count = pending_tx_count_;
         pending_tx_count_ = 0;
+        return count;
     }
 
     template<typename Func>

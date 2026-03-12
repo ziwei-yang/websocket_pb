@@ -371,12 +371,31 @@ struct DPDKPacketIO {
             // Check TX pool capacity
             uint32_t in_use = tx_alloc_pos_ - tx_free_pos_;
             if (in_use >= kTxPoolSize) {
+                fprintf(stderr, "[WARN][DPDK-PIO] claim_tx_frames: TX pool full (%u/%u)\n",
+                        in_use, kTxPoolSize);
                 break;
+            }
+
+            // Pre-allocate mbuf BEFORE incrementing tx_alloc_pos_
+            // This prevents orphaned frames if mbuf pool is exhausted
+            struct rte_mbuf* m = rte_pktmbuf_alloc(tx_hdr_pool_);
+            if (!m) {
+                // Try TX cleanup: send 0 packets to trigger driver completion
+                rte_eth_tx_burst(port_id_, 0, nullptr, 0);
+                m = rte_pktmbuf_alloc(tx_hdr_pool_);
+                if (!m) {
+                    fprintf(stderr, "[WARN][DPDK-PIO] claim_tx_frames: mbuf alloc failed "
+                            "(pool_avail=%u, tx_in_use=%u/%u)\n",
+                            rte_mempool_avail_count(tx_hdr_pool_),
+                            tx_alloc_pos_ - tx_free_pos_, kTxPoolSize);
+                    break;  // claim fails, tx_alloc_pos_ NOT incremented
+                }
             }
 
             uint32_t relative_idx = tx_alloc_pos_ % kTxPoolSize;
             uint32_t frame_idx = TX_POOL_START + relative_idx;
             frame_sent_[relative_idx] = false;
+            frame_acked_[relative_idx] = false;  // defense-in-depth
 
             // Setup descriptor with actual pointer
             uint64_t umem_offset = static_cast<uint64_t>(frame_idx) * frame_size_;
@@ -391,6 +410,7 @@ struct DPDKPacketIO {
             // Store for commit
             tx_pending_descs_[claimed] = desc;
             tx_pending_frame_idx_[claimed] = frame_idx;
+            tx_pending_mbufs_[claimed] = m;
 
             tx_alloc_pos_++;
             claimed++;
@@ -400,8 +420,8 @@ struct DPDKPacketIO {
         return claimed;
     }
 
-    void commit_tx_frames([[maybe_unused]] uint32_t lowest_idx, [[maybe_unused]] uint32_t highest_idx) {
-        if (tx_pending_count_ == 0) return;
+    uint32_t commit_tx_frames([[maybe_unused]] uint32_t lowest_idx, [[maybe_unused]] uint32_t highest_idx) {
+        if (tx_pending_count_ == 0) return 0;
 
         struct rte_mbuf* tx_mbufs[kTxBatch];
         uint16_t tx_count = 0;
@@ -411,11 +431,8 @@ struct DPDKPacketIO {
             uint32_t frame_idx = tx_pending_frame_idx_[i];
             uint32_t relative_idx = (frame_idx - TX_POOL_START) % kTxPoolSize;
 
-            struct rte_mbuf* m = rte_pktmbuf_alloc(tx_hdr_pool_);
-            if (!m) {
-                fprintf(stderr, "[DPDK-PIO] TX header alloc failed\n");
-                break;
-            }
+            // Use pre-allocated mbuf from claim phase
+            struct rte_mbuf* m = tx_pending_mbufs_[i];
 
             // Attach UMEM frame as external buffer — zero-copy
             uint8_t* frame_data = reinterpret_cast<uint8_t*>(desc.frame_ptr);
@@ -432,14 +449,16 @@ struct DPDKPacketIO {
             tx_mbufs[tx_count++] = m;
         }
 
+        uint16_t sent = 0;
         if (tx_count > 0) {
-            uint16_t sent = rte_eth_tx_burst(port_id_, 0, tx_mbufs, tx_count);
+            sent = rte_eth_tx_burst(port_id_, 0, tx_mbufs, tx_count);
             for (uint16_t i = sent; i < tx_count; i++) {
                 rte_pktmbuf_free(tx_mbufs[i]);
             }
         }
 
         tx_pending_count_ = 0;
+        return sent;
     }
 
     template<typename Func>
@@ -451,7 +470,8 @@ struct DPDKPacketIO {
             callback(desc);
         });
         if (claimed > 0) {
-            commit_tx_frames(frame_idx, frame_idx);
+            uint32_t committed = commit_tx_frames(frame_idx, frame_idx);
+            if (committed == 0) return 0;
             mark_frame_acked(frame_idx);
             return frame_idx;
         }
@@ -485,7 +505,11 @@ struct DPDKPacketIO {
 
         // Alloc header mbuf, attach existing UMEM frame, tx_burst
         struct rte_mbuf* m = rte_pktmbuf_alloc(tx_hdr_pool_);
-        if (!m) return -1;
+        if (!m) {
+            fprintf(stderr, "[WARN][DPDK-PIO] retransmit_frame: mbuf alloc failed "
+                    "(pool_avail=%u)\n", rte_mempool_avail_count(tx_hdr_pool_));
+            return -1;
+        }
 
         uint64_t umem_offset = static_cast<uint64_t>(idx) * frame_size_;
         uint8_t* frame_data = umem_area_ + umem_offset;
@@ -503,6 +527,7 @@ struct DPDKPacketIO {
         uint16_t sent = rte_eth_tx_burst(port_id_, 0, &m, 1);
         if (sent == 0) {
             rte_pktmbuf_free(m);
+            fprintf(stderr, "[WARN][DPDK-PIO] retransmit_frame: tx_burst returned 0\n");
             return -1;
         }
         return len;
@@ -987,6 +1012,7 @@ private:
     // TX pending (claim -> commit two-phase)
     websocket::xdp::PacketFrameDescriptor tx_pending_descs_[64];
     uint32_t tx_pending_frame_idx_[64];
+    struct rte_mbuf* tx_pending_mbufs_[64] = {};
     uint32_t tx_pending_count_ = 0;
 
     // ARP / filter

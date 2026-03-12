@@ -953,7 +953,12 @@ struct PacketTransport {
                 return -1;
             }
 
-            pio().commit_tx_frames(frame_idx, frame_idx);
+            uint32_t committed = pio().commit_tx_frames(frame_idx, frame_idx);
+            if (committed == 0) {
+                if (sent > 0) break;
+                errno = EIO;
+                return -1;
+            }
 
             retransmit_queue_.add_ref(tcp_params_.snd_nxt,
                                       userspace_stack::TCP_FLAG_ACK | userspace_stack::TCP_FLAG_PSH,
@@ -1909,7 +1914,10 @@ private:
         });
 
         if (frame_idx == 0) {
-            fprintf(stderr, "[TRANSPORT] WARNING: Failed to send ACK (TX frame pool full)\n");
+            fprintf(stderr, "[TRANSPORT] WARNING: Failed to send ACK (TX frame pool full) "
+                    "retransmit_q=%zu snd_una=%u snd_nxt=%u port=%u\n",
+                    retransmit_queue_.size(), tcp_params_.snd_una,
+                    tcp_params_.snd_nxt, tcp_params_.local_port);
         }
     }
 

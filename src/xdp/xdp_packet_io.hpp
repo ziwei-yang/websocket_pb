@@ -169,8 +169,8 @@ struct XDPPacketIO {
      * @param lowest_idx  First frame index to commit
      * @param highest_idx Last frame index to commit (inclusive)
      */
-    void commit_tx_frames(uint32_t lowest_idx, uint32_t highest_idx) {
-        xdp_.commit_tx_frames(lowest_idx, highest_idx);
+    uint32_t commit_tx_frames(uint32_t lowest_idx, uint32_t highest_idx) {
+        return xdp_.commit_tx_frames(lowest_idx, highest_idx);
     }
 
     /**
@@ -191,7 +191,8 @@ struct XDPPacketIO {
             callback(desc);
         });
         if (claimed > 0) {
-            commit_tx_frames(frame_idx, frame_idx);
+            uint32_t committed = commit_tx_frames(frame_idx, frame_idx);
+            if (committed == 0) return 0;
             // In single-process mode, mark ACK as acked immediately
             // (no separate congestion control tracking needed)
             mark_frame_acked(frame_idx);

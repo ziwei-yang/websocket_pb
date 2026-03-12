@@ -289,6 +289,7 @@ TEST_ORDERBOOK_SRC := $(TEST_DIR)/test_orderbook.cpp
 TEST_MKT_VIEWER_DEDUP_SRC := $(TEST_DIR)/test_mkt_viewer_dedup.cpp
 TEST_MKT_EVENT_BITFIELDS_SRC := $(TEST_DIR)/test_mkt_event_bitfields.cpp
 TEST_WATCHDOG_POLICY_SRC := $(TEST_DIR)/test_watchdog_policy.cpp
+TEST_TX_POOL_FIFO_SRC := $(TEST_DIR)/test_tx_pool_fifo.cpp
 
 # Integration test source files
 TEST_BINANCE_SRC := $(INTEGRATION_DIR)/binance.cpp
@@ -332,6 +333,7 @@ TEST_ORDERBOOK_BIN := $(BUILD_DIR)/test_orderbook
 TEST_MKT_VIEWER_DEDUP_BIN := $(BUILD_DIR)/test_mkt_viewer_dedup
 TEST_MKT_EVENT_BITFIELDS_BIN := $(BUILD_DIR)/test_mkt_event_bitfields
 TEST_WATCHDOG_POLICY_BIN := $(BUILD_DIR)/test_watchdog_policy
+TEST_TX_POOL_FIFO_BIN := $(BUILD_DIR)/test_tx_pool_fifo
 TEST_AES_CTR_SEQ_SRC := $(TEST_DIR)/test_aes_ctr_seq.cpp
 TEST_AES_CTR_SEQ_BIN := $(BUILD_DIR)/test_aes_ctr_seq
 TEST_TLS13_INNER_CT_SRC := $(TEST_DIR)/test_tls13_inner_ct.cpp
@@ -653,6 +655,17 @@ $(TEST_WATCHDOG_POLICY_BIN): $(TEST_WATCHDOG_POLICY_SRC) | $(BUILD_DIR)
 test-watchdog-policy: $(TEST_WATCHDOG_POLICY_BIN)
 	@echo "🧪 Running watchdog policy unit tests..."
 	./$(TEST_WATCHDOG_POLICY_BIN)
+
+# Build TX pool FIFO tests
+$(TEST_TX_POOL_FIFO_BIN): $(TEST_TX_POOL_FIFO_SRC) | $(BUILD_DIR)
+	@echo "🔨 Compiling TX pool FIFO unit tests..."
+	$(CXX) $(CXXFLAGS) -o $@ $<
+	@echo "✅ Test build complete: $@"
+
+# Run TX pool FIFO tests
+test-tx-pool-fifo: $(TEST_TX_POOL_FIFO_BIN)
+	@echo "🧪 Running TX pool FIFO unit tests..."
+	./$(TEST_TX_POOL_FIFO_BIN)
 
 # Build WS parser tests
 $(TEST_WS_PARSER_BIN): $(TEST_WS_PARSER_SRC) | $(BUILD_DIR)
@@ -1919,7 +1932,7 @@ test-simulator: $(SIMULATOR_BIN)
 # Unified Test Target - Run All Unit Tests
 # ============================================================================
 
-test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-aes-ctr-seq test-tls13-inner-ct test-wolfssl-seq-num test-last-byte-ts test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-watchdog-policy test-ws-parser test-sbe-decoder test-sbe-handler test-usdm-json-parser test-orderbook test-mkt-viewer-dedup test-mkt-event-bitfields
+test: test-ringbuffer test-event test-bug-fixes test-new-bug-fixes test-aes-ctr-seq test-tls13-inner-ct test-wolfssl-seq-num test-last-byte-ts test-xdp-transport test-xdp-frame test-xdp-send-recv test-core-http test-ip-layer test-ip-optimizations test-stack-checksum test-tcp-state test-retransmit-queue test-ssl-policy test-watchdog-policy test-tx-pool-fifo test-ws-parser test-sbe-decoder test-sbe-handler test-usdm-json-parser test-orderbook test-mkt-viewer-dedup test-mkt-event-bitfields
 	@echo ""
 	@echo "╔════════════════════════════════════════════════════════════════════╗"
 	@echo "║                    ALL UNIT TESTS COMPLETED                        ║"

@@ -971,6 +971,7 @@ private:
             return;
         }
 
+        // Rate limit: 1 PING per second
         if ((now_cycle - w.last_client_ping_cycle) < tsc_freq) return;
 
         if (w.check_alert(now_cycle, tsc_freq)) {
