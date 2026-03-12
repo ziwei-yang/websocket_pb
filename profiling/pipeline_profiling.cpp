@@ -1776,26 +1776,29 @@ int analyze_xdp_poll_loop(const char* filename) {
 
     // Total loop: use data-moved vs idle
     {
-        char dm_label[64];
-        char idle_label[64];
+        char dm_label[96];
+        char idle_label[96];
         char title[128];
         double dm_pct = samples.size() > 0 ? 100.0 * data_moved_count / samples.size() : 0;
         double idle_pct = samples.size() > 0 ? 100.0 * idle_count / samples.size() : 0;
+        double total_cycle_sum = total_cycles_data_moved.sum + total_cycles_idle.sum;
+        double dm_time_pct = total_cycle_sum > 0 ? 100.0 * total_cycles_data_moved.sum / total_cycle_sum : 0;
+        double idle_time_pct = total_cycle_sum > 0 ? 100.0 * total_cycles_idle.sum / total_cycle_sum : 0;
         // Use enough decimal places to show at least one non-zero digit
-        if (dm_pct > 0 && dm_pct < 0.1) {
-            snprintf(dm_label, sizeof(dm_label), "%.3f%% Data-Moved", dm_pct);
-        } else if (dm_pct > 0 && dm_pct < 1.0) {
-            snprintf(dm_label, sizeof(dm_label), "%.2f%% Data-Moved", dm_pct);
-        } else {
-            snprintf(dm_label, sizeof(dm_label), "%.1f%% Data-Moved", dm_pct);
-        }
-        if (idle_pct > 0 && idle_pct < 0.1) {
-            snprintf(idle_label, sizeof(idle_label), "%.3f%% Idle", idle_pct);
-        } else if (idle_pct > 0 && idle_pct < 1.0) {
-            snprintf(idle_label, sizeof(idle_label), "%.2f%% Idle", idle_pct);
-        } else {
-            snprintf(idle_label, sizeof(idle_label), "%.1f%% Idle", idle_pct);
-        }
+        // Adaptive precision for iteration percentage
+        const char* dm_iter_fmt = (dm_pct > 0 && dm_pct < 0.1) ? "%.3f" : (dm_pct > 0 && dm_pct < 1.0) ? "%.2f" : "%.1f";
+        const char* idle_iter_fmt = (idle_pct > 0 && idle_pct < 0.1) ? "%.3f" : (idle_pct > 0 && idle_pct < 1.0) ? "%.2f" : "%.1f";
+        // Adaptive precision for time percentage
+        const char* dm_time_fmt = (dm_time_pct > 0 && dm_time_pct < 0.1) ? "%.3f" : (dm_time_pct > 0 && dm_time_pct < 1.0) ? "%.2f" : "%.1f";
+        const char* idle_time_fmt = (idle_time_pct > 0 && idle_time_pct < 0.1) ? "%.3f" : (idle_time_pct > 0 && idle_time_pct < 1.0) ? "%.2f" : "%.1f";
+        // Build labels: "{iter_pct}% Data-Moved ({time_pct}% time)"
+        char dm_iter_str[16], dm_time_str[16], idle_iter_str[16], idle_time_str[16];
+        snprintf(dm_iter_str, sizeof(dm_iter_str), dm_iter_fmt, dm_pct);
+        snprintf(dm_time_str, sizeof(dm_time_str), dm_time_fmt, dm_time_pct);
+        snprintf(idle_iter_str, sizeof(idle_iter_str), idle_iter_fmt, idle_pct);
+        snprintf(idle_time_str, sizeof(idle_time_str), idle_time_fmt, idle_time_pct);
+        snprintf(dm_label, sizeof(dm_label), "%s%% Data-Moved (%s%% time)", dm_iter_str, dm_time_str);
+        snprintf(idle_label, sizeof(idle_label), "%s%% Idle (%s%% time)", idle_iter_str, idle_time_str);
         snprintf(title, sizeof(title), "Total Loop Cycles (overhead: %.1f%%)", overhead_pct);
         Histogram::print_side_by_side_with_stats(title,
                                       total_cycles_data_moved_hist, dm_label, total_cycles_data_moved,
