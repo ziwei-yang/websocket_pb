@@ -415,6 +415,10 @@ public:
                 msg_outbox_cons_ != nullptr);
 
             // ── Per-connection state machine dispatch (active connection first) ──
+            [[maybe_unused]] uint64_t ssl_block_start = 0;
+            [[maybe_unused]] int32_t ssl_total_bytes = 0;
+            if constexpr (Profiling) ssl_block_start = rdtsc();
+
             uint8_t conn_order[NUM_CONN];
             conn_order[0] = 0;
             if constexpr (MaxConn > 1) {
@@ -511,13 +515,7 @@ public:
                         // Normal direct AES-CTR decrypt path
                         {
                             int32_t ssl_bytes = process_ssl_read_for_conn(ci, timing[ci]);
-                            if constexpr (Profiling) {
-                                // Map conn 0 → op slot 2, conn 1 → op slot 4
-                                size_t op_idx = (ci == 0) ? 2 : 4;
-                                slot->op_details[op_idx] = ssl_bytes;
-                                slot->op_cycles[op_idx] = (timing[ci].recv_end_cycle > timing[ci].recv_start_cycle)
-                                    ? static_cast<int32_t>(timing[ci].recv_end_cycle - timing[ci].recv_start_cycle) : 0;
-                            }
+                            if constexpr (Profiling) ssl_total_bytes += ssl_bytes;
                             if (!AutoReconnect && ssl_bytes < 0) {
                                 running_ = false;
                             }
@@ -539,12 +537,7 @@ public:
                 } else {
                     // Non-reconnect: all connections already ACTIVE from init()
                     int32_t ssl_bytes = process_ssl_read_for_conn(ci, timing[ci]);
-                    if constexpr (Profiling) {
-                        size_t op_idx = (ci == 0) ? 2 : 4;
-                        slot->op_details[op_idx] = ssl_bytes;
-                        slot->op_cycles[op_idx] = (timing[ci].recv_end_cycle > timing[ci].recv_start_cycle)
-                            ? static_cast<int32_t>(timing[ci].recv_end_cycle - timing[ci].recv_start_cycle) : 0;
-                    }
+                    if constexpr (Profiling) ssl_total_bytes += ssl_bytes;
                     if (ssl_bytes < 0) {
                         running_ = false;
                     }
@@ -557,6 +550,11 @@ public:
                 if constexpr (InlineWS) {
                     inline_ws_.ws_core.end_rx_cycle(ci);
                 }
+            }
+
+            if constexpr (Profiling) {
+                slot->op_details[2] = ssl_total_bytes;
+                slot->op_cycles[2] = static_cast<int32_t>(rdtsc() - ssl_block_start);
             }
 
             // Op 3: Process LOW_MSG_OUTBOX (PONGs) / InlineWS idle tick

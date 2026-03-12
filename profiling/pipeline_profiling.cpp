@@ -84,9 +84,9 @@ static const char* XDP_POLL_OP_NAMES[CycleSample::N] = {
 static const char* TRANSPORT_OP_NAMES[CycleSample::N] = {
     "Poll",                // 0: transport_.poll() - always 0
     "MSG Outbox",          // 1: process_msg_outbox() - messages sent
-    "SSL Read",            // 2: process_ssl_read() - bytes read
+    "RX Process",          // 2: per-conn SSL read + dispatch - total bytes read
     "Low-Prio TX",         // 3: process_low_prio_outbox() - messages sent (IDLE only)
-    "(reserved)",          // 4: unused
+    "(reserved)",           // 4: unused
     "(reserved)"           // 5: unused
 };
 
