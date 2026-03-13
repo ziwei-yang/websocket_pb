@@ -192,10 +192,13 @@ struct XDPPacketIO {
         });
         if (claimed > 0) {
             uint32_t committed = commit_tx_frames(frame_idx, frame_idx);
-            if (committed == 0) return 0;
-            // In single-process mode, mark ACK as acked immediately
-            // (no separate congestion control tracking needed)
+            // Always free FIFO slot — ACK frames are fire-and-forget.
+            // If TX ring was full, delayed ACK timer or next data piggyback re-sends.
             mark_frame_acked(frame_idx);
+            if (committed == 0) {
+                fprintf(stderr, "[WARN][XDP-PIO] commit_ack_frame: TX submit failed, ACK dropped\n");
+                return 0;
+            }
             return frame_idx;
         }
         return 0;

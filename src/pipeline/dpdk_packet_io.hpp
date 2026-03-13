@@ -452,8 +452,12 @@ struct DPDKPacketIO {
         uint16_t sent = 0;
         if (tx_count > 0) {
             sent = rte_eth_tx_burst(port_id_, 0, tx_mbufs, tx_count);
-            for (uint16_t i = sent; i < tx_count; i++) {
-                rte_pktmbuf_free(tx_mbufs[i]);
+            if (sent < tx_count) {
+                fprintf(stderr, "[WARN][DPDK-PIO] commit_tx_frames: tx_burst partial (%u/%u sent)\n",
+                        sent, tx_count);
+                for (uint16_t i = sent; i < tx_count; i++) {
+                    rte_pktmbuf_free(tx_mbufs[i]);
+                }
             }
         }
 
@@ -471,8 +475,13 @@ struct DPDKPacketIO {
         });
         if (claimed > 0) {
             uint32_t committed = commit_tx_frames(frame_idx, frame_idx);
-            if (committed == 0) return 0;
+            // Always free FIFO slot — ACK frames are fire-and-forget.
+            // If tx_burst failed, delayed ACK timer or next data piggyback re-sends.
             mark_frame_acked(frame_idx);
+            if (committed == 0) {
+                fprintf(stderr, "[WARN][DPDK-PIO] commit_ack_frame: tx_burst failed, ACK dropped\n");
+                return 0;
+            }
             return frame_idx;
         }
         return 0;
@@ -955,6 +964,13 @@ private:
         const auto* ip = rte_pktmbuf_mtod_offset(m, const struct rte_ipv4_hdr*,
                                                    sizeof(struct rte_ether_hdr));
         if (ip->next_proto_id != IPPROTO_TCP)
+            return false;
+
+        // Drop truncated frames: IP header declares more bytes than frame contains.
+        // Mirrors BPF filter (exchange_filter.bpf.c:329-333).
+        // igc PMD passes non-EOP descriptors through (igc_txrx.c:269-274).
+        uint16_t ip_total = rte_be_to_cpu_16(ip->total_length);
+        if (m->data_len < sizeof(struct rte_ether_hdr) + ip_total)
             return false;
 
         return is_exchange_ip(ip->src_addr) || is_exchange_ip(ip->dst_addr);

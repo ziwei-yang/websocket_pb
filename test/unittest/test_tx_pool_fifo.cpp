@@ -47,6 +47,9 @@ struct MockTxPool {
     // Tracks how many mbufs are "available" (simulates rte_pktmbuf_alloc)
     uint32_t mbuf_avail;
 
+    // Simulates rte_eth_tx_burst() returning 0 (NIC TX ring temporarily full)
+    bool tx_burst_fail = false;
+
     MockTxPool(uint32_t initial_mbufs = POOL_SIZE)
         : mbuf_avail(initial_mbufs) {}
 
@@ -73,14 +76,20 @@ struct MockTxPool {
         return claimed;
     }
 
-    // Mirrors FIXED DPDKPacketIO::commit_tx_frames()
-    // mbufs already pre-allocated in claim — commit always succeeds
+    // Mirrors DPDKPacketIO::commit_tx_frames()
+    // When tx_burst_fail=true, simulates rte_eth_tx_burst() returning 0:
+    // frame_sent[] is set (attach_extbuf happened), but burst fails, mbuf freed.
     uint32_t commit_tx_frames(uint32_t count) {
         uint32_t committed = 0;
         for (uint32_t i = 0; i < count; i++) {
             uint32_t relative_idx = (tx_alloc_pos - count + i) % POOL_SIZE;
             frame_sent[relative_idx] = true;
             committed++;
+        }
+        if (tx_burst_fail) {
+            // tx_burst returned 0: free mbufs (return to pool), report 0 sent
+            return_mbufs(count);
+            return 0;
         }
         return committed;
     }
@@ -93,8 +102,8 @@ struct MockTxPool {
         return {claimed, committed};
     }
 
-    // Mirrors commit_ack_frame(): claim 1, commit 1, immediately ack
-    // Returns frame_idx or 0 on failure
+    // Mirrors FIXED commit_ack_frame(): claim 1, commit 1, always ack FIFO slot.
+    // Returns frame_idx or 0 on failure.
     uint32_t commit_ack_frame() {
         uint32_t claimed = claim_tx_frames(1);
         if (claimed == 0) return 0;
@@ -102,10 +111,12 @@ struct MockTxPool {
         uint32_t relative_idx = (tx_alloc_pos - 1) % POOL_SIZE;
         uint32_t frame_idx = POOL_START + relative_idx;
 
-        commit_tx_frames(1);
+        uint32_t committed = commit_tx_frames(1);
 
-        // ACK immediately (ACKs don't wait for TCP ACK)
+        // Always free FIFO slot — ACK frames are fire-and-forget.
         mark_frame_acked(frame_idx);
+
+        if (committed == 0) return 0;
         return frame_idx;
     }
 
@@ -372,11 +383,63 @@ void test_pool_wrapping() {
 
 
 // ============================================================================
+// FIX: ACK frame tx_burst failure does NOT leak FIFO slot
+// ============================================================================
+void test_ack_frame_tx_burst_fail_no_leak() {
+    TEST("FIX: ACK frame tx_burst failure does NOT leak FIFO slot")
+        MockTxPool pool;
+
+        // Simulate NIC TX ring temporarily full
+        pool.tx_burst_fail = true;
+
+        // commit_ack_frame: claim succeeds, tx_burst fails → returns 0
+        uint32_t result = pool.commit_ack_frame();
+        ASSERT(result == 0, "commit_ack_frame returns 0 on tx_burst failure");
+
+        // CRITICAL: FIFO slot must NOT be leaked
+        ASSERT(pool.in_use() == 0, "No FIFO slot leaked after tx_burst failure");
+        ASSERT(!pool.is_fifo_stuck(), "FIFO is not stuck");
+
+        // Restore normal operation
+        pool.tx_burst_fail = false;
+
+        // Pool should be fully functional — can still claim all slots
+        auto [c, co] = pool.claim_and_commit(MockTxPool::POOL_SIZE);
+        ASSERT(c == MockTxPool::POOL_SIZE, "Pool fully usable after failed ACK");
+    END_TEST
+}
+
+// ============================================================================
+// FIX: Repeated ACK tx_burst failures don't fill pool (deadlock scenario)
+// ============================================================================
+void test_ack_frame_tx_burst_fail_no_deadlock() {
+    TEST("FIX: Repeated ACK tx_burst failures don't deadlock pool")
+        MockTxPool pool;
+        pool.tx_burst_fail = true;
+
+        // Simulate many failed ACK commits (e.g., during TLS handshake errors)
+        for (int i = 0; i < 100; i++) {
+            uint32_t result = pool.commit_ack_frame();
+            ASSERT(result == 0, "Each failed ACK returns 0");
+        }
+
+        // Pool must still be completely empty — no leaked slots
+        ASSERT(pool.in_use() == 0, "Zero slots leaked after 100 failed ACKs");
+
+        // Restore and verify pool is fully functional
+        pool.tx_burst_fail = false;
+        pool.return_mbufs(MockTxPool::POOL_SIZE);  // replenish mbufs consumed by claims
+        auto [c, co] = pool.claim_and_commit(MockTxPool::POOL_SIZE);
+        ASSERT(c == MockTxPool::POOL_SIZE, "Pool fully usable — no deadlock");
+    END_TEST
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 int main() {
     std::cout << "=== TX Pool FIFO Release Unit Tests ===" << std::endl;
-    std::cout << "(Tests verify DPDK TX pool mbuf pre-alloc fix)" << std::endl;
+    std::cout << "(Tests verify DPDK TX pool FIFO fixes)" << std::endl;
     std::cout << std::endl;
 
     test_normal_cycle();
@@ -387,6 +450,8 @@ int main() {
     test_no_gradual_pool_leak();
     test_ack_frame_works_after_mbuf_recovery();
     test_mbuf_exhaustion_partial_claim();
+    test_ack_frame_tx_burst_fail_no_leak();
+    test_ack_frame_tx_burst_fail_no_deadlock();
 
     std::cout << std::endl;
     std::cout << "=== Results: " << tests_passed << " passed, "
