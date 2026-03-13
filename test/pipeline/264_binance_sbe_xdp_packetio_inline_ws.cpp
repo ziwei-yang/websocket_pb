@@ -201,11 +201,6 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "WARNING: BINANCE_API_KEY not set. SBE stream may reject connection.\n");
     }
 
-    if (geteuid() != 0) {
-        fprintf(stderr, "WARN: Not running as root. AF_XDP may fail without capabilities.\n");
-        fprintf(stderr, "      Fix: sudo setcap 'cap_net_admin,cap_net_raw,cap_bpf,cap_perfmon,cap_ipc_lock,cap_sys_nice+ep' %s\n", argv[0]);
-    }
-
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);

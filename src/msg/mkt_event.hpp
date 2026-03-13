@@ -330,14 +330,14 @@ struct alignas(512) MktEvent {
     // Σ = total latency: NIC/BPF arrival to event publish
     // ========================================================================
 
-    void print(int padding = 98) const {
+    void print(int padding = 100) const {
         if (is_system_status()) {
             const char* st_name =
                 payload.status.status_type == 0 ? "HEARTBEAT" :
                 payload.status.status_type == 1 ? "DISCONNECTED" :
                 payload.status.status_type == 2 ? "RECONNECTED" : "UNKNOWN";
             std::fprintf(stderr,
-                "\033[2m%*s| STATUS %s conn=%u %s\033[0m\n",
+                "\033[2m%*s  STATUS %s conn=%u %s\033[0m\n",
                 padding, "", st_name, payload.status.connection_id,
                 payload.status.message);
             return;
@@ -377,14 +377,14 @@ struct alignas(512) MktEvent {
             uint8_t ci = connection_id();
             char cc = (ci < 10) ? ('0' + ci) : ('a' + ci - 10);
             if (event_type() == 0)
-                std::snprintf(flush_id, sizeof(flush_id), "| %c %s ID %3u ",
+                std::snprintf(flush_id, sizeof(flush_id), "  %c %s ID %3u ",
                               cc, is_last_in_batch() ? "last" : "    ", count2);
             else
-                std::snprintf(flush_id, sizeof(flush_id), "| %c             ", cc);
+                std::snprintf(flush_id, sizeof(flush_id), "  %c             ", cc);
         }
 
         std::fprintf(stderr,
-                "\033[2m%*s%s| %3s %-2s \xce\xa3%6s | %+ldms | #%ld\033[0m\n",
+                "\033[2m%*s%s %3s %-2s \xce\xa3%6s   %+ldms #%ld\033[0m\n",
                 padding - static_cast<int>(std::strlen(flush_id)), "",
                 flush_id, mkt_cnt, mkt_typ, lat, server_ms, src_seq);
     }

@@ -117,7 +117,8 @@ struct alignas(128) MsgMetadata {
     uint8_t event_type;                     // MetaEventType (0=DATA, 1=TCP_DISCONNECTED, 2=TLS_CONNECTED)
     uint16_t first_pkt_mem_idx;            // UMEM frame index of first packet
     uint16_t last_pkt_mem_idx;             // UMEM frame index of last packet
-    uint8_t _pad[26];                      // Padding to 128 bytes
+    uint16_t tx_pool_avail;                // TX pool available slots at publish time
+    uint8_t _pad[24];                      // Padding to 128 bytes
 
     // Flag accessors
     bool tls_record_end() const { return flags & 0x01; }
@@ -143,6 +144,7 @@ struct alignas(128) MsgMetadata {
         event_type = 0;
         first_pkt_mem_idx = 0;
         last_pkt_mem_idx = 0;
+        tx_pool_avail = 0;
     }
 };
 static_assert(sizeof(MsgMetadata) == 128, "MsgMetadata must be 128 bytes");
@@ -199,7 +201,8 @@ enum class TransportMode : uint8_t {
 //   offset132: uint32_t conn_target_ip       (4)   resolved IP (network order)
 //   offset136: int64_t  mkt_event_seq        (8)   exchange sequence
 //   offset144: int64_t  exchange_event_time_us(8)  exchange event time (us)
-//   offset152: uint8_t  reserved[104]       (104)
+//   offset152: uint16_t tx_pool_avail        (2)   TX pool available slots
+//   offset154: uint8_t  reserved[102]       (102)
 //   offset256: total
 // ============================================================================
 
@@ -266,7 +269,8 @@ struct alignas(64) WSFrameInfo {
     uint32_t conn_target_ip;               // resolved target IP (network byte order)
     int64_t  mkt_event_seq;                // exchange sequence (book_update_id or trade_id)
     int64_t  exchange_event_time_us;       // exchange event timestamp (microseconds)
-    uint8_t  reserved[104];               // zero-initialized, future expansion
+    uint16_t tx_pool_avail;               // TX pool available slots (from MsgMetadata)
+    uint8_t  reserved[102];               // zero-initialized, future expansion
 
     // Flag accessors
     bool is_fin() const { return flags & 0x01; }
@@ -318,6 +322,7 @@ struct alignas(64) WSFrameInfo {
         conn_target_ip = 0;
         mkt_event_seq = 0;
         exchange_event_time_us = 0;
+        tx_pool_avail = 0;
         std::memset(reserved, 0, sizeof(reserved));
     }
 
@@ -402,15 +407,15 @@ struct alignas(64) WSFrameInfo {
                 fmt(bv, bpf_us);
                 if (interval_us >= 0) {
                     fmt(iv, interval_us);
-                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "%7s| %s %6s ", iv, nic_label, bv);
+                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "%7s %s %6s ", iv, nic_label, bv);
                 } else {
                     fmt(iv, -interval_us);
-                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "\033[31m%7s\033[0m| %s %6s ", iv, nic_label, bv);
+                    std::snprintf(bpf_prefix, sizeof(bpf_prefix), "\033[31m%7s\033[0m %s %6s ", iv, nic_label, bv);
                 }
             } else {
                 char bv[16];
                 fmt(bv, bpf_us);
-                std::snprintf(bpf_prefix, sizeof(bpf_prefix), "       | %s %6s ", nic_label, bv);
+                std::snprintf(bpf_prefix, sizeof(bpf_prefix), "        %s %6s ", nic_label, bv);
             }
         } else if (first_poll_cycle > 0 && publish_time_ts > 0 && tsc_freq_hz > 0) {
             // No BPF timestamps (BSD socket mode) — reconstruct poll mono ns from TSC
@@ -552,7 +557,7 @@ struct alignas(64) WSFrameInfo {
         // Seq suffix for matching WSFrameInfo with MktEvent Σ lines
         char seq_suffix[40] = "";
         if (mkt_event_seq != 0) {
-            std::snprintf(seq_suffix, sizeof(seq_suffix), " | #%ld", mkt_event_seq);
+            std::snprintf(seq_suffix, sizeof(seq_suffix), " #%ld", mkt_event_seq);
         }
         const char* frag_ul_on = "";
         const char* frag_ul_off = "";
@@ -599,16 +604,16 @@ struct alignas(64) WSFrameInfo {
                 double nic_us = static_cast<double>(publish_time_ts - first_byte_ts) / 1000.0;
                 char nv[16];
                 fmt(nv, nic_us);
-                std::snprintf(nic_col, sizeof(nic_col), "| nic %6s ", nv);
+                std::snprintf(nic_col, sizeof(nic_col), "  nic %6s ", nv);
                 // Use NIC-to-publish as total (more accurate than poll-to-publish)
                 fmt(tot, nic_us);
             }
             fprintf(stderr,
                     "%s%s%s%s"
-                    "| socket %5u %10s "
-                    "|%s %2u %s %4s~%6s "
-                    "| WS %3u %6s "
-                    "|%s%s%3s %-2s @%6s%s |%s%s%s%s%s%s\n",
+                    "  socket %5u %10s "
+                    "%s %2u %s %4s~%6s "
+                    "WS %3u %6s "
+                    "%s%s%3s %-2s @%6s%s  %s%s%s%s%s%s\n",
                     conn_prefix, line_color, bpf_prefix, nic_col,
                     nic_packet_ct, t[1],
                     ssl_prefix, ssl_read_ct, sz, t[2], t[3],
@@ -616,12 +621,12 @@ struct alignas(64) WSFrameInfo {
         } else {
             fprintf(stderr,
                     "%s%s%s"
-                    "| %2u pkt %5u %4s~%6s "
-                    "|%s %2u %s %4s~%6s "
-                    "| WS %3u %6s "
-                    "|%s%s%3s %-2s @%6s%s |%s%s%s%s%s%s\n",
+                    " %2u pkt %5u %4s~%6s tx:%4u"
+                    "%s %2u %s %4s~%6s "
+                    "WS %3u %6s "
+                    "%s%s%3s %-2s @%6s%s  %s%s%s%s%s%s\n",
                     conn_prefix, line_color, bpf_prefix,
-                    nic_packet_ct, last_pkt_mem_idx, t[0], t[1],
+                    nic_packet_ct, last_pkt_mem_idx, t[0], t[1], tx_pool_avail,
                     ssl_prefix, ssl_read_ct, sz, t[2], t[3],
                     ssl_read_batch_num, t[4], discard_mark, frag_ul_on, mkt_cnt, mkt_typ, tot, frag_ul_off, exch_diff, seq_suffix, frag_suffix, dbg_suffix, line_reset, winner_mark);
         }

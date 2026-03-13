@@ -359,6 +359,8 @@ struct DPDKPacketIO {
         return rx_process_pos_;
     }
 
+    uint32_t get_tx_pool_avail() const { return kTxPoolSize - (tx_alloc_pos_ - tx_free_pos_); }
+
     // ========================================================================
     // TX Path — claim / commit / ack
     // ========================================================================

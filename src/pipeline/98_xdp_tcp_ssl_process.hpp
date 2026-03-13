@@ -466,6 +466,7 @@ private:
         meta.set_tls_record_end(tls_record_end);
         meta.first_pkt_mem_idx = timing.oldest_pkt_mem_idx;
         meta.last_pkt_mem_idx = timing.latest_pkt_mem_idx;
+        meta.tx_pool_avail = static_cast<uint16_t>(transport_.pio().get_tx_pool_avail());
         msg_metadata_prod_->publish(seq);
         last_op_cycle_ = rdtscp();
     }

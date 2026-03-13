@@ -347,6 +347,7 @@ struct DisruptorPacketIO {
     uint32_t get_queue_id() const { return 0; }
     uint32_t get_frame_size() const { return frame_size_; }
     void* get_umem_area() { return umem_area_; }
+    uint32_t get_tx_pool_avail() const { return TX_POOL_SIZE - (tx_alloc_pos_ - tx_free_pos_); }
 
 private:
     // ========================================================================

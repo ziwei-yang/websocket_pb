@@ -958,6 +958,7 @@ private:
         meta.set_tls_record_end(tls_record_end);
         meta.first_pkt_mem_idx = timing.oldest_pkt_mem_idx;
         meta.last_pkt_mem_idx = timing.latest_pkt_mem_idx;
+        meta.tx_pool_avail = static_cast<uint16_t>(get_transport(ci).pio().get_tx_pool_avail());
         meta.event_type = static_cast<uint8_t>(MetaEventType::DATA);
         if (active_conn_ptr_ && ci == *active_conn_ptr_)
             meta.set_active_conn(true);

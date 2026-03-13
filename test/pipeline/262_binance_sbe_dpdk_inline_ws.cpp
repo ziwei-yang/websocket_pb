@@ -201,12 +201,6 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "WARNING: BINANCE_API_KEY not set. SBE stream may reject connection.\n");
     }
 
-    if (geteuid() != 0) {
-        fprintf(stderr, "WARN: Not running as root. DPDK may fail without capabilities.\n");
-        fprintf(stderr, "      Fix: sudo setcap 'cap_ipc_lock,cap_net_admin,cap_net_raw,cap_sys_nice,cap_sys_rawio+ep' %s\n", argv[0]);
-        fprintf(stderr, "      Or:  sudo %s %s ...\n", argv[0], argv[1]);
-    }
-
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);

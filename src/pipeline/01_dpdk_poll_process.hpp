@@ -876,6 +876,14 @@ private:
             return false;
         }
 
+        // Drop truncated frames: IP header declares more bytes than frame contains.
+        // Mirrors BPF filter (exchange_filter.bpf.c:329-333).
+        // igc PMD passes non-EOP descriptors through (igc_txrx.c:269-274).
+        uint16_t ip_total = rte_be_to_cpu_16(ip->total_length);
+        if (m->data_len < sizeof(struct rte_ether_hdr) + ip_total) {
+            return false;
+        }
+
         // Check if source or destination IP matches any exchange IP
         return is_exchange_ip(ip->src_addr) || is_exchange_ip(ip->dst_addr);
     }

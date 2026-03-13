@@ -386,6 +386,12 @@ struct XDPPacketIO {
     BPFLoader* get_bpf_loader() { return xdp_.get_bpf_loader(); }
     int get_fd() const { return xdp_.get_fd(); }
 
+    uint32_t get_tx_pool_avail() const {
+        uint32_t allocated, pending, available;
+        xdp_.get_tx_pool_stats(allocated, pending, available);
+        return available;
+    }
+
 private:
     XDPTransport xdp_;
 };

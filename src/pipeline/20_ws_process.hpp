@@ -1947,6 +1947,7 @@ private:
             total_bytes += ps.accumulated_metadata[i].decrypted_len;
         }
         info.ssl_read_total_bytes = total_bytes;
+        info.tx_pool_avail = ps.current_metadata.tx_pool_avail;
     }
 
     // ========================================================================
