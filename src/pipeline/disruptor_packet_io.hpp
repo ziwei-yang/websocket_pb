@@ -13,8 +13,9 @@
 //               └── RAW_OUTBOX (producer) - TX packets to XDP Poll
 //
 // Frame Pool Usage (from pipeline_config.hpp):
-//   - RX: Frames [0, RX_FRAMES) (consumed from RAW_INBOX, produced by XDP Poll)
-//   - TX: Frames [RX_FRAMES, TOTAL_UMEM_FRAMES) (unified pool for data + ACKs + retransmits)
+//   - RX:      Frames [0, RX_FRAMES) (consumed from RAW_INBOX, produced by XDP/DPDK Poll)
+//   - TX_DATA: Frames [RX_FRAMES, RX_FRAMES + TX_POOL_SIZE) — retransmit-tracked
+//   - TX_ACK:  Frames [RX_FRAMES + TX_POOL_SIZE, TOTAL_UMEM_FRAMES) — fire-and-forget
 //
 // C++20, policy-based design, single-thread HFT focus
 #pragma once
@@ -69,13 +70,20 @@ struct DisruptorPacketIO {
         raw_outbox_prod_ = config.raw_outbox_prod;
         conn_state_ = config.conn_state;
 
-        // Initialize TX pool state
+        // Initialize TX data pool state
         tx_alloc_pos_ = 0;
         tx_free_pos_ = 0;
         pending_tx_count_ = 0;
         for (uint32_t i = 0; i < TX_POOL_SIZE; ++i) {
             frame_acked_[i] = false;
             frame_sent_[i] = false;
+        }
+        // Initialize TX ACK pool state
+        ack_alloc_pos_ = 0;
+        ack_free_pos_ = 0;
+        for (uint32_t i = 0; i < TX_ACK_SIZE; ++i) {
+            ack_frame_acked_[i] = false;
+            ack_frame_sent_[i] = false;
         }
 
         // Initialize RX tracking
@@ -216,18 +224,17 @@ struct DisruptorPacketIO {
     uint32_t commit_ack_frame(Func&& callback) {
         if (!raw_outbox_prod_ || !conn_state_) return 0;
 
-        // Check pool capacity
-        uint32_t in_use = tx_alloc_pos_ - tx_free_pos_;
-        if (in_use >= TX_POOL_SIZE) return 0;
+        // Check ACK pool capacity
+        uint32_t in_use = ack_alloc_pos_ - ack_free_pos_;
+        if (in_use >= TX_ACK_SIZE) return 0;
 
         // Claim single slot from RAW_OUTBOX
         int64_t seq = raw_outbox_prod_->try_claim();
         if (seq < 0) return 0;
 
-        // Allocate frame from unified TX pool
-        uint32_t frame_idx = TX_POOL_START + (tx_alloc_pos_ % TX_POOL_SIZE);
-        uint32_t relative_idx = tx_alloc_pos_ % TX_POOL_SIZE;
-        frame_sent_[relative_idx] = false;
+        uint32_t relative_idx = ack_alloc_pos_ % TX_ACK_SIZE;
+        uint32_t frame_idx = TX_ACK_POOL_START + relative_idx;
+        ack_frame_sent_[relative_idx] = false;
         uint64_t umem_offset = static_cast<uint64_t>(frame_idx) * frame_size_;
 
         auto& ipc_desc = (*raw_outbox_prod_)[seq];
@@ -240,23 +247,32 @@ struct DisruptorPacketIO {
         // Create local desc with actual pointer for callback
         websocket::xdp::PacketFrameDescriptor desc = ipc_desc;
         desc.frame_ptr = reinterpret_cast<uint64_t>(umem_area_) + umem_offset;
-
         callback(desc);
-
         ipc_desc.frame_len = desc.frame_len;
 
-        tx_alloc_pos_++;
-        conn_state_->tx_frame.msg_alloc_pos.fetch_add(1, std::memory_order_relaxed);
+        ack_alloc_pos_++;
+        // NOTE: Do NOT increment conn_state_->tx_frame.msg_alloc_pos for ACK pool
+        // (that counter tracks data pool only — used for cross-process monitoring)
 
-        // Mark sent and publish
-        frame_sent_[relative_idx] = true;
-
+        ack_frame_sent_[relative_idx] = true;
         raw_outbox_prod_->publish(seq);
 
-        // Immediate release (fire-and-forget ACK)
-        mark_frame_acked(frame_idx);
-
+        // Immediate release (fire-and-forget)
+        mark_ack_frame_acked(frame_idx);
         return frame_idx;
+    }
+
+    void mark_ack_frame_acked(uint32_t frame_idx) {
+        uint32_t relative_idx = (frame_idx - TX_ACK_POOL_START) % TX_ACK_SIZE;
+        ack_frame_acked_[relative_idx] = true;
+        while (ack_free_pos_ < ack_alloc_pos_) {
+            uint32_t free_rel = ack_free_pos_ % TX_ACK_SIZE;
+            if (!ack_frame_acked_[free_rel]) break;
+            ack_frame_acked_[free_rel] = false;
+            ack_frame_sent_[free_rel] = false;
+            ack_free_pos_++;
+        }
+        // No cross-process counter update — ACK pool is fire-and-forget
     }
 
     void mark_frame_acked(uint32_t frame_idx) {
@@ -348,6 +364,7 @@ struct DisruptorPacketIO {
     uint32_t get_frame_size() const { return frame_size_; }
     void* get_umem_area() { return umem_area_; }
     uint32_t get_tx_pool_avail() const { return TX_POOL_SIZE - (tx_alloc_pos_ - tx_free_pos_); }
+    uint32_t get_ack_pool_avail() const { return TX_ACK_SIZE - (ack_alloc_pos_ - ack_free_pos_); }
 
 private:
     // ========================================================================
@@ -363,13 +380,21 @@ private:
     IPCRingProducer<websocket::xdp::PacketFrameDescriptor>* raw_outbox_prod_ = nullptr;
     ConnStateShm* conn_state_ = nullptr;
 
-    // TX pool (frames RX_FRAMES .. TOTAL_UMEM_FRAMES-1)
+    // TX data pool (frames RX_FRAMES .. RX_FRAMES + TX_POOL_SIZE - 1)
     static constexpr uint32_t TX_POOL_START = websocket::pipeline::RX_FRAMES;
     static constexpr uint32_t TX_POOL_SIZE = websocket::pipeline::TX_POOL_SIZE;
     uint32_t tx_alloc_pos_ = 0;    // monotonic, next to allocate
     uint32_t tx_free_pos_ = 0;     // monotonic, next available for reuse
     bool frame_acked_[TX_POOL_SIZE] = {};
     bool frame_sent_[TX_POOL_SIZE] = {};
+
+    // TX ACK pool (frames RX_FRAMES + TX_POOL_SIZE .. TOTAL_UMEM_FRAMES - 1)
+    static constexpr uint32_t TX_ACK_POOL_START = TX_POOL_START + TX_POOL_SIZE;
+    static constexpr uint32_t TX_ACK_SIZE = websocket::pipeline::TX_ACK_POOL_SIZE;
+    uint32_t ack_alloc_pos_ = 0;
+    uint32_t ack_free_pos_ = 0;
+    bool ack_frame_acked_[websocket::pipeline::TX_ACK_POOL_SIZE] = {};
+    bool ack_frame_sent_[websocket::pipeline::TX_ACK_POOL_SIZE] = {};
 
     // TX pending (for claim -> commit two-phase)
     typename IPCRingProducer<websocket::xdp::PacketFrameDescriptor>::ClaimContext pending_batch_;

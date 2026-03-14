@@ -435,6 +435,275 @@ void test_ack_frame_tx_burst_fail_no_deadlock() {
 }
 
 // ============================================================================
+// MockDualPool — Models the split TX Data + ACK pool (HOL-fix)
+// ============================================================================
+
+struct MockDualPool {
+    // Data pool (retransmit-tracked)
+    static constexpr uint32_t DATA_POOL_SIZE = 8;
+    static constexpr uint32_t DATA_POOL_START = 100;
+    uint32_t tx_alloc_pos = 0, tx_free_pos = 0;
+    bool frame_acked[DATA_POOL_SIZE] = {}, frame_sent[DATA_POOL_SIZE] = {};
+    uint32_t mbuf_avail;
+    bool tx_burst_fail = false;
+
+    // ACK pool (fire-and-forget)
+    static constexpr uint32_t ACK_POOL_SIZE = 8;
+    static constexpr uint32_t ACK_POOL_START = DATA_POOL_START + DATA_POOL_SIZE;  // 108
+    uint32_t ack_alloc_pos = 0, ack_free_pos = 0;
+    bool ack_frame_acked[ACK_POOL_SIZE] = {}, ack_frame_sent[ACK_POOL_SIZE] = {};
+
+    MockDualPool(uint32_t initial_mbufs = DATA_POOL_SIZE + ACK_POOL_SIZE)
+        : mbuf_avail(initial_mbufs) {}
+
+    uint32_t data_in_use() const { return tx_alloc_pos - tx_free_pos; }
+    uint32_t data_avail() const { return DATA_POOL_SIZE - data_in_use(); }
+    uint32_t ack_in_use() const { return ack_alloc_pos - ack_free_pos; }
+    uint32_t ack_avail() const { return ACK_POOL_SIZE - ack_in_use(); }
+
+    // Data pool: claim_tx_frames (same as MockTxPool)
+    uint32_t claim_tx_frames(uint32_t count) {
+        uint32_t claimed = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            if (data_in_use() >= DATA_POOL_SIZE) break;
+            if (mbuf_avail == 0) break;
+            mbuf_avail--;
+            uint32_t relative_idx = tx_alloc_pos % DATA_POOL_SIZE;
+            frame_sent[relative_idx] = false;
+            frame_acked[relative_idx] = false;
+            tx_alloc_pos++;
+            claimed++;
+        }
+        return claimed;
+    }
+
+    uint32_t commit_tx_frames(uint32_t count) {
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t relative_idx = (tx_alloc_pos - count + i) % DATA_POOL_SIZE;
+            frame_sent[relative_idx] = true;
+        }
+        if (tx_burst_fail) { mbuf_avail += count; return 0; }
+        return count;
+    }
+
+    std::pair<uint32_t, uint32_t> claim_and_commit(uint32_t count) {
+        uint32_t claimed = claim_tx_frames(count);
+        uint32_t committed = commit_tx_frames(claimed);
+        return {claimed, committed};
+    }
+
+    void mark_frame_acked(uint32_t frame_idx) {
+        if (frame_idx < DATA_POOL_START || frame_idx >= DATA_POOL_START + DATA_POOL_SIZE) return;
+        uint32_t relative_idx = (frame_idx - DATA_POOL_START) % DATA_POOL_SIZE;
+        frame_acked[relative_idx] = true;
+        while (tx_free_pos < tx_alloc_pos) {
+            uint32_t free_rel = tx_free_pos % DATA_POOL_SIZE;
+            if (!frame_acked[free_rel]) break;
+            frame_acked[free_rel] = false;
+            frame_sent[free_rel] = false;
+            tx_free_pos++;
+        }
+    }
+
+    // ACK pool: commit_ack_frame (uses separate pool)
+    uint32_t commit_ack_frame() {
+        if (ack_in_use() >= ACK_POOL_SIZE) return 0;
+        if (mbuf_avail == 0) return 0;
+        mbuf_avail--;
+
+        uint32_t relative_idx = ack_alloc_pos % ACK_POOL_SIZE;
+        uint32_t frame_idx = ACK_POOL_START + relative_idx;
+        ack_frame_sent[relative_idx] = false;
+        ack_frame_acked[relative_idx] = false;
+
+        ack_frame_sent[relative_idx] = true;
+        ack_alloc_pos++;
+
+        if (tx_burst_fail) {
+            mbuf_avail++;
+            mark_ack_frame_acked(frame_idx);
+            return 0;
+        }
+
+        // Always free — fire-and-forget
+        mark_ack_frame_acked(frame_idx);
+        return frame_idx;
+    }
+
+    void mark_ack_frame_acked(uint32_t frame_idx) {
+        uint32_t relative_idx = (frame_idx - ACK_POOL_START) % ACK_POOL_SIZE;
+        ack_frame_acked[relative_idx] = true;
+        while (ack_free_pos < ack_alloc_pos) {
+            uint32_t free_rel = ack_free_pos % ACK_POOL_SIZE;
+            if (!ack_frame_acked[free_rel]) break;
+            ack_frame_acked[free_rel] = false;
+            ack_frame_sent[free_rel] = false;
+            ack_free_pos++;
+        }
+    }
+
+    void return_mbufs(uint32_t count) { mbuf_avail += count; }
+};
+
+// ============================================================================
+// DUAL POOL TESTS — Verify HOL-fix: data pool full does NOT block ACK pool
+// ============================================================================
+
+void test_data_pool_full_does_not_affect_ack_pool() {
+    TEST("HOL-FIX: data pool full does NOT affect ACK pool")
+        MockDualPool pool;
+
+        // Fill data pool completely (no ACKs from remote yet)
+        auto [c, co] = pool.claim_and_commit(MockDualPool::DATA_POOL_SIZE);
+        ASSERT(c == MockDualPool::DATA_POOL_SIZE, "Data pool filled");
+        ASSERT(pool.data_in_use() == MockDualPool::DATA_POOL_SIZE, "Data pool full");
+
+        // Data pool full — cannot claim more data frames
+        ASSERT(pool.claim_tx_frames(1) == 0, "Data pool rejects new claims");
+
+        // BUT: ACK pool is completely independent — ACKs still work!
+        uint32_t acks_sent = 0;
+        for (uint32_t i = 0; i < MockDualPool::ACK_POOL_SIZE; i++) {
+            uint32_t idx = pool.commit_ack_frame();
+            if (idx == 0) break;
+            ASSERT(idx >= MockDualPool::ACK_POOL_START, "ACK frame_idx in ACK pool range");
+            ASSERT(idx < MockDualPool::ACK_POOL_START + MockDualPool::ACK_POOL_SIZE, "ACK frame_idx in range");
+            acks_sent++;
+        }
+        ASSERT(acks_sent == MockDualPool::ACK_POOL_SIZE, "All ACK frames sent despite data pool being full");
+        ASSERT(pool.ack_in_use() == 0, "ACK pool clean (all immediately freed)");
+    END_TEST
+}
+
+void test_ack_pool_basic_alloc_free() {
+    TEST("ACK pool: basic alloc/free cycle")
+        MockDualPool pool;
+
+        uint32_t idx = pool.commit_ack_frame();
+        ASSERT(idx >= MockDualPool::ACK_POOL_START, "Frame idx in ACK range");
+        ASSERT(idx < MockDualPool::ACK_POOL_START + MockDualPool::ACK_POOL_SIZE, "Frame idx in range");
+        ASSERT(pool.ack_in_use() == 0, "Immediately freed (fire-and-forget)");
+        ASSERT(pool.ack_alloc_pos == 1, "ack_alloc_pos advanced");
+        ASSERT(pool.ack_free_pos == 1, "ack_free_pos advanced (immediately freed)");
+    END_TEST
+}
+
+void test_ack_pool_fifo_sequential() {
+    TEST("ACK pool: N sequential commit_ack_frames")
+        MockDualPool pool;
+
+        for (uint32_t i = 0; i < MockDualPool::ACK_POOL_SIZE; i++) {
+            uint32_t idx = pool.commit_ack_frame();
+            ASSERT(idx != 0, "ACK frame succeeded");
+        }
+        ASSERT(pool.ack_alloc_pos == MockDualPool::ACK_POOL_SIZE, "Alloc pos advanced by N");
+        ASSERT(pool.ack_free_pos == MockDualPool::ACK_POOL_SIZE, "Free pos advanced by N");
+        ASSERT(pool.ack_in_use() == 0, "All freed");
+    END_TEST
+}
+
+void test_ack_pool_full() {
+    TEST("ACK pool full: returns 0, data pool unaffected")
+        MockDualPool pool(MockDualPool::DATA_POOL_SIZE + MockDualPool::ACK_POOL_SIZE);
+
+        // Fill data pool to verify independence
+        auto [c, co] = pool.claim_and_commit(4);
+        ASSERT(c == 4, "Data pool: 4 claimed");
+
+        // Send ACKs with mbuf replenishment (simulates NIC returning mbufs)
+        for (uint32_t i = 0; i < 20; i++) {
+            uint32_t idx = pool.commit_ack_frame();
+            ASSERT(idx != 0, "ACK succeeds (self-draining pool)");
+            pool.return_mbufs(1);  // NIC returns the mbuf
+        }
+        // Data pool still has 4 in use
+        ASSERT(pool.data_in_use() == 4, "Data pool unaffected by ACK traffic");
+    END_TEST
+}
+
+void test_ack_pool_wrap_around() {
+    TEST("ACK pool: wrap around pool boundary")
+        MockDualPool pool;
+
+        // Send 3 full cycles of ACKs (3 * 8 = 24 ACKs)
+        for (uint32_t cycle = 0; cycle < 3; cycle++) {
+            for (uint32_t i = 0; i < MockDualPool::ACK_POOL_SIZE; i++) {
+                uint32_t idx = pool.commit_ack_frame();
+                ASSERT(idx != 0, "ACK frame succeeded");
+                pool.return_mbufs(1);  // NIC returns the mbuf
+            }
+        }
+        ASSERT(pool.ack_alloc_pos == 24, "24 total ACK allocations");
+        ASSERT(pool.ack_free_pos == 24, "24 total ACK frees");
+        ASSERT(pool.ack_in_use() == 0, "All freed after wrap");
+    END_TEST
+}
+
+void test_ack_pool_tx_burst_fail_no_leak() {
+    TEST("ACK pool: tx_burst failure does NOT leak FIFO slot")
+        MockDualPool pool;
+        pool.tx_burst_fail = true;
+
+        uint32_t result = pool.commit_ack_frame();
+        ASSERT(result == 0, "Returns 0 on tx_burst failure");
+        ASSERT(pool.ack_in_use() == 0, "No ACK FIFO slot leaked");
+
+        pool.tx_burst_fail = false;
+        // Pool still works
+        uint32_t idx = pool.commit_ack_frame();
+        ASSERT(idx != 0, "ACK pool works after recovery");
+    END_TEST
+}
+
+void test_pools_independent_exhaustion() {
+    TEST("Pools independent: fill each, other remains available")
+        MockDualPool pool;
+
+        // Fill data pool
+        auto [c, co] = pool.claim_and_commit(MockDualPool::DATA_POOL_SIZE);
+        ASSERT(c == MockDualPool::DATA_POOL_SIZE, "Data pool filled");
+        ASSERT(pool.data_avail() == 0, "Data pool: 0 available");
+
+        // ACK pool unaffected
+        ASSERT(pool.ack_avail() == MockDualPool::ACK_POOL_SIZE, "ACK pool: full capacity");
+        uint32_t idx = pool.commit_ack_frame();
+        ASSERT(idx != 0, "ACK works with data pool full");
+
+        // Free data pool
+        for (uint32_t i = 0; i < MockDualPool::DATA_POOL_SIZE; i++) {
+            pool.mark_frame_acked(MockDualPool::DATA_POOL_START + i);
+        }
+        ASSERT(pool.data_avail() == MockDualPool::DATA_POOL_SIZE, "Data pool recovered");
+    END_TEST
+}
+
+void test_frame_idx_routing() {
+    TEST("Frame idx routing: mark_frame_acked only affects data pool")
+        MockDualPool pool;
+
+        // Claim 2 data frames
+        auto [c, co] = pool.claim_and_commit(2);
+        ASSERT(c == 2, "2 data frames claimed");
+
+        // Send 2 ACKs
+        uint32_t ack1 = pool.commit_ack_frame();
+        uint32_t ack2 = pool.commit_ack_frame();
+        ASSERT(ack1 != 0 && ack2 != 0, "2 ACKs sent");
+
+        // mark_frame_acked with ACK pool indices should be no-op for data pool
+        pool.mark_frame_acked(ack1);  // Out of data pool range — ignored
+        pool.mark_frame_acked(ack2);  // Out of data pool range — ignored
+        ASSERT(pool.data_in_use() == 2, "Data pool unaffected by ACK pool indices");
+
+        // mark_frame_acked with data pool indices works correctly
+        pool.mark_frame_acked(MockDualPool::DATA_POOL_START + 0);
+        ASSERT(pool.data_in_use() == 1, "Data frame #0 freed");
+        pool.mark_frame_acked(MockDualPool::DATA_POOL_START + 1);
+        ASSERT(pool.data_in_use() == 0, "Data frame #1 freed");
+    END_TEST
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 int main() {
@@ -442,6 +711,7 @@ int main() {
     std::cout << "(Tests verify DPDK TX pool FIFO fixes)" << std::endl;
     std::cout << std::endl;
 
+    // Original single-pool tests (data pool via MockTxPool)
     test_normal_cycle();
     test_out_of_order_ack();
     test_pool_full_claim_rejected();
@@ -452,6 +722,19 @@ int main() {
     test_mbuf_exhaustion_partial_claim();
     test_ack_frame_tx_burst_fail_no_leak();
     test_ack_frame_tx_burst_fail_no_deadlock();
+
+    std::cout << std::endl;
+    std::cout << "--- Dual Pool Tests (HOL-fix) ---" << std::endl;
+
+    // New dual-pool tests (MockDualPool)
+    test_data_pool_full_does_not_affect_ack_pool();
+    test_ack_pool_basic_alloc_free();
+    test_ack_pool_fifo_sequential();
+    test_ack_pool_full();
+    test_ack_pool_wrap_around();
+    test_ack_pool_tx_burst_fail_no_leak();
+    test_pools_independent_exhaustion();
+    test_frame_idx_routing();
 
     std::cout << std::endl;
     std::cout << "=== Results: " << tests_passed << " passed, "

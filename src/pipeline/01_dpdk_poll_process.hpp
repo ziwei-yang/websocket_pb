@@ -184,8 +184,9 @@ struct DPDKPollProcess {
             conn_state_->set_handshake_xdp_ready();  // Reuses same handshake flag
         }
 
-        fprintf(stderr, "[DPDK-POLL] Initialized: port=%u, RX pool=%u mbufs, TX hdr pool=%u mbufs, local_ip=%u.%u.%u.%u\n",
-                port_id_, static_cast<uint32_t>(RX_FRAMES), static_cast<uint32_t>(TX_POOL_SIZE),
+        fprintf(stderr, "[DPDK-POLL] Initialized: port=%u, RX pool=%u, TX data=%u, TX ACK=%u mbufs, local_ip=%u.%u.%u.%u\n",
+                port_id_, static_cast<uint32_t>(RX_FRAMES),
+                static_cast<uint32_t>(TX_POOL_SIZE), static_cast<uint32_t>(TX_ACK_POOL_SIZE),
                 local_ip_ & 0xFF, (local_ip_ >> 8) & 0xFF,
                 (local_ip_ >> 16) & 0xFF, (local_ip_ >> 24) & 0xFF);
         return true;
@@ -695,8 +696,9 @@ private:
                 static_cast<uint32_t>(RX_FRAMES), kFrameSize, (void*)umem_area_);
 
         // TX header-only pool (no data buffer — data lives in shared UMEM TX region)
+        // Sized for both data pool and ACK pool
         tx_hdr_pool_ = rte_pktmbuf_pool_create("TX_HDR_POOL",
-            static_cast<uint32_t>(TX_POOL_SIZE),
+            static_cast<uint32_t>(TX_POOL_SIZE + TX_ACK_POOL_SIZE),
             0,      // cache size
             0,      // priv size
             0,      // data_room_size = 0 (header-only)
@@ -790,7 +792,7 @@ private:
     }
 
     void init_tx_shinfo() {
-        for (size_t i = 0; i < TX_POOL_SIZE; i++) {
+        for (size_t i = 0; i < TX_POOL_SIZE + TX_ACK_POOL_SIZE; i++) {
             tx_shinfo_[i].free_cb = noop_free_cb;
             tx_shinfo_[i].fcb_opaque = nullptr;
             rte_mbuf_ext_refcnt_set(&tx_shinfo_[i], 1);
@@ -924,7 +926,8 @@ private:
     struct rte_mbuf* rx_mbuf_ring_[RX_FRAMES] = {};
 
     // TX external buffer shared info (one per TX frame, free_cb = noop)
-    struct rte_mbuf_ext_shared_info tx_shinfo_[TX_POOL_SIZE] = {};
+    // Covers both data pool and ACK pool: frame_idx - RX_FRAMES maps to [0, TX_POOL_SIZE + TX_ACK_POOL_SIZE)
+    struct rte_mbuf_ext_shared_info tx_shinfo_[TX_POOL_SIZE + TX_ACK_POOL_SIZE] = {};
 
     // Exchange IP filter table
     uint32_t exchange_ips_[ConnStateShm::MAX_EXCHANGE_IPS] = {};

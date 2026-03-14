@@ -484,12 +484,14 @@ private:
 
 // Include XDP headers outside namespace to avoid conflicts
 #if defined(USE_XDP) || defined(USE_DPDK)
+// pipeline_data.hpp must be included BEFORE xdp_packet_io.hpp (which pulls in
+// pipeline_config.hpp) to avoid CACHE_LINE_SIZE macro conflict with disruptor
+#include "../pipeline/pipeline_data.hpp"
 #ifdef USE_XDP
 #include "../xdp/xdp_packet_io.hpp"
 #include "../xdp/xdp_frame.hpp"
 #endif
 #include "../stack/userspace_stack.hpp"
-#include "../pipeline/pipeline_data.hpp"
 #include <net/if.h>
 #include <sys/ioctl.h>
 #endif
@@ -845,7 +847,7 @@ struct PacketTransport {
         // Send SYN using batch TX API
         uint32_t syn_frame_idx;
         size_t syn_len = 0;
-        uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+        uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t /*i*/, websocket::xdp::PacketFrameDescriptor& desc) {
             syn_frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
             uint8_t* syn_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
             syn_len = stack_.build_syn(syn_buffer, pio().frame_capacity(), tcp_params_);
@@ -933,7 +935,7 @@ struct PacketTransport {
 
             uint32_t frame_idx;
             size_t frame_len = 0;
-            uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+            uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t /*i*/, websocket::xdp::PacketFrameDescriptor& desc) {
                 frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
                 uint8_t* frame_data = reinterpret_cast<uint8_t*>(desc.frame_ptr);
                 frame_len = stack_.build_data(frame_data, pio().frame_capacity(),
@@ -1105,7 +1107,7 @@ struct PacketTransport {
         if (state_ == userspace_stack::TCPState::ESTABLISHED) {
             uint32_t fin_frame_idx;
             size_t fin_len = 0;
-            uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+            uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t /*i*/, websocket::xdp::PacketFrameDescriptor& desc) {
                 fin_frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
                 uint8_t* fin_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
                 fin_len = stack_.build_fin(fin_buffer, pio().frame_capacity(), tcp_params_);
@@ -1152,7 +1154,7 @@ struct PacketTransport {
      * Process a single RX frame — extracted from poll_rx_and_process() lambda.
      * Called by PacketTransportAB's demuxed poll loop.
      */
-    void process_rx_frame(uint32_t idx, websocket::xdp::PacketFrameDescriptor& desc) {
+    void process_rx_frame(uint32_t /*idx*/, websocket::xdp::PacketFrameDescriptor& desc) {
         uint32_t frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
         uint8_t* frame_data = reinterpret_cast<uint8_t*>(desc.frame_ptr);
         uint16_t frame_len = desc.frame_len;
@@ -1325,7 +1327,7 @@ struct PacketTransport {
         // Send SYN
         uint32_t syn_frame_idx;
         size_t syn_len = 0;
-        uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+        uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t /*i*/, websocket::xdp::PacketFrameDescriptor& desc) {
             syn_frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
             uint8_t* syn_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
             syn_len = stack_.build_syn(syn_buffer, pio().frame_capacity(), tcp_params_);
@@ -1384,7 +1386,7 @@ struct PacketTransport {
         // Send SYN
         uint32_t syn_frame_idx;
         size_t syn_len = 0;
-        uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+        uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t /*i*/, websocket::xdp::PacketFrameDescriptor& desc) {
             syn_frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
             uint8_t* syn_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
             syn_len = stack_.build_syn(syn_buffer, pio().frame_capacity(), tcp_params_);
@@ -1452,7 +1454,7 @@ struct PacketTransport {
         // Send SYN
         uint32_t syn_frame_idx;
         size_t syn_len = 0;
-        uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t i, websocket::xdp::PacketFrameDescriptor& desc) {
+        uint32_t claimed = pio().claim_tx_frames(1, [&](uint32_t /*i*/, websocket::xdp::PacketFrameDescriptor& desc) {
             syn_frame_idx = pio().frame_ptr_to_idx(desc.frame_ptr);
             uint8_t* syn_buffer = reinterpret_cast<uint8_t*>(desc.frame_ptr);
             syn_len = stack_.build_syn(syn_buffer, pio().frame_capacity(), tcp_params_);

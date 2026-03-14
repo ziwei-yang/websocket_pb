@@ -15,8 +15,9 @@
 //   Fork → DPDKPollProcess → IPC rings → PacketTransport<DisruptorPacketIO>
 //
 // Frame Pool Usage (from pipeline_config.hpp):
-//   - RX: Frames [0, RX_FRAMES) — NIC DMA writes directly into UMEM
-//   - TX: Frames [RX_FRAMES, TOTAL_UMEM_FRAMES) — unified pool for data + ACKs + retransmits
+//   - RX:      Frames [0, RX_FRAMES) — NIC DMA writes directly into UMEM
+//   - TX_DATA: Frames [RX_FRAMES, RX_FRAMES + TX_POOL_SIZE) — retransmit-tracked (SYN/DATA/FIN/PONG)
+//   - TX_ACK:  Frames [RX_FRAMES + TX_POOL_SIZE, TOTAL_UMEM_FRAMES) — fire-and-forget (pure ACK)
 //
 // C++20, policy-based design, single-thread HFT focus
 #pragma once
@@ -89,9 +90,11 @@ struct DPDKPacketIO {
     static constexpr uint32_t kFrameSize = calculate_frame_size(NIC_MTU);
     static constexpr uint16_t kRxBatch = RX_BATCH;
     static constexpr uint16_t kTxBatch = 64;
-    static constexpr uint32_t kRxPoolSize = PIPELINE_MAX_CONN * 4096;
-    static constexpr uint32_t TX_POOL_START = kRxPoolSize;
+    static constexpr uint32_t kRxPoolSize = static_cast<uint32_t>(RX_FRAMES);
     static constexpr uint32_t kTxPoolSize = static_cast<uint32_t>(TX_POOL_SIZE);
+    static constexpr uint32_t kTxAckPoolSize = static_cast<uint32_t>(TX_ACK_POOL_SIZE);
+    static constexpr uint32_t TX_POOL_START = kRxPoolSize;
+    static constexpr uint32_t TX_ACK_POOL_START = TX_POOL_START + kTxPoolSize;
 
     DPDKPacketIO() = default;
     ~DPDKPacketIO() = default;
@@ -114,7 +117,7 @@ struct DPDKPacketIO {
             umem_size_ = config.umem_size;
             owns_umem_ = false;
         } else {
-            umem_size_ = static_cast<size_t>(kRxPoolSize + kTxPoolSize) * kFrameSize;
+            umem_size_ = static_cast<size_t>(kRxPoolSize + kTxPoolSize + kTxAckPoolSize) * kFrameSize;
             umem_area_ = static_cast<uint8_t*>(
                 mmap(reinterpret_cast<void*>(DPDK_UMEM_BASE_VA), umem_size_,
                      PROT_READ | PROT_WRITE,
@@ -205,6 +208,13 @@ struct DPDKPacketIO {
         for (uint32_t i = 0; i < kTxPoolSize; ++i) {
             frame_acked_[i] = false;
             frame_sent_[i] = false;
+        }
+        // Initialize ACK pool state
+        ack_alloc_pos_ = 0;
+        ack_free_pos_ = 0;
+        for (uint32_t i = 0; i < kTxAckPoolSize; ++i) {
+            ack_frame_acked_[i] = false;
+            ack_frame_sent_[i] = false;
         }
         // Reset NIC stats to avoid residual counters from previous run
         rte_eth_stats_reset(port_id_);
@@ -360,6 +370,7 @@ struct DPDKPacketIO {
     }
 
     uint32_t get_tx_pool_avail() const { return kTxPoolSize - (tx_alloc_pos_ - tx_free_pos_); }
+    uint32_t get_ack_pool_avail() const { return kTxAckPoolSize - (ack_alloc_pos_ - ack_free_pos_); }
 
     // ========================================================================
     // TX Path — claim / commit / ack
@@ -469,24 +480,66 @@ struct DPDKPacketIO {
 
     template<typename Func>
     uint32_t commit_ack_frame(Func&& callback) {
-        uint32_t frame_idx = 0;
-        uint32_t claimed = claim_tx_frames(1, [&](uint32_t, websocket::xdp::PacketFrameDescriptor& desc) {
-            frame_idx = frame_ptr_to_idx(desc.frame_ptr);
-            desc.frame_type = websocket::xdp::FRAME_TYPE_TX_ACK;
-            callback(desc);
-        });
-        if (claimed > 0) {
-            uint32_t committed = commit_tx_frames(frame_idx, frame_idx);
-            // Always free FIFO slot — ACK frames are fire-and-forget.
-            // If tx_burst failed, delayed ACK timer or next data piggyback re-sends.
-            mark_frame_acked(frame_idx);
-            if (committed == 0) {
-                fprintf(stderr, "[WARN][DPDK-PIO] commit_ack_frame: tx_burst failed, ACK dropped\n");
-                return 0;
-            }
-            return frame_idx;
+        // Check ACK pool capacity
+        uint32_t in_use = ack_alloc_pos_ - ack_free_pos_;
+        if (in_use >= kTxAckPoolSize) return 0;
+
+        // Pre-allocate mbuf
+        struct rte_mbuf* m = rte_pktmbuf_alloc(tx_hdr_pool_);
+        if (!m) {
+            rte_eth_tx_burst(port_id_, 0, nullptr, 0);  // trigger driver completion
+            m = rte_pktmbuf_alloc(tx_hdr_pool_);
+            if (!m) return 0;
         }
-        return 0;
+
+        uint32_t relative_idx = ack_alloc_pos_ % kTxAckPoolSize;
+        uint32_t frame_idx = TX_ACK_POOL_START + relative_idx;
+        ack_frame_sent_[relative_idx] = false;
+        ack_frame_acked_[relative_idx] = false;
+
+        uint64_t umem_offset = static_cast<uint64_t>(frame_idx) * frame_size_;
+        websocket::xdp::PacketFrameDescriptor desc;
+        desc.clear();
+        desc.frame_ptr = reinterpret_cast<uint64_t>(umem_area_ + umem_offset);
+        desc.frame_type = websocket::xdp::FRAME_TYPE_TX_ACK;
+
+        callback(desc);
+
+        // Attach UMEM frame as external buffer
+        uint8_t* frame_data = reinterpret_cast<uint8_t*>(desc.frame_ptr);
+        rte_mbuf_ext_refcnt_set(&ack_tx_shinfo_[relative_idx], 1);
+        rte_pktmbuf_attach_extbuf(m, frame_data,
+            rte_mem_virt2iova(frame_data),
+            frame_size_, &ack_tx_shinfo_[relative_idx]);
+        m->data_off = 0;
+        m->data_len = desc.frame_len;
+        m->pkt_len = desc.frame_len;
+
+        ack_frame_sent_[relative_idx] = true;
+        ack_alloc_pos_++;
+
+        uint16_t sent = rte_eth_tx_burst(port_id_, 0, &m, 1);
+
+        // Always free FIFO slot — fire-and-forget
+        mark_ack_frame_acked(frame_idx);
+
+        if (sent == 0) {
+            rte_pktmbuf_free(m);
+            return 0;
+        }
+        return frame_idx;
+    }
+
+    void mark_ack_frame_acked(uint32_t frame_idx) {
+        uint32_t relative_idx = (frame_idx - TX_ACK_POOL_START) % kTxAckPoolSize;
+        ack_frame_acked_[relative_idx] = true;
+        while (ack_free_pos_ < ack_alloc_pos_) {
+            uint32_t free_rel = ack_free_pos_ % kTxAckPoolSize;
+            if (!ack_frame_acked_[free_rel]) break;
+            ack_frame_acked_[free_rel] = false;
+            ack_frame_sent_[free_rel] = false;
+            ack_free_pos_++;
+        }
     }
 
     void mark_frame_acked(uint32_t frame_idx) {
@@ -816,7 +869,7 @@ private:
                 kRxPoolSize, frame_size_, static_cast<void*>(umem_area_));
 
         tx_hdr_pool_ = rte_pktmbuf_pool_create("TX_HDR_POOL",
-            static_cast<uint32_t>(TX_POOL_SIZE),
+            static_cast<uint32_t>(TX_POOL_SIZE + TX_ACK_POOL_SIZE),
             0, 0, 0, socket_id);
 
         if (!tx_hdr_pool_) {
@@ -898,6 +951,11 @@ private:
             tx_shinfo_[i].free_cb = noop_free_cb;
             tx_shinfo_[i].fcb_opaque = nullptr;
             rte_mbuf_ext_refcnt_set(&tx_shinfo_[i], 1);
+        }
+        for (size_t i = 0; i < TX_ACK_POOL_SIZE; i++) {
+            ack_tx_shinfo_[i].free_cb = noop_free_cb;
+            ack_tx_shinfo_[i].fcb_opaque = nullptr;
+            rte_mbuf_ext_refcnt_set(&ack_tx_shinfo_[i], 1);
         }
     }
 
@@ -1020,12 +1078,19 @@ private:
     uint32_t rx_consume_pos_ = 0;
     bool* rx_consumed_ = nullptr;                    // [kRxPoolSize]
 
-    // TX pool [RX_FRAMES, TOTAL_UMEM_FRAMES)
+    // TX data pool [TX_POOL_START, TX_POOL_START + kTxPoolSize)
     uint32_t tx_alloc_pos_ = 0;
     uint32_t tx_free_pos_ = 0;
     bool frame_acked_[TX_POOL_SIZE] = {};
     bool frame_sent_[TX_POOL_SIZE] = {};
     struct rte_mbuf_ext_shared_info tx_shinfo_[TX_POOL_SIZE] = {};
+
+    // TX ACK pool [TX_ACK_POOL_START, TX_ACK_POOL_START + kTxAckPoolSize)
+    uint32_t ack_alloc_pos_ = 0;
+    uint32_t ack_free_pos_ = 0;
+    bool ack_frame_acked_[TX_ACK_POOL_SIZE] = {};
+    bool ack_frame_sent_[TX_ACK_POOL_SIZE] = {};
+    struct rte_mbuf_ext_shared_info ack_tx_shinfo_[TX_ACK_POOL_SIZE] = {};
 
     // TX pending (claim -> commit two-phase)
     websocket::xdp::PacketFrameDescriptor tx_pending_descs_[64];

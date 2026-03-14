@@ -171,11 +171,8 @@ struct XDPTransport {
     // Headroom: configurable via -DXDP_HEADROOM=N (0 for ENA driver)
     static constexpr uint32_t HEADROOM = XDP_HEADROOM;
 
-    // Frame pool configuration (separate RX and TX pools)
-    // Total frames split 50/50 between RX and TX (16x larger: 65536 total)
+    // Frame pool configuration (from pipeline_config.hpp)
     static constexpr uint32_t RX_POOL_START = 0;
-    static constexpr uint32_t DEFAULT_RX_POOL_SIZE = 32768;  // Frames 0-32767 for RX
-    static constexpr uint32_t DEFAULT_TX_POOL_SIZE = 32768;  // Frames 32768-65535 for TX
 
     XDPTransport()
         : xsk_(nullptr)
@@ -192,12 +189,16 @@ struct XDPTransport {
         , rx_trickle_fd_(-1)
         , poll_fd_{}
         , poll_wait_count_(0)
-        , rx_pool_size_(DEFAULT_RX_POOL_SIZE)
-        , tx_pool_start_(DEFAULT_RX_POOL_SIZE)
-        , tx_pool_size_(DEFAULT_TX_POOL_SIZE)
+        , rx_pool_size_(static_cast<uint32_t>(websocket::pipeline::RX_FRAMES))
+        , tx_pool_start_(static_cast<uint32_t>(websocket::pipeline::RX_FRAMES))
+        , tx_pool_size_(static_cast<uint32_t>(websocket::pipeline::TX_POOL_SIZE))
         , tx_alloc_pos_(0)
         , tx_free_pos_(0)
         , tx_commit_pos_(0)
+        , ack_pool_start_(static_cast<uint32_t>(websocket::pipeline::RX_FRAMES + websocket::pipeline::TX_POOL_SIZE))
+        , ack_pool_size_(static_cast<uint32_t>(websocket::pipeline::TX_ACK_POOL_SIZE))
+        , ack_alloc_pos_(0)
+        , ack_free_pos_(0)
         , rx_process_pos_(0)
         , rx_consume_pos_(0)
     {
@@ -205,6 +206,8 @@ struct XDPTransport {
         frame_acked_.fill(false);    // Initialize ACK bitmap
         frame_sent_.fill(false);     // Initialize sent bitmap
         rx_consumed_.fill(false);    // Initialize RX consumed bitmap
+        ack_frame_acked_.fill(false);
+        ack_frame_sent_.fill(false);
     }
 
     ~XDPTransport() {
@@ -307,9 +310,8 @@ struct XDPTransport {
         // Configure UMEM
         struct xsk_umem_config umem_cfg;
         memset(&umem_cfg, 0, sizeof(umem_cfg));
-        // Use larger ring sizes to match increased UMEM (32768 RX frames)
-        umem_cfg.fill_size = rx_pool_size_;  // FILL ring holds all RX frames
-        umem_cfg.comp_size = tx_pool_size_;  // COMP ring holds all TX frames
+        umem_cfg.fill_size = rx_pool_size_;                      // FILL ring holds all RX frames
+        umem_cfg.comp_size = tx_pool_size_ + ack_pool_size_;  // COMP ring covers both TX pools
         umem_cfg.frame_size = config_.frame_size;
         umem_cfg.frame_headroom = HEADROOM;  // Configurable via -DXDP_HEADROOM=N
         umem_cfg.flags = 0;
@@ -325,9 +327,8 @@ struct XDPTransport {
         // Configure XDP socket
         struct xsk_socket_config xsk_cfg;
         memset(&xsk_cfg, 0, sizeof(xsk_cfg));
-        // Use larger ring sizes to match increased UMEM
-        xsk_cfg.rx_size = rx_pool_size_;  // RX ring size matches RX pool
-        xsk_cfg.tx_size = tx_pool_size_;  // TX ring size matches TX pool
+        xsk_cfg.rx_size = rx_pool_size_;                      // RX ring size matches RX pool
+        xsk_cfg.tx_size = tx_pool_size_ + ack_pool_size_;  // TX ring covers both TX pools
 
         // If BPF filtering enabled, bind to the existing XDP program
         // Otherwise, let libxsk attach its default XDP program
@@ -393,17 +394,24 @@ struct XDPTransport {
             printf("[XDP] ✅ BPF filtering enabled\n");
         }
 
-        // Initialize frame pools: split UMEM into RX and TX pools
-        // RX pool: frames 0 to rx_pool_size_-1 (for FILL/RX rings)
-        // TX pool: frames tx_pool_start_ to num_frames-1 (sequential allocation)
-        rx_pool_size_ = config_.num_frames / 2;
+        // Initialize frame pools from pipeline_config.hpp constants
+        // RX pool: frames [0, RX_FRAMES)
+        // TX data pool: frames [RX_FRAMES, RX_FRAMES + TX_POOL_SIZE)
+        // TX ACK pool: frames [RX_FRAMES + TX_POOL_SIZE, TOTAL_UMEM_FRAMES)
+        rx_pool_size_ = static_cast<uint32_t>(websocket::pipeline::RX_FRAMES);
         tx_pool_start_ = rx_pool_size_;
-        tx_pool_size_ = config_.num_frames - rx_pool_size_;
+        tx_pool_size_ = static_cast<uint32_t>(websocket::pipeline::TX_POOL_SIZE);
+        ack_pool_start_ = tx_pool_start_ + tx_pool_size_;
+        ack_pool_size_ = static_cast<uint32_t>(websocket::pipeline::TX_ACK_POOL_SIZE);
         tx_alloc_pos_ = 0;
         tx_free_pos_ = 0;
         tx_commit_pos_ = tx_pool_start_;  // First TX frame to commit
+        ack_alloc_pos_ = 0;
+        ack_free_pos_ = 0;
         frame_acked_.fill(false);
         frame_sent_.fill(false);
+        ack_frame_acked_.fill(false);
+        ack_frame_sent_.fill(false);
 
         // RX pool tracking for batch API
         rx_process_pos_ = 0;
@@ -554,9 +562,8 @@ struct XDPTransport {
             PacketFrameDescriptor desc;
             desc.clear();
 
-            // Calculate frame index from address
+            // Calculate base address for frame (used by mark_frame_consumed)
             uint64_t base_addr = rx_desc->addr & ~(config_.frame_size - 1);
-            uint32_t frame_idx = static_cast<uint32_t>(base_addr / config_.frame_size);
 
             desc.frame_ptr = reinterpret_cast<uint64_t>(
                 static_cast<uint8_t*>(umem_area_) + rx_desc->addr);
@@ -682,8 +689,8 @@ struct XDPTransport {
      * @param frame_idx Frame index that was ACKed
      */
     void mark_frame_acked(uint32_t frame_idx) {
-        if (frame_idx < tx_pool_start_ || frame_idx >= config_.num_frames) {
-            return;  // Invalid frame index
+        if (frame_idx < tx_pool_start_ || frame_idx >= tx_pool_start_ + tx_pool_size_) {
+            return;  // Not a data pool frame (could be ACK pool or out of range)
         }
         uint32_t relative_idx = (frame_idx - tx_pool_start_) % tx_pool_size_;
         frame_acked_[relative_idx] = true;
@@ -697,6 +704,70 @@ struct XDPTransport {
             tx_free_pos_++;
         }
     }
+
+    /**
+     * Commit a single ACK frame from the dedicated ACK pool
+     *
+     * Separate from data pool's claim_tx_frames/commit_tx_frames because
+     * commit_tx_frames has a defensive tx_commit_pos_ check that expects
+     * consecutive data frame indices.
+     *
+     * @param callback Lambda(PacketFrameDescriptor& desc) to fill the ACK frame
+     * @return Frame index on success, 0 on failure
+     */
+    template<typename Func>
+    uint32_t commit_ack_frame(Func&& callback) {
+        if (ack_alloc_pos_ - ack_free_pos_ >= ack_pool_size_) return 0;
+
+        uint32_t relative_idx = ack_alloc_pos_ % ack_pool_size_;
+        uint32_t frame_idx = ack_pool_start_ + relative_idx;
+
+        PacketFrameDescriptor desc;
+        desc.clear();
+        uint64_t addr = frame_idx_to_addr(frame_idx);
+        desc.frame_ptr = reinterpret_cast<uint64_t>(get_frame_ptr(addr));
+        desc.frame_type = FRAME_TYPE_TX_ACK;
+
+        callback(desc);
+
+        // Reserve TX ring slot
+        uint32_t tx_idx;
+        if (xsk_ring_prod__reserve(&tx_ring_, 1, &tx_idx) != 1) {
+            // TX ring full — ACK dropped, still advance and free FIFO slot
+            ack_alloc_pos_++;
+            mark_ack_frame_acked(frame_idx);
+            return 0;
+        }
+
+        struct xdp_desc* tx_desc = xsk_ring_prod__tx_desc(&tx_ring_, tx_idx);
+        tx_desc->addr = addr + HEADROOM;
+        tx_desc->len = desc.frame_len;
+        tx_desc->options = 0;
+
+        ack_frame_sent_[relative_idx] = true;
+        ack_alloc_pos_++;
+
+        xsk_ring_prod__submit(&tx_ring_, 1);
+        kick_tx();
+
+        // Always free — fire-and-forget
+        mark_ack_frame_acked(frame_idx);
+        return frame_idx;
+    }
+
+    void mark_ack_frame_acked(uint32_t frame_idx) {
+        uint32_t relative_idx = (frame_idx - ack_pool_start_) % ack_pool_size_;
+        ack_frame_acked_[relative_idx] = true;
+        while (ack_free_pos_ < ack_alloc_pos_) {
+            uint32_t free_rel = ack_free_pos_ % ack_pool_size_;
+            if (!ack_frame_acked_[free_rel]) break;
+            ack_frame_acked_[free_rel] = false;
+            ack_frame_sent_[free_rel] = false;
+            ack_free_pos_++;
+        }
+    }
+
+    uint32_t get_ack_pool_avail() const { return ack_pool_size_ - (ack_alloc_pos_ - ack_free_pos_); }
 
     /**
      * Retransmit existing frame (no rebuild/re-encryption)
@@ -1518,15 +1589,23 @@ private:
     uint32_t tx_alloc_pos_;                 // Next frame to allocate (monotonic counter)
     uint32_t tx_free_pos_;                  // Next frame available for reuse (monotonic counter)
     uint32_t tx_commit_pos_;                // Next expected commit index (for batch TX API)
-    std::array<bool, DEFAULT_TX_POOL_SIZE> frame_acked_;  // Per-TX-frame ACK status
-    std::array<bool, DEFAULT_TX_POOL_SIZE> frame_sent_;   // Per-TX-frame sent-to-NIC status
-    std::array<PacketFrameDescriptor, DEFAULT_TX_POOL_SIZE> tx_claimed_descs_;  // Descriptors for batch TX
+    std::array<bool, websocket::pipeline::TX_POOL_SIZE> frame_acked_;  // Per-TX-frame ACK status
+    std::array<bool, websocket::pipeline::TX_POOL_SIZE> frame_sent_;   // Per-TX-frame sent-to-NIC status
+    std::array<PacketFrameDescriptor, websocket::pipeline::TX_POOL_SIZE> tx_claimed_descs_;  // Descriptors for batch TX
+
+    // TX ACK Pool Management (fire-and-forget, separate FIFO)
+    uint32_t ack_pool_start_;               // First frame index in ACK pool
+    uint32_t ack_pool_size_;                // Number of frames in ACK pool
+    uint32_t ack_alloc_pos_;                // Next ACK frame to allocate (monotonic)
+    uint32_t ack_free_pos_;                 // Next ACK frame available for reuse (monotonic)
+    std::array<bool, websocket::pipeline::TX_ACK_POOL_SIZE> ack_frame_acked_;
+    std::array<bool, websocket::pipeline::TX_ACK_POOL_SIZE> ack_frame_sent_;
 
     // RX Pool Management (for batch RX API)
     uint32_t rx_process_pos_;               // Next frame to process (monotonic counter)
     uint32_t rx_consume_pos_;               // First unconsumed frame (monotonic counter)
-    std::array<bool, DEFAULT_RX_POOL_SIZE> rx_consumed_;  // Per-RX-frame consumed status
-    std::array<uint64_t, DEFAULT_RX_POOL_SIZE> rx_frame_addrs_;  // Frame addresses for FIFO refill
+    std::array<bool, websocket::pipeline::RX_FRAMES> rx_consumed_;  // Per-RX-frame consumed status
+    std::array<uint64_t, websocket::pipeline::RX_FRAMES> rx_frame_addrs_;  // Frame addresses for FIFO refill
 };
 
 #else  // !USE_XDP

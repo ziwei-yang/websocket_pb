@@ -1328,14 +1328,16 @@ private:
         snprintf(url, sizeof(url), "wss://%s:%u%s",
                  Traits::WSS_HOST, Traits::WSS_PORT, Traits::WSS_PATH);
 
-        TransportType transport(url, umem_area_, FRAME_SIZE,
+        // Heap-allocate: TransportType contains PacketIO arrays sized by TX_POOL_SIZE
+        // (>1MB per PacketIO), exceeding default 8MB stack for large MaxConn.
+        auto transport = std::make_unique<TransportType>(url, umem_area_, FRAME_SIZE,
             &raw_inbox_cons, &raw_outbox_prod,
             inboxes, msg_metadata_prod_ptrs, &pongs_cons,
             conn_state_, &msg_outbox_cons);
-        if constexpr (Prof) transport.set_profiling_data(&profiling_->transport);
-        if (!transport.init()) { conn_state_->shutdown_all(); return; }
-        transport.run();
-        transport.cleanup();
+        if constexpr (Prof) transport->set_profiling_data(&profiling_->transport);
+        if (!transport->init()) { conn_state_->shutdown_all(); return; }
+        transport->run();
+        transport->cleanup();
     }
 
     void run_websocket_process() {
@@ -1428,31 +1430,33 @@ private:
             inboxes[i] = msg_inbox_[i];
             null_prods[i] = nullptr;
         }
-        InlineTransportType transport(url, umem_area_, FRAME_SIZE,
+        // Heap-allocate: TransportType contains PacketIO arrays sized by TX_POOL_SIZE
+        // (>1MB per PacketIO), exceeding default 8MB stack for large MaxConn.
+        auto transport = std::make_unique<InlineTransportType>(url, umem_area_, FRAME_SIZE,
             &raw_inbox_cons, &raw_outbox_prod,
             inboxes, null_prods, nullptr,
             conn_state_, &msg_outbox_cons);
-        transport.inline_mkt_event_handler() = std::move(mkt_event_handler_);
+        transport->inline_mkt_event_handler() = std::move(mkt_event_handler_);
 
         // Wire MktEvent producer and ConnStateShm to mkt_event_handler
         if constexpr (MaxConn > 1) {
-            transport.inline_mkt_event_handler().mkt_event_prod = mkt_event_prod_holder.get();
-            transport.inline_mkt_event_handler().conn_state = conn_state_;
+            transport->inline_mkt_event_handler().mkt_event_prod = mkt_event_prod_holder.get();
+            transport->inline_mkt_event_handler().conn_state = conn_state_;
         }
 
-        if constexpr (Prof) transport.set_profiling_data(&profiling_->transport);
-        if (!transport.init()) { conn_state_->shutdown_all(); return; }
+        if constexpr (Prof) transport->set_profiling_data(&profiling_->transport);
+        if (!transport->init()) { conn_state_->shutdown_all(); return; }
 
         // Wire WSCore to msg_inbox, ws_frame_info_prod, DirectTXSink
-        transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_, inboxes);
+        transport->init_inline(ws_frame_info_prod_holder.get(), conn_state_, inboxes);
 
         // Wire active connection pointer for priority ordering
         if constexpr (MaxConn > 1) {
-            transport.set_active_conn_ptr(&transport.inline_mkt_event_handler().active_ci_);
+            transport->set_active_conn_ptr(&transport->inline_mkt_event_handler().active_ci_);
         }
 
-        transport.run();
-        transport.cleanup();
+        transport->run();
+        transport->cleanup();
     }
 
     void run_direct_io_transport_process() {
@@ -1491,31 +1495,33 @@ private:
             inboxes[i] = msg_inbox_[i];
             null_prods[i] = nullptr;
         }
-        DirectIOTransportType transport(url, nullptr, 0,
+        // Heap-allocate: TransportType contains PacketIO arrays sized by TX_POOL_SIZE
+        // (>1MB per PacketIO), exceeding default 8MB stack for large MaxConn.
+        auto transport = std::make_unique<DirectIOTransportType>(url, nullptr, 0,
             nullptr, nullptr,  // no raw inbox/outbox
             inboxes, null_prods, nullptr,
             conn_state_, &msg_outbox_cons);
-        transport.inline_mkt_event_handler() = std::move(mkt_event_handler_);
+        transport->inline_mkt_event_handler() = std::move(mkt_event_handler_);
 
         // Wire MktEvent producer and ConnStateShm to mkt_event_handler
         if constexpr (MaxConn > 1) {
-            transport.inline_mkt_event_handler().mkt_event_prod = mkt_event_prod_holder.get();
-            transport.inline_mkt_event_handler().conn_state = conn_state_;
+            transport->inline_mkt_event_handler().mkt_event_prod = mkt_event_prod_holder.get();
+            transport->inline_mkt_event_handler().conn_state = conn_state_;
         }
 
-        if constexpr (Prof) transport.set_profiling_data(&profiling_->transport);
-        if (!transport.init()) { conn_state_->shutdown_all(); return; }
+        if constexpr (Prof) transport->set_profiling_data(&profiling_->transport);
+        if (!transport->init()) { conn_state_->shutdown_all(); return; }
 
         // Wire WSCore to msg_inbox, ws_frame_info_prod, DirectTXSink
-        transport.init_inline(ws_frame_info_prod_holder.get(), conn_state_, inboxes);
+        transport->init_inline(ws_frame_info_prod_holder.get(), conn_state_, inboxes);
 
         // Wire active connection pointer for priority ordering
         if constexpr (MaxConn > 1) {
-            transport.set_active_conn_ptr(&transport.inline_mkt_event_handler().active_ci_);
+            transport->set_active_conn_ptr(&transport->inline_mkt_event_handler().active_ci_);
         }
 
-        transport.run();
-        transport.cleanup();
+        transport->run();
+        transport->cleanup();
     }
 
     // Helper to conditionally create WSFrameInfo producer

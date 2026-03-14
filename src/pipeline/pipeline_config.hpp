@@ -6,16 +6,37 @@
 #include <cstdint>
 #include <cstddef>
 
-namespace websocket::pipeline {
-
 // ============================================================================
-// Compile-time Configuration (passed via Makefile -D flags)
+// File-scope constants (must be outside namespace for cross-namespace use)
 // ============================================================================
 
 // NIC_MTU must be passed as a compile-time argument via -DNIC_MTU=<value>
 #ifndef NIC_MTU
 #error "NIC_MTU must be defined at compile time (e.g., -DNIC_MTU=1500)"
 #endif
+
+// Compile-time max connection count (pass -DMAX_CONN=N, default 1)
+// At file scope (not inside websocket::pipeline) because it's referenced from
+// other namespaces (e.g., websocket::sbe). pipeline_data.hpp #undef's MAX_CONN
+// to prevent collision with Traits::MAX_CONN member names.
+#ifndef MAX_CONN
+#define MAX_CONN 1
+#endif
+inline constexpr size_t PIPELINE_MAX_CONN = MAX_CONN;
+
+// Cache line size (configurable via -DPIPELINE_CACHE_LINE_SIZE=N)
+#ifndef PIPELINE_CACHE_LINE_SIZE
+#define PIPELINE_CACHE_LINE_SIZE 64
+#endif
+#ifndef CACHE_LINE_SIZE
+inline constexpr size_t CACHE_LINE_SIZE = PIPELINE_CACHE_LINE_SIZE;
+#endif
+
+namespace websocket::pipeline {
+
+// ============================================================================
+// Compile-time Configuration (passed via Makefile -D flags)
+// ============================================================================
 
 // FRAME_SIZE calculation: MTU + headers, rounded up to next power of 2
 // For MTU=1500: 1500 + 14 + 20 + 60 + 500 = 2094 -> 4096 (minimum for igc driver)
@@ -38,20 +59,23 @@ constexpr uint32_t calculate_frame_size(uint32_t mtu) {
 inline constexpr uint32_t FRAME_SIZE = calculate_frame_size(NIC_MTU);
 #endif
 
-// Cache line size (configurable for different architectures)
-#ifndef CACHE_LINE_SIZE
-#define CACHE_LINE_SIZE 64
-#endif
-
 // ============================================================================
 // UMEM Configuration
 // ============================================================================
 
-// UMEM layout: [RX_FRAMES | TX_POOL_SIZE]
-// TX pool is unified — no sub-pool distinction (ACKs, PONGs, MSGs all share one FIFO)
-inline constexpr size_t RX_FRAMES   = 2048;
-inline constexpr size_t TX_POOL_SIZE = 2048;
-inline constexpr size_t TOTAL_UMEM_FRAMES = RX_FRAMES + TX_POOL_SIZE;  // 4096
+// UMEM layout: [RX_FRAMES | TX_POOL_SIZE | TX_ACK_POOL_SIZE]
+// TX_POOL_SIZE = retransmit-tracked (SYN, DATA, FIN, PONG) — freed on remote TCP ACK
+// TX_ACK_POOL_SIZE = fire-and-forget (pure ACK, DUP-ACK) — freed immediately after commit
+// Separate pools prevent data frame HOL blocking from starving ACK frame recycling.
+// All sizes rounded up to power-of-2 (required by AF_XDP fill/comp/rx/tx ring sizes).
+constexpr size_t next_power_of_2(size_t v) {
+    v--; v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16; v |= v >> 32;
+    return v + 1;
+}
+inline constexpr size_t RX_FRAMES        = next_power_of_2(PIPELINE_MAX_CONN * 4096);
+inline constexpr size_t TX_POOL_SIZE      = next_power_of_2(PIPELINE_MAX_CONN * 2048);  // retransmit-tracked
+inline constexpr size_t TX_ACK_POOL_SIZE  = next_power_of_2(PIPELINE_MAX_CONN * 2048);  // fire-and-forget
+inline constexpr size_t TOTAL_UMEM_FRAMES = RX_FRAMES + TX_POOL_SIZE + TX_ACK_POOL_SIZE;
 
 // TX throttle: max MSG packets in flight before blocking RAW_OUTBOX
 // This implements congestion control at XDP level to prevent overwhelming
@@ -131,8 +155,8 @@ inline constexpr uint32_t COMP_BATCH = 32;
 inline constexpr uint32_t XDP_FRAME_HEADROOM = XDP_HEADROOM;
 
 // XSK ring sizes (must match fill/comp sizes for optimal throughput)
-inline constexpr uint32_t XDP_RX_RING_SIZE = RX_FRAMES;       // 2048
-inline constexpr uint32_t XDP_TX_RING_SIZE = TX_POOL_SIZE;     // 2048
+inline constexpr uint32_t XDP_RX_RING_SIZE = RX_FRAMES;
+inline constexpr uint32_t XDP_TX_RING_SIZE = TX_POOL_SIZE + TX_ACK_POOL_SIZE;
 
 // Batch size for XDP RX/TX/COMP operations
 inline constexpr uint32_t XDP_BATCH_SIZE = 64;
@@ -223,7 +247,7 @@ namespace shm_paths {
 static_assert(FRAME_SIZE >= NIC_MTU + 94, "FRAME_SIZE must fit NIC_MTU + headers");
 static_assert((FRAME_SIZE & (FRAME_SIZE - 1)) == 0 || FRAME_SIZE % 1024 == 0,
               "FRAME_SIZE should be power of 2 or 1KB aligned");
-static_assert(RX_FRAMES + TX_POOL_SIZE == TOTAL_UMEM_FRAMES,
+static_assert(RX_FRAMES + TX_POOL_SIZE + TX_ACK_POOL_SIZE == TOTAL_UMEM_FRAMES,
               "UMEM partition must equal total frames");
 static_assert((RAW_INBOX_SIZE & (RAW_INBOX_SIZE - 1)) == 0, "RAW_INBOX_SIZE must be power of 2");
 static_assert((MSG_METADATA_SIZE & (MSG_METADATA_SIZE - 1)) == 0, "MSG_METADATA_SIZE must be power of 2");
@@ -234,11 +258,12 @@ static_assert((MSG_INBOX_SIZE & (MSG_INBOX_SIZE - 1)) == 0, "MSG_INBOX_SIZE must
 // Helper Functions
 // ============================================================================
 
-// Derive pool type from UMEM address (RX vs TX)
+// Derive pool type from UMEM address (RX vs TX_DATA vs TX_ACK)
 constexpr FrameType get_pool_from_addr(uint64_t addr, uint32_t frame_size) {
     uint32_t frame_idx = static_cast<uint32_t>(addr / frame_size);
     if (frame_idx < RX_FRAMES) return FRAME_TYPE_RX;
-    return FRAME_TYPE_MSG;  // All TX frames are in one unified pool
+    if (frame_idx < RX_FRAMES + TX_POOL_SIZE) return FRAME_TYPE_MSG;
+    return FRAME_TYPE_ACK;
 }
 
 // Get frame index from UMEM address

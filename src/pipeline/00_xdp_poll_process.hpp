@@ -123,8 +123,8 @@ struct XDPPollProcess {
         // Fill ring needs to be large enough for RX_FRAMES (32768)
         // Completion ring needs to handle TX completions (ACK + PONG + MSG frames)
         struct xsk_umem_config umem_cfg = {};
-        umem_cfg.fill_size = RX_FRAMES;     // Must match RX pool size (32768)
-        umem_cfg.comp_size = TX_POOL_SIZE;  // Must match TX pool size (32768)
+        umem_cfg.fill_size = RX_FRAMES;                        // Must match RX pool size
+        umem_cfg.comp_size = TX_POOL_SIZE + TX_ACK_POOL_SIZE;  // Completions from both TX pools
         umem_cfg.frame_size = kFrameSize;
         umem_cfg.frame_headroom = kFrameHeadroom;
         umem_cfg.flags = 0;

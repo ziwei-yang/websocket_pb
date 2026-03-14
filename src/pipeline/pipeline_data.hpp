@@ -32,14 +32,12 @@
 #include "pipeline_config.hpp"
 #include "../xdp/packet_frame_descriptor.hpp"
 
-// Compile-time maximum connection count (pass -DMAX_CONN=N, default 16)
-// With DNS capping, 16 is safe as a generous default — actual connections
-// are capped to available DNS IPs at runtime.
-#ifndef MAX_CONN
-#define MAX_CONN 16
+// PIPELINE_MAX_CONN is now defined in pipeline_config.hpp (included above)
+// so pool size constants can reference it. #undef the macro here to prevent
+// collision with Traits::MAX_CONN member names.
+#ifdef MAX_CONN
+#undef MAX_CONN
 #endif
-static constexpr size_t PIPELINE_MAX_CONN = MAX_CONN;
-#undef MAX_CONN  // Prevent macro collision with Traits::MAX_CONN member names
 
 namespace websocket::pipeline {
 
@@ -357,8 +355,8 @@ struct alignas(64) WSFrameInfo {
     }
 
     void print_timeline(uint64_t tsc_freq_hz,
-                        uint64_t prev_publish_mono_ns = 0,
-                        uint64_t prev_latest_poll_cycle = 0,
+                        uint64_t /*prev_publish_mono_ns*/ = 0,
+                        uint64_t /*prev_latest_poll_cycle*/ = 0,
                         const uint8_t* payload_data = nullptr) const {
         uint64_t ref = ws_frame_publish_cycle;
         if (ref == 0) return;
@@ -385,7 +383,6 @@ struct alignas(64) WSFrameInfo {
         };
         auto fmt = [](char* b, double us) { fmt_latency(b, us); };
         char bpf_prefix[80] = "";
-        bool is_batch_continuation = (ssl_read_batch_num > 1);
         bool is_chunk_mode = ssl_read_ct > 0 &&
                              (ssl_read_total_bytes / ssl_read_ct) < NIC_MTU;
         bool use_latest_ref = is_chunk_mode || nic_packet_ct > 1;

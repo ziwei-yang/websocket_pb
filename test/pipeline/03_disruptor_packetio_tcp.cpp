@@ -65,7 +65,7 @@ using XDPPollType = XDPPollProcess<
     true,        // TrickleEnabled
     false,       // Profiling
     256,         // FrameHeadroom
-    FRAME_SIZE>; // FrameSize — from pipeline_config.hpp (4096 for MTU=1500)
+    NIC_MTU>;    // MTU — from pipeline_config.hpp (1500 default)
 
 // ============================================================================
 // Configuration

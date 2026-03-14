@@ -50,11 +50,11 @@
 // Must be captured and #undef'd BEFORE including websocket_pipeline.hpp
 // ============================================================================
 
-#ifdef MAX_CONN
-static constexpr size_t CONN_COUNT = MAX_CONN;
-#else
-static constexpr size_t CONN_COUNT = 16;  // DNS capping limits to available IPs
+// Default MAX_CONN=16 (8 IPs × 2 conn/IP) — capped at runtime by DNS record count
+#ifndef MAX_CONN
+#define MAX_CONN 16
 #endif
+static constexpr size_t CONN_COUNT = MAX_CONN;
 
 // ENABLE_RECONNECT is required for InlineWS — always force true
 #ifdef ENABLE_RECONNECT

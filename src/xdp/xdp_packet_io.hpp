@@ -174,34 +174,19 @@ struct XDPPacketIO {
     }
 
     /**
-     * Commit a single ACK frame
+     * Commit a single ACK frame from the dedicated ACK pool
      *
-     * In single-process XDP mode, ACKs use the same TX path as data.
-     * This method exists for API compatibility with DisruptorPacketIO.
+     * Delegates to XDPTransport::commit_ack_frame() which uses a separate
+     * FIFO pool to prevent data frame HOL blocking from starving ACKs.
      *
      * @param callback Lambda(PacketFrameDescriptor& desc) to fill the ACK frame
      * @return Frame index on success, 0 on failure
      */
     template<typename Func>
     uint32_t commit_ack_frame(Func&& callback) {
-        uint32_t frame_idx = 0;
-        uint32_t claimed = claim_tx_frames(1, [&](uint32_t, PacketFrameDescriptor& desc) {
-            frame_idx = frame_ptr_to_idx(desc.frame_ptr);
-            desc.frame_type = FRAME_TYPE_TX_ACK;
+        return xdp_.commit_ack_frame([&](PacketFrameDescriptor& desc) {
             callback(desc);
         });
-        if (claimed > 0) {
-            uint32_t committed = commit_tx_frames(frame_idx, frame_idx);
-            // Always free FIFO slot — ACK frames are fire-and-forget.
-            // If TX ring was full, delayed ACK timer or next data piggyback re-sends.
-            mark_frame_acked(frame_idx);
-            if (committed == 0) {
-                fprintf(stderr, "[WARN][XDP-PIO] commit_ack_frame: TX submit failed, ACK dropped\n");
-                return 0;
-            }
-            return frame_idx;
-        }
-        return 0;
     }
 
     /**
@@ -391,6 +376,8 @@ struct XDPPacketIO {
         xdp_.get_tx_pool_stats(allocated, pending, available);
         return available;
     }
+
+    uint32_t get_ack_pool_avail() const { return xdp_.get_ack_pool_avail(); }
 
 private:
     XDPTransport xdp_;
