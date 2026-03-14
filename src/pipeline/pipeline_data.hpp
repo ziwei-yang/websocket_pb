@@ -618,7 +618,7 @@ struct alignas(64) WSFrameInfo {
         } else {
             fprintf(stderr,
                     "%s%s%s"
-                    " %2u pkt %5u %4s~%6s tx:%4u"
+                    " %2u pkt %5u %4s~%6s tx:%5u"
                     "%s %2u %s %4s~%6s "
                     "WS %3u %6s "
                     "%s%s%3s %-2s @%6s%s  %s%s%s%s%s%s\n",

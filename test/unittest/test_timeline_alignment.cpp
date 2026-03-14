@@ -82,7 +82,7 @@ static void test_ws_column_alignment() {
     info.mkt_event_type = 0;   // BOOK_DELTA
     info.mkt_event_count = 20;
     info.mkt_event_seq = 12345678;
-    info.tx_pool_avail = 48;
+    info.tx_pool_avail = 32761;  // 5-digit DPDK pool to exercise tx:%5u
     info.set_active_conn(true);
 
     // --- MktEvent setup (matching fields) ---
@@ -105,7 +105,7 @@ static void test_ws_column_alignment() {
     dup2(fileno(tmp), fileno(stderr));
 
     info.print_timeline(tsc_freq);
-    mkt.print(100);
+    mkt.print();  // uses default padding=101
 
     fflush(stderr);
     dup2(saved_fd, fileno(stderr));
@@ -123,19 +123,15 @@ static void test_ws_column_alignment() {
     std::string ml = strip_ansi(mkt_raw.c_str());
 
     // --- Assert "WS" position matches connection char position ---
-    // Timeline: conn_prefix(2) + bpf_prefix(19) + pkt(33) + ssl(32) + "WS" → "W" at col 86
-    // MktEvent: padding(84 spaces) + flush_id "  0 ..." → '0' at col 86
+    // Timeline: conn_prefix(2) + bpf_prefix(19) + pkt(34) + ssl(32) + "WS" → "W" at col 87
+    // MktEvent: padding(85 spaces) + flush_id "  0 ..." → '0' at col 87+2=89
     size_t ws_pos = tl.find("WS");
     assert(ws_pos != std::string::npos);
     assert(ws_pos < ml.size());
     assert(ml[ws_pos] == '0');  // connection_id=0 → char '0'
 
     // --- mkt_cnt column alignment: both lines have "20" at the same position ---
-    // Timeline tail starts right after WS column; MktEvent tail starts right after flush_id
-    // Both use %3s for mkt_cnt, so find the mkt_cnt "20" after the WS/flush_id region
     {
-        // In timeline, mkt_cnt appears in tail after WS column (position 100+)
-        // Search for " 20 " pattern after ws_pos
         size_t tl_cnt = tl.find(" 20 ", ws_pos);
         size_t ml_cnt = ml.find(" 20 ", ws_pos);
         assert(tl_cnt != std::string::npos);
@@ -144,9 +140,6 @@ static void test_ws_column_alignment() {
     }
 
     // --- Both lines contain same seq number ---
-    // Byte positions differ (Σ is 2 UTF-8 bytes vs @ is 1, and exch_diff is
-    // conditional in timeline but always present in MktEvent), but display
-    // columns align when exch_diff is set. mkt_cnt alignment above anchors this.
     assert(tl.find("#12345678") != std::string::npos);
     assert(ml.find("#12345678") != std::string::npos);
 

@@ -330,7 +330,7 @@ struct alignas(512) MktEvent {
     // Σ = total latency: NIC/BPF arrival to event publish
     // ========================================================================
 
-    void print(int padding = 100) const {
+    void print(int padding = 101) const {
         if (is_system_status()) {
             const char* st_name =
                 payload.status.status_type == 0 ? "HEARTBEAT" :
