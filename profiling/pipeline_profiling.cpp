@@ -1250,6 +1250,15 @@ int main(int argc, char* argv[]) {
     return analyze_xdp_poll_loop(filename);
 }
 
+struct BurstWindow {
+    uint64_t dm_count = 0;      // data-moved iterations
+    uint64_t idle_count = 0;    // idle iterations
+    double   dm_cycles = 0;     // total cycles in data-moved iterations
+    double   idle_cycles = 0;   // total cycles in idle iterations
+    size_t   start_idx = 0;     // first sample index in this window
+    size_t   end_idx = 0;       // last sample index (exclusive)
+};
+
 // Analyze XDP Poll or Transport loop profiling file
 int analyze_xdp_poll_loop(const char* filename) {
     // Set operation names based on file type
@@ -1647,7 +1656,15 @@ int analyze_xdp_poll_loop(const char* filename) {
     uint64_t data_moved_count = 0;
     uint64_t idle_count = 0;
 
-    for (const auto& sample : samples) {
+    // Burst window tracking (1ms windows)
+    const double window_cycles_1ms = 0.001 * g_cpu_freq_ghz * 1e9;
+    std::vector<BurstWindow> burst_windows_1ms;
+    BurstWindow cur_window_1ms;
+    cur_window_1ms.start_idx = 0;
+    double window_accum_cycles_1ms = 0;
+
+    for (size_t si = 0; si < samples.size(); ++si) {
+        const auto& sample = samples[si];
         // Total loop cycles = sum of op_cycles (for both XDP Poll and Transport)
         uint64_t total_cycles = sample.total_op_cycles();
         total_cycles_stats.add(static_cast<int64_t>(total_cycles));
@@ -1710,6 +1727,23 @@ int analyze_xdp_poll_loop(const char* filename) {
             }
         }
 
+        // 1ms burst window tracking
+        window_accum_cycles_1ms += total_cycles;
+        if (data_moved) {
+            cur_window_1ms.dm_count++;
+            cur_window_1ms.dm_cycles += total_cycles;
+        } else {
+            cur_window_1ms.idle_count++;
+            cur_window_1ms.idle_cycles += total_cycles;
+        }
+        if (window_accum_cycles_1ms >= window_cycles_1ms) {
+            cur_window_1ms.end_idx = si + 1;
+            burst_windows_1ms.push_back(cur_window_1ms);
+            cur_window_1ms = BurstWindow{};
+            cur_window_1ms.start_idx = si + 1;
+            window_accum_cycles_1ms = 0;
+        }
+
         // Per-operation stats (all iterations)
         for (size_t i = 0; i < CycleSample::N; ++i) {
             op_cycles_stats[i].add(sample.op_cycles[i]);
@@ -1739,6 +1773,12 @@ int analyze_xdp_poll_loop(const char* filename) {
             event_latency_stats.add(latency_ns);
             event_latency_hist.add(ipc_latency_cycles);
         }
+    }
+
+    // Push last partial burst window
+    if (cur_window_1ms.dm_count + cur_window_1ms.idle_count > 0) {
+        cur_window_1ms.end_idx = samples.size();
+        burst_windows_1ms.push_back(cur_window_1ms);
     }
 
     // Compute cycle breakdown percentages from DATA-MOVED samples only
@@ -1804,6 +1844,64 @@ int analyze_xdp_poll_loop(const char* filename) {
                                       total_cycles_data_moved_hist, dm_label, total_cycles_data_moved,
                                       total_cycles_idle_hist, idle_label, total_cycles_idle,
                                       nullptr);
+    }
+
+    // Burst analysis: top 10 busiest 1ms windows
+    if (burst_windows_1ms.size() > 1) {
+        std::vector<size_t> ranked_1ms(burst_windows_1ms.size());
+        for (size_t i = 0; i < ranked_1ms.size(); ++i) ranked_1ms[i] = i;
+        std::sort(ranked_1ms.begin(), ranked_1ms.end(), [&](size_t a, size_t b) {
+            const auto& wa = burst_windows_1ms[a];
+            const auto& wb = burst_windows_1ms[b];
+            double total_a = wa.dm_cycles + wa.idle_cycles;
+            double total_b = wb.dm_cycles + wb.idle_cycles;
+            double frac_a = total_a > 0 ? wa.dm_cycles / total_a : 0;
+            double frac_b = total_b > 0 ? wb.dm_cycles / total_b : 0;
+            return frac_a > frac_b;
+        });
+
+        size_t top_n_1ms = std::min(ranked_1ms.size(), size_t(10));
+
+        std::vector<double> window_time_offset_1ms(burst_windows_1ms.size());
+        double cum_sec_1ms = 0;
+        for (size_t i = 0; i < burst_windows_1ms.size(); ++i) {
+            window_time_offset_1ms[i] = cum_sec_1ms;
+            cum_sec_1ms += (burst_windows_1ms[i].dm_cycles + burst_windows_1ms[i].idle_cycles) / (g_cpu_freq_ghz * 1e9);
+        }
+
+        printf("\n%s========================================%s\n", Color::Bold, Color::Reset);
+        printf("%sBURST ANALYSIS (1ms windows, %zu total)%s\n", Color::Bold, burst_windows_1ms.size(), Color::Reset);
+        printf("%s========================================%s\n", Color::Bold, Color::Reset);
+        printf(" %sRank   Window               Data-Moved              Samples%s\n", Color::Dim, Color::Reset);
+
+        for (size_t r = 0; r < top_n_1ms; ++r) {
+            size_t wi = ranked_1ms[r];
+            const auto& w = burst_windows_1ms[wi];
+            double total_w = w.dm_cycles + w.idle_cycles;
+            double dm_iter_pct = 100.0 * w.dm_count / (w.dm_count + w.idle_count);
+            double dm_time_pct = total_w > 0 ? 100.0 * w.dm_cycles / total_w : 0;
+            double t_start = window_time_offset_1ms[wi];
+            double t_end = t_start + total_w / (g_cpu_freq_ghz * 1e9);
+
+            auto fmt = [](double pct) -> const char* {
+                if (pct > 0 && pct < 0.1) return "%.3f";
+                if (pct > 0 && pct < 1.0) return "%.2f";
+                return "%.1f";
+            };
+            char iter_str[16], time_str[16];
+            snprintf(iter_str, sizeof(iter_str), fmt(dm_iter_pct), dm_iter_pct);
+            snprintf(time_str, sizeof(time_str), fmt(dm_time_pct), dm_time_pct);
+
+            const char* color = (r < 3) ? Color::Red : (r < 6) ? Color::Yellow : "";
+            const char* reset = (r < 6) ? Color::Reset : "";
+
+            printf("  %s#%-4zu  T+%.3f~%.3fs    %5s%% (%5s%% time)    %7lu%s\n",
+                   color, r + 1, t_start, t_end,
+                   iter_str, time_str,
+                   static_cast<unsigned long>(w.dm_count + w.idle_count),
+                   reset);
+        }
+        printf("\n");
     }
 
     // Per-operation: use op_details[i] != 0 as "active" vs op_details[i] == 0 as "inactive"
